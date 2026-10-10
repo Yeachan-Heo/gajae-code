@@ -4,10 +4,21 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	BACKMERGE_CONFLICT_PATH,
+	type BackmergePullRequest,
 	backmergeReleaseIntoDev,
 	classifyBackmergePushFailure,
 	resolveDiagnosticArtifactBackmerge,
 } from "./release";
+
+/** Records pull requests instead of calling GitHub; fixtures have a local-path origin. */
+function recordingOpener(failure?: string) {
+	const opened: BackmergePullRequest[] = [];
+	const openPullRequest = async (request: BackmergePullRequest) => {
+		opened.push(request);
+		return failure;
+	};
+	return { opened, openPullRequest };
+}
 
 const DEV = `{
   "schema": "gjc.diagnostic-artifact",
@@ -145,34 +156,60 @@ async function backmergeFixture(options: { devManifest?: string; secondConflict?
 	await Bun.write(path.join(work, "released.txt"), "released\n");
 	await git(work, "add", "-A");
 	await git(work, "commit", "-m", "chore: release 0.18.7");
-	await git(work, "push", "origin", "main");
+	await git(work, "tag", "v0.18.7");
+	await git(work, "push", "origin", "main", "--tags");
 	return { origin, work };
 }
 
 describe("backmerge orchestration", () => {
-	test("merges a diverged dev, resolves the manifest, and lands a conventional commit", async () => {
+	test("pushes the resolved merge to backmerge/<version> and opens a PR instead of touching dev", async () => {
 		const { origin, work } = await backmergeFixture();
+		const devBefore = await git(origin, "rev-parse", "dev");
+		const opener = recordingOpener();
 
-		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work });
-		expect(outcome.action).toBe("merged");
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
+		expect(outcome.action).toBe("opened");
+
+		// dev only moves through the reviewed pull request.
+		expect(await git(origin, "rev-parse", "dev")).toBe(devBefore);
+		expect(opener.opened).toHaveLength(1);
+		expect(opener.opened[0]).toMatchObject({
+			head: "backmerge/0.18.7",
+			base: "dev",
+			title: "chore(release): backmerge v0.18.7 into dev",
+		});
 
 		// The released version wins while dev's digests and its own work survive.
-		const merged = JSON.parse(await git(origin, "show", `dev:${BACKMERGE_CONFLICT_PATH}`)) as Record<string, unknown>;
+		const branch = "backmerge/0.18.7";
+		const merged = JSON.parse(await git(origin, "show", `${branch}:${BACKMERGE_CONFLICT_PATH}`)) as Record<string, unknown>;
 		expect(merged).toEqual({
 			schema: "gjc.diagnostic-artifact",
 			version: "0.18.7",
 			artifacts: { "pi_natives.darwin-arm64.node": "dev-digest" },
 		});
-		expect(await git(origin, "show", "dev:released.txt")).toBe("released\n");
-		expect(await git(origin, "show", "dev:dev-only.txt")).toBe("dev\n");
+		expect(await git(origin, "show", `${branch}:released.txt`)).toBe("released\n");
+		expect(await git(origin, "show", `${branch}:dev-only.txt`)).toBe("dev\n");
+		expect((await git(origin, "rev-parse", `${branch}^1`)).trim()).toBe(devBefore.trim());
 
 		// The generated commit carries the required conventional subject and why body.
-		expect((await git(origin, "log", "-1", "--format=%s", "dev")).trim()).toBe("chore(release): sync the v0.18.7 release into dev");
-		expect(await git(origin, "log", "-1", "--format=%b", "dev")).toContain("fast-forward");
+		expect((await git(origin, "log", "-1", "--format=%s", branch)).trim()).toBe("chore(release): sync the v0.18.7 release into dev");
+		expect(await git(origin, "log", "-1", "--format=%b", branch)).toContain("fast-forward");
 
-		// dev now contains main, so a repeat run has nothing to do.
-		const repeat = await backmergeReleaseIntoDev("0.18.7", { repoDir: work });
-		expect(repeat.action).toBe("skipped");
+		// A rerun never rewrites the existing branch (it may carry review fixes); it only
+		// re-ensures the pull request, which the gh opener treats as idempotent.
+		const tip = await git(origin, "rev-parse", branch);
+		await git(work, "checkout", "main");
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.8", "later-main-digest"));
+		await Bun.write(path.join(work, "later-release.txt"), "later release\n");
+		await git(work, "add", "-A");
+		await git(work, "commit", "-m", "chore: release 0.18.8");
+		await git(work, "tag", "v0.18.8");
+		await git(work, "push", "origin", "main", "--tags");
+		const repeat = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
+		expect(repeat.action).toBe("opened");
+		expect(await git(origin, "rev-parse", branch)).toBe(tip);
+		expect(opener.opened).toHaveLength(2);
+		expect(opener.opened[1]?.head).toBe(branch);
 
 		// The throwaway worktree is deregistered rather than left behind.
 		const registered = (await git(work, "worktree", "list", "--porcelain"))
@@ -181,11 +218,89 @@ describe("backmerge orchestration", () => {
 		expect(registered).toHaveLength(1);
 	});
 
+	test("merges the requested release tag when main advances before a delayed backmerge", async () => {
+		const { origin, work } = await backmergeFixture();
+		await git(work, "checkout", "main");
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.8", "later-main-digest"));
+		await Bun.write(path.join(work, "later-release.txt"), "later release\n");
+		await git(work, "add", "-A");
+		await git(work, "commit", "-m", "chore: release 0.18.8");
+		await git(work, "tag", "v0.18.8");
+		await git(work, "push", "origin", "main", "--tags");
+
+		const releaseCommit = (await git(origin, "rev-parse", "v0.18.7^{commit}")).trim();
+		const opener = recordingOpener();
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
+
+		expect(outcome.action).toBe("opened");
+		expect((await git(origin, "rev-parse", "backmerge/0.18.7^2")).trim()).toBe(releaseCommit);
+		expect(JSON.parse(await git(origin, "show", `backmerge/0.18.7:${BACKMERGE_CONFLICT_PATH}`))).toEqual({
+			schema: "gjc.diagnostic-artifact",
+			version: "0.18.7",
+			artifacts: { "pi_natives.darwin-arm64.node": "dev-digest" },
+		});
+		expect((await gitCommand(origin, ["cat-file", "-e", "backmerge/0.18.7:later-release.txt"])).exitCode).not.toBe(0);
+		expect(await git(origin, "show", "main:later-release.txt")).toBe("later release\n");
+	});
+
+	test("refuses to reopen an existing backmerge branch that includes a later release", async () => {
+		const { origin, work } = await backmergeFixture();
+		await git(work, "checkout", "main");
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.8", "later-main-digest"));
+		await Bun.write(path.join(work, "later-release.txt"), "later release\n");
+		await git(work, "add", "-A");
+		await git(work, "commit", "-m", "chore: release 0.18.8");
+		await git(work, "tag", "v0.18.8");
+		await git(work, "push", "origin", "main", "--tags");
+
+		await git(work, "fetch", "origin");
+		await git(work, "checkout", "-b", "legacy-backmerge", "origin/dev");
+		const merge = await gitCommand(work, ["merge", "--no-commit", "--no-ff", "origin/main"]);
+		expect(merge.exitCode).not.toBe(0);
+		const conflicts = (await git(work, "diff", "--name-only", "--diff-filter=U"))
+			.split("\n")
+			.map(line => line.trim())
+			.filter(Boolean);
+		expect(conflicts).toEqual([BACKMERGE_CONFLICT_PATH]);
+		const ours = await git(work, "show", `:2:${BACKMERGE_CONFLICT_PATH}`);
+		const theirs = await git(work, "show", `:3:${BACKMERGE_CONFLICT_PATH}`);
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(ours, theirs));
+		await git(work, "add", BACKMERGE_CONFLICT_PATH);
+		await git(work, "commit", "-m", "chore(release): sync the v0.18.7 release into dev");
+		await git(work, "push", "origin", "HEAD:refs/heads/backmerge/0.18.7");
+		const oldTip = await git(origin, "rev-parse", "backmerge/0.18.7");
+		const opener = recordingOpener();
+
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
+
+		expect(outcome.action).toBe("blocked");
+		expect(outcome.detail).toContain("does not have one merge commit from the v0.18.7 release tag");
+		expect(opener.opened).toHaveLength(0);
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(oldTip);
+	});
+
+	test("a rerun opens the pull request a failed run left behind without rebuilding the branch", async () => {
+		const { origin, work } = await backmergeFixture();
+		const failing = recordingOpener("HTTP 403: Resource not accessible by integration");
+
+		const first = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: failing.openPullRequest });
+		expect(first.action).toBe("blocked");
+		expect(first.detail).toContain("HTTP 403");
+		const tip = await git(origin, "rev-parse", "backmerge/0.18.7");
+
+		const working = recordingOpener();
+		const retry = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: working.openPullRequest });
+		expect(retry.action).toBe("opened");
+		expect(working.opened).toHaveLength(1);
+		expect(working.opened[0]).toMatchObject({ head: "backmerge/0.18.7", base: "dev" });
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
+	});
+
 	test("fails closed on a conflict the resolver does not own and leaves dev untouched", async () => {
 		const { origin, work } = await backmergeFixture({ secondConflict: true });
 		const before = await git(origin, "rev-parse", "dev");
 
-		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work });
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: recordingOpener().openPullRequest });
 
 		expect(outcome.action).toBe("blocked");
 		expect(outcome.detail).toContain("unexpected conflict");
@@ -198,7 +313,7 @@ describe("backmerge orchestration", () => {
 		});
 		const before = await git(origin, "rev-parse", "dev");
 
-		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work });
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: recordingOpener().openPullRequest });
 
 		expect(outcome.action).toBe("blocked");
 		expect(outcome.detail).toContain("no artifacts map on dev");

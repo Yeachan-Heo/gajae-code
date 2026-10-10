@@ -215,12 +215,12 @@ import {
 	type AsyncJob,
 	type AsyncJobDeliveryState,
 	AsyncJobManager,
-	asyncJobEndpointId as deriveAsyncJobEndpointId,
 	type FoldReason,
 	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
 	type SubagentLifecycle,
 } from "../async";
+import { asyncJobEndpointId as deriveAsyncJobEndpointId } from "../async/endpoint-id";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -238,11 +238,8 @@ import {
 } from "../config/model-profile-contract";
 import {
 	commitDurableModelProfileOwnership,
-	type DurableModelProfileOwnership,
 	InvalidModelProfileOwnershipError,
 	ModelProfileOwnershipConflictError,
-	type ModelProfileOwnershipMarker,
-	modelProfileOwnershipMarkersEqual,
 	readDurableModelProfileOwnership,
 } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
@@ -427,7 +424,7 @@ import {
 	readVisibleSkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
-import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
+import { assertWorkflowMutationAllowed, isWorkflowMutationTool } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
 import { DelegationHintController } from "../task/delegation-hint";
@@ -452,6 +449,7 @@ import {
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
+import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
@@ -535,6 +533,7 @@ import type {
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
+	SessionArtifactPublication,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -921,6 +920,28 @@ export interface QueuedInputSubmission {
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+/**
+ * Deliver one event to one listener, containing both synchronous throws and
+ * async rejections. Listeners are `void`-typed but interactive mode subscribes
+ * with an `async` one whose handlers can persist (plan approval calls
+ * `session.prompt()`); a rejection there, e.g. the managed append fence after
+ * another process took over the transcript, must not escape as an unhandled
+ * rejection and terminate the process.
+ */
+function deliverSessionEvent(
+	listener: AgentSessionEventListener,
+	event: AgentSessionEvent,
+	onError: (error: unknown) => void,
+): void {
+	try {
+		const result: unknown = listener(event);
+		if (result instanceof Promise) result.catch(onError);
+	} catch (error) {
+		onError(error);
+	}
+}
+
 export type AsyncJobSnapshotItem = Pick<
 	AsyncJob,
 	"id" | "type" | "status" | "label" | "startTime" | "endTime" | "metadata"
@@ -1802,20 +1823,14 @@ function summarizeAgentBashArtifactSave(
 	};
 }
 
-export interface AgentBashArtifactStore {
-	saveArtifact(content: string, toolType: string): Promise<string | undefined>;
-	getArtifactPath(id: string): Promise<string | null>;
-}
-
 export async function saveAgentBashOriginalArtifact(
-	store: AgentBashArtifactStore,
+	publication: SessionArtifactPublication,
 	originalText: string,
 ): Promise<BashArtifactSaveResult> {
 	try {
-		const artifactId = await store.saveArtifact(originalText, "bash-original");
-		if (!artifactId) return { status: "failed", diagnostic: "storage returned no artifact id" };
-		const artifactPath = await store.getArtifactPath(artifactId);
-		return artifactPath ? summarizeAgentBashArtifactSave(artifactId, originalText) : { status: "unavailable" };
+		const artifactId = await publication(originalText, "bash-original");
+		if (!artifactId) return { status: "unavailable" };
+		return summarizeAgentBashArtifactSave(artifactId, originalText);
 	} catch (error) {
 		return { status: "failed", diagnostic: boundAgentBashArtifactSaveDiagnostic(error) };
 	}
@@ -1995,7 +2010,7 @@ async function discardPreparedNewSessionAfterFailure(
 // ============================================================================
 
 /** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move"]);
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move", "github"]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
 	return toolName === "bash" || toolName === "monitor";
@@ -2119,6 +2134,7 @@ function getPermissionIntent(
 			cacheKey: "edit:move",
 		};
 	}
+	if (toolName === "github") return githubPermissionIntent(args);
 	return undefined;
 }
 
@@ -6936,11 +6952,9 @@ export class AgentSession {
 	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
 	#emit(event: AgentSessionEvent): void {
 		for (const listener of this.#eventListenerSnapshot) {
-			try {
-				listener(event);
-			} catch (error) {
+			deliverSessionEvent(listener, event, error => {
 				logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
-			}
+			});
 		}
 	}
 
@@ -10814,6 +10828,11 @@ export class AgentSession {
 	 * at `timeoutMs` so a wedged subprocess can't stall process exit.
 	 */
 	async disposeChildSubprocesses(timeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS): Promise<void> {
+		this.#evalExecutionDisposing = true;
+		this.abortEval();
+		const evalExecutionsSettled = this.#waitForEvalExecutionsToSettle(timeoutMs).then(settled => {
+			if (!settled) logger.warn("signal teardown: active eval executions remain unsettled");
+		});
 		const sessionId = this.sessionManager.getSessionId();
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		this.#unregisterResourceGc?.();
@@ -10823,6 +10842,7 @@ export class AgentSession {
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([
+			evalExecutionsSettled,
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).
 			releaseTabsForOwner(sessionId, { kill: true }).catch((error: unknown) =>
@@ -10851,7 +10871,8 @@ export class AgentSession {
 				logger.warn("signal teardown: tool session transition cleanups failed", { error }),
 			),
 		]);
-		await Promise.race([work, Bun.sleep(timeoutMs)]);
+		const completed = await Promise.race([work.then(() => true), Bun.sleep(timeoutMs).then(() => false)]);
+		if (!completed) logger.warn("signal teardown: cleanup exceeded its bounded caller deadline");
 	}
 
 	#rebindProviderSessionState(providerSessionState: Map<string, ProviderSessionState>): void {
@@ -11813,7 +11834,9 @@ export class AgentSession {
 							: undefined;
 					const commandContent = command
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
-						: undefined;
+						: target.name === "github"
+							? [{ type: "content" as const, content: { type: "text" as const, text: permissionIntent.title } }]
+							: undefined;
 					if (this.#sdkPermissionMode === "allow") {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
@@ -11926,7 +11949,7 @@ export class AgentSession {
 	/**
 	/** Wrap a tool with the workflow mutation guard before permissions or execution. */
 	#wrapToolForWorkflowMutationGuard<T extends AgentTool>(tool: T): T {
-		if (!["edit", "write", "ast_edit", "bash"].includes(tool.name)) return tool;
+		if (!isWorkflowMutationTool(tool.name)) return tool;
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return Reflect.get(target, prop, target);
@@ -18983,14 +19006,12 @@ export class AgentSession {
 		if (thinkingLevelChanged) {
 			const event: AgentSessionEvent = { type: "thinking_level_changed", thinkingLevel };
 			for (const listener of this.#eventListenerSnapshot) {
-				try {
-					listener(event);
-				} catch {
+				deliverSessionEvent(listener, event, () => {
 					logger.warn("Default model selection event listener failed", {
 						code: "default_model_selection_listener_failed",
 						disposition: "continue",
 					});
-				}
+				});
 			}
 		}
 		this.#applyPreparedDefaultModelSelectionPrompt(systemPrompt);
@@ -20981,7 +21002,28 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
+		// A successful empty stop with nonzero usage is not overflow evidence by usage
+		// alone. Zero-usage empty stops stay on the legacy proxy-overflow path, and typed
+		// overflow classification is preserved; only the empty-stop heuristic is disabled.
+		const hasOverflowEvidenceBeyondEmptyStopHeuristic =
+			assistantMessage.stopReason === "stop" &&
+			assistantMessage.content.length === 0 &&
+			classifyContextOverflow(
+				{ ...assistantMessage, content: [{ type: "text", text: "" }] },
+				assistantMessage.transportFailure,
+				contextWindow,
+			);
+		const emptyStopPromptTokens =
+			assistantMessage.usage.input + assistantMessage.usage.cacheRead + assistantMessage.usage.cacheWrite;
+		const successfulEmptyStop =
+			assistantMessage.stopReason === "stop" &&
+			assistantMessage.content.length === 0 &&
+			(emptyStopPromptTokens + assistantMessage.usage.output > 0 ||
+				assistantMessage.usage.totalTokens > 0) &&
+			emptyStopPromptTokens <= contextWindow &&
+			!hasOverflowEvidenceBeyondEmptyStopHeuristic;
 		if (
+			!successfulEmptyStop &&
 			sameModel &&
 			!errorIsFromBeforeCompaction &&
 			classifyContextOverflow(assistantMessage, assistantMessage.transportFailure, contextWindow)
@@ -23675,6 +23717,7 @@ export class AgentSession {
 
 	#managedFallbackPromptOptions(): {
 		fallbackManaged?: boolean;
+		contextOverflowManaged?: boolean;
 		nextFallbackAttempt?: (model: Model) => FallbackAttemptToken;
 		onManagedAttemptAccepted?: () => void;
 		onManagedAttemptOutcome?: (
@@ -23682,9 +23725,10 @@ export class AgentSession {
 		) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
 	} {
 		const controller = this.#defaultFallbackChain();
-		if (controller.chain.entries.length < 2) return {};
+		if (controller.chain.entries.length < 2) return { contextOverflowManaged: true };
 		return {
 			fallbackManaged: true,
+			contextOverflowManaged: true,
 			nextFallbackAttempt: model => {
 				controller.onAttemptStarted();
 				this.#managedFallbackProviderAttemptCount++;
@@ -25597,10 +25641,6 @@ export class AgentSession {
 	// Bash Execution
 	// =========================================================================
 
-	async #saveBashOriginalArtifact(originalText: string): Promise<BashArtifactSaveResult> {
-		return saveAgentBashOriginalArtifact(this.sessionManager, originalText);
-	}
-
 	/**
 	 * Execute a bash command.
 	 * Adds result to agent context and session.
@@ -25615,6 +25655,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
+		const publishArtifact = this.sessionManager.captureArtifactPublication();
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
@@ -25652,7 +25693,7 @@ export class AgentSession {
 					sessionId: this.sessionId,
 					cwd,
 				}),
-				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText),
+				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 
 			this.recordBashResult(command, result, options);
@@ -25756,9 +25797,18 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
 		this.assertEvalExecutionAllowed();
+		const sessionFile = this.sessionManager.getSessionFile();
+		const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
+		const kernelOwnerId = this.#evalKernelOwnerId;
+		const kernelMode = this.settings.get("python.kernelMode");
+		const settings = this.settings;
 
 		const abortController = new AbortController();
-		const execution = (async (): Promise<PythonResult> => {
+		const execution = Promise.resolve().then(async (): Promise<PythonResult> => {
+			if (abortController.signal.aborted) {
+				throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+			}
+			this.assertEvalExecutionAllowed();
 			if (this.#extensionRunner?.hasHandlers("user_python")) {
 				const hookResult = await this.#extensionRunner.emitUserPython({
 					type: "user_python",
@@ -25766,6 +25816,9 @@ export class AgentSession {
 					excludeFromContext,
 					cwd,
 				});
+				if (abortController.signal.aborted) {
+					throw abortController.signal.reason ?? new DOMException("Aborted", "AbortError");
+				}
 				this.assertEvalExecutionAllowed();
 				if (hookResult?.result) {
 					this.recordPythonResult(code, hookResult.result, options);
@@ -25773,15 +25826,12 @@ export class AgentSession {
 				}
 			}
 
-			// Use the same session ID as eval's Python backend for kernel sharing
-			const sessionFile = this.sessionManager.getSessionFile();
-			const sessionId = sessionFile ? `session:${sessionFile}:cwd:${cwd}` : `cwd:${cwd}`;
 			const result = await executePythonCommand(code, {
 				cwd,
 				sessionId,
-				kernelOwnerId: this.#evalKernelOwnerId,
-				kernelMode: this.settings.get("python.kernelMode"),
-				settings: this.settings,
+				kernelOwnerId,
+				kernelMode,
+				settings,
 				onChunk,
 				signal: abortController.signal,
 			});
@@ -25790,7 +25840,7 @@ export class AgentSession {
 			// must not reopen a closing session to append history.
 			if (!this.#evalExecutionDisposing) this.recordPythonResult(code, result, options);
 			return result;
-		})();
+		});
 		return await this.trackEvalExecution(execution, abortController);
 	}
 

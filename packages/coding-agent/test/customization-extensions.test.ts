@@ -121,6 +121,30 @@ describe("customization inventory", () => {
 		expect(row?.scope).toBe("global");
 	});
 
+	test("uses scanned import metadata for external user skill symlinks", async () => {
+		const skillDir = path.join(tmpRoot, "shared", "linked-skill");
+		const skillLink = path.join(getAgentDir(), "skills", "linked-skill");
+		await writeFile(
+			path.join(skillDir, "SKILL.md"),
+			"---\nname: linked-skill\ndescription: Shared helper\nx-gjc-imported-from: claude-code\n---\n# Shared helper\n",
+		);
+		await fs.mkdir(path.dirname(skillLink), { recursive: true });
+		await fs.symlink(skillDir, skillLink, "dir");
+
+		const inventory = await loadCustomizationInventory({
+			cwd: projectDir,
+			home: homeDir,
+			policy: { trustUserSkills: true },
+			allowExternalUserSkillSymlinks: true,
+		});
+		const row = inventory.rows.find(entry => entry.surface === "skills" && entry.name === "linked-skill");
+		expect(row).toMatchObject({
+			status: "imported",
+			provenance: expect.stringContaining("Claude Code"),
+			path: path.join(skillLink, "SKILL.md"),
+		});
+	});
+
 	test("invalid frontmatter is flagged with remediation diagnostics", async () => {
 		await writeFile(path.join(projectDir, ".gjc", "skills", "broken", "SKILL.md"), "no frontmatter here\n");
 		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir });

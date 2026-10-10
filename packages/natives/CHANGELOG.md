@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.18.8] - 2026-10-08
+
+### Added
+
+- Add a no-follow native empty-directory snapshot that stops at the first child and revalidates root and parent identities without recursive traversal or payload hashing.
+
+### Changed
+
+- Hash the file descriptor already exclusively owned by exact regular-file matching rather than duplicating it, preserving no-follow, byte, identity and post-hash pathname validation with deterministic descriptor cleanup.
+
+### Fixed
+
+- Avoid redundant ancestor metadata probes during POSIX exact deletion while retaining a fresh no-follow directory open for every ancestor, exact parent and file validation, and quarantine safeguards. Failed opens remain failures; symlink diagnostics never authorize retries or deletion.
+
+- Refresh the Darwin ARM64 diagnostic artifact descriptor from a genuine current-source native build after the strict native prerequisite changes. Digest and version validation remain enforced.
+
+- Accept Windows managed roots owned by the built-in Administrators group after elevated setup, while continuing to reject other owner SIDs and validate the root DACL.
+
 ## [0.18.7] - 2026-10-04
 
 ### Fixed

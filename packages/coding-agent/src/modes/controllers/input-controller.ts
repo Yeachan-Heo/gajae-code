@@ -42,6 +42,7 @@ import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 import { focusedUiOwnsInterrupt } from "../utils/interrupt-ownership";
 import { matchesAppInterrupt } from "../utils/keybinding-matchers";
+import { createUnforwardedOptionChordWarner } from "../utils/macos-option-forwarding";
 
 const QUEUE_SELECTOR_NAVIGATION_ACTIONS = [
 	"tui.select.up",
@@ -818,6 +819,12 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => this.#executeAction("app.message.queue");
 		this.#registerCommandPaletteAction("app.message.queue", queue, true);
+		this.ctx.editor.onUnforwardedOptionChord ??= createUnforwardedOptionChordWarner({
+			platform: process.platform,
+			terminalProgram: Bun.env.TERM_PROGRAM,
+			formatKeyHint: key => this.ctx.keybindings.formatKeyHint(key),
+			showWarning: message => this.ctx.showWarning(message),
+		});
 
 		this.ctx.editor.onViewportPageScroll = direction => this.ctx.ui.scrollViewportPages(direction);
 		this.ctx.editor.onViewportFollowLive = () => {
@@ -1293,7 +1300,7 @@ export class InputController {
 		});
 
 		// Stop the TUI (restore terminal to normal mode)
-		this.ctx.ui.stop();
+		this.ctx.ui.suspend();
 
 		// Send SIGTSTP to process group (pid=0 means all processes in group)
 		process.kill(0, "SIGTSTP");
@@ -2555,7 +2562,7 @@ export class InputController {
 		let ttyHandle: fs.FileHandle | null = null;
 		try {
 			ttyHandle = await this.#openEditorTerminalHandle();
-			this.ctx.ui.stop();
+			this.ctx.ui.suspend();
 
 			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
 				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]

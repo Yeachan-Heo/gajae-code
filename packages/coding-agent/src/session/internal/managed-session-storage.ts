@@ -1280,8 +1280,8 @@ export function retainManagedDirectoryAuthority(
 	expected?: { dev: bigint; ino: bigint },
 ): RecoveryFsRoot | undefined {
 	assertManagedDirectoryRoot(root);
-	managedRelativePath(root, directory);
-	const resolved = path.resolve(directory);
+	const resolved = canonicalizeManagedPathWithinRoot(root.canonicalPath, directory);
+	const relative = managedRelativePath(root, resolved).join("/");
 	if (process.platform !== "linux") return undefined;
 	const named = fs.lstatSync(resolved, { bigint: true });
 	if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("Managed directory authority is unavailable");
@@ -1297,7 +1297,6 @@ export function retainManagedDirectoryAuthority(
 			retainedRoot.identity.ino !== root.ino.toString()
 		)
 			throw new Error("Managed root authority changed");
-		const relative = path.relative(root.canonicalPath, resolved).split(path.sep).join("/");
 		const rootRecovery = rootAuthority.recoveryReaperMetrics();
 		const rootRecoveryUnhealthy = !rootRecovery.ok || Boolean(rootRecovery.code);
 		if (rootRecoveryUnhealthy)
@@ -1366,12 +1365,77 @@ function ensureManagedRoot(root: ManagedDirectoryRoot): void {
 	assertManagedDirectoryRoot(root);
 }
 
-function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): readonly string[] {
-	const relative = path.relative(root.canonicalPath, path.resolve(pathname));
+/** Resolve aliases above a managed root without following descendant symlinks. */
+function canonicalizeManagedPathWithinRoot(rootPath: string, pathname: string): string {
+	const canonicalRootPath = path.resolve(rootPath);
+	const namedRoot = fs.lstatSync(canonicalRootPath);
+	if (!namedRoot.isDirectory() || namedRoot.isSymbolicLink())
+		throw new Error(`Managed root authority changed: ${canonicalRootPath}`);
+	const resolvedPath = path.resolve(pathname);
+	const filesystemRoot = path.parse(resolvedPath).root;
+	const components = path.relative(filesystemRoot, resolvedPath).split(path.sep).filter(Boolean);
+	let currentPath = filesystemRoot;
+	let reachedManagedRoot = currentPath === canonicalRootPath;
+	if (reachedManagedRoot) currentPath = canonicalRootPath;
+
+	for (let index = 0; index < components.length; index++) {
+		const component = components[index]!;
+		const nextPath = path.join(currentPath, component);
+		if (!reachedManagedRoot) {
+			let canonicalPrefix: string;
+			try {
+				canonicalPrefix = fs.realpathSync.native(nextPath);
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "ENOENT" || code === "ENOTDIR")
+					throw new Error(`Managed path escapes configured root: ${pathname}`, { cause: error });
+				throw error;
+			}
+			if (canonicalPrefix === canonicalRootPath) {
+				reachedManagedRoot = true;
+				currentPath = canonicalRootPath;
+				continue;
+			}
+			currentPath = nextPath;
+			continue;
+		}
+
+		let named: fs.Stats;
+		try {
+			named = fs.lstatSync(nextPath);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") return path.join(currentPath, ...components.slice(index));
+			throw error;
+		}
+		if (named.isSymbolicLink()) throw new Error(`Managed path contains symlink: ${nextPath}`);
+		if (index < components.length - 1 && !named.isDirectory())
+			throw new Error(`Managed path component is not a directory: ${nextPath}`);
+		currentPath = nextPath;
+	}
+
+	if (!reachedManagedRoot) throw new Error(`Managed path escapes configured root: ${pathname}`);
+	return currentPath;
+}
+
+function relativeWithinManagedRoot(rootPath: string, pathname: string): readonly string[] {
+	const canonicalPath = canonicalizeManagedPathWithinRoot(rootPath, pathname);
+	const relative = path.relative(rootPath, canonicalPath);
+	if (process.platform === "win32") {
+		const canonicalRoot = path.win32.normalize(rootPath);
+		const canonicalCandidate = path.win32.normalize(canonicalPath);
+		const rootPrefix = canonicalRoot.endsWith(path.win32.sep) ? canonicalRoot : `${canonicalRoot}${path.win32.sep}`;
+		if (canonicalCandidate !== canonicalRoot && !canonicalCandidate.startsWith(rootPrefix))
+			throw new Error(`Managed path escapes configured root: ${pathname}`);
+	}
 	if (relative === "") return [];
 	if (path.isAbsolute(relative) || relative.split(path.sep).includes(".."))
 		throw new Error(`Managed path escapes configured root: ${pathname}`);
 	return relative.split(path.sep);
+}
+
+function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): readonly string[] {
+	return relativeWithinManagedRoot(root.canonicalPath, pathname);
 }
 
 const PROCESS_START_ID = randomUUID();
@@ -1538,16 +1602,21 @@ export class ManagedSessionDescendantStore {
 		if (access === "read-only" && retained) throw new Error("managed_read_store_cannot_borrow_authority");
 		if (access === "read-only" && !expectedSubtreeRoot)
 			throw new Error("managed_read_store_requires_existing_identity");
-		managedRelativePath(root, baseDir);
+		assertManagedDirectoryRoot(root);
+		const canonicalBaseDir = canonicalizeManagedPathWithinRoot(root.canonicalPath, baseDir);
+		const canonicalAuthorityBaseDir = retained
+			? canonicalizeManagedPathWithinRoot(root.canonicalPath, retained.authorityBaseDir)
+			: canonicalBaseDir;
+		managedRelativePath(root, canonicalBaseDir);
 
 		this.#root = root;
-		this.#baseDir = path.resolve(baseDir);
+		this.#baseDir = canonicalBaseDir;
 		this.#policy = policy ?? "default";
 		this.#access = access;
 		this.#profileAgentDir = profileAgentDir ?? root.canonicalPath;
-		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
+		this.#authorityBaseDir = canonicalAuthorityBaseDir;
 		if (retained) {
-			const relative = path.relative(retained.authorityBaseDir, this.#baseDir).split(path.sep).join("/");
+			const relative = relativeWithinManagedRoot(canonicalAuthorityBaseDir, this.#baseDir).join("/");
 			// For the root case (authorityBaseDir === baseDir, relative === ""), the
 			// stable identity() result carries the exact root dev/inode without
 			// snapshotting the entire live session tree. snapshotManagedTree("")
@@ -2668,12 +2737,18 @@ export class ManagedSessionDescendantStore {
 				canonicalFileId(rootBefore.ino) !== this.#subtreeRoot.ino
 			)
 				throw new Error("Managed descendant root binding changed");
-			let fd: number | undefined;
+			let fd: number;
 			try {
 				fd = fs.openSync(
 					resolved,
 					fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
 				);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			}
+			let descriptor: SessionStorageStat;
+			try {
 				const opened = fs.fstatSync(fd, { bigint: true });
 				const named = fs.lstatSync(resolved, { bigint: true });
 				if (
@@ -2695,7 +2770,7 @@ export class ManagedSessionDescendantStore {
 				)
 					throw new Error("Managed descendant root binding changed");
 				this.#assertBound();
-				return managedAppendReceiptFromIdentity({
+				descriptor = managedAppendReceiptFromIdentity({
 					dev: canonicalFileId(opened.dev),
 					ino: canonicalFileId(opened.ino),
 					nlink: opened.nlink,
@@ -2704,11 +2779,13 @@ export class ManagedSessionDescendantStore {
 					ctimeNs: opened.ctimeNs,
 				}).descriptor;
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				try {
+					fs.closeSync(fd);
+				} catch {}
 				throw error;
-			} finally {
-				if (fd !== undefined) fs.closeSync(fd);
 			}
+			fs.closeSync(fd);
+			return descriptor;
 		}
 		const stat = this.#authority.stat(this.#relative(resolved));
 		if (!stat.ok) {
@@ -2759,6 +2836,7 @@ export class ManagedSessionDescendantStore {
 			resolved,
 			fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
 		);
+		let snapshot: SessionStorageRangeSnapshot;
 		try {
 			const before = fs.fstatSync(fd, { bigint: true });
 			if (!before.isFile() || before.nlink > 1n) throw new Error("source_changed");
@@ -2805,7 +2883,10 @@ export class ManagedSessionDescendantStore {
 				named.isSymbolicLink() ||
 				named.dev !== before.dev ||
 				named.ino !== before.ino ||
-				named.nlink !== before.nlink
+				named.nlink !== before.nlink ||
+				named.size !== before.size ||
+				named.mtimeNs !== before.mtimeNs ||
+				named.ctimeNs !== before.ctimeNs
 			)
 				throw new Error("source_changed");
 			const rootAfter = fs.lstatSync(this.#baseDir, { bigint: true });
@@ -2817,7 +2898,7 @@ export class ManagedSessionDescendantStore {
 			)
 				throw new Error("Managed descendant root binding changed");
 			this.#assertBound();
-			return {
+			snapshot = {
 				bytes,
 				stat: {
 					dev: canonicalFileId(after.dev),
@@ -2831,9 +2912,14 @@ export class ManagedSessionDescendantStore {
 					isFile: true,
 				},
 			};
-		} finally {
-			fs.closeSync(fd);
+		} catch (error) {
+			try {
+				fs.closeSync(fd);
+			} catch {}
+			throw error;
 		}
+		fs.closeSync(fd);
+		return snapshot;
 	}
 
 	/** Open an identity-bound stream lease; Darwin uses exact bounded range reads per chunk. */
@@ -2851,6 +2937,7 @@ export class ManagedSessionDescendantStore {
 			return {
 				readRange: (start, length) => {
 					if (closed) throw new Error("closed");
+					if (start + length > expectedDescriptor.size) throw new Error("range_not_present");
 					return this.readRangeExpectedSync(relativePath, start, length, expectedDescriptor).bytes;
 				},
 				close: () => {
@@ -2992,7 +3079,7 @@ export class ManagedSessionDescendantStore {
 	readExpectedBounded(
 		relativePath: string,
 		maxBytes: number,
-		admitSize?: (size: number) => void,
+		admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 	): ManagedFileSnapshot | null {
 		if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
 		this.#assertBound();
@@ -3019,17 +3106,37 @@ export class ManagedSessionDescendantStore {
 		if (stat.nlink !== 1n) throw new Error("source_changed");
 		if (!Number.isSafeInteger(stat.size) || stat.size < 0) throw new Error("source_changed");
 		if (stat.size > maxBytes) throw new Error("artifact_capacity_exceeded");
-		admitSize?.(stat.size);
-		const bytes = Buffer.alloc(stat.size);
 		const lease = this.openReadLease(this.#relative(resolved), stat);
 		let failed = false;
 		let failure: unknown;
+		let snapshot: ManagedFileSnapshot | undefined;
 		try {
+			admitSize?.(stat.size, {
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				ctimeNs: stat.ctimeNs,
+			});
+			const bytes = Buffer.alloc(stat.size);
 			for (let offset = 0; offset < bytes.byteLength; ) {
 				const length = Math.min(1024 * 1024, bytes.byteLength - offset);
 				bytes.set(lease.readRange(offset, length), offset);
 				offset += length;
 			}
+			snapshot = {
+				bytes,
+				identity: {
+					dev: stat.dev,
+					ino: stat.ino,
+					nlink: stat.nlink,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					ctimeNs: stat.ctimeNs,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+				},
+			};
 		} catch (error) {
 			failed = true;
 			failure = error;
@@ -3043,18 +3150,8 @@ export class ManagedSessionDescendantStore {
 			}
 		}
 		if (failed) throw failure;
-		return {
-			bytes,
-			identity: {
-				dev: stat.dev,
-				ino: stat.ino,
-				nlink: stat.nlink,
-				size: stat.size,
-				mtimeNs: stat.mtimeNs,
-				ctimeNs: stat.ctimeNs,
-				sha256: createHash("sha256").update(bytes).digest("hex"),
-			},
-		};
+		if (!snapshot) throw new Error("Managed descendant snapshot is unavailable");
+		return snapshot;
 	}
 
 	/** Remove an exact captured file without reopening its pathname as authority. */
@@ -3706,7 +3803,7 @@ export function captureManagedFilePrefixNoFollow(pathname: string, maxBytes: num
 export function captureManagedFileNoFollowBounded(
 	pathname: string,
 	maxBytes: number,
-	admitSize?: (size: number) => void,
+	admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 ): ManagedFileSnapshot {
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
 	return captureManagedFileNoFollowLimit(pathname, maxBytes, true, admitSize);
@@ -3721,9 +3818,12 @@ function captureManagedFileNoFollowLimit(
 	pathname: string,
 	maxBytes?: number,
 	rejectOversized = false,
-	admitSize?: (size: number) => void,
+	admitSize?: (size: number, descriptor: ManagedFileIdentity) => void,
 ): ManagedFileSnapshot {
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+	let failed = false;
+	let failure: unknown;
+	let snapshot: ManagedFileSnapshot | undefined;
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || (rejectOversized ? before.nlink !== 1n : before.nlink > 1n))
@@ -3732,7 +3832,7 @@ function captureManagedFileNoFollowLimit(
 		if (!Number.isSafeInteger(fileSize) || fileSize < 0) throw new Error("source_changed");
 		if (rejectOversized && maxBytes !== undefined && fileSize > maxBytes)
 			throw new Error("artifact_capacity_exceeded");
-		admitSize?.(fileSize);
+		admitSize?.(fileSize, identity(before));
 		const captureSize = maxBytes === undefined ? fileSize : Math.min(fileSize, maxBytes);
 		const bytes = Buffer.alloc(captureSize);
 		let offset = 0;
@@ -3746,10 +3846,22 @@ function captureManagedFileNoFollowLimit(
 		const named = fs.lstatSync(pathname, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
 			throw new Error("source_changed");
-		return { bytes, identity: identity(before, createHash("sha256").update(bytes).digest("hex")) };
-	} finally {
-		fs.closeSync(fd);
+		snapshot = { bytes, identity: identity(before, createHash("sha256").update(bytes).digest("hex")) };
+	} catch (error) {
+		failed = true;
+		failure = error;
 	}
+	try {
+		fs.closeSync(fd);
+	} catch (error) {
+		if (!failed) {
+			failed = true;
+			failure = error;
+		}
+	}
+	if (failed) throw failure;
+	if (!snapshot) throw new Error("Managed file capture is unavailable");
+	return snapshot;
 }
 
 /** Streams a managed file once while retaining only a bounded header prefix and the full descriptor-bound digest. */

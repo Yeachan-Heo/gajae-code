@@ -8,9 +8,11 @@ import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import {
 	captureManagedFileNoFollow,
+	captureManagedFileNoFollowBounded,
 	ensureManagedDirectory,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedCommittedMutationError,
+	type ManagedFileIdentity,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -729,53 +731,572 @@ describe("MemorySessionStorageWriter owned append publication", () => {
 });
 
 describe("managed descriptor reads", () => {
-	it("returns transcript identity without exposing file bytes", () => {
-		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
+	const cjsFs = require("node:fs") as typeof fs;
+	const realCjsReadSync = cjsFs.readSync;
+	const realCjsCloseSync = cjsFs.closeSync;
+	const realCjsFstatSync = cjsFs.fstatSync;
+	const realCjsLstatSync = cjsFs.lstatSync;
+	const realCjsOpenSync = cjsFs.openSync;
+
+	function forwardFstatSync(fd: number): fs.Stats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+	function forwardFstatSync(fd: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+	function forwardFstatSync(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+		return options === undefined ? realCjsFstatSync(fd) : realCjsFstatSync(fd, options);
+	}
+
+	function forwardLstatSync(file: fs.PathLike): fs.Stats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options?: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+	): fs.Stats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+	): fs.BigIntStats;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+	): fs.Stats | undefined;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry: false },
+	): fs.BigIntStats | undefined;
+	function forwardLstatSync(
+		file: fs.PathLike,
+		options: fs.StatOptions & { throwIfNoEntry?: true | undefined },
+	): fs.Stats | fs.BigIntStats;
+	function forwardLstatSync(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined;
+	function forwardLstatSync(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined {
+		return options === undefined ? realCjsLstatSync(file) : realCjsLstatSync(file, options);
+	}
+
+	function capturePathLstatError(
+		pathname: string,
+		onPathnameError: (error: NodeJS.ErrnoException) => void,
+	): typeof fs.lstatSync {
+		function lstat(file: fs.PathLike): fs.Stats;
+		function lstat(
+			file: fs.PathLike,
+			options?: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+		): fs.Stats;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+		): fs.BigIntStats;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+		): fs.Stats | undefined;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { bigint: true; throwIfNoEntry: false },
+		): fs.BigIntStats | undefined;
+		function lstat(
+			file: fs.PathLike,
+			options: fs.StatOptions & { throwIfNoEntry?: true | undefined },
+		): fs.Stats | fs.BigIntStats;
+		function lstat(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined;
+		function lstat(file: fs.PathLike, options?: fs.StatOptions): fs.Stats | fs.BigIntStats | undefined {
+			try {
+				return forwardLstatSync(file, options);
+			} catch (error) {
+				if (path.resolve(String(file)) === pathname && (error as NodeJS.ErrnoException).code === "ENOENT")
+					onPathnameError(error as NodeJS.ErrnoException);
+				throw error;
+			}
+		}
+		return lstat;
+	}
+
+	function forwardReadSync(
+		fd: number,
+		buffer: NodeJS.ArrayBufferView,
+		offset: number,
+		length: number,
+		position: fs.ReadPosition | null,
+	): number;
+	function forwardReadSync(fd: number, buffer: NodeJS.ArrayBufferView, options?: fs.ReadOptions): number;
+	function forwardReadSync(
+		fd: number,
+		buffer: NodeJS.ArrayBufferView,
+		offsetOrOptions?: number | fs.ReadOptions,
+		length?: number,
+		position?: fs.ReadPosition | null,
+	): number {
+		if (typeof offsetOrOptions === "number") {
+			if (length === undefined || position === undefined) throw new Error("Invalid positional read arguments");
+			return realCjsReadSync(fd, buffer, offsetOrOptions, length, position);
+		}
+		return realCjsReadSync(fd, buffer, offsetOrOptions);
+	}
+
+	function instrumentReadSync(afterRead: () => void): typeof fs.readSync {
+		function read(
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: fs.ReadPosition | null,
+		): number;
+		function read(fd: number, buffer: NodeJS.ArrayBufferView, options?: fs.ReadOptions): number;
+		function read(
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offsetOrOptions?: number | fs.ReadOptions,
+			length?: number,
+			position?: fs.ReadPosition | null,
+		): number {
+			let count: number;
+			if (typeof offsetOrOptions === "number") {
+				if (length === undefined || position === undefined) throw new Error("Invalid positional read arguments");
+				count = forwardReadSync(fd, buffer, offsetOrOptions, length, position);
+			} else {
+				count = forwardReadSync(fd, buffer, offsetOrOptions);
+			}
+			afterRead();
+			return count;
+		}
+		return read;
+	}
+
+	function closeAfterForwarding(failure: Error | undefined, closedDescriptors: number[]): Mock<typeof fs.closeSync> {
+		return vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+			realCjsCloseSync(fd);
+			closedDescriptors.push(fd);
+			if (failure) throw failure;
+		});
+	}
+
+	function descriptorsAreClosed(descriptors: number[]): boolean {
+		let closed = true;
+		let failed = false;
+		let failure: unknown;
+		for (const fd of descriptors) {
+			let error: unknown;
+			try {
+				realCjsFstatSync(fd);
+			} catch (caught) {
+				error = caught;
+			}
+			if ((error as NodeJS.ErrnoException | undefined)?.code !== "EBADF") closed = false;
+			try {
+				expect(error).toMatchObject({ code: "EBADF" });
+			} catch (caught) {
+				if (!failed) {
+					failed = true;
+					failure = caught;
+				}
+			}
+		}
+		if (failed) throw failure;
+		return closed;
+	}
+
+	function cleanupReaderTest(
+		root: string,
+		store: ManagedSessionDescendantStore | undefined,
+		closedDescriptors: number[],
+		spies: Array<{ mockRestore(): void } | undefined>,
+		bodyFailed: boolean,
+		ownedDescriptor?: number,
+	): void {
+		let cleanupFailed = false;
+		let cleanupError: unknown;
+		let resourcesDischarged = true;
+		const attempt = (cleanup: () => void): void => {
+			try {
+				cleanup();
+			} catch (error) {
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+		};
+		for (const spy of spies) {
+			if (spy) attempt(() => spy.mockRestore());
+		}
+		if (store) {
+			try {
+				store.close();
+			} catch (error) {
+				resourcesDischarged = false;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+		}
+		const ownedDescriptorIsClosed = (): boolean => {
+			if (ownedDescriptor === undefined) return true;
+			try {
+				realCjsFstatSync(ownedDescriptor);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EBADF") return true;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+				return false;
+			}
+			let closeFailure: unknown;
+			try {
+				realCjsCloseSync(ownedDescriptor);
+			} catch (error) {
+				closeFailure = error;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = error;
+				}
+			}
+			try {
+				realCjsFstatSync(ownedDescriptor);
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = closeFailure ?? new Error("Owned descriptor remained open during test cleanup");
+				}
+				return false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EBADF") return true;
+				if (!cleanupFailed) {
+					cleanupFailed = true;
+					cleanupError = closeFailure ?? error;
+				}
+				return false;
+			}
+		};
+		if (!ownedDescriptorIsClosed()) resourcesDischarged = false;
 		try {
-			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
-			const bytes = Buffer.from("descriptor payload\n");
-			store.publishNoReplaceSync("session.jsonl", bytes);
-			const readSpy = vi.spyOn(fs, "readSync");
-			const descriptor = store.descriptorExpected("session.jsonl");
-			expect(descriptor).toMatchObject({ size: bytes.byteLength, isFile: true });
-			expect(descriptor?.dev).toBeTypeOf("bigint");
-			expect(descriptor?.ino).toBeTypeOf("bigint");
-			expect(store.descriptorExpected("missing.jsonl")).toBeNull();
-			expect(readSpy).not.toHaveBeenCalled();
+			if (!descriptorsAreClosed(closedDescriptors)) resourcesDischarged = false;
+		} catch (error) {
+			resourcesDischarged = false;
+			if (!cleanupFailed) {
+				cleanupFailed = true;
+				cleanupError = error;
+			}
+		}
+		if (resourcesDischarged) attempt(() => fs.rmSync(root, { recursive: true, force: true }));
+		if (!bodyFailed && cleanupFailed) throw cleanupError;
+	}
+
+	async function prepareReadOnlyStore(
+		root: string,
+		relativePath: string,
+		contents: string,
+	): Promise<ManagedSessionDescendantStore> {
+		fs.chmodSync(root, 0o700);
+		const pathname = path.join(root, relativePath);
+		await Bun.write(pathname, contents);
+		fs.chmodSync(pathname, 0o600);
+		const identity = managedDirectoryRoot(root);
+		return new ManagedSessionDescendantStore(identity, root, undefined, "default", root, identity, "read-only");
+	}
+
+	it("forwards both actual positional and options readSync overloads", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-read-overloads-")));
+		const pathname = path.join(root, "session.jsonl");
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let descriptor: number | undefined;
+		let bodyFailed = false;
+		try {
+			await Bun.write(pathname, "0123456789\n");
+			const actualDescriptor = realCjsOpenSync(pathname, fs.constants.O_RDONLY);
+			descriptor = actualDescriptor;
+			readSpy = vi.spyOn(fs, "readSync").mockImplementation(forwardReadSync);
+
+			const positionalBytes = Buffer.alloc(4);
+			expect(fs.readSync(actualDescriptor, positionalBytes, 0, positionalBytes.byteLength, 0n)).toBe(4);
+			expect(positionalBytes.toString("utf8")).toBe("0123");
+
+			const optionsBytes = Buffer.alloc(4);
+			expect(
+				fs.readSync(actualDescriptor, optionsBytes, {
+					offset: 0,
+					length: optionsBytes.byteLength,
+					position: 6n,
+				}),
+			).toBe(4);
+			expect(optionsBytes.toString("utf8")).toBe("6789");
+			expect(readSpy).toHaveBeenCalledTimes(2);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
 		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
+			cleanupReaderTest(root, undefined, [], [readSpy], bodyFailed, descriptor);
 		}
 	});
 
-	it("reads bounded ranges and rejects a pathname swap before returning bytes", () => {
-		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-")));
-		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
-		const transcript = path.join(root, "session.jsonl");
+	it("returns transcript identity from an actual path-backed read-only descriptor", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-")));
+		const closedDescriptors: number[] = [];
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let store: ManagedSessionDescendantStore | undefined;
+		let bodyFailed = false;
 		try {
-			store.publishNoReplaceSync("session.jsonl", Buffer.from("0123456789\n"));
-			expect(Buffer.from(store.readRangeExpectedSync("session.jsonl", 2, 4).bytes).toString("utf8")).toBe("2345");
-			expect(() => store.readRangeExpectedSync("session.jsonl", Number.MAX_SAFE_INTEGER, 1)).toThrow(
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor payload\n");
+			store = actualStore;
+			readSpy = vi.spyOn(fs, "readSync");
+			closeSpy = closeAfterForwarding(undefined, closedDescriptors);
+			const descriptor = actualStore.descriptorExpected("session.jsonl");
+			expect(descriptor).toMatchObject({ size: Buffer.byteLength("descriptor payload\n"), isFile: true });
+			expect(descriptor?.dev).toBeTypeOf("bigint");
+			expect(descriptor?.ino).toBeTypeOf("bigint");
+			expect(actualStore.descriptorExpected("missing.jsonl")).toBeNull();
+			expect(readSpy).not.toHaveBeenCalled();
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [readSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("returns descriptor identity through the separate genuine owned native authority control", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-native-")));
+		let store: ManagedSessionDescendantStore | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("native descriptor payload\n"));
+			readSpy = vi.spyOn(fs, "readSync");
+			expect(actualStore.descriptorExpected("session.jsonl")).toMatchObject({
+				size: Buffer.byteLength("native descriptor payload\n"),
+				isFile: true,
+			});
+			expect(readSpy).not.toHaveBeenCalled();
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, [], [readSpy], bodyFailed);
+		}
+	});
+
+	it("preserves descriptor metadata errors when actual descriptor close also fails", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-close-")));
+		const closedDescriptors: number[] = [];
+		const primaryFailure = new Error("descriptor metadata inspection failed");
+		const secondaryFailure = new Error("descriptor close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let fstatSpy: Mock<typeof fs.fstatSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor payload\n");
+			store = actualStore;
+			fstatSpy = vi.spyOn(fs, "fstatSync").mockImplementation((fd: number, options?: fs.StatOptions) => {
+				forwardFstatSync(fd, options);
+				throw primaryFailure;
+			});
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+
+			let caught: unknown;
+			try {
+				actualStore.descriptorExpected("session.jsonl");
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [fstatSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("preserves the actual post-open pathname ENOENT over a secondary close error", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-disappear-")));
+		const pathname = path.join(root, "session.jsonl");
+		const detached = path.join(root, "session.detached.jsonl");
+		const closedDescriptors: number[] = [];
+		const secondaryFailure = new Error("descriptor close failed after unlink");
+		let store: ManagedSessionDescendantStore | undefined;
+		let fstatSpy: Mock<typeof fs.fstatSync> | undefined;
+		let lstatSpy: Mock<typeof fs.lstatSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let originalPathnameError: NodeJS.ErrnoException | undefined;
+		let fileDisplaced = false;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor before unlink\n");
+			store = actualStore;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+			function fstatAfterOpen(fd: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+			function fstatAfterOpen(fd: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+				const stats = forwardFstatSync(fd, options);
+				if (!fileDisplaced) {
+					fs.renameSync(pathname, detached);
+					fileDisplaced = true;
+				}
+				return stats;
+			}
+			fstatSpy = vi.spyOn(fs, "fstatSync").mockImplementation(fstatAfterOpen);
+			lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation(
+				capturePathLstatError(pathname, error => {
+					originalPathnameError = error;
+				}),
+			);
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+
+			let caught: unknown;
+			try {
+				actualStore.descriptorExpected("session.jsonl");
+			} catch (error) {
+				caught = error;
+			}
+			expect(fileDisplaced).toBe(true);
+			expect(originalPathnameError).toMatchObject({ code: "ENOENT" });
+			expect(caught).toBe(originalPathnameError);
+			expect((caught as NodeJS.ErrnoException).code).toBe("ENOENT");
+			expect(caught).not.toBe(secondaryFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [fstatSpy, lstatSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("propagates a healthy descriptor close-only failure", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-descriptor-close-only-")));
+		const closedDescriptors: number[] = [];
+		const closeFailure = new Error("descriptor close-only failure");
+		let store: ManagedSessionDescendantStore | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = await prepareReadOnlyStore(root, "session.jsonl", "descriptor payload\n");
+			store = actualStore;
+			closeSpy = closeAfterForwarding(closeFailure, closedDescriptors);
+			let caught: unknown;
+			try {
+				actualStore.descriptorExpected("session.jsonl");
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(closeFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [closeSpy], bodyFailed);
+		}
+	});
+
+	it("reads bounded ranges and rejects a pathname swap before returning bytes", async () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-")));
+		const closedDescriptors: number[] = [];
+		const secondaryFailure = new Error("range descriptor close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		const transcript = path.join(root, "session.jsonl");
+		const replacement = path.join(root, "attacker.jsonl");
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("0123456789\n"));
+			await Bun.write(replacement, "attacker\n");
+			closeSpy = closeAfterForwarding(undefined, closedDescriptors);
+			expect(Buffer.from(actualStore.readRangeExpectedSync("session.jsonl", 2, 4).bytes).toString("utf8")).toBe(
+				"2345",
+			);
+			closeSpy.mockRestore();
+			closeSpy = undefined;
+			expect(() => actualStore.readRangeExpectedSync("session.jsonl", Number.MAX_SAFE_INTEGER, 1)).toThrow(
 				"Managed range read start overflows",
 			);
 
-			const readSync = fs.readSync;
-			const spy = vi.spyOn(fs, "readSync").mockImplementationOnce(((
-				fd: number,
-				buffer: NodeJS.ArrayBufferView,
-				offset: number,
-				length: number,
-				position: number | null,
-			) => {
-				const count = readSync(fd, buffer, offset, length, position);
-				fs.renameSync(transcript, `${transcript}.detached`);
-				fs.writeFileSync(transcript, "attacker\n", { mode: 0o600 });
-				return count;
-			}) as never);
-			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4)).toThrow("source_changed");
-			spy.mockRestore();
+			readSpy = vi.spyOn(fs, "readSync").mockImplementationOnce(
+				instrumentReadSync(() => {
+					fs.renameSync(transcript, `${transcript}.detached`);
+					fs.renameSync(replacement, transcript);
+				}),
+			);
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+			expect(() => actualStore.readRangeExpectedSync("session.jsonl", 0, 4)).toThrow("source_changed");
+			expect(closedDescriptors).toHaveLength(2);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
 		} finally {
-			store.close();
-			fs.rmSync(root, { recursive: true, force: true });
+			cleanupReaderTest(root, store, closedDescriptors, [readSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("preserves range read error identity when actual descriptor close also fails", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-error-")));
+		const closedDescriptors: number[] = [];
+		const primaryFailure = new Error("range read failed after reading from the descriptor");
+		const secondaryFailure = new Error("range close failed after closing");
+		let store: ManagedSessionDescendantStore | undefined;
+		let readSpy: Mock<typeof fs.readSync> | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("range payload\n"));
+			readSpy = vi.spyOn(fs, "readSync").mockImplementationOnce(
+				instrumentReadSync(() => {
+					throw primaryFailure;
+				}),
+			);
+			closeSpy = closeAfterForwarding(secondaryFailure, closedDescriptors);
+
+			let caught: unknown;
+			try {
+				actualStore.readRangeExpectedSync("session.jsonl", 0, 4);
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [readSpy, closeSpy], bodyFailed);
+		}
+	});
+
+	it("propagates a healthy range-reader close-only failure", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-close-only-")));
+		const closedDescriptors: number[] = [];
+		const closeFailure = new Error("range close-only failure");
+		let store: ManagedSessionDescendantStore | undefined;
+		let closeSpy: Mock<typeof fs.closeSync> | undefined;
+		let bodyFailed = false;
+		try {
+			const actualStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store = actualStore;
+			actualStore.publishNoReplaceSync("session.jsonl", Buffer.from("range payload\n"));
+			closeSpy = closeAfterForwarding(closeFailure, closedDescriptors);
+			let caught: unknown;
+			try {
+				actualStore.readRangeExpectedSync("session.jsonl", 0, 4);
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(closeFailure);
+			expect(closedDescriptors).toHaveLength(1);
+		} catch (error) {
+			bodyFailed = true;
+			throw error;
+		} finally {
+			cleanupReaderTest(root, store, closedDescriptors, [closeSpy], bodyFailed);
 		}
 	});
 	it("binds ranges to the caller's committed descriptor generation", () => {
@@ -845,6 +1366,189 @@ describe("managed descriptor reads", () => {
 			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
 			spy.mockRestore();
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("admits the opened descriptor before allocation, closes it, and preserves the admission failure", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-admission-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		const bytes = Buffer.from("admitted descriptor bytes\n");
+		store.publishNoReplaceSync("session.jsonl", bytes);
+		const expectedStat = fs.statSync(transcript, { bigint: true });
+		const originalOpenReadLease = store.openReadLease.bind(store);
+		let actualLease: ReturnType<typeof store.openReadLease> | undefined;
+		let admissionObserved = false;
+		let forwardedClose = false;
+		let closeInjectionCount = 0;
+		const injectedCloseFailure = new Error("injected terminal close failure");
+		let observedAdmission: { size: number; descriptor: ManagedFileIdentity } | undefined;
+		const primaryFailure = new Error("admission rejected before allocation");
+		const openLease = vi.spyOn(store, "openReadLease").mockImplementation((relativePath, expectedDescriptor) => {
+			const lease = originalOpenReadLease(relativePath, expectedDescriptor);
+			actualLease = lease;
+			return {
+				readRange: (start, length) => lease.readRange(start, length),
+				close: () => {
+					lease.close();
+					if (admissionObserved) {
+						forwardedClose = true;
+						closeInjectionCount++;
+						throw injectedCloseFailure;
+					}
+				},
+			};
+		});
+		const read = vi.spyOn(fs, "readSync");
+		const allocate = vi.spyOn(Buffer, "alloc");
+		let caught: unknown;
+		try {
+			try {
+				store.readExpectedBounded("session.jsonl", bytes.byteLength, (size, descriptor) => {
+					admissionObserved = true;
+					observedAdmission = { size, descriptor };
+					throw primaryFailure;
+				});
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBe(primaryFailure);
+			expect(observedAdmission?.size).toBe(bytes.byteLength);
+			expect(observedAdmission?.descriptor).toMatchObject({
+				dev: expectedStat.dev,
+				ino: expectedStat.ino,
+				nlink: 1n,
+				size: bytes.byteLength,
+				mtimeNs: expectedStat.mtimeNs,
+				ctimeNs: expectedStat.ctimeNs,
+			});
+			if (!actualLease) throw new Error("managed capture read lease was not opened");
+			expect(forwardedClose).toBe(true);
+			expect(admissionObserved).toBe(true);
+			expect(closeInjectionCount).toBe(1);
+			expect(() => actualLease!.readRange(0, 0)).toThrow("closed");
+			expect(read).not.toHaveBeenCalled();
+			expect(allocate.mock.calls.some(([size]) => size === bytes.byteLength)).toBe(false);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			openLease.mockRestore();
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects growth during bounded capture without reading beyond the admitted size", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-growth-")));
+		const pathname = path.join(root, "session.jsonl");
+		const initial = Buffer.from("initial-sized transcript\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let grew = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!grew) {
+				grew = true;
+				fs.truncateSync(pathname, initial.byteLength + 9);
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.statSync(pathname).size).toBe(initial.byteLength + 9);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects pathname replacement during bounded capture after reading only the original generation", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-replacement-")));
+		const pathname = path.join(root, "session.jsonl");
+		const detached = `${pathname}.detached`;
+		const initial = Buffer.from("original generation bytes\n");
+		const replacement = Buffer.from("replacement generation must not be read\n");
+		fs.writeFileSync(pathname, initial, { mode: 0o600 });
+		const originalRead = fs.readSync.bind(fs);
+		let bytesRead = 0;
+		let bytesRequested = 0;
+		let replaced = false;
+		const read = vi.spyOn(fs, "readSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => {
+			bytesRequested += length;
+			const count = originalRead(fd, buffer, offset, length, position);
+			bytesRead += count;
+			if (!replaced) {
+				replaced = true;
+				fs.renameSync(pathname, detached);
+				fs.writeFileSync(pathname, replacement, { mode: 0o600 });
+			}
+			return count;
+		}) as typeof fs.readSync);
+		const allocate = vi.spyOn(Buffer, "alloc");
+		try {
+			expect(() => captureManagedFileNoFollowBounded(pathname, initial.byteLength)).toThrow("source_changed");
+			expect(bytesRead).toBe(initial.byteLength);
+			expect(bytesRequested).toBe(initial.byteLength);
+			expect(allocate.mock.calls.some(([size]) => size === initial.byteLength)).toBe(true);
+			expect(fs.readFileSync(detached)).toEqual(initial);
+			expect(fs.readFileSync(pathname)).toEqual(replacement);
+		} finally {
+			allocate.mockRestore();
+			read.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fences lease ranges to their initial size and returns fresh exact bytes and digest", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-lease-fence-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		try {
+			const firstBytes = Buffer.from("first descriptor generation\n");
+			store.publishNoReplaceSync("session.jsonl", firstBytes);
+			const firstDescriptor = store.descriptorExpected("session.jsonl");
+			if (!firstDescriptor) throw new Error("first managed descriptor missing");
+			const firstLease = store.openReadLease("session.jsonl", firstDescriptor);
+			expect(() => firstLease.readRange(firstBytes.byteLength - 1, 2)).toThrow("range_not_present");
+			expect(Buffer.from(firstLease.readRange(0, firstBytes.byteLength))).toEqual(firstBytes);
+			firstLease.close();
+
+			const freshBytes = Buffer.from("fresh positive exact transcript bytes\n");
+			store.replaceSync("session.jsonl", freshBytes);
+			const freshDescriptor = store.descriptorExpected("session.jsonl");
+			if (!freshDescriptor) throw new Error("fresh managed descriptor missing");
+			const freshLease = store.openReadLease("session.jsonl", freshDescriptor);
+			const exactBytes = Buffer.from(freshLease.readRange(0, freshBytes.byteLength));
+			freshLease.close();
+			const snapshot = store.readExpectedBounded("session.jsonl", freshBytes.byteLength);
+			if (!snapshot) throw new Error("fresh bounded snapshot missing");
+			expect(exactBytes).toEqual(freshBytes);
+			expect(snapshot.bytes).toEqual(freshBytes);
+			expect(snapshot.identity.sha256).toBe(createHash("sha256").update(freshBytes).digest("hex"));
+			expect(snapshot.identity.size).toBe(freshBytes.byteLength);
+		} finally {
+			store.close();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});

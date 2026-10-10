@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { withFileLock } from "../../config/file-lock";
+import { type FileLockOptions, isFileLockAcquireTimeout, withFileLock } from "../../config/file-lock";
 import { repo } from "../../utils/git";
 import { endpointIncarnation } from "./endpoint-authority";
 import { processIncarnation } from "./process-incarnation";
@@ -653,6 +653,7 @@ function reduceEvents(
 	now: number,
 	agentDir: string,
 	probedIncarnations?: ReadonlyMap<string, string | undefined>,
+	sessionIds?: ReadonlySet<string>,
 ): SessionIndexProjection {
 	// Resolved once: the fence-row check runs per root, and only this side of the
 	// comparison is ours to normalize.
@@ -669,7 +670,12 @@ function reduceEvents(
 		}
 		return identity;
 	};
-	const { admitted } = admitEvents(events);
+	// Admission and projection are keyed by sessionId (tuple, tombstone, identity),
+	// so a scoped read reduces only the requested sessions' events and skips the
+	// other sessions' pid/incarnation probes without changing their rows.
+	const { admitted } = admitEvents(
+		sessionIds === undefined ? events : events.filter(event => sessionIds.has(event.sessionId)),
+	);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
 	for (const event of admitted) {
@@ -804,6 +810,8 @@ const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
  * heartbeat for long enough that live hosts project as dead.
  */
 const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
+/** One elapsed budget for queueing, probing and every reacquisition in a pass. */
+const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
 const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
 /** Maximum distinct live identity probes admitted by one public status query. */
 const SESSION_GENERATION_PROBE_LIMIT = 32;
@@ -815,10 +823,16 @@ const SESSION_GENERATION_PROBE_LIMIT = 32;
  * observation window and (b) the lock budget cannot silently drift per call
  * site.
  */
-function withSessionIndexLock<T>(operation: string, agentDir: string, callback: () => Promise<T>): Promise<T> {
+function withSessionIndexLock<T>(
+	operation: string,
+	agentDir: string,
+	callback: () => Promise<T>,
+	options: FileLockOptions = SESSION_INDEX_LOCK_OPTIONS,
+): Promise<T> {
 	return withFileLock(
 		logFor(agentDir),
 		async () => {
+			options.signal?.throwIfAborted();
 			// Armed only once the lock is actually held: queueing time behind another
 			// legitimate holder must not be attributed to this operation.
 			const note = setTimeout(
@@ -834,7 +848,7 @@ function withSessionIndexLock<T>(operation: string, agentDir: string, callback: 
 				clearTimeout(note);
 			}
 		},
-		SESSION_INDEX_LOCK_OPTIONS,
+		options,
 	);
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
@@ -1203,32 +1217,39 @@ export class SessionIndex {
 	 * stamp of the last completed locked pass, the in-memory projection is
 	 * already current and the locked rescan is skipped entirely — this is what
 	 * keeps an idle SessionRouter reconcile (2s cadence) from re-parsing and
-	 * re-checksumming the whole index forever. An append committed before the
-	 * stat always changes the stamp, so a miss is impossible; a change landing
-	 * after the stat is seen on the next poll, the same TOCTOU envelope a
-	 * locked read has. A corrupt suffix never takes the fast path: re-scanning
+	 * re-checksumming the whole index forever. The unchanged check runs before
+	 * the local queue so unrelated heartbeat work cannot delay ordinary creates.
+	 * Admission that requires serialized authority must use refresh() instead.
+	 * An append committed before the stat always changes
+	 * the stamp; a change landing after the stat is seen on the next poll, the
+	 * same TOCTOU envelope a locked read has. A corrupt suffix never takes the fast path: re-scanning
 	 * preserves the existing re-diagnosis behavior. Returns true when state was
 	 * reloaded. Authority revalidation that needs the strongest available
 	 * snapshot inside an already-locked write (append, unregister) keeps using
 	 * the exact locked paths.
 	 */
 	async refreshIfChanged(): Promise<boolean> {
-		if (this.#changeStamp !== undefined && !this.#corruptSuffix) {
+		if (this.#changeStamp === undefined || this.#corruptSuffix) {
+			await this.open();
+			await this.refresh();
+			return true;
+		}
+		const stamp = await readIndexChangeStamp(this.#agentDir);
+		if (sameIndexChangeStamp(this.#changeStamp, stamp)) return false;
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			if (this.#changeStamp === undefined || this.#corruptSuffix) {
+				await withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshUnderLock());
+				return true;
+			}
 			const stamp = await readIndexChangeStamp(this.#agentDir);
 			if (sameIndexChangeStamp(this.#changeStamp, stamp)) return false;
 			// A possible change is re-classified UNDER the lock (#4689 review):
 			// writers mutate these files only while holding it, so the locked
-			// observation is atomic with the tail/replay it selects. The
-			// unlocked stamp above is only the cheap "definitely unchanged" cut.
-			const indexPath = path.resolve(logFor(this.#agentDir));
-			await SessionIndex.#enqueue(indexPath, () =>
-				withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshOrReplayUnderLock()),
-			);
+			// observation is atomic with the tail/replay it selects.
+			await withSessionIndexLock("poll-refresh", this.#agentDir, () => this.#refreshOrReplayUnderLock());
 			return true;
-		}
-		await this.open();
-		await this.refresh();
-		return true;
+		});
 	}
 	/**
 	 * Locked change classification (#4689). Append-only log growth with an
@@ -1335,6 +1356,10 @@ export class SessionIndex {
 	}
 	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
 	async #writeAuditUnderLock(): Promise<void> {
+		const candidates = auditRecords(this.#events, this.#policy.clock());
+		// The audit log only dedupes rejections, so a reader with none never pays
+		// for loading it.
+		if (candidates.length === 0) return;
 		if (this.#auditedSeq === null) {
 			this.#auditedSeq = new Set();
 			try {
@@ -1352,9 +1377,7 @@ export class SessionIndex {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
 		}
-		const pending = auditRecords(this.#events, this.#policy.clock()).filter(
-			record => !this.#auditedSeq!.has(record.indexSeq),
-		);
+		const pending = candidates.filter(record => !this.#auditedSeq!.has(record.indexSeq));
 		if (pending.length === 0) return;
 		await appendSync(auditFor(this.#agentDir), pending.map(record => JSON.stringify(record)).join("\n"));
 		for (const record of pending) this.#auditedSeq.add(record.indexSeq);
@@ -1964,10 +1987,18 @@ export class SessionIndex {
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 
-	listSessions(probedIncarnations?: ReadonlyMap<string, string | undefined>): SessionList {
+	/**
+	 * Public session rows. `sessionIds` scopes the projection to those sessions:
+	 * rows for them are identical to the unscoped read, other sessions are absent.
+	 */
+	listSessions(
+		probedIncarnations?: ReadonlyMap<string, string | undefined>,
+		sessionIds?: ReadonlySet<string>,
+	): SessionList {
 		return {
 			indexSeq: this.indexSeq,
-			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations).sessions,
+			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations, sessionIds)
+				.sessions,
 			warnings: this.#warnings,
 		};
 	}
@@ -2335,14 +2366,18 @@ export class SessionIndex {
 	 * Production coalesced heartbeat checkpoint pass (C2): appends one
 	 * `host_heartbeat` per session at most once per {@link SESSION_HEARTBEAT_INTERVAL_MS}.
 	 * The pass observes liveness the same way the projection does — the host process
-	/**
+	 * must be alive and, for composite identities, still carry the recorded OS process
 	 * incarnation (a reused PID is never checkpointed). Stopped, terminal, and ambiguous rows
 	 * and rows whose heartbeat is still fresh are skipped. After a broker restart, sessions whose
 	 * host survived are re-observed as live on the first pass; sessions whose host died
 	 * while the broker was down keep their stale or missing heartbeat and read as
 	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
 	 */
-	async checkpointLiveHeartbeats(now = Date.now(), deadlineAt?: number): Promise<number> {
+	async checkpointLiveHeartbeats(
+		now = Date.now(),
+		abortSignal?: AbortSignal,
+		deadlineAt = performance.now() + SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS,
+	): Promise<number> {
 		// A stale observation batch fails closed (no heartbeat), but on a busy
 		// machine a single contended lock acquisition is enough to discard the
 		// whole cycle. With the broker's 5s cadence repeatedly losing that race,
@@ -2351,19 +2386,51 @@ export class SessionIndex {
 		// Re-probe from scratch a bounded number of times inside this pass: each
 		// attempt keeps the exact fail-closed contract (fresh probes, freshness
 		// bounds re-checked under the lock); only the starvation is removed.
-		// When a deadline is supplied, stop retrying if the deadline is exhausted.
-		for (let attempt = 0; ; attempt++) {
-			if (deadlineAt !== undefined && Date.now() >= deadlineAt) return 0;
-			const result = await this.#checkpointLiveHeartbeatsOnce(now, deadlineAt);
-			if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
-				return result === STALE_OBSERVATION ? 0 : result;
-			now = Date.now();
+		const deadline = Math.min(deadlineAt, performance.now() + SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS);
+		if (abortSignal?.aborted || performance.now() >= deadline) return 0;
+		const budget = new AbortController();
+		const signal = abortSignal ? AbortSignal.any([abortSignal, budget.signal]) : budget.signal;
+		const timer = setTimeout(() => budget.abort(), deadline - performance.now());
+		timer.unref?.();
+		const checkpoint = async (): Promise<number> => {
+			for (let attempt = 0; ; attempt++) {
+				if (signal.aborted || performance.now() >= deadline) return 0;
+				const result = await this.#checkpointLiveHeartbeatsOnce(now, signal, deadline);
+				if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
+					return result === STALE_OBSERVATION ? 0 : result;
+				now = Date.now();
+			}
+		};
+		try {
+			// The deadline aborts queued work and prevents a late callback from
+			// entering its write section, but it cannot cancel an append/fsync that
+			// has already started. Keep the caller tied to the lock-owning operation
+			// so startup readiness never overtakes lock release.
+			return await checkpoint();
+		} catch (error) {
+			if (signal.aborted && error === signal.reason) return 0;
+			if (
+				performance.now() >= deadline &&
+				isFileLockAcquireTimeout(error) &&
+				!error.orphanPath &&
+				!error.removalFailure
+			)
+				return 0;
+			throw error;
+		} finally {
+			clearTimeout(timer);
+			budget.abort();
 		}
 	}
 
-	async #checkpointLiveHeartbeatsOnce(now: number, deadlineAt?: number): Promise<number | typeof STALE_OBSERVATION> {
+	async #checkpointLiveHeartbeatsOnce(
+		now: number,
+		signal: AbortSignal,
+		deadline: number,
+	): Promise<number | typeof STALE_OBSERVATION> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
+			if (signal.aborted || performance.now() >= deadline) return 0;
 			// An absent index holds no registration to checkpoint, so this pass must read
 			// it as "nothing to do" instead of creating one. Recreating the directory
 			// resurrects a state root its owner already retired: the broker's 5s
@@ -2398,66 +2465,78 @@ export class SessionIndex {
 				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
 			}
 			const probedAt = performance.now();
-			return await withSessionIndexLock("heartbeat checkpoint", this.#agentDir, async () => {
-				// Contended or delayed acquisition invalidates the observation set:
-				// never trust identity evidence gathered meaningfully before the
-				// lock was held. The checkpoint is skipped this cycle (fail-closed);
-				// the OS is never probed while the machine-global lock is held. The
-				// bound tolerates scheduler jitter on an uncontended acquisition —
-				// which is the only path where the evidence is trustworthy.
-				if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return STALE_OBSERVATION;
-				await this.#replayUnderLock();
-				// Recheck AFTER the awaited replay too (#4544 review round 4): the
-				// replay re-reads the whole log (up to the 4 MiB rotation bound) and
-				// fsyncs pending audit rows, so the probe→write interval can stretch
-				// well past the acquisition bound above while the lock is held. The
-				// same pid-reuse window exists across that awaited replay; consuming
-				// the cached observation then would checkpoint the replacement
-				// process as the dead row. The replay bound covers the full locked
-				// replay cost envelope of a healthy machine; anything slower fails
-				// closed (no heartbeat this cycle) and the next pass re-probes.
-				if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
-				// If a startup deadline is supplied, abandon the write if it is exhausted:
-				// the startup watchdog will exit the process shortly, so persisting
-				// incomplete checkpoint work is not progress.
-				if (deadlineAt !== undefined && Date.now() >= deadlineAt) return 0;
-				if (this.#corruptSuffix) return 0;
-				const events: SessionIndexEvent[] = [];
-				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
-				for (const row of rows) {
-					if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
-					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
-						continue;
-					if (!alive(row.pid)) continue;
-					const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
-					if (recordedIncarnation === undefined) continue;
-					const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
-					if (current === undefined || current !== recordedIncarnation) continue;
-					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
-						version: SESSION_INDEX_EVENT_VERSION,
-						indexSeq: this.indexSeq + events.length + 1,
-						type: "host_heartbeat",
-						sessionId: row.sessionId,
-						locator: row.locator,
-						endpointGeneration: row.endpointGeneration,
-						pid: row.pid,
-						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
-						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
-						...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
-						// Preserve the host's last observed activity state while this
-						// broker-owned heartbeat only renews liveness. A live idle host
-						// must not be rewritten as active merely because its pid is alive.
-						activity: row.activity ?? { state: "active", at: now },
-						ts: now,
-					};
-					events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });
-				}
-				if (events.length === 0) return 0;
-				for (const event of events) await appendSync(logFor(this.#agentDir), JSON.stringify(event));
-				await this.#refreshUnderLock();
-				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
-				return events.length;
-			});
+			if (signal.aborted || probedAt >= deadline) return 0;
+			return await withSessionIndexLock(
+				"heartbeat checkpoint",
+				this.#agentDir,
+				async () => {
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					// Contended or delayed acquisition invalidates the observation set:
+					// never trust identity evidence gathered meaningfully before the
+					// lock was held. The checkpoint is skipped this cycle (fail-closed);
+					// the OS is never probed while the machine-global lock is held. The
+					// bound tolerates scheduler jitter on an uncontended acquisition —
+					// which is the only path where the evidence is trustworthy.
+					if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return STALE_OBSERVATION;
+					await this.#replayUnderLock();
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					// Recheck AFTER the awaited replay too (#4544 review round 4): the
+					// replay re-reads the whole log (up to the 4 MiB rotation bound) and
+					// fsyncs pending audit rows, so the probe→write interval can stretch
+					// well past the acquisition bound above while the lock is held. The
+					// same pid-reuse window exists across that awaited replay; consuming
+					// the cached observation then would checkpoint the replacement
+					// process as the dead row. The replay bound covers the full locked
+					// replay cost envelope of a healthy machine; anything slower fails
+					// closed (no heartbeat this cycle) and the next pass re-probes.
+					if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return STALE_OBSERVATION;
+					if (this.#corruptSuffix) return 0;
+					const events: SessionIndexEvent[] = [];
+					const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
+					for (const row of rows) {
+						if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
+						if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
+							continue;
+						if (!alive(row.pid)) continue;
+						const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+						if (recordedIncarnation === undefined) continue;
+						const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
+						if (current === undefined || current !== recordedIncarnation) continue;
+						const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+							version: SESSION_INDEX_EVENT_VERSION,
+							indexSeq: this.indexSeq + events.length + 1,
+							type: "host_heartbeat",
+							sessionId: row.sessionId,
+							locator: row.locator,
+							endpointGeneration: row.endpointGeneration,
+							pid: row.pid,
+							...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
+							...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
+							...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
+							// Preserve the host's last observed activity state while this
+							// broker-owned heartbeat only renews liveness. A live idle host
+							// must not be rewritten as active merely because its pid is alive.
+							activity: row.activity ?? { state: "active", at: now },
+							ts: now,
+						};
+						events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });
+					}
+					if (events.length === 0) return 0;
+					if (signal.aborted || performance.now() >= deadline) return 0;
+					for (const event of events) await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+					await this.#refreshUnderLock();
+					if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+					return events.length;
+				},
+				{
+					...SESSION_INDEX_LOCK_OPTIONS,
+					retries: Math.min(
+						SESSION_INDEX_LOCK_OPTIONS.retries,
+						Math.max(1, Math.ceil((deadline - performance.now()) / SESSION_INDEX_LOCK_OPTIONS.retryDelayMs)),
+					),
+					signal,
+				},
+			);
 		});
 	}
 

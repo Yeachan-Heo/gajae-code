@@ -38,7 +38,11 @@ function createControllerContext() {
 			onMutationStarted?: () => void;
 		};
 	}> = [];
-	const setModelTemporary = vi.fn(async () => {});
+	const setModelTemporary = vi.fn(
+		async (_model: Model, _thinkingLevel?: ThinkingLevel, options?: { onMutationStarted?: () => void }) => {
+			options?.onMutationStarted?.();
+		},
+	);
 	const markUserModelSelection = vi.fn();
 	const setDefaultFallbackRuntimeModel = vi.fn();
 
@@ -449,6 +453,7 @@ describe("SelectorController model batch assignments", () => {
 		failure.reject(new Error("credential rejected"));
 		await settleSelectorInput();
 		expect(ctx.showError).toHaveBeenCalledTimes(1);
+		expect(session.markUserModelSelection).not.toHaveBeenCalled();
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/original-executor:low" });
 
 		selectMenuAction(selector, 1);
@@ -457,6 +462,23 @@ describe("SelectorController model batch assignments", () => {
 
 		expect(session.modelRegistry.getApiKey).toHaveBeenCalledTimes(2);
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/selected" });
+	});
+
+	test("does not fence a temporary selection rejected before mutation", async () => {
+		const { ctx, session, setModelTemporary } = createControllerContext();
+		setModelTemporary.mockRejectedValueOnce(new Error("No API key for provider-a/selected"));
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: null,
+			thinkingLevel: ThinkingLevel.Low,
+			selector: "provider-a/selected:low",
+		});
+		await settleSelectorInput();
+
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("No API key"));
+		expect(session.markUserModelSelection).not.toHaveBeenCalled();
 	});
 
 	test("temporary selection replaces the live fallback chain with the selected model", async () => {
@@ -472,6 +494,7 @@ describe("SelectorController model batch assignments", () => {
 
 		expect(setModelTemporary).toHaveBeenCalledWith(selectedModel, ThinkingLevel.Low, {
 			cause: "temporary-operation",
+			onMutationStarted: expect.any(Function),
 			reason: "other",
 		});
 		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
@@ -549,7 +572,7 @@ describe("SelectorController model batch assignments", () => {
 		});
 
 		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
-		expect(marksAtCredentialProbe).toBe(1);
+		expect(marksAtCredentialProbe).toBe(0);
 		expect(settings.get("task.agentModelOverrides")).toEqual({
 			executor: "provider-a/profile-executor:medium",
 			architect: "provider-a/selected:high",

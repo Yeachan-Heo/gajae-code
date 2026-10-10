@@ -385,8 +385,10 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		try {
 			const authorizationEndpoint = new URL(this.config.authorizationUrl);
 			const metadataUrl = new URL("/.well-known/oauth-authorization-server", authorizationEndpoint.origin);
+			await assertPublicOAuthUrl(metadataUrl.toString());
 			const response = await fetch(metadataUrl.toString(), {
 				method: "GET",
+				redirect: "error",
 				headers: { Accept: "application/json" },
 				signal,
 			});

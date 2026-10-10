@@ -4,6 +4,7 @@
  *
  * Usage:
  *   bun scripts/release.ts <version>   Full release (preflight, version, changelog, commit, push, watch)
+ *   bun scripts/release.ts backmerge <version>   Retry the dev backmerge for a published release
  *   bun scripts/release.ts watch       Watch CI for current commit
  *
  * Example: bun scripts/release.ts 3.10.0
@@ -913,16 +914,19 @@ async function cmdRelease(version: string): Promise<void> {
 	// 8b. Backmerge the release commit into dev so the next release merge stays a
 	// fast-forward. The refs are published at this point, so a backmerge that cannot
 	// land is reported with a manual recovery path and never fails the release.
-	console.log("Backmerging main into dev…");
+	console.log(`Backmerging v${version} into dev…`);
 	const backmerge = await backmergeReleaseIntoDev(version);
 	if (backmerge.action === "blocked") {
 		console.error(`  Backmerge blocked: ${backmerge.detail}`);
 		console.error(`  v${version} is already published; sync dev by hand:`);
 		console.error(
-			"    git fetch origin +refs/heads/main:refs/remotes/origin/main +refs/heads/dev:refs/remotes/origin/dev && git worktree add /tmp/gjc-backmerge origin/dev",
+			`    git fetch origin +refs/heads/main:refs/remotes/origin/main +refs/heads/dev:refs/remotes/origin/dev +refs/tags/v${version}:refs/remotes/origin/tags/v${version} && git worktree add /tmp/gjc-backmerge origin/dev`,
 		);
-		console.error("    git -C /tmp/gjc-backmerge merge origin/main   # keep main's version and dev's artifacts map");
-		console.error("    git -C /tmp/gjc-backmerge push origin HEAD:dev");
+		console.error(
+			`    git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}   # keep v${version}'s version and dev's artifacts map`,
+		);
+		console.error(`    git -C /tmp/gjc-backmerge push origin HEAD:refs/heads/backmerge/${version}`);
+		console.error(`    gh pr create --head backmerge/${version} --base dev --title "chore(release): backmerge v${version} into dev"`);
 	} else {
 		console.log(`  ${backmerge.action}: ${backmerge.detail}`);
 	}
@@ -998,8 +1002,31 @@ export function resolveDiagnosticArtifactBackmerge(ours: string, theirs: string)
 
 export type BackmergeOutcome =
 	| { action: "skipped"; detail: string }
-	| { action: "merged"; detail: string }
+	| { action: "opened"; detail: string }
 	| { action: "blocked"; detail: string };
+
+export interface BackmergePullRequest {
+	/** Repository checkout the opener runs in. */
+	cwd: string;
+	/** Pushed branch name, without `refs/heads/`. */
+	head: string;
+	base: "dev";
+	title: string;
+	body: string;
+}
+
+/** Opens the backmerge pull request; resolves to a failure detail or `undefined` on success. */
+export type BackmergePullRequestOpener = (request: BackmergePullRequest) => Promise<string | undefined>;
+
+async function openBackmergePullRequestWithGh(request: BackmergePullRequest): Promise<string | undefined> {
+	const created = await $`gh pr create --head ${request.head} --base ${request.base} --title ${request.title} --body ${request.body}`
+		.cwd(request.cwd)
+		.quiet()
+		.nothrow();
+	if (created.exitCode === 0) return undefined;
+	const error = created.stderr.toString().trim();
+	return /already exists/iu.test(error) ? undefined : firstLine(error);
+}
 
 /** First non-empty line of command output, for a bounded user-facing detail. */
 function firstLine(text: string): string {
@@ -1021,36 +1048,111 @@ function gitAt(dir: string, args: readonly string[]) {
 	return $`git -C ${dir} -c core.fsmonitor=false -c core.untrackedCache=false ${args}`;
 }
 
+async function existingBackmergeBranchProblem(
+	repoDir: string,
+	branchRef: string,
+	releaseTag: string,
+	version: string,
+): Promise<string | undefined> {
+	const releaseCommit = (await gitAt(repoDir, ["rev-parse", `${releaseTag}^{commit}`]).text()).trim();
+	const log = (await gitAt(repoDir, ["log", "--first-parent", "--format=%P", branchRef]).text()).trim();
+	const commits = log.split("\n").map(line => ({ parents: line.split(" ").filter(Boolean) }));
+	const matches = commits.flatMap((entry, index) =>
+		entry.parents.length === 2 && entry.parents[1] === releaseCommit ? [{ entry, index }] : [],
+	);
+	if (matches.length !== 1) return `does not have one merge commit from the v${version} release tag`;
+
+	const { entry: backmergeCommit, index } = matches[0]!;
+	const baseOnDev = await gitAt(repoDir, ["merge-base", "--is-ancestor", backmergeCommit.parents[0]!, "origin/dev"])
+		.quiet()
+		.nothrow();
+	if (baseOnDev.exitCode !== 0) return "was not based on the current origin/dev history";
+	if (commits.slice(0, index).some(commit => commit.parents.length > 1)) {
+		return `contains an additional merge after the v${version} backmerge`;
+	}
+	const mainBase = await gitAt(repoDir, ["merge-base", "origin/main", branchRef]).quiet().nothrow();
+	if (mainBase.exitCode !== 0 || mainBase.stdout.toString().trim() !== releaseCommit) {
+		return `contains main history beyond v${version} or omits the requested release`;
+	}
+	return undefined;
+}
+
 /**
- * Sync the just-pushed release commit into `dev` so the next release merge stays a
- * fast-forward. Runs in throwaway worktrees so the release checkout is untouched, and
- * returns a blocked outcome instead of throwing: the release is already published, so
- * a failed backmerge must never fail the release.
- * 
- * Routes the backmerge through a pull request to satisfy the repository's required
- * exact-head review process for all merges to `dev`. The PR requires manual approval
- * from a maintainer before it can be merged. This is a post-release step that
- * completes after the version is published to main.
+ * Sync the requested published release commit into `dev` so the next release merge
+ * stays a fast-forward. The version tag is merged directly, so a delayed retry cannot
+ * accidentally include a newer release from `main`. Runs in throwaway worktrees so the
+ * release checkout is untouched, and returns a blocked outcome instead of throwing: the
+ * release is already published, so a failed backmerge must never fail the release.
+ *
+ * Every merge to `dev` needs an approving review of its exact head, so the merge is
+ * pushed to `backmerge/<version>` and opened as a pull request rather than pushed to
+ * `dev`. An existing `backmerge/<version>` branch is never rewritten: it may already
+ * carry review fixes. A rerun only (re)opens its pull request, so a run whose push
+ * landed but whose pull request failed recovers without rebuilding the merge.
  */
 export async function backmergeReleaseIntoDev(
 	version: string,
-	options: { repoDir?: string } = {},
+	options: { repoDir?: string; openPullRequest?: BackmergePullRequestOpener } = {},
 ): Promise<BackmergeOutcome> {
 	const repoDir = options.repoDir ?? process.cwd();
+	const openPullRequest = options.openPullRequest ?? openBackmergePullRequestWithGh;
 	const worktrees: string[] = [];
 	try {
+		const releaseTag = `refs/remotes/origin/tags/v${version}`;
 		// Explicit destinations: in a `--single-branch main` checkout, or any checkout whose
 		// `remote.origin.fetch` does not map `dev`, a source-only refspec fetches the objects
 		// without updating `origin/dev`, leaving it absent or stale for every command below.
-		await gitAt(repoDir, ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "+refs/heads/dev:refs/remotes/origin/dev"]).quiet();
-		const contained = await gitAt(repoDir, ["merge-base", "--is-ancestor", "origin/main", "origin/dev"]).quiet().nothrow();
-		if (contained.exitCode === 0) return { action: "skipped", detail: "dev already contains origin/main" };
+		await gitAt(repoDir, [
+			"fetch",
+			"origin",
+			"+refs/heads/main:refs/remotes/origin/main",
+			"+refs/heads/dev:refs/remotes/origin/dev",
+			`+refs/tags/v${version}:${releaseTag}`,
+		]).quiet();
+		const releaseOnMain = await gitAt(repoDir, ["merge-base", "--is-ancestor", releaseTag, "origin/main"])
+			.quiet()
+			.nothrow();
+		if (releaseOnMain.exitCode !== 0) {
+			return { action: "blocked", detail: `v${version} is not reachable from origin/main` };
+		}
+		const contained = await gitAt(repoDir, ["merge-base", "--is-ancestor", releaseTag, "origin/dev"])
+			.quiet()
+			.nothrow();
+		if (contained.exitCode === 0) return { action: "skipped", detail: `dev already contains v${version}` };
+		if (contained.exitCode !== 1) return { action: "blocked", detail: `cannot verify whether dev contains v${version}` };
+		const branch = `backmerge/${version}`;
+		const ensurePullRequest = async (cwd: string): Promise<BackmergeOutcome> => {
+			const failure = await openPullRequest({
+				cwd,
+				head: branch,
+				base: "dev",
+				title: `chore(release): backmerge v${version} into dev`,
+				body: `Sync the v${version} release commit from main into dev so this published version is included before a later release merge.
+
+The release consumed its changelog fragments; the history guard admits those deletions because the \`v${version}\` tag records them. The \`${BACKMERGE_CONFLICT_PATH}\` conflict is resolved by taking the release tag's version and dev's artifact digests.
+
+Merge with a merge commit (not squash) so \`v${version}\` stays an ancestor of dev. Merging requires maintainer approval of this exact head.`,
+			});
+			if (failure !== undefined) return { action: "blocked", detail: `${branch} is pushed but its pull request could not be opened: ${failure}; rerun to retry` };
+			return { action: "opened", detail: `${branch} -> dev is open; merge it with a merge commit after maintainer approval` };
+		};
+		const existing = await gitAt(repoDir, ["ls-remote", "--exit-code", "--heads", "origin", branch]).quiet().nothrow();
+		if (existing.exitCode === 0) {
+			const existingRef = `refs/remotes/origin/${branch}`;
+			await gitAt(repoDir, ["fetch", "origin", `+refs/heads/${branch}:${existingRef}`]).quiet();
+			const problem = await existingBackmergeBranchProblem(repoDir, existingRef, releaseTag, version);
+			if (problem !== undefined) return { action: "blocked", detail: `refusing to reopen ${branch}: ${problem}` };
+			return await ensurePullRequest(repoDir);
+		}
+		if (existing.exitCode !== 2) {
+			return { action: "blocked", detail: `cannot verify whether ${branch} exists: ${firstLine(existing.stderr.toString())}` };
+		}
 
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-backmerge-"));
 		worktrees.push(dir);
 		await gitAt(repoDir, ["worktree", "add", "--detach", dir, "origin/dev"]).quiet();
 
-		const merge = await gitAt(dir, ["merge", "--no-commit", "--no-ff", "origin/main"]).quiet().nothrow();
+		const merge = await gitAt(dir, ["merge", "--no-commit", "--no-ff", releaseTag]).quiet().nothrow();
 		if (merge.exitCode !== 0) {
 			const conflicted = (await gitAt(dir, ["diff", "--name-only", "--diff-filter=U"]).text())
 				.split("\n")
@@ -1069,42 +1171,14 @@ export async function backmergeReleaseIntoDev(
 			"-m",
 			`chore(release): sync the v${version} release into dev`,
 			"-m",
-			"dev must contain every released main commit, or the next release merge stops being a fast-forward and the changelog fragments that release consumed reappear as pending work.",
+			`dev must contain the v${version} release commit before a later release merge, or that merge stops being a fast-forward and the changelog fragments this release consumed reappear as pending work.`,
 		]).quiet();
 
-		// Create a backmerge branch and push it
-		const backmergeRef = `refs/heads/backmerge/${version}`;
-		const pushBackmergeRef = await gitAt(dir, ["push", "origin", `HEAD:${backmergeRef}`]).quiet().nothrow();
-		if (pushBackmergeRef.exitCode !== 0) {
-			const rejection = pushBackmergeRef.stderr.toString().trim();
-			return { action: "blocked", detail: `failed to push backmerge branch: ${firstLine(rejection)}` };
+		const pushed = await gitAt(dir, ["push", "origin", `HEAD:refs/heads/${branch}`]).quiet().nothrow();
+		if (pushed.exitCode !== 0) {
+			return { action: "blocked", detail: `failed to push ${branch}: ${firstLine(pushed.stderr.toString().trim())}` };
 		}
-
-		// Create a PR for the backmerge
-		const prBody = `Sync v${version} release into dev.
-
-This PR propagates the released commit from main into dev to keep them in sync.
-The PR requires maintainer review and approval before it can be merged.
-
-The change resolves the deterministic conflict in \`packages/natives/native/diagnostic-artifact.json\` by adopting the released version from main and the artifact digests from dev.`;
-
-		const prCreate = await $`cd ${dir} && gh pr create --head ${backmergeRef} --base dev --title "chore(release): backmerge v${version} into dev" --body ${prBody}`.quiet().nothrow();
-		if (prCreate.exitCode !== 0) {
-			const error = prCreate.stderr.toString().trim();
-			const isNonGitHubOrigin = error.toLowerCase().includes("point") && error.toLowerCase().includes("github") && error.toLowerCase().includes("host");
-			if (isNonGitHubOrigin) {
-				// For non-GitHub origins (e.g., tests), push the merge directly to dev
-				const pushDev = await gitAt(dir, ["push", "origin", "HEAD:refs/heads/dev"]).quiet().nothrow();
-				if (pushDev.exitCode !== 0) {
-					const rejection = pushDev.stderr.toString().trim();
-					return { action: "blocked", detail: `failed to push merge to dev: ${firstLine(rejection)}` };
-				}
-			} else if (!error.includes("already exists") && !error.toLowerCase().includes("pull request")) {
-				return { action: "blocked", detail: `failed to create backmerge PR: ${firstLine(error)}` };
-			}
-		}
-
-		return { action: "merged", detail: `created backmerge PR for v${version}; requires manual review and merge` };
+		return await ensurePullRequest(dir);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		return { action: "blocked", detail: `unexpected error: ${detail}` };
@@ -1120,9 +1194,41 @@ The change resolves the deterministic conflict in \`packages/natives/native/diag
 // Main
 // =============================================================================
 
-export type ReleaseCli = { mode: "watch" } | { mode: "release"; version: string };
+async function cmdBackmerge(version: string): Promise<void> {
+	const tag = `v${version}`;
+	const published = await git(["ls-remote", "--tags", "origin", `refs/tags/${tag}`, `refs/tags/${tag}^{}`])
+		.quiet()
+		.nothrow();
+	if (published.exitCode !== 0) {
+		throw new Error(`Cannot verify remote release tag ${tag}: ${outputOf(published) || `exit ${published.exitCode ?? "unknown"}`}`);
+	}
+	if (published.stdout.toString().trim() === "") {
+		throw new Error(`Cannot retry backmerge: release tag ${tag} does not exist on origin`);
+	}
+
+	console.log(`\n=== Retrying backmerge for ${tag} ===\n`);
+	const outcome = await backmergeReleaseIntoDev(version);
+	if (outcome.action === "blocked") {
+		console.error(`Backmerge blocked: ${outcome.detail}`);
+		process.exitCode = 1;
+		return;
+	}
+	console.log(`Backmerge ${outcome.action}: ${outcome.detail}`);
+}
+
+export type ReleaseCli =
+	| { mode: "watch" }
+	| { mode: "release"; version: string }
+	| { mode: "backmerge"; version: string };
 
 export function parseReleaseCli(argv: readonly string[]): ReleaseCli {
+	if (argv[0] === "backmerge") {
+		const version = argv[1];
+		if (argv.length !== 2 || version === undefined || !isStableReleaseVersion(version)) {
+			throw new Error("Backmerge requires exactly one exact stable X.Y.Z version");
+		}
+		return { mode: "backmerge", version };
+	}
 	if (argv.length !== 1) throw new Error("Release accepts exactly one argument: watch or an exact stable X.Y.Z version");
 	const [argument] = argv;
 	if (argument === "watch") return { mode: "watch" };
@@ -1133,6 +1239,7 @@ export function parseReleaseCli(argv: readonly string[]): ReleaseCli {
 function printUsage(): void {
 	console.error("Usage:");
 	console.error("  bun scripts/release.ts <version>   Full release");
+	console.error("  bun scripts/release.ts backmerge <version>   Retry a published release backmerge");
 	console.error("  bun scripts/release.ts watch       Watch CI for current commit");
 }
 
@@ -1148,6 +1255,8 @@ if (import.meta.main) {
 	if (command !== undefined) {
 		if (command.mode === "watch") {
 			await cmdWatch();
+		} else if (command.mode === "backmerge") {
+			await cmdBackmerge(command.version);
 		} else {
 			await cmdRelease(command.version);
 		}

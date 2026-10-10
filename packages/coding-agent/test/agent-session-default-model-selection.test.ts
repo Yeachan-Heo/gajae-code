@@ -483,6 +483,36 @@ describe("AgentSession durable default model selection", () => {
 		}
 	});
 
+	it("contains an async subscriber rejection during default selection", async () => {
+		// Given
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		const unsubscribe = session.subscribe(async event => {
+			await Promise.resolve();
+			if (event.type === "thinking_level_changed") throw new Error("async subscriber failed");
+		});
+		const subscriberWarning = vi.spyOn(logger, "warn");
+
+		try {
+			// When
+			await session.setDefaultModelSelection(targetModel(), Effort.High);
+			await Bun.sleep(20);
+
+			// Then
+			expect(unhandled).toEqual([]);
+			expect(subscriberWarning).toHaveBeenCalledWith("Default model selection event listener failed", {
+				code: "default_model_selection_listener_failed",
+				disposition: "continue",
+			});
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			unsubscribe();
+		}
+	});
+
 	it("restores an unchanged explicit default thinking level on resume", async () => {
 		// Given
 		modelRegistry.registerProvider("target-provider", {

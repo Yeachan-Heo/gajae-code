@@ -679,7 +679,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			startPendingSubmission: input => thisMode.startPendingSubmission(input),
 			addChatChild: child => addChatChild(thisMode, child),
 			requestRender: full => thisMode.ui.requestRender(full),
-			stopUi: () => thisMode.ui.stop(),
+			stopUi: () => thisMode.ui.suspend(),
 			startUi: () => thisMode.ui.start(),
 			showStatus: message => thisMode.showStatus(message),
 			showWarning: message => thisMode.showWarning(message),
