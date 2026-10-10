@@ -399,6 +399,55 @@ describe("tmux self-injection guard", () => {
 		});
 	});
 
+	describe("regression: long-option arities for timeout/nice/stdbuf (issue #6564-3)", () => {
+		it("should block tmux after timeout with --signal long option", async () => {
+			// Issue: timeout --signal TERM 5 tmux send-keys
+			// --signal takes TERM as argument, 5 is the duration, tmux should be checked
+			await expect(
+				checkTmuxSelfInjection("timeout --signal TERM 5 tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after timeout with --signal=SIGNAL format", async () => {
+			// Issue: timeout --signal=TERM 5 tmux send-keys
+			await expect(
+				checkTmuxSelfInjection("timeout --signal=TERM 5 tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after nice with --adjustment long option", async () => {
+			// Issue: nice --adjustment 5 tmux ...
+			// --adjustment takes 5 as argument, tmux should be checked
+			await expect(
+				checkTmuxSelfInjection("nice --adjustment 5 tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after stdbuf with --output long option", async () => {
+			// Issue: stdbuf --output L tmux ...
+			// --output takes L as argument, tmux should be checked
+			await expect(
+				checkTmuxSelfInjection("stdbuf --output L tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after stdbuf with --output=MODE format", async () => {
+			await expect(
+				checkTmuxSelfInjection("stdbuf --output=L tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+	});
+
 	// Regression tests for socket override through wrapper assignments (issue #6564-6)
 	// Note: These tests are complex and require careful token ordering
 	// TODO: implement full TMUX assignment traversal through wrapper assignments

@@ -43,6 +43,20 @@ const WRAPPER_LONG_OPTIONS: Record<string, Record<string, boolean>> = {
 		"--unset": true, // env --unset=VAR or --unset VAR
 		"--split-string": false, // env -S/--split-string (flag-only)
 	},
+	timeout: {
+		"--signal": true, // timeout --signal=SIGNAL (takes signal name)
+		"--kill-after": true, // timeout --kill-after=TIME
+		"--preserve-status": false, // timeout --preserve-status (flag-only)
+		"--verbose": false, // timeout --verbose (flag-only)
+	},
+	nice: {
+		"--adjustment": true, // nice --adjustment=N (takes adjustment value)
+	},
+	stdbuf: {
+		"--input": true, // stdbuf --input=MODE
+		"--output": true, // stdbuf --output=MODE
+		"--error": true, // stdbuf --error=MODE
+	},
 	xargs: {
 		"--null": false, // xargs --null (flag-only)
 		"--max-args": true, // xargs --max-args N
