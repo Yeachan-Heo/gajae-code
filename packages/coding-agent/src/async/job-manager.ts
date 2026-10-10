@@ -253,6 +253,7 @@ export type ResumeRunner = (
 	message?: string,
 	descriptor?: ResumeDescriptor,
 	resumeToolCallId?: string,
+	admissionEndpointId?: string,
 ) => string | undefined;
 
 function sessionFileFromResumeDescriptorData(data: unknown): string | null {
@@ -2000,7 +2001,7 @@ export class AsyncJobManager {
 		// never renders the prior run's tool/output as live before it emits again.
 		this.#subagentProgress.delete(rec.subagentId);
 		const runner = this.#resolveResumeRunner(rec, descriptor);
-		const newJobId = runner?.(rec.subagentId, message, descriptor, resumeToolCallId);
+		const newJobId = runner?.(rec.subagentId, message, descriptor, resumeToolCallId, admissionEndpointId ?? rec.queued?.admissionEndpointId);
 		if (!newJobId) {
 			// The queued resume FAILED to start: retire its owned registration
 			// so the tuple does not accumulate indefinitely (review thread P2).
@@ -2120,9 +2121,9 @@ export class AsyncJobManager {
 					this.#descriptorForRecord(rec),
 					rec.queued?.resumeToolCallId,
 					entry.admissionEndpointId,
-				);
-				if (!result.ok) {
-					if (result.reason === "owner_shutdown_in_progress") {
+			);
+			if (!result.ok) {
+				if (result.reason === "owner_shutdown_in_progress") {
 						index += 1;
 						continue;
 					}

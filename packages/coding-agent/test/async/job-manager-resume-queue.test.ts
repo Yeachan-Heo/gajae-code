@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { AsyncJobManager, type SubagentRunOutcome } from "@gajae-code/coding-agent/async/job-manager";
-import { bindToolLineage, lookupOwnedRegistration } from "@gajae-code/coding-agent/session/terminal-abort";
+import { bindToolLineage, lookupOwnedRegistration, registerOwnedIfLineaged } from "@gajae-code/coding-agent/session/terminal-abort";
 
 /** Build a manager that records every delivered completion. */
 function makeManager(opts?: { maxRunningJobs?: number; retentionMs?: number }) {
@@ -53,9 +53,9 @@ function spawnControllable(manager: AsyncJobManager, subagentId: string, ownerId
 
 /** A resume runner that re-spawns a subagent which completes immediately. */
 function installResumeRunner(manager: AsyncJobManager) {
-	manager.setResumeRunner((subagentId, message) => {
+	manager.setResumeRunner((subagentId, message, descriptor, resumeToolCallId, admissionEndpointId) => {
 		const rec = manager.getSubagentRecord(subagentId);
-		return manager.register(
+		const jobId = manager.register(
 			"task",
 			subagentId,
 			async (): Promise<SubagentRunOutcome> => ({
@@ -68,6 +68,9 @@ function installResumeRunner(manager: AsyncJobManager) {
 				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
 			},
 		);
+		// Register the resumed job as owned work using the admission endpoint
+		registerOwnedIfLineaged(manager, resumeToolCallId, jobId, admissionEndpointId);
+		return jobId;
 	});
 }
 
@@ -819,6 +822,10 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 			endpointId: endpointE1,
 		});
 
+		// Register the manager at endpoint E1
+		const registeredAtE1 = AsyncJobManager.registerForEndpoint(endpointE1, manager);
+		expect(registeredAtE1).toBe(true);
+
 		// Queue the resume with the tool call ID at E1; this saves endpointE1 as the admission endpoint
 		expect(manager.resumeSubagent("A", { ownerId: "owner-a" }, "valid", validToolCallId).queued).toBe(true);
 		const validGen = `queued:A:1`;
@@ -829,6 +836,8 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		const endpointE2 = "endpoint-e2-valid";
 		const rekeySuccess = AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager);
 		expect(rekeySuccess).toBe(true);
+		// Verify the manager has been moved to E2
+		expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE2);
 
 		// Drain the queue by releasing the blocker; the valid entry should be cleaned up
 		// using the saved E1 endpoint, not the manager's current E2 endpoint
@@ -843,6 +852,17 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		// The resumed job should have transitioned from queued to running/completed
 		const rec = manager.getSubagentRecord("A");
 		expect(rec?.status).not.toBe("queued");
+
+		// Verify that the resumed job is registered at the admission endpoint E1,
+		// not at the current endpoint E2
+		if (rec?.currentJobId && rec?.currentJobGeneration) {
+			// Should exist at E1 (admission endpoint)
+			const runningRegE1 = lookupOwnedRegistration(rec.currentJobId, rec.currentJobGeneration, endpointE1);
+			expect(runningRegE1).toBeDefined();
+			// Should NOT exist at E2 (current endpoint)
+			const runningRegE2 = lookupOwnedRegistration(rec.currentJobId, rec.currentJobGeneration, endpointE2);
+			expect(runningRegE2).toBeUndefined();
+		}
 
 		await manager.dispose({ timeoutMs: 500 });
 	});
