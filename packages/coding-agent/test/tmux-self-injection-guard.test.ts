@@ -473,6 +473,10 @@ describe("tmux self-injection guard", () => {
 	// Note: These tests are complex and require careful token ordering
 	// TODO: implement full TMUX assignment traversal through wrapper assignments
 	describe("regression: socket override through wrapper assignments (issue #6564-6)", () => {
+		// TODO: Socket override with TMUX assignments before wrappers requires
+		// fixing tokenizer to properly preserve assignment tokens in backtracking.
+		// Currently, assignments are tokenized with commandStart=true, making them
+		// appear as command boundaries during backtracking.
 		/*
 		it("should allow TMUX assignment before wrapper to override socket", async () => {
 			// Issue: TMUX=/tmp/other env FOO=x tmux send-keys -t %47 x
@@ -614,17 +618,17 @@ describe("tmux self-injection guard", () => {
 			// Issue: bash -c true 'tmux send-keys -t %47 x'
 			// bash executes 'true', not the quoted tmux command
 			// Guard should check 'true' as the actual command
-			await expect(
-				checkTmuxSelfInjection("bash -c true 'tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({ block: false }); // 'true' is not tmux, so no injection
+			await expect(checkTmuxSelfInjection("bash -c true 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject(
+				{ block: false },
+			); // 'true' is not tmux, so no injection
 		});
 
 		it("blocks bash -c with quoted tmux command", async () => {
 			// Issue: bash -c 'tmux send-keys -t %47 x'
 			// Guard should check the quoted string as the payload
-			await expect(
-				checkTmuxSelfInjection("bash -c 'tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({ block: true });
+			await expect(checkTmuxSelfInjection("bash -c 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
+				block: true,
+			});
 		});
 
 		// Issue 2: P1 — Long wrapper arities for xargs
@@ -656,9 +660,9 @@ describe("tmux self-injection guard", () => {
 		it("blocks env -S with tmux in split string", async () => {
 			// Issue: env -S 'tmux send-keys -t %47 x'
 			// -S splits the string and executes the command
-			await expect(
-				checkTmuxSelfInjection("env -S 'tmux send-keys -t %47 x'", options),
-			).resolves.toMatchObject({ block: true });
+			await expect(checkTmuxSelfInjection("env -S 'tmux send-keys -t %47 x'", options)).resolves.toMatchObject({
+				block: true,
+			});
 		});
 
 		it("blocks env --split-string with tmux in split string", async () => {
@@ -696,9 +700,9 @@ describe("tmux self-injection guard", () => {
 
 		it("blocks tmux with correct TMUX assignment in same invocation", async () => {
 			// TMUX=/tmp/other should affect the tmux command in the same invocation
-			await expect(
-				checkTmuxSelfInjection("TMUX=/tmp/other tmux send-keys -t %47 x", options),
-			).resolves.toEqual({ block: false }); // Different socket
+			await expect(checkTmuxSelfInjection("TMUX=/tmp/other tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			}); // Different socket
 		});
 
 		// Issue 5: P1 — Short bundle parsing with argument-taking options
@@ -706,16 +710,16 @@ describe("tmux self-injection guard", () => {
 			// Issue: env -iu FOO tmux send-keys -t %47 x
 			// -i (flag-only), -u FOO (takes argument)
 			// tmux is the wrapped command
-			await expect(
-				checkTmuxSelfInjection("env -iu FOO tmux send-keys -t %47 x", options),
-			).resolves.toMatchObject({ block: true });
+			await expect(checkTmuxSelfInjection("env -iu FOO tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
 		});
 
 		it("blocks env -uFOO (bundled) with tmux as wrapped command", async () => {
 			// -u FOO bundled without space
-			await expect(
-				checkTmuxSelfInjection("env -uFOO tmux send-keys -t %47 x", options),
-			).resolves.toMatchObject({ block: true });
+			await expect(checkTmuxSelfInjection("env -uFOO tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
 		});
 
 		// Issue 6: P1 — Pending operands before option classification

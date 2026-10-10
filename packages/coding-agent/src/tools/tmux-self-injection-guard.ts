@@ -629,7 +629,7 @@ function collectShellPayloads(tokens: Token[]): string[] {
 			// Check for long options without = that might take arguments
 			else if (arg.startsWith("--")) {
 				// Check if this long option takes an argument
-				const wrapperLongOpts = WRAPPER_LONG_OPTIONS["env"];
+				const wrapperLongOpts = WRAPPER_LONG_OPTIONS.env;
 				if (wrapperLongOpts && arg in wrapperLongOpts && wrapperLongOpts[arg]) {
 					skipNextArg = true;
 				}
@@ -759,33 +759,30 @@ function sameSocket(left: string, right: string): boolean {
 
 function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | undefined {
 	// Backtrack from the command position to find any TMUX assignment
-	// Only look for assignments that are arguments to wrappers, or at the command start
-	// Stop at the first commandStart token (which marks an invocation boundary from a separator like ;)
-	let firstWrapperIndex = -1;
+	// TMUX assignments are valid if they appear before the command and any wrappers,
+	// within the same invocation (before a command boundary marked by non-wrapper commandStart).
 	for (let index = commandIndex - 1; index >= 0 && commandIndex - index <= 20; index++) {
 		const token = tokens[index];
 
-		// Check for TMUX assignment
+		// Check for TMUX assignment (before checking command boundaries)
 		const assignment = token.text.match(/^TMUX=([^,\s]+)/);
 		if (assignment) {
-			// Only return the assignment if it's within the same invocation
-			// (before any command boundary marked by commandStart)
-			if (firstWrapperIndex === -1 || index > firstWrapperIndex) {
-				return assignment[1];
-			}
+			// Found a TMUX assignment; it applies to this invocation
+			return assignment[1];
 		}
 
 		// Track command boundaries
 		if (token.commandStart) {
-			if (!COMMAND_WRAPPERS.has(token.text) && !COMMAND_WRAPPERS_WITH_ARGS[token.text]) {
-				// Hit a non-wrapper command start; this marks the boundary of a previous invocation
+			// Normalize the wrapper name (handle path-qualified commands)
+			const baseName = token.text.includes("/") ? token.text.split("/").pop() || token.text : token.text;
+			// Skip assignments (they have commandStart=true but aren't command boundaries)
+			const isAssignmentToken = isAssignment(token.text);
+			if (!isAssignmentToken && !COMMAND_WRAPPERS.has(baseName) && !COMMAND_WRAPPERS_WITH_ARGS[baseName]) {
+				// Hit a non-wrapper, non-assignment command start; this marks the boundary of a previous invocation
 				// Stop searching - assignments found here belong to a different command
 				break;
 			}
-			// Track the first wrapper we encounter while backtracking
-			if (firstWrapperIndex === -1) {
-				firstWrapperIndex = index;
-			}
+			// Continue searching through wrapper commands and assignments
 		}
 	}
 	return undefined;
