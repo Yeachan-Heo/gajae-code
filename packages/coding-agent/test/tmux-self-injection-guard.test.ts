@@ -423,4 +423,43 @@ describe("tmux self-injection guard", () => {
 		});
 		*/
 	});
+
+	// Regression tests for command -v lookup boundary (issue #6564-1)
+	describe("regression: command -v lookup boundary (issue #6564-1)", () => {
+		it("should block tmux after empty lookup with semicolon", async () => {
+			// Issue: `command -v; tmux send-keys -t %47 x`
+			// The lookup has no operand (empty), so tmux is a new command after separator
+			// The tmux command should be checked for injection, not suppressed
+			await expect(checkTmuxSelfInjection("command -v; tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after empty lookup with pipe", async () => {
+			// Issue: `command -v | tmux send-keys -t %47 x`
+			// Similar to semicolon - the lookup has no operand, so tmux is a separate command
+			await expect(checkTmuxSelfInjection("command -v | tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block tmux after assignment-shaped lookup operand", async () => {
+			// Issue: `command -v FOO=bar; tmux send-keys -t %47 x`
+			// FOO=bar looks like an assignment but is the operand of command -v
+			// After the separator, tmux is a new command and should be checked
+			await expect(
+				checkTmuxSelfInjection("command -v FOO=bar; tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should suppress tmux when it's the actual operand of command -v", async () => {
+			// Issue: `command -v tmux` where tmux is an actual command lookup operand
+			// This should still be suppressed because tmux is not executed
+			await expect(checkTmuxSelfInjection("command -v tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+	});
 });

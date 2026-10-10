@@ -81,6 +81,7 @@ interface Token {
 	text: string;
 	quoted: boolean;
 	commandStart: boolean;
+	isWrappedCommand?: boolean; // true if this token is the actual command being wrapped by a wrapper like 'command', 'env', 'sudo'
 }
 
 function isSeparator(ch: string): boolean {
@@ -114,6 +115,7 @@ function tokenize(command: string): Token[] {
 		if (text.length === 0) return;
 
 		let commandStart = atCommandStart;
+		let isWrappedCommand = false;
 
 		if (atCommandStart) {
 			const newWrapper = COMMAND_WRAPPERS_WITH_ARGS[text];
@@ -197,11 +199,12 @@ function tokenize(command: string): Token[] {
 					wrapperCommand = undefined;
 					skipNextArg = false;
 					commandStart = true; // The wrapped command is a command start
+					isWrappedCommand = true; // Track that this is a wrapped command
 				}
 			}
 		}
 
-		const token: Token = { text, quoted, commandStart };
+		const token: Token = { text, quoted, commandStart, ...(isWrappedCommand && { isWrappedCommand }) };
 		tokens.push(token);
 
 		text = "";
@@ -576,15 +579,17 @@ function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
 			// Find the wrapped command (first non-option, non-assignment after the lookup flag)
 			for (let i = lookupFlagIdx + 1; i < tokens.length; i++) {
 				const word = tokens[i].text;
-				// Stop at any command boundary (except the target itself)
-				if (tokens[i].commandStart && i !== targetIndex && i > lookupFlagIdx + 1) {
-					break;
-				}
 				// Skip options and assignments
 				if (word.startsWith("-") || isAssignment(word)) {
 					continue;
 				}
-				// This is the wrapped command; check if it matches the target
+				// If the first non-option word has commandStart=true but is NOT a wrapped command,
+				// it's a new command after a separator, not an operand of the lookup.
+				// This handles empty lookups like `command -v; tmux send-keys`
+				if (tokens[i].commandStart && !tokens[i].isWrappedCommand) {
+					break;
+				}
+				// This is the operand of the lookup; check if it matches the target
 				return i === targetIndex;
 			}
 		}
