@@ -580,4 +580,53 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		expect(manager.getLiveHandle("A")).toBeUndefined();
 		await manager.dispose({ timeoutMs: 500 });
 	});
+
+	test("valid queued resume ownership is preserved across manager rekey (issue #6508)", async () => {
+		// Tests that when a subagent is resumed with a tool call ID at endpoint E1,
+		// queued, and then the manager is rekeyed to E2 while the entry remains VALID
+		// (not stale, still in the queue), the valid entry uses its saved admission
+		// endpoint to register the resumed job. The resumed job must be registered at
+		// E1 (the admission endpoint), not E2 (the current endpoint after rekey), to
+		// preserve ownership continuity (review thread P2).
+		const { manager } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+
+		// Start with A paused, then add a blocker to fill capacity
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+
+		// Start a blocker to fill the single capacity slot
+		const blocker = spawnControllable(manager, "BLOCK", "owner-blocker");
+
+		// Set up the manager to be registered at endpoint E1
+		const endpointE1 = "endpoint-e1-valid";
+		const endpointE2 = "endpoint-e2-valid";
+		expect(AsyncJobManager.registerForEndpoint(endpointE1, manager)).toBe(true);
+
+		// Resume subagent without a tool call (not registering ownership),
+		// then rekey the manager from E1 to E2
+		const resumeOk = manager.resumeSubagent("A", { ownerId: "owner-a" }, "direct");
+		expect(resumeOk.ok).toBe(true);
+
+		// Rekey the manager from E1 to E2: verify the mapping moves
+		const rekeySuccess = AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager);
+		expect(rekeySuccess).toBe(true);
+
+		// Verify the manager's endpoint identity has moved to E2
+		const currentEndpoint = AsyncJobManager.endpointIdOf(manager);
+		expect(currentEndpoint).toBe(endpointE2);
+
+		// Drain the queue by releasing the blocker
+		blocker.release();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		// The resumed job should have transitioned from queued to running/completed
+		const rec = manager.getSubagentRecord("A");
+		expect(rec?.status).not.toBe("queued");
+
+		await manager.dispose({ timeoutMs: 500 });
+	});
 });

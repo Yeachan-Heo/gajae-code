@@ -246,6 +246,7 @@ export type ResumeRunner = (
 	message?: string,
 	descriptor?: ResumeDescriptor,
 	resumeToolCallId?: string,
+	admissionEndpointId?: string,
 ) => string | undefined;
 
 function sessionFileFromResumeDescriptorData(data: unknown): string | null {
@@ -1881,6 +1882,17 @@ export class AsyncJobManager {
 			return { ok: false, reason: "context_unavailable" };
 		}
 		if (!this.#resolveResumeRunner(rec, descriptor)) return { ok: false, reason: "no_runner" };
+		// Resolve the admission endpoint: when the manager is rekeyed before the
+		// queue is drained or the subagent is resumed/cancelled, we need the
+		// original endpoint to unregister the queued registration and register
+		// the resumed job (review thread P2).
+		let admissionEndpointId: string | undefined;
+		if (resumeToolCallId) {
+			const lineage = resolveToolLineage(resumeToolCallId, AsyncJobManager.endpointIdOf(this));
+			if (lineage) {
+				admissionEndpointId = lineage.endpointId ?? AsyncJobManager.endpointIdOf(this);
+			}
+		}
 		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
 			const seq = ++this.#resumeSeq;
 			rec.terminalQueuedSeq = undefined;
@@ -1890,6 +1902,7 @@ export class AsyncJobManager {
 				seq,
 				message,
 				...(resumeToolCallId ? { resumeToolCallId } : {}),
+				...(admissionEndpointId ? { admissionEndpointId } : {}),
 				createdAt: Date.now(),
 			};
 			this.#resumeQueue.push({
@@ -1898,6 +1911,7 @@ export class AsyncJobManager {
 				seq,
 				message,
 				...(resumeToolCallId ? { resumeToolCallId } : {}),
+				...(admissionEndpointId ? { admissionEndpointId } : {}),
 				createdAt: rec.queued.createdAt,
 			});
 			// Register the QUEUED generation as owned work of the resume request's
@@ -1922,7 +1936,7 @@ export class AsyncJobManager {
 			this.#notifyChange();
 			return { ok: true, queued: true, status: "queued" };
 		}
-		return this.#startResume(rec, message, descriptor, resumeToolCallId);
+		return this.#startResume(rec, message, descriptor, resumeToolCallId, admissionEndpointId);
 	}
 
 	/** Retire the owned registration of a job that settles WITHOUT a delivery
@@ -1960,6 +1974,7 @@ export class AsyncJobManager {
 		message: string | undefined,
 		descriptor: ResumeDescriptor | undefined,
 		resumeToolCallId?: string,
+		admissionEndpointId?: string,
 	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
 		if (this.#isOwnerSubagentShutdownFenced(rec.ownerId)) {
 			return { ok: false, status: rec.status, reason: "owner_shutdown_in_progress" };
@@ -1970,7 +1985,7 @@ export class AsyncJobManager {
 		// never renders the prior run's tool/output as live before it emits again.
 		this.#subagentProgress.delete(rec.subagentId);
 		const runner = this.#resolveResumeRunner(rec, descriptor);
-		const newJobId = runner?.(rec.subagentId, message, descriptor, resumeToolCallId);
+		const newJobId = runner?.(rec.subagentId, message, descriptor, resumeToolCallId, admissionEndpointId);
 		if (!newJobId) {
 			// The queued resume FAILED to start: retire its owned registration
 			// so the tuple does not accumulate indefinitely (review thread P2).

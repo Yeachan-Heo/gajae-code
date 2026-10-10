@@ -1083,7 +1083,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
-			resumeRunner = (_subagentId, message, resumeDescriptor, resumeToolCallId) => {
+			resumeRunner = (_subagentId, message, resumeDescriptor, resumeToolCallId, admissionEndpointId) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
 				const admission = (() => {
@@ -1204,11 +1204,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				// receive the same provider-local tool-call id, and an
 				// endpoint-less resolve would take the FIRST matching binding —
 				// registering B's task under A's endpoint/lineage (review P1).
+				// Use the admission endpoint if provided (from the queued registration),
+				// otherwise fall back to the current session endpoint (review P2).
 				registerOwnedIfLineaged(
 					manager,
 					resumeToolCallId ?? descriptor.toolCallId,
 					resumeJobId,
-					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+					admissionEndpointId ?? this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
 				);
 				return resumeJobId;
 			};
