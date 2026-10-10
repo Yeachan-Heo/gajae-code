@@ -138,7 +138,9 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		const data = tryParseJson<{ mcpServers?: Record<string, unknown> }>(content);
 		if (!data?.mcpServers) return result;
 
-		const expanded = expandEnvVarsDeep(data.mcpServers);
+		// Project mcp.json is repo content. Skip secret-named ${VAR} the same way
+		// project ssh.json does; user scope still expands those names.
+		const expanded = expandEnvVarsDeep(data.mcpServers, undefined, level === "project");
 		for (const [serverName, config] of Object.entries(expanded)) {
 			const serverConfig = config as Record<string, unknown>;
 
