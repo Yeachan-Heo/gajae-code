@@ -156,7 +156,8 @@ async function backmergeFixture(options: { devManifest?: string; secondConflict?
 	await Bun.write(path.join(work, "released.txt"), "released\n");
 	await git(work, "add", "-A");
 	await git(work, "commit", "-m", "chore: release 0.18.7");
-	await git(work, "push", "origin", "main");
+	await git(work, "tag", "v0.18.7");
+	await git(work, "push", "origin", "main", "--tags");
 	return { origin, work };
 }
 
@@ -194,12 +195,21 @@ describe("backmerge orchestration", () => {
 		expect((await git(origin, "log", "-1", "--format=%s", branch)).trim()).toBe("chore(release): sync the v0.18.7 release into dev");
 		expect(await git(origin, "log", "-1", "--format=%b", branch)).toContain("fast-forward");
 
-		// A rerun leaves the existing branch, and any review fixes on it, alone.
+		// A rerun never rewrites the existing branch (it may carry review fixes); it only
+		// re-ensures the pull request, which the gh opener treats as idempotent.
 		const tip = await git(origin, "rev-parse", branch);
+		await git(work, "checkout", "main");
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.8", "later-main-digest"));
+		await Bun.write(path.join(work, "later-release.txt"), "later release\n");
+		await git(work, "add", "-A");
+		await git(work, "commit", "-m", "chore: release 0.18.8");
+		await git(work, "tag", "v0.18.8");
+		await git(work, "push", "origin", "main", "--tags");
 		const repeat = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
-		expect(repeat.action).toBe("skipped");
+		expect(repeat.action).toBe("opened");
 		expect(await git(origin, "rev-parse", branch)).toBe(tip);
-		expect(opener.opened).toHaveLength(1);
+		expect(opener.opened).toHaveLength(2);
+		expect(opener.opened[1]?.head).toBe(branch);
 
 		// The throwaway worktree is deregistered rather than left behind.
 		const registered = (await git(work, "worktree", "list", "--porcelain"))
@@ -208,15 +218,82 @@ describe("backmerge orchestration", () => {
 		expect(registered).toHaveLength(1);
 	});
 
-	test("reports a pull request that cannot be opened as blocked after pushing the branch", async () => {
+	test("merges the requested release tag when main advances before a delayed backmerge", async () => {
 		const { origin, work } = await backmergeFixture();
-		const opener = recordingOpener("HTTP 403: Resource not accessible by integration");
+		await git(work, "checkout", "main");
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.8", "later-main-digest"));
+		await Bun.write(path.join(work, "later-release.txt"), "later release\n");
+		await git(work, "add", "-A");
+		await git(work, "commit", "-m", "chore: release 0.18.8");
+		await git(work, "tag", "v0.18.8");
+		await git(work, "push", "origin", "main", "--tags");
+
+		const releaseCommit = (await git(origin, "rev-parse", "v0.18.7^{commit}")).trim();
+		const opener = recordingOpener();
+		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
+
+		expect(outcome.action).toBe("opened");
+		expect((await git(origin, "rev-parse", "backmerge/0.18.7^2")).trim()).toBe(releaseCommit);
+		expect(JSON.parse(await git(origin, "show", `backmerge/0.18.7:${BACKMERGE_CONFLICT_PATH}`))).toEqual({
+			schema: "gjc.diagnostic-artifact",
+			version: "0.18.7",
+			artifacts: { "pi_natives.darwin-arm64.node": "dev-digest" },
+		});
+		expect((await gitCommand(origin, ["cat-file", "-e", "backmerge/0.18.7:later-release.txt"])).exitCode).not.toBe(0);
+		expect(await git(origin, "show", "main:later-release.txt")).toBe("later release\n");
+	});
+
+	test("refuses to reopen an existing backmerge branch that includes a later release", async () => {
+		const { origin, work } = await backmergeFixture();
+		await git(work, "checkout", "main");
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), manifest("0.18.8", "later-main-digest"));
+		await Bun.write(path.join(work, "later-release.txt"), "later release\n");
+		await git(work, "add", "-A");
+		await git(work, "commit", "-m", "chore: release 0.18.8");
+		await git(work, "tag", "v0.18.8");
+		await git(work, "push", "origin", "main", "--tags");
+
+		await git(work, "fetch", "origin");
+		await git(work, "checkout", "-b", "legacy-backmerge", "origin/dev");
+		const merge = await gitCommand(work, ["merge", "--no-commit", "--no-ff", "origin/main"]);
+		expect(merge.exitCode).not.toBe(0);
+		const conflicts = (await git(work, "diff", "--name-only", "--diff-filter=U"))
+			.split("\n")
+			.map(line => line.trim())
+			.filter(Boolean);
+		expect(conflicts).toEqual([BACKMERGE_CONFLICT_PATH]);
+		const ours = await git(work, "show", `:2:${BACKMERGE_CONFLICT_PATH}`);
+		const theirs = await git(work, "show", `:3:${BACKMERGE_CONFLICT_PATH}`);
+		await Bun.write(path.join(work, BACKMERGE_CONFLICT_PATH), resolveDiagnosticArtifactBackmerge(ours, theirs));
+		await git(work, "add", BACKMERGE_CONFLICT_PATH);
+		await git(work, "commit", "-m", "chore(release): sync the v0.18.7 release into dev");
+		await git(work, "push", "origin", "HEAD:refs/heads/backmerge/0.18.7");
+		const oldTip = await git(origin, "rev-parse", "backmerge/0.18.7");
+		const opener = recordingOpener();
 
 		const outcome = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: opener.openPullRequest });
 
 		expect(outcome.action).toBe("blocked");
-		expect(outcome.detail).toContain("HTTP 403");
-		expect((await git(origin, "rev-parse", "backmerge/0.18.7")).trim()).not.toBe("");
+		expect(outcome.detail).toContain("does not have one merge commit from the v0.18.7 release tag");
+		expect(opener.opened).toHaveLength(0);
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(oldTip);
+	});
+
+	test("a rerun opens the pull request a failed run left behind without rebuilding the branch", async () => {
+		const { origin, work } = await backmergeFixture();
+		const failing = recordingOpener("HTTP 403: Resource not accessible by integration");
+
+		const first = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: failing.openPullRequest });
+		expect(first.action).toBe("blocked");
+		expect(first.detail).toContain("HTTP 403");
+		const tip = await git(origin, "rev-parse", "backmerge/0.18.7");
+
+		const working = recordingOpener();
+		const retry = await backmergeReleaseIntoDev("0.18.7", { repoDir: work, openPullRequest: working.openPullRequest });
+		expect(retry.action).toBe("opened");
+		expect(working.opened).toHaveLength(1);
+		expect(working.opened[0]).toMatchObject({ head: "backmerge/0.18.7", base: "dev" });
+		expect(await git(origin, "rev-parse", "backmerge/0.18.7")).toBe(tip);
 	});
 
 	test("fails closed on a conflict the resolver does not own and leaves dev untouched", async () => {

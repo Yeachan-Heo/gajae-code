@@ -168,14 +168,13 @@ export interface StableFileIdentity {
 const initialNodeIdentities = initialProcessEnvironment.then(async environment => {
 	const identities = new Map<string, StableFileIdentity>();
 	const temporaryRoots = await initialTemporaryRoots;
-	const cwdReal = await fs.realpath(process.cwd()).catch(() => process.cwd());
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
-			// Skip temporary roots, unless the path is under the current working directory.
-			// Development environments might have worktrees in /tmp, so we should trust those.
-			if (!isWithin(cwdReal, real) && temporaryRoots.some(root => isWithin(root, real))) continue;
+			// A temporary root is writable by other local users and by checkouts the user
+			// never vetted, so a `node` resolved there never becomes launch authority.
+			if (temporaryRoots.some(root => isWithin(root, real))) continue;
 			if (identities.has(real)) continue;
 			const stat = await fs.stat(real);
 			identities.set(real, {
@@ -192,7 +191,11 @@ const initialNodeIdentities = initialProcessEnvironment.then(async environment =
 	return identities;
 });
 
-/** First-use digests of startup Node candidates, keyed by realpath; failures are cached as `undefined`. */
+/**
+ * First-use digests of startup Node candidates, keyed by realpath. Successful and
+ * in-flight digests stay memoized; a failed attempt is evicted so a transient error
+ * (e.g. EMFILE) can be retried against the same startup identity.
+ */
 const initialNodeHashes = new Map<string, Promise<string | undefined>>();
 
 /**

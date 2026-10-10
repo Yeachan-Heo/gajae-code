@@ -103,6 +103,11 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 // files for the credential-only snapshot.
 const projectSnapshot = loadProjectEnv();
 const projectEnv = projectSnapshot.values;
+
+/** Project dotenv as it was when this module loaded, before a later `chdir` or file delete. */
+export function startupProjectEnvSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
+	return projectSnapshot;
+}
 const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
 const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
 const declaredHome = projectEnv[declaredHomeKey];

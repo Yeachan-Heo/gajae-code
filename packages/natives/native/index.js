@@ -50,6 +50,7 @@ export const diagnosticSnapshotOpen = nativeBindings.diagnosticSnapshotOpen;
 export const diffLineRuns = nativeBindings.diffLineRuns;
 export const diffLines = nativeBindings.diffLines;
 export const diffWords = nativeBindings.diffWords;
+export const directoryCaseSensitive = nativeBindings.directoryCaseSensitive;
 export const editFindMatch = nativeBindings.editFindMatch;
 export const editParseApplyPatch = nativeBindings.editParseApplyPatch;
 export const editPatchApplyText = nativeBindings.editPatchApplyText;
@@ -124,6 +125,7 @@ export const verifyOwnerOnlyPathSecurityExpected = nativeBindings.verifyOwnerOnl
 export const visibleWidth = nativeBindings.visibleWidth;
 export const visibleWidths = nativeBindings.visibleWidths;
 export const walkerPoolStatus = nativeBindings.walkerPoolStatus;
+export const windowsOrdinalCaseFold = nativeBindings.windowsOrdinalCaseFold;
 export const wrapTextWithAnsi = nativeBindings.wrapTextWithAnsi;
 
 // string/numeric enums (napi-rs string_enum produces TS-only const enum)

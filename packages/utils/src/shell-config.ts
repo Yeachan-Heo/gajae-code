@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $pickCredentialEnv, $pickflag, filterProcessEnv } from "./env";
+import { $credentialEnv, $pickCredentialEnv, $pickflag, filterProcessEnv } from "./env";
 import { $which } from "./which";
 
 export interface ShellConfig {
@@ -184,7 +184,8 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 	}
 
 	// Unix: prefer user's shell from $SHELL if it's bash/zsh and executable
-	const userShell = Bun.env.SHELL;
+	// Bun fills an unset SHELL from cwd/.env, so read only the launching shell's value.
+	const userShell = $credentialEnv("SHELL");
 	const isValidShell = userShell && (userShell.includes("bash") || userShell.includes("zsh"));
 	if (isValidShell && isExecutable(userShell)) {
 		cachedShellConfig = buildConfig(userShell);

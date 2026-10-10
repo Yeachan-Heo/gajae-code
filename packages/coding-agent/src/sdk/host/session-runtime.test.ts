@@ -5378,19 +5378,18 @@ async function settledStatus(
 	harness: InvocationHarness,
 	name: string,
 	input: Record<string, unknown>,
+	timeoutMs = 10_000,
 ): Promise<NonNullable<ResponseFrame["result"]>> {
 	// Wall-clock budget instead of a fixed poll count: CI runners can starve the
-	// event loop long enough to exhaust 200 ~1ms polls before a 25ms deadline
-	// timer is dispatched, failing a correct implementation on timing alone.
-	// The contract is unchanged — the status must still reach a terminal
-	// reconciliation state with the asserted shape within a bounded horizon.
-	const budgetEndsAt = Date.now() + 10_000;
+	// event loop and delay deadline timers. Polling every 10ms avoids flooding
+	// reconciliation queries while preserving the asserted terminal contract.
+	const budgetEndsAt = Date.now() + timeoutMs;
 	for (;;) {
 		const frame = await harness.query(name, input);
 		const result = frame.result;
 		if (result && (result.status === "failed" || result.status === "terminal_ok")) return result;
 		if (Date.now() > budgetEndsAt) throw new Error(`${name} never reported a terminal reconciliation status`);
-		await Bun.sleep(1);
+		await Bun.sleep(10);
 	}
 }
 
@@ -5842,6 +5841,48 @@ test("SDK turn.steer preserves its expected run token and propagates a stale-run
 });
 
 describe("post-acceptance invocation terminalization", () => {
+	test("completion fallback and a held lifecycle end publish one terminal boundary", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-completion-lifecycle-race-"));
+		const completion = Promise.withResolvers<string>();
+		const terminalEntered = Promise.withResolvers<void>();
+		const releaseTerminal = Promise.withResolvers<void>();
+		const completionReconciled = Promise.withResolvers<void>();
+		let harness: InvocationHarness | undefined;
+		try {
+			harness = await invocationHarness("completion-lifecycle-race", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					return completion.promise;
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 0,
+				persistHold: { type: "agent_end", onEntered: terminalEntered.resolve, release: releaseTerminal.promise },
+				onInvocationCompletionReconciled: () => completionReconciled.resolve(),
+			});
+			const accepted = await harness.control("turn.prompt", { text: "complete once" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			completion.resolve("completed");
+			await terminalEntered.promise;
+			const end = harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "stop", content: "completed" }],
+			});
+			await Bun.sleep(0);
+			releaseTerminal.resolve();
+			await Promise.all([end, completionReconciled.promise]);
+			expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation })).toMatchObject({
+				status: "terminal_ok",
+				content: { text: "completed" },
+			});
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+		} finally {
+			completion.resolve("completed");
+			releaseTerminal.resolve();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 	test.each([
 		false,
 		true,
@@ -8488,8 +8529,15 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		try {
 			harness = await invocationHarness(sessionId, cwd, {
 				settings: {
+					// This test covers deferred terminal recovery, not deadline-triggered worktree persistence.
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+						key === "sdk.promptDeadlineMs"
+							? 150
+							: key === "sdk.promptMaxRuntimeMs"
+								? 60_000
+								: key === "sdk.flushWorktreeOnDeadline"
+									? false
+									: undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
@@ -8549,7 +8597,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 
 			activeTools.clear();
-			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+			// Keep this inside the 60s hard-runtime budget while tolerating a slow CI retry tick.
+			expect(await settledStatus(harness, "turn.prompt_status", correlation, 30_000)).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
@@ -8559,7 +8608,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await Bun.sleep(10);
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 60_000);
 
 	test("an unproven real end stays private until exact settlement evidence exists", async () => {
 		// A matching lifecycle end still cannot settle a recovered deadline record

@@ -307,6 +307,12 @@ class MCPPoolLeaseImpl implements MCPPoolLease {
 				notify: (method, params) => lease.notify(method, params),
 				close: () => lease.release(),
 				closeBeforeReconnect: physical.transport.closeBeforeReconnect,
+				get onRequest() {
+					return physical.transport.onRequest;
+				},
+				set onRequest(handler) {
+					physical.transport.onRequest = handler;
+				},
 			};
 			const facade = { ...physical, transport };
 			for (const property of ["tools", "resources", "resourceTemplates", "prompts"] as const) {
