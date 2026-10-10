@@ -1913,7 +1913,42 @@ export default class Sdk extends Command {
 		};
 		let startupFenceAcquired = false;
 		try {
+			// Bounded retry for session-index lock contention: fit all retries inside the
+			// parent's discovery deadline by checking the remaining time before each attempt.
+			const MAX_SESSION_INDEX_TIMEOUT_RETRIES = 2;
+			let sessionIndexTimeoutRetries = 0;
 			const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
+				while (sessionIndexTimeoutRetries <= MAX_SESSION_INDEX_TIMEOUT_RETRIES) {
+					try {
+						return await singleStartupAttempt(deadline);
+					} catch (error) {
+						if (
+							error instanceof FileLockAcquireError &&
+							startupFenceAcquired &&
+							error.code === "acquire_timeout" &&
+							sessionIndexTimeoutRetries < MAX_SESSION_INDEX_TIMEOUT_RETRIES
+						) {
+							sessionIndexTimeoutRetries++;
+							const backoffMs = 100 * 2 ** (sessionIndexTimeoutRetries - 1);
+							const timeAfterBackoff = Date.now() + backoffMs;
+							if (timeAfterBackoff >= deadline) {
+								throw error;
+							}
+							logger.debug("sdk broker: session-index lock timeout, retrying", {
+								reason: "session-index-timeout-retry",
+								attempt: sessionIndexTimeoutRetries,
+								backoffMs,
+							});
+							startupFenceAcquired = false;
+							await Bun.sleep(backoffMs);
+							continue;
+						}
+						throw error;
+					}
+				}
+				return undefined;
+			};
+			const singleStartupAttempt = async (deadline: number): Promise<Broker | undefined> => {
 				startupFenceAcquired = true;
 				// Only a matching committed restart intent extends this child's startup
 				// fence beyond the ordinary operation window. The durable lease is the
@@ -2059,39 +2094,10 @@ export default class Sdk extends Command {
 					clearTimeout(startupWatchdog);
 				}
 			};
-			// Bounded retry for session-index lock contention: if the session-index
-			// lock times out during startup, retry a small number of times before giving up.
-			const MAX_SESSION_INDEX_TIMEOUT_RETRIES = 2;
-			let sessionIndexTimeoutRetries = 0;
-			while (sessionIndexTimeoutRetries <= MAX_SESSION_INDEX_TIMEOUT_RETRIES) {
-				try {
-					broker = await withBrokerStartupLock(agentDir, startupOperation, {
-						onAcquired: () => void emitBrokerStartupTestSignal("fence-acquired"),
-						onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
-					});
-					break; // Success, exit retry loop
-				} catch (error) {
-					// If session-index lock times out after fence is acquired, retry with backoff
-					if (
-						error instanceof FileLockAcquireError &&
-						startupFenceAcquired &&
-						error.code === "acquire_timeout" &&
-						sessionIndexTimeoutRetries < MAX_SESSION_INDEX_TIMEOUT_RETRIES
-					) {
-						sessionIndexTimeoutRetries++;
-						const backoffMs = 100 * 2 ** (sessionIndexTimeoutRetries - 1); // 100ms, 200ms
-						logger.debug("sdk broker: session-index lock timeout, retrying", {
-							reason: "session-index-timeout-retry",
-							attempt: sessionIndexTimeoutRetries,
-							backoffMs,
-						});
-						startupFenceAcquired = false; // Reset for next iteration
-						await Bun.sleep(backoffMs);
-						continue; // Retry
-					}
-					throw error; // Re-throw non-retryable errors
-				}
-			}
+			broker = await withBrokerStartupLock(agentDir, startupOperation, {
+				onAcquired: () => void emitBrokerStartupTestSignal("fence-acquired"),
+				onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
+			});
 		} catch (error) {
 			if (pendingShutdownSignal) {
 				await finishPendingStartupSignal();
