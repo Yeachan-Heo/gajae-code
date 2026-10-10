@@ -216,26 +216,26 @@ describe("usage authentication recovery", () => {
 		expect(requests.filter(request => request === "Bearer renewed-access")).toHaveLength(2);
 	});
 
-	it.each([false, true])(
-		"does not overwrite a newer peer token after lease persistence (expired=%s)",
-		async expired => {
-			if (expired) {
-				store.updateAuthCredential(rowId, { ...credential(), expires: Date.now() - 60_000 });
-				await storage.reload();
-			}
-			const complete = store.completeOAuthRefreshLease.bind(store);
-			vi.spyOn(store, "completeOAuthRefreshLease").mockImplementation((lease, renewed) => {
-				const completed = complete(lease, renewed);
-				store.updateAuthCredential(rowId, credential("newer-peer-access", "newer-peer-refresh"));
-				return completed;
-			});
-			vi.spyOn(oauth, "refreshOAuthToken").mockResolvedValue(credential("renewed-access", "rotated-refresh"));
-			const [result] = await storage.checkCredentials({ provider: "openai-codex" });
-			expect(result?.ok).toBe(true);
-			expect(store.listAuthCredentials("openai-codex")[0]?.credential).toMatchObject({
-				access: "newer-peer-access",
-				refresh: "newer-peer-refresh",
-			});
-		},
-	);
+	it.each([
+		false,
+		true,
+	])("does not overwrite a newer peer token after lease persistence (expired=%s)", async expired => {
+		if (expired) {
+			store.updateAuthCredential(rowId, { ...credential(), expires: Date.now() - 60_000 });
+			await storage.reload();
+		}
+		const complete = store.completeOAuthRefreshLease.bind(store);
+		vi.spyOn(store, "completeOAuthRefreshLease").mockImplementation((lease, renewed) => {
+			const completed = complete(lease, renewed);
+			store.updateAuthCredential(rowId, credential("newer-peer-access", "newer-peer-refresh"));
+			return completed;
+		});
+		vi.spyOn(oauth, "refreshOAuthToken").mockResolvedValue(credential("renewed-access", "rotated-refresh"));
+		const [result] = await storage.checkCredentials({ provider: "openai-codex" });
+		expect(result?.ok).toBe(true);
+		expect(store.listAuthCredentials("openai-codex")[0]?.credential).toMatchObject({
+			access: "newer-peer-access",
+			refresh: "newer-peer-refresh",
+		});
+	});
 });

@@ -155,12 +155,16 @@ describe("Cursor requested model wire translation", () => {
 		});
 	});
 
-	it.each(["gpt-5.6-sol-fast", "gpt-5.6-sol", "gpt-5.6-sol-none", "gpt-5.1-codex-max", "native", "claude-sonnet-4-5"])(
-		"omits requestedModel from the captured AgentRunRequest for native/pass-through %s",
-		async id => {
-			const payload = await captureCursorRequest(cursorModel(id));
-			expect(payload.modelDetails?.modelId).toBe(id);
-			expect(payload.requestedModel).toBeUndefined();
-		},
-	);
+	it.each([
+		"gpt-5.6-sol-fast",
+		"gpt-5.6-sol",
+		"gpt-5.6-sol-none",
+		"gpt-5.1-codex-max",
+		"native",
+		"claude-sonnet-4-5",
+	])("omits requestedModel from the captured AgentRunRequest for native/pass-through %s", async id => {
+		const payload = await captureCursorRequest(cursorModel(id));
+		expect(payload.modelDetails?.modelId).toBe(id);
+		expect(payload.requestedModel).toBeUndefined();
+	});
 });

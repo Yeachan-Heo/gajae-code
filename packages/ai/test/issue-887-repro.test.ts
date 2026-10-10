@@ -35,13 +35,17 @@ describe("opencode-go resolver follows the official Go endpoint and metadata con
 		expect(resolved).toEqual({ api: "openai-completions", baseUrl: OPENCODE_GO_CHAT_BASE });
 	});
 
-	test.each([["minimax-m2.5"], ["minimax-m2.7"], ["minimax-m3"], ["qwen3.6-plus"], ["qwen3.7-max"], ["qwen3.7-plus"]])(
-		"%s resolves to anthropic-messages on /v1/messages",
-		modelId => {
-			const resolved = descriptor?.resolveApi?.(modelId, { tool_call: true });
-			expect(resolved).toEqual({ api: "anthropic-messages", baseUrl: OPENCODE_GO_MESSAGES_BASE });
-		},
-	);
+	test.each([
+		["minimax-m2.5"],
+		["minimax-m2.7"],
+		["minimax-m3"],
+		["qwen3.6-plus"],
+		["qwen3.7-max"],
+		["qwen3.7-plus"],
+	])("%s resolves to anthropic-messages on /v1/messages", modelId => {
+		const resolved = descriptor?.resolveApi?.(modelId, { tool_call: true });
+		expect(resolved).toEqual({ api: "anthropic-messages", baseUrl: OPENCODE_GO_MESSAGES_BASE });
+	});
 
 	test("models.dev rows are corrected to official OpenCode Go context/output metadata", () => {
 		const models = mapModelsDevToModels(

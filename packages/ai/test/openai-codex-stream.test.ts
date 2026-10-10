@@ -1054,32 +1054,32 @@ describe("openai-codex streaming", () => {
 		).toHaveLength(0);
 	});
 
-	it.each([false, true])(
-		"salvages the production request_timeout replay over SSE (nested error: %s)",
-		async nestedError => {
-			global.fetch = vi.fn(
-				async () =>
-					new Response(createCodexErrorSse(createProductionCodexToolCallEvents(nestedError)), {
-						status: 200,
-						headers: { "content-type": "text/event-stream" },
-					}),
-			) as unknown as typeof fetch;
+	it.each([
+		false,
+		true,
+	])("salvages the production request_timeout replay over SSE (nested error: %s)", async nestedError => {
+		global.fetch = vi.fn(
+			async () =>
+				new Response(createCodexErrorSse(createProductionCodexToolCallEvents(nestedError)), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		) as unknown as typeof fetch;
 
-			const result = await streamOpenAICodexResponses(
-				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
-				createCodexTestContext(),
-				{ apiKey: createCodexTestToken() },
-			).result();
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
 
-			expect(result.stopReason).toBe("toolUse");
-			expect(result.content).toContainEqual({
-				type: "toolCall",
-				id: "call_production|fc_production",
-				name: "todo_write",
-				arguments: { ops: [{ op: "init", phases: [] }] },
-			});
-		},
-	);
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toContainEqual({
+			type: "toolCall",
+			id: "call_production|fc_production",
+			name: "todo_write",
+			arguments: { ops: [{ op: "init", phases: [] }] },
+		});
+	});
 
 	it.each(
 		(["none", "message", "reasoning"] as const).flatMap(newItem =>
@@ -1094,66 +1094,63 @@ describe("openai-codex streaming", () => {
 				),
 			),
 		),
-	)(
-		"salvages complete todo_write arguments across replay variants (%j)",
-		async (variant: CompleteToolTimeoutReplayVariant) => {
-			const sse = createCodexErrorSse(createCompleteToolTimeoutReplayEvents(variant));
-			global.fetch = vi.fn(
-				async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
-			) as unknown as typeof fetch;
+	)("salvages complete todo_write arguments across replay variants (%j)", async (variant: CompleteToolTimeoutReplayVariant) => {
+		const sse = createCodexErrorSse(createCompleteToolTimeoutReplayEvents(variant));
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
 
-			const result = await streamOpenAICodexResponses(
-				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
-				createCodexTestContext(),
-				{ apiKey: createCodexTestToken() },
-			).result();
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
 
-			expect(result.stopReason).toBe("toolUse");
-			expect(result.content).toContainEqual({
-				type: "toolCall",
-				id: "call_variant|fc_variant",
-				name: "todo_write",
-				arguments: { ops: [] },
-			});
-		},
-	);
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toContainEqual({
+			type: "toolCall",
+			id: "call_variant|fc_variant",
+			name: "todo_write",
+			arguments: { ops: [] },
+		});
+	});
 
-	it.each([false, true])(
-		"salvages the production request_timeout replay over websocket (nested error: %s)",
-		async nestedError => {
-			class ProductionReplayWebSocket extends MockWebSocket {
-				constructor(url: string, options?: { headers?: WsHeaders }) {
-					super(url, options);
-					this.scheduleOpen();
-				}
-
-				send(): void {
-					for (const event of createProductionCodexToolCallEvents(nestedError)) this.sendJson(event);
-				}
+	it.each([
+		false,
+		true,
+	])("salvages the production request_timeout replay over websocket (nested error: %s)", async nestedError => {
+		class ProductionReplayWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
 			}
-			global.WebSocket = ProductionReplayWebSocket as unknown as typeof WebSocket;
-			global.fetch = vi.fn() as unknown as typeof fetch;
 
-			const result = await streamOpenAICodexResponses(
-				createCodexTestModel("https://chatgpt.com/backend-api"),
-				createCodexTestContext(),
-				{
-					apiKey: createCodexTestToken(),
-					sessionId: `production-replay-${nestedError}`,
-					streamIdleTimeoutMs: 100,
-					providerSessionState: new Map<string, ProviderSessionState>(),
-				},
-			).result();
+			send(): void {
+				for (const event of createProductionCodexToolCallEvents(nestedError)) this.sendJson(event);
+			}
+		}
+		global.WebSocket = ProductionReplayWebSocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn() as unknown as typeof fetch;
 
-			expect(result.stopReason).toBe("toolUse");
-			expect(result.content).toContainEqual({
-				type: "toolCall",
-				id: "call_production|fc_production",
-				name: "todo_write",
-				arguments: { ops: [{ op: "init", phases: [] }] },
-			});
-		},
-	);
+		const result = await streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			{
+				apiKey: createCodexTestToken(),
+				sessionId: `production-replay-${nestedError}`,
+				streamIdleTimeoutMs: 100,
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toContainEqual({
+			type: "toolCall",
+			id: "call_production|fc_production",
+			name: "todo_write",
+			arguments: { ops: [{ op: "init", phases: [] }] },
+		});
+	});
 
 	it("salvages a complete todo_write snapshot after a later reasoning item opens", async () => {
 		const sse = createCodexErrorSse([
@@ -1295,60 +1292,61 @@ describe("openai-codex streaming", () => {
 		}
 	});
 
-	it.each(["finalized", "unfinished", "visible text"])(
-		"handles EOF without response.completed after a %s tool call",
-		async state => {
-			const item = {
-				type: "function_call",
-				id: "fc_eof",
-				call_id: "call_eof",
-				name: "todo_write",
-				arguments: '{"ops":[]}',
-			};
-			const events: Record<string, unknown>[] = [{ type: "response.output_item.added", output_index: 0, item }];
-			if (state !== "unfinished") {
-				events.push({ type: "response.output_item.done", output_index: 0, item });
-			}
-			events.push({
-				type: "response.output_item.added",
-				output_index: 1,
-				item: {
-					type: "message",
-					id: "msg_eof",
-					role: "assistant",
-					content: state === "visible text" ? [{ type: "output_text", text: "visible" }] : [],
-				},
-			});
-			const fetchMock = vi.fn(
-				async () =>
-					new Response(createCodexErrorSse(events), {
-						status: 200,
-						headers: { "content-type": "text/event-stream" },
-					}),
-			);
-			global.fetch = fetchMock as unknown as typeof fetch;
-			const result = await streamOpenAICodexResponses(
-				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
-				createCodexTestContext(),
-				{ apiKey: createCodexTestToken() },
-			).result();
+	it.each([
+		"finalized",
+		"unfinished",
+		"visible text",
+	])("handles EOF without response.completed after a %s tool call", async state => {
+		const item = {
+			type: "function_call",
+			id: "fc_eof",
+			call_id: "call_eof",
+			name: "todo_write",
+			arguments: '{"ops":[]}',
+		};
+		const events: Record<string, unknown>[] = [{ type: "response.output_item.added", output_index: 0, item }];
+		if (state !== "unfinished") {
+			events.push({ type: "response.output_item.done", output_index: 0, item });
+		}
+		events.push({
+			type: "response.output_item.added",
+			output_index: 1,
+			item: {
+				type: "message",
+				id: "msg_eof",
+				role: "assistant",
+				content: state === "visible text" ? [{ type: "output_text", text: "visible" }] : [],
+			},
+		});
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(createCodexErrorSse(events), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		);
+		global.fetch = fetchMock as unknown as typeof fetch;
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
 
-			expect(fetchMock).toHaveBeenCalledTimes(1);
-			expect(result.stopReason).toBe(state === "finalized" ? "toolUse" : "error");
-			if (state === "finalized") {
-				expect(result.errorCode).toBe("codex_stream_closed_after_finalized_tool_calls");
-				expect(result.providerPayload).toMatchObject({
-					items: [{ ...item }],
-				});
-				expect(result.content).toContainEqual({
-					type: "toolCall",
-					id: "call_eof|fc_eof",
-					name: "todo_write",
-					arguments: { ops: [] },
-				});
-			}
-		},
-	);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe(state === "finalized" ? "toolUse" : "error");
+		if (state === "finalized") {
+			expect(result.errorCode).toBe("codex_stream_closed_after_finalized_tool_calls");
+			expect(result.providerPayload).toMatchObject({
+				items: [{ ...item }],
+			});
+			expect(result.content).toContainEqual({
+				type: "toolCall",
+				id: "call_eof|fc_eof",
+				name: "todo_write",
+				arguments: { ops: [] },
+			});
+		}
+	});
 
 	it("fails closed when a complete tool call has no source item id", async () => {
 		const sse = createCodexErrorSse([
@@ -4907,109 +4905,109 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
-	it.each([undefined, 0])(
-		"retries websocket continuations when previous_response_id expires with fallbackManaged and streamMaxRetries=%s",
-		async streamMaxRetries => {
-			const tempDir = TempDir.createSync("@pi-codex-stream-fallback-managed-");
-			setAgentDir(tempDir.path());
-			const token = createCodexTestToken();
-			const sentRequests: Array<Record<string, unknown>> = [];
-			const fetchMock = vi.fn(async () => {
-				throw new Error("SSE fallback should not be called");
-			});
-			global.fetch = fetchMock as unknown as typeof fetch;
+	it.each([
+		undefined,
+		0,
+	])("retries websocket continuations when previous_response_id expires with fallbackManaged and streamMaxRetries=%s", async streamMaxRetries => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-fallback-managed-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
 
-			class PreviousResponseMissingWebSocket extends MockWebSocket {
-				constructor(url: string, options?: { headers?: WsHeaders }) {
-					super(url, options);
-					this.scheduleOpen();
-				}
-
-				send(data: string): void {
-					const request = JSON.parse(data) as Record<string, unknown>;
-					sentRequests.push(request);
-					const requestIndex = sentRequests.length;
-
-					if (requestIndex === 1) {
-						this.emitCodexResponse({
-							messageId: "msg_1",
-							responseId: "resp_1",
-							text: "First answer",
-							terminalType: "response.completed",
-							includeCreated: true,
-						});
-						return;
-					}
-
-					if (requestIndex === 2) {
-						expect(request.previous_response_id).toBe("resp_1");
-						this.sendJson({
-							type: "error",
-							code: "previous_response_not_found",
-							message: "Previous response with id 'resp_1' not found.",
-						});
-						return;
-					}
-
-					if (requestIndex === 3) {
-						expect(request.previous_response_id).toBeUndefined();
-						this.emitCodexResponse({
-							messageId: "msg_3",
-							responseId: "resp_3",
-							text: "Second answer",
-							terminalType: "response.completed",
-							includeCreated: true,
-						});
-						return;
-					}
-
-					throw new Error(`Unexpected websocket request index: ${requestIndex}`);
-				}
+		class PreviousResponseMissingWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
 			}
 
-			global.WebSocket = PreviousResponseMissingWebSocket as unknown as typeof WebSocket;
-			const model = createCodexTestModel("https://chatgpt.com/backend-api");
-			const providerSessionState = new Map<string, ProviderSessionState>();
-			const sessionId = `ws-expired-previous-response-fallback-managed-${streamMaxRetries}-session`;
-			const firstContext: Context = {
-				systemPrompt: ["You are a helpful assistant."],
-				messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
-			};
-			const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
-				apiKey: token,
-				sessionId,
-				fallbackManaged: true,
-				providerSessionState,
-			}).result();
-			const secondContext: Context = {
-				systemPrompt: ["You are a helpful assistant."],
-				messages: [
-					...firstContext.messages,
-					firstResponse,
-					{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
-				],
-			};
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
 
-			const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
-				apiKey: token,
-				sessionId,
-				fallbackManaged: true,
-				streamMaxRetries,
-				providerSessionState,
-			}).result();
+				if (requestIndex === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
 
-			expect(secondResponse.stopReason).toBe("stop");
-			expect(JSON.stringify(secondResponse.content)).toContain("Second answer");
-			expect(fetchMock).not.toHaveBeenCalled();
-			expect(sentRequests).toHaveLength(3);
-			expect(sentRequests[2]?.previous_response_id).toBeUndefined();
-			const retryInput = sentRequests[2]?.input;
-			expect(Array.isArray(retryInput)).toBe(true);
-			expect(JSON.stringify(retryInput)).toContain("First question");
-			expect(JSON.stringify(retryInput)).toContain("First answer");
-			expect(JSON.stringify(retryInput)).toContain("Second question");
-		},
-	);
+				if (requestIndex === 2) {
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({
+						type: "error",
+						code: "previous_response_not_found",
+						message: "Previous response with id 'resp_1' not found.",
+					});
+					return;
+				}
+
+				if (requestIndex === 3) {
+					expect(request.previous_response_id).toBeUndefined();
+					this.emitCodexResponse({
+						messageId: "msg_3",
+						responseId: "resp_3",
+						text: "Second answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				throw new Error(`Unexpected websocket request index: ${requestIndex}`);
+			}
+		}
+
+		global.WebSocket = PreviousResponseMissingWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sessionId = `ws-expired-previous-response-fallback-managed-${streamMaxRetries}-session`;
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			fallbackManaged: true,
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId,
+			fallbackManaged: true,
+			streamMaxRetries,
+			providerSessionState,
+		}).result();
+
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(JSON.stringify(secondResponse.content)).toContain("Second answer");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(3);
+		expect(sentRequests[2]?.previous_response_id).toBeUndefined();
+		const retryInput = sentRequests[2]?.input;
+		expect(Array.isArray(retryInput)).toBe(true);
+		expect(JSON.stringify(retryInput)).toContain("First question");
+		expect(JSON.stringify(retryInput)).toContain("First answer");
+		expect(JSON.stringify(retryInput)).toContain("Second question");
+	});
 
 	it("does not replay expired previous_response_id with fallbackManaged when provider retries are disabled", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-fallback-managed-disabled-");
@@ -6659,74 +6657,76 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it.each(["null", "42", '["task"]', '"task"'])(
-		"preserves recovery and diagnostics for non-record provisional arguments: %s",
-		async argumentsJson => {
-			for (const mode of ["replay", "close", "idle"] as const) {
-				class ProvisionalArgumentsWebSocket extends MockWebSocket {
-					constructor(url: string, options?: { headers?: WsHeaders }) {
-						super(url, options);
-						this.scheduleOpen();
-					}
-					send(): void {
-						this.sendJson({
-							type: "response.output_item.added",
-							item: {
-								type: "function_call",
-								id: "fc_provisional",
-								call_id: "call_provisional",
-								name: "todo_write",
-								arguments: "",
-							},
-						});
-						this.sendJson({ type: "response.function_call_arguments.done", arguments: argumentsJson });
-						// No output_item.done: successful JSON parsing does not validate the terminal object.
-						if (mode !== "idle") {
-							this.readyState = MockWebSocket.CLOSED;
-							this.emit("close", { code: 1006 } as unknown as Event);
-						}
-					}
+	it.each([
+		"null",
+		"42",
+		'["task"]',
+		'"task"',
+	])("preserves recovery and diagnostics for non-record provisional arguments: %s", async argumentsJson => {
+		for (const mode of ["replay", "close", "idle"] as const) {
+			class ProvisionalArgumentsWebSocket extends MockWebSocket {
+				constructor(url: string, options?: { headers?: WsHeaders }) {
+					super(url, options);
+					this.scheduleOpen();
 				}
-				global.WebSocket = ProvisionalArgumentsWebSocket as unknown as typeof WebSocket;
-				const fetchSpy = vi
-					.spyOn(globalThis, "fetch")
-					.mockResolvedValue(
-						new Response(
-							`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}\n\n` +
-								createCompletedCodexSse("Recovered from SSE"),
-							{ headers: { "content-type": "text/event-stream" } },
-						),
-					);
-				try {
-					const result = await streamOpenAICodexResponses(
-						createCodexTestModel("https://chatgpt.com/backend-api"),
-						createCodexTestContext(),
-						{
-							apiKey: createCodexTestToken(),
-							sessionId: `provisional-${argumentsJson}-${mode}`,
-							providerSessionState: new Map<string, ProviderSessionState>(),
-							streamIdleTimeoutMs: 25,
-							disableProviderRetries: mode !== "replay",
+				send(): void {
+					this.sendJson({
+						type: "response.output_item.added",
+						item: {
+							type: "function_call",
+							id: "fc_provisional",
+							call_id: "call_provisional",
+							name: "todo_write",
+							arguments: "",
 						},
-					).result();
-					if (mode === "replay") {
-						expect(result.stopReason).toBe("stop");
-						expect(result.errorMessage).toBeUndefined();
-						expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered from SSE");
-						expect(fetchSpy).toHaveBeenCalledTimes(1);
-					} else {
-						expect(result.stopReason).toBe("error");
-						expect(result.errorMessage).toContain(
-							mode === "idle" ? "idle timeout waiting for websocket" : "websocket closed (1006)",
-						);
-						expect(fetchSpy).not.toHaveBeenCalled();
+					});
+					this.sendJson({ type: "response.function_call_arguments.done", arguments: argumentsJson });
+					// No output_item.done: successful JSON parsing does not validate the terminal object.
+					if (mode !== "idle") {
+						this.readyState = MockWebSocket.CLOSED;
+						this.emit("close", { code: 1006 } as unknown as Event);
 					}
-				} finally {
-					fetchSpy.mockRestore();
 				}
 			}
-		},
-	);
+			global.WebSocket = ProvisionalArgumentsWebSocket as unknown as typeof WebSocket;
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(
+					new Response(
+						`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}\n\n` +
+							createCompletedCodexSse("Recovered from SSE"),
+						{ headers: { "content-type": "text/event-stream" } },
+					),
+				);
+			try {
+				const result = await streamOpenAICodexResponses(
+					createCodexTestModel("https://chatgpt.com/backend-api"),
+					createCodexTestContext(),
+					{
+						apiKey: createCodexTestToken(),
+						sessionId: `provisional-${argumentsJson}-${mode}`,
+						providerSessionState: new Map<string, ProviderSessionState>(),
+						streamIdleTimeoutMs: 25,
+						disableProviderRetries: mode !== "replay",
+					},
+				).result();
+				if (mode === "replay") {
+					expect(result.stopReason).toBe("stop");
+					expect(result.errorMessage).toBeUndefined();
+					expect(result.content.find(block => block.type === "text")?.text).toBe("Recovered from SSE");
+					expect(fetchSpy).toHaveBeenCalledTimes(1);
+				} else {
+					expect(result.stopReason).toBe("error");
+					expect(result.errorMessage).toContain(
+						mode === "idle" ? "idle timeout waiting for websocket" : "websocket closed (1006)",
+					);
+					expect(fetchSpy).not.toHaveBeenCalled();
+				}
+			} finally {
+				fetchSpy.mockRestore();
+			}
+		}
+	});
 
 	it("replays over SSE when websocket closes after buffered output without a terminal event", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
@@ -7479,68 +7479,68 @@ describe("openai-codex streaming", () => {
 		}
 	});
 
-	it.each([false, true])(
-		"ends a silent todo_write start with complete arguments and zero usage (item finalized: %s)",
-		async finalized => {
-			const args = {
-				ops: [{ op: "init", phases: [{ name: "Investigate", tasks: [{ content: "Inspect the stall" }] }] }],
-			};
-			class SilentTodoWebSocket extends MockWebSocket {
-				constructor(url: string, options?: { headers?: WsHeaders }) {
-					super(url, options);
-					this.scheduleOpen();
-				}
-				send(): void {
-					const item = {
-						type: "function_call",
-						id: "fc_todo",
-						call_id: "call_todo",
-						name: "todo_write",
-						arguments: JSON.stringify(args),
-					};
-					this.sendJson({ type: "response.output_item.added", item });
-					this.sendJson({ type: "response.function_call_arguments.delta", delta: item.arguments });
-					this.sendJson({ type: "response.function_call_arguments.done", arguments: item.arguments });
-					if (finalized) this.sendJson({ type: "response.output_item.done", item });
-					// No response.completed, usage, or subsequent transport activity.
-				}
+	it.each([
+		false,
+		true,
+	])("ends a silent todo_write start with complete arguments and zero usage (item finalized: %s)", async finalized => {
+		const args = {
+			ops: [{ op: "init", phases: [{ name: "Investigate", tasks: [{ content: "Inspect the stall" }] }] }],
+		};
+		class SilentTodoWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
 			}
-			global.WebSocket = SilentTodoWebSocket as unknown as typeof WebSocket;
-			const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-				new Response(new ReadableStream({ start() {} }), {
-					status: 200,
-					headers: { "content-type": "text/event-stream" },
-				}),
+			send(): void {
+				const item = {
+					type: "function_call",
+					id: "fc_todo",
+					call_id: "call_todo",
+					name: "todo_write",
+					arguments: JSON.stringify(args),
+				};
+				this.sendJson({ type: "response.output_item.added", item });
+				this.sendJson({ type: "response.function_call_arguments.delta", delta: item.arguments });
+				this.sendJson({ type: "response.function_call_arguments.done", arguments: item.arguments });
+				if (finalized) this.sendJson({ type: "response.output_item.done", item });
+				// No response.completed, usage, or subsequent transport activity.
+			}
+		}
+		global.WebSocket = SilentTodoWebSocket as unknown as typeof WebSocket;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(new ReadableStream({ start() {} }), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+		try {
+			const result = await streamOpenAICodexResponses(
+				createCodexTestModel("https://chatgpt.com/backend-api"),
+				createCodexTestContext(),
+				{
+					apiKey: createCodexTestToken(),
+					sessionId: `silent-complete-todo-${finalized}`,
+					preferWebsockets: true,
+					streamIdleTimeoutMs: 25,
+					streamFirstEventTimeoutMs: 50,
+					providerSessionState: new Map<string, ProviderSessionState>(),
+				},
+			).result();
+			expect(result.stopReason).toBe("toolUse");
+			expect(result.errorCode).toBe(
+				finalized
+					? "codex_stream_closed_after_finalized_tool_calls"
+					: "codex_stream_closed_after_complete_tool_arguments",
 			);
-			try {
-				const result = await streamOpenAICodexResponses(
-					createCodexTestModel("https://chatgpt.com/backend-api"),
-					createCodexTestContext(),
-					{
-						apiKey: createCodexTestToken(),
-						sessionId: `silent-complete-todo-${finalized}`,
-						preferWebsockets: true,
-						streamIdleTimeoutMs: 25,
-						streamFirstEventTimeoutMs: 50,
-						providerSessionState: new Map<string, ProviderSessionState>(),
-					},
-				).result();
-				expect(result.stopReason).toBe("toolUse");
-				expect(result.errorCode).toBe(
-					finalized
-						? "codex_stream_closed_after_finalized_tool_calls"
-						: "codex_stream_closed_after_complete_tool_arguments",
-				);
-				expect(result.usage.totalTokens).toBe(0);
-				expect(result.content).toContainEqual(
-					expect.objectContaining({ type: "toolCall", name: "todo_write", arguments: args }),
-				);
-				expect(fetchSpy).not.toHaveBeenCalled();
-			} finally {
-				fetchSpy.mockRestore();
-			}
-		},
-	);
+			expect(result.usage.totalTokens).toBe(0);
+			expect(result.content).toContainEqual(
+				expect.objectContaining({ type: "toolCall", name: "todo_write", arguments: args }),
+			);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
 
 	it("salvages a complete websocket tool call when the idle watchdog fires", async () => {
 		vi.useFakeTimers();
@@ -8199,33 +8199,33 @@ describe("openai-codex streaming", () => {
 		expect(JSON.stringify(events)).not.toContain("old");
 	});
 
-	it.each(["invalid_request_error", "invalid_prompt"])(
-		"does not replay a partial call for non-retryable %s socket-close errors",
-		async code => {
-			const sse = createCodexErrorSse([
-				{
-					type: "response.output_item.added",
-					item: { type: "function_call", id: "fc_veto", call_id: "call_veto", name: "veto_tool", arguments: "" },
-				},
-				{ type: "response.function_call_arguments.delta", item_id: "fc_veto", delta: '{"partial":' },
-				{ type: "error", code, message: "The socket connection was closed unexpectedly" },
-			]);
-			const fetchMock = vi.fn(
-				async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
-			);
-			global.fetch = fetchMock as unknown as typeof fetch;
+	it.each([
+		"invalid_request_error",
+		"invalid_prompt",
+	])("does not replay a partial call for non-retryable %s socket-close errors", async code => {
+		const sse = createCodexErrorSse([
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_veto", call_id: "call_veto", name: "veto_tool", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "fc_veto", delta: '{"partial":' },
+			{ type: "error", code, message: "The socket connection was closed unexpectedly" },
+		]);
+		const fetchMock = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+		global.fetch = fetchMock as unknown as typeof fetch;
 
-			const result = await streamOpenAICodexResponses(
-				{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
-				createCodexTestContext(),
-				{ apiKey: createCodexTestToken() },
-			).result();
+		const result = await streamOpenAICodexResponses(
+			{ ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false },
+			createCodexTestContext(),
+			{ apiKey: createCodexTestToken() },
+		).result();
 
-			expect(fetchMock).toHaveBeenCalledTimes(1);
-			expect(result.stopReason).toBe("error");
-			expect(result.errorMessage).toContain(`code=${code}`);
-		},
-	);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(`code=${code}`);
+	});
 
 	it("replays a partial call when socket-close wording has no non-retryable provider veto", async () => {
 		const partial = createCodexErrorSse([

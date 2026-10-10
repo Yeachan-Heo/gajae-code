@@ -164,16 +164,16 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.body?.prompt_cache_retention).toBeUndefined();
 	});
 
-	it.each(["https://api.openai.com", "https://api.openai.com/"])(
-		"sets affinity headers for the canonical official OpenAI Responses root origin %s",
-		async baseUrl => {
-			const captured = await captureOpenAIResponseHeaders({ sessionId: "session-123" }, { ...model, baseUrl });
+	it.each([
+		"https://api.openai.com",
+		"https://api.openai.com/",
+	])("sets affinity headers for the canonical official OpenAI Responses root origin %s", async baseUrl => {
+		const captured = await captureOpenAIResponseHeaders({ sessionId: "session-123" }, { ...model, baseUrl });
 
-			expect(captured.sessionId).toBe("session-123");
-			expect(captured.clientRequestId).toBe("session-123");
-			expect(captured.body?.prompt_cache_key).toBe("session-123");
-		},
-	);
+		expect(captured.sessionId).toBe("session-123");
+		expect(captured.clientRequestId).toBe("session-123");
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+	});
 
 	it("sets affinity headers for an explicitly opted-in openai-relay provider", async () => {
 		const captured = await captureOpenAIResponseHeaders(
@@ -192,23 +192,24 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.body?.prompt_cache_retention).toBeUndefined();
 	});
 
-	it.each(["https://api.openai.com", "https://api.openai.com/v1", "https://api.openai.com/"])(
-		"does not set affinity headers for an unknown provider on a canonical OpenAI origin %s",
-		async baseUrl => {
-			const captured = await captureOpenAIResponseHeaders(
-				{ sessionId: "session-123" },
-				{
-					...model,
-					provider: "openai-relay",
-					baseUrl,
-					compat: { ...model.compat, supportsResponsesSessionAffinity: true },
-				},
-			);
+	it.each([
+		"https://api.openai.com",
+		"https://api.openai.com/v1",
+		"https://api.openai.com/",
+	])("does not set affinity headers for an unknown provider on a canonical OpenAI origin %s", async baseUrl => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{
+				...model,
+				provider: "openai-relay",
+				baseUrl,
+				compat: { ...model.compat, supportsResponsesSessionAffinity: true },
+			},
+		);
 
-			expect(captured.sessionId).toBeNull();
-			expect(captured.clientRequestId).toBeNull();
-		},
-	);
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+	});
 	it("does not set affinity headers for an unknown provider without an explicit base URL", async () => {
 		const captured = await captureOpenAIResponseHeaders(
 			{ sessionId: "session-123" },
