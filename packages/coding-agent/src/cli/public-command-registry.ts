@@ -81,6 +81,9 @@ const argument = (description: string, extra: Partial<PublicArgumentDescriptor> 
 	...extra,
 });
 const agentDir = stringFlag("SDK broker/state directory (default: the configured agent directory).");
+const attachOnly = booleanFlag(
+	"Attach only to a live SDK broker; never start, retire or restart one (same as GJC_SDK_BROKER_AUTOSTART=0).",
+);
 const repo = stringFlag("Workspace directory for scope or saved-session resolution (default: current directory).");
 const exactSessionRepo = stringFlag(
 	"Accepted for compatibility only; ignored because the exact session ID selects the broker target.",
@@ -187,7 +190,8 @@ function node(path: string, input: NodeInput): PublicCommandDescriptor {
 		examples: [{ syntax: example ?? `gjc ${path} --help --json`, executable: false }],
 	};
 }
-const sessionFlags = { "agent-dir": agentDir };
+const guideFlags = { "agent-dir": agentDir };
+const sessionFlags = { "agent-dir": agentDir, "attach-only": attachOnly };
 const observeDaemonFlags = {
 	all: booleanFlag("Target all registered daemon kinds."),
 	verbose: booleanFlag("Show runtime detail and the full roots list.", { char: "v" }),
@@ -442,7 +446,7 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 	node("sdk guides refresh", {
 		description: "Fetch and verify an allowlisted HTTPS guide manifest and advisory cache.",
 		flags: {
-			...sessionFlags,
+			...guideFlags,
 			url: stringFlag("HTTPS allowlisted manifest URL.", { required: true }),
 			"timeout-ms": positive("Bounded refresh timeout in milliseconds."),
 		},
@@ -451,14 +455,14 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 			"A fallback cache or bundled selection is an operational refresh failure, not online refresh success.",
 		],
 	}),
-	node("sdk guides list", { description: "List guides from the verified advisory selection.", flags: sessionFlags }),
+	node("sdk guides list", { description: "List guides from the verified advisory selection.", flags: guideFlags }),
 	node("sdk guides show", {
 		description: "Read a verified guide by ID.",
 		args: { guideId: argument("Exact guide ID from guides list.") },
-		flags: sessionFlags,
+		flags: guideFlags,
 		syntax: "<guideId>",
 	}),
-	node("sdk guides status", { description: "Report guide cache and selection status.", flags: sessionFlags }),
+	node("sdk guides status", { description: "Report guide cache and selection status.", flags: guideFlags }),
 	node("sdk guides trust", { description: "Show the static guide trust policy; no refresh or cache mutation." }),
 	node("daemon", {
 		description: "Manage Telegram, Discord and Slack background daemons, not the SDK broker.",

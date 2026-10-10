@@ -258,4 +258,13 @@ describe("model cache migrations", () => {
 		tempDir = "";
 		dbPath = "";
 	});
+
+	it("finalizes cached read statements before releasing the database file", async () => {
+		writeModelCache("ollama-cloud", Date.now(), [createModel("cached", "Cached")], true, "static", dbPath);
+		expect(readModelCache("ollama-cloud", TTL_MS, Date.now, dbPath)).not.toBeNull();
+		expect(closeModelCache(dbPath)).toBe(true);
+		await fs.rm(tempDir, { recursive: true, force: true });
+		tempDir = "";
+		dbPath = "";
+	});
 });

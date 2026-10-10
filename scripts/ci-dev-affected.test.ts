@@ -1396,6 +1396,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
 	});
 
+	test("a deleted test in a non-runtime package does not schedule CLI smoke or native build", () => {
+		const tasks = planTargetedTasks(
+			["packages/example/test/deleted.test.ts"],
+			[...targetingPackages, ...packages],
+			testFiles,
+		);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toEqual(["check:@gajae-code/example"]);
+		expect(keys).not.toContain("cli-smoke");
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
+	});
+
 	test("the live RLM e2e test gets native artifacts for skipped import-time setup", () => {
 		const tasks = targeted(["packages/coding-agent/test/rlm-live-model-e2e.test.ts"]);
 		const keys = tasks.map(task => task.key);

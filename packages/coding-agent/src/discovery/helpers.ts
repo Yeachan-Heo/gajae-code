@@ -878,7 +878,7 @@ export async function scanSkillsFromDir(
 			await handle.close();
 		}
 	};
-	const loadSkill = async (candidatePath: string) => {
+	const loadSkill = async (candidatePath: string, expectedCanonicalPath?: string) => {
 		try {
 			const linkIdentities = (
 				await Promise.all([
@@ -889,6 +889,13 @@ export async function scanSkillsFromDir(
 			await SkillDiscoveryTestHooks.afterSkillLinksCaptured?.(candidatePath);
 			const skillPath = await fs.promises.realpath(candidatePath);
 			await SkillDiscoveryTestHooks.afterSkillPathResolved?.(candidatePath);
+			if (
+				expectedCanonicalPath &&
+				normalizePathForComparison(skillPath) !== normalizePathForComparison(expectedCanonicalPath)
+			) {
+				warnings.push(`Refusing changed skill path during isolated-home scan: ${candidatePath}`);
+				return;
+			}
 			const allowOutsideRoot = options.allowExternalUserSkillSymlinks && level === "user";
 			if (!isWithinRoot(skillPath) && !allowOutsideRoot) {
 				const remedy =
@@ -971,14 +978,10 @@ export async function scanSkillsFromDir(
 	for (const entry of entries) {
 		if (entry.name.startsWith(".")) continue;
 		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-		const skillPath = await canonicalizePathWithinHome(
-			_ctx,
-			path.join(scanDir, entry.name, "SKILL.md"),
-			containmentRoot,
-			scope,
-		);
-		if (!skillPath) continue;
-		work.push(loadSkill(skillPath));
+		const candidatePath = path.join(scanDir, entry.name, "SKILL.md");
+		const canonicalSkillPath = await canonicalizePathWithinHome(_ctx, candidatePath, containmentRoot, scope);
+		if (!canonicalSkillPath) continue;
+		work.push(loadSkill(candidatePath, _ctx.isolatedHome ? canonicalSkillPath : undefined));
 	}
 	await Promise.all(work);
 

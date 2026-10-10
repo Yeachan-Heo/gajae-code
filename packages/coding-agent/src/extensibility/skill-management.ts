@@ -56,6 +56,7 @@ export type SkillDisabledReason = "protected" | "scope-trust" | "ignored" | "inc
 export interface ManagedSkillRecord {
 	name: string;
 	description: string;
+	importedFrom?: string;
 	path: string;
 	scope: SkillScope;
 	/** Canonical source label, e.g. "project .gjc/skills" or "user ~/.gjc/agent/skills". */
@@ -392,9 +393,11 @@ export async function listNativeSkillsForManagement(options: {
 
 			if (!seenNames.has(skill.name)) {
 				seenNames.add(skill.name);
+				const importedFrom = skill.frontmatter?.xGjcImportedFrom ?? skill.frontmatter?.["x-gjc-imported-from"];
 				records.push({
 					name: skill.name,
 					description: typeof skill.frontmatter?.description === "string" ? skill.frontmatter.description : "",
+					...(typeof importedFrom === "string" ? { importedFrom } : {}),
 					path: skill.discoveryPath ?? skill.path,
 					scope,
 					source,

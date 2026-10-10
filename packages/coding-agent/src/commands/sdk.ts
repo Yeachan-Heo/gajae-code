@@ -35,6 +35,7 @@ import {
 	BROKER_DISCOVERY_BUDGET,
 	emitBrokerStartupTestSignal,
 	reconcileBrokerGenerationForStartup,
+	SDK_BROKER_AUTOSTART_ENV,
 	withBrokerStartupLock,
 } from "../sdk/broker/ensure";
 import {
@@ -1604,6 +1605,8 @@ export default class Sdk extends Command {
 			const scan = scanPublicCommand("sdk", this.argv);
 			if (scan.kind !== "operation") throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 			const { args, flags } = scan;
+			// `--attach-only` is the flag form of GJC_SDK_BROKER_AUTOSTART=0 for this invocation.
+			if (flags["attach-only"] === true) process.env[SDK_BROKER_AUTOSTART_ENV] = "0";
 			const operation = scan.descriptor.command[1];
 			const stringFlag = (name: string): string | undefined => flags[name] as string | undefined;
 			const timeoutMs = flags["timeout-ms"] === undefined ? undefined : Number(flags["timeout-ms"]);

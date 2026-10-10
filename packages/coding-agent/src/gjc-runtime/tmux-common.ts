@@ -63,11 +63,14 @@ export function envDisabled(value: string | undefined): boolean {
  * failure mode where `gjc --tmux` creates a psmux-backed session and then
  * `gjc session status` fails because it queries literal `tmux` is closed off.
  *
- * Explicit `GJC_TMUX_COMMAND` overrides are honored on
- * every platform. On native Windows without an override the resolver walks
- * `psmux`, then `pmux`, then `tmux` and uses the first binary present on PATH.
- * On POSIX the resolver returns `tmux` (the historical default) and only
- * falls through to the platform-aware walker if the caller opts in.
+ * An operator `GJC_TMUX_COMMAND` is honored on every platform. A value that
+ * matches the project dotenv snapshot, including a dynamic declaration, is
+ * ignored so a repository cannot choose the binary, and the resolver uses the
+ * same default as when the variable is unset. On native Windows without an
+ * override the resolver walks `psmux`, then `pmux`, then `tmux` and uses the
+ * first binary present on PATH. On POSIX the resolver returns `tmux` (the
+ * historical default) and only falls through to the platform-aware walker if
+ * the caller opts in.
  */
 export function resolveGjcTmuxCommand(
 	env: NodeJS.ProcessEnv = process.env,

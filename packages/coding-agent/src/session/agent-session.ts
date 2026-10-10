@@ -215,12 +215,12 @@ import {
 	type AsyncJob,
 	type AsyncJobDeliveryState,
 	AsyncJobManager,
-	asyncJobEndpointId as deriveAsyncJobEndpointId,
 	type FoldReason,
 	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
 	type SubagentLifecycle,
 } from "../async";
+import { asyncJobEndpointId as deriveAsyncJobEndpointId } from "../async/endpoint-id";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -238,11 +238,8 @@ import {
 } from "../config/model-profile-contract";
 import {
 	commitDurableModelProfileOwnership,
-	type DurableModelProfileOwnership,
 	InvalidModelProfileOwnershipError,
 	ModelProfileOwnershipConflictError,
-	type ModelProfileOwnershipMarker,
-	modelProfileOwnershipMarkersEqual,
 	readDurableModelProfileOwnership,
 } from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
@@ -427,7 +424,7 @@ import {
 	readVisibleSkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
-import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
+import { assertWorkflowMutationAllowed, isWorkflowMutationTool } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
 import { DelegationHintController } from "../task/delegation-hint";
@@ -452,6 +449,7 @@ import {
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
+import { githubPermissionIntent } from "../tools/github-side-effect";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
@@ -2012,7 +2010,7 @@ async function discardPreparedNewSessionAfterFailure(
 // ============================================================================
 
 /** Tools that require user permission before execution when an ACP client is connected. */
-const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move"]);
+const PERMISSION_REQUIRED_TOOLS = new Set(["bash", "monitor", "eval", "edit", "delete", "move", "github"]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
 	return toolName === "bash" || toolName === "monitor";
@@ -2136,6 +2134,7 @@ function getPermissionIntent(
 			cacheKey: "edit:move",
 		};
 	}
+	if (toolName === "github") return githubPermissionIntent(args);
 	return undefined;
 }
 
@@ -11835,7 +11834,9 @@ export class AgentSession {
 							: undefined;
 					const commandContent = command
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
-						: undefined;
+						: target.name === "github"
+							? [{ type: "content" as const, content: { type: "text" as const, text: permissionIntent.title } }]
+							: undefined;
 					if (this.#sdkPermissionMode === "allow") {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
@@ -11948,7 +11949,7 @@ export class AgentSession {
 	/**
 	/** Wrap a tool with the workflow mutation guard before permissions or execution. */
 	#wrapToolForWorkflowMutationGuard<T extends AgentTool>(tool: T): T {
-		if (!["edit", "write", "ast_edit", "bash"].includes(tool.name)) return tool;
+		if (!isWorkflowMutationTool(tool.name)) return tool;
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return Reflect.get(target, prop, target);
@@ -21001,7 +21002,28 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
+		// A successful empty stop with nonzero usage is not overflow evidence by usage
+		// alone. Zero-usage empty stops stay on the legacy proxy-overflow path, and typed
+		// overflow classification is preserved; only the empty-stop heuristic is disabled.
+		const hasOverflowEvidenceBeyondEmptyStopHeuristic =
+			assistantMessage.stopReason === "stop" &&
+			assistantMessage.content.length === 0 &&
+			classifyContextOverflow(
+				{ ...assistantMessage, content: [{ type: "text", text: "" }] },
+				assistantMessage.transportFailure,
+				contextWindow,
+			);
+		const emptyStopPromptTokens =
+			assistantMessage.usage.input + assistantMessage.usage.cacheRead + assistantMessage.usage.cacheWrite;
+		const successfulEmptyStop =
+			assistantMessage.stopReason === "stop" &&
+			assistantMessage.content.length === 0 &&
+			(emptyStopPromptTokens + assistantMessage.usage.output > 0 ||
+				assistantMessage.usage.totalTokens > 0) &&
+			emptyStopPromptTokens <= contextWindow &&
+			!hasOverflowEvidenceBeyondEmptyStopHeuristic;
 		if (
+			!successfulEmptyStop &&
 			sameModel &&
 			!errorIsFromBeforeCompaction &&
 			classifyContextOverflow(assistantMessage, assistantMessage.transportFailure, contextWindow)
@@ -23695,6 +23717,7 @@ export class AgentSession {
 
 	#managedFallbackPromptOptions(): {
 		fallbackManaged?: boolean;
+		contextOverflowManaged?: boolean;
 		nextFallbackAttempt?: (model: Model) => FallbackAttemptToken;
 		onManagedAttemptAccepted?: () => void;
 		onManagedAttemptOutcome?: (
@@ -23702,9 +23725,10 @@ export class AgentSession {
 		) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
 	} {
 		const controller = this.#defaultFallbackChain();
-		if (controller.chain.entries.length < 2) return {};
+		if (controller.chain.entries.length < 2) return { contextOverflowManaged: true };
 		return {
 			fallbackManaged: true,
+			contextOverflowManaged: true,
 			nextFallbackAttempt: model => {
 				controller.onAttemptStarted();
 				this.#managedFallbackProviderAttemptCount++;

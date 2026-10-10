@@ -18,6 +18,229 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 }
 
 describe("AsyncJobManager delivery reliability", () => {
+	test("reentrant drains wait for the enrolled delivery callback", async () => {
+		const heldDeliveryStarted = Promise.withResolvers<void>();
+		const releaseHeldDelivery = Promise.withResolvers<void>();
+		const healthyRun = Promise.withResolvers<string>();
+		const delivered: string[] = [];
+		let heldJobId = "";
+		let queuedObserved = false;
+		let callbackStarted = false;
+		const dequeueTransition: { reached: boolean; callbackAlreadyStarted: boolean; pending: boolean } = {
+			reached: false,
+			callbackAlreadyStarted: false,
+			pending: false,
+		};
+		const drains: {
+			unbounded?: Promise<boolean>;
+			unboundedOutcome: "pending" | "fulfilled" | "rejected";
+			bounded?: Promise<boolean>;
+			boundedOutcome: "pending" | "fulfilled" | "timed-out" | "rejected";
+		} = { unboundedOutcome: "pending", boundedOutcome: "pending" };
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				if (jobId === heldJobId) {
+					callbackStarted = true;
+					heldDeliveryStarted.resolve();
+					await releaseHeldDelivery.promise;
+				}
+				delivered.push(jobId);
+			},
+		});
+		const unsubscribe = manager.onChange(() => {
+			const state = manager.getDeliveryState();
+			const pending = state.pendingJobIds.includes(heldJobId);
+			if (pending && !state.delivering) {
+				queuedObserved = true;
+				return;
+			}
+			if (drains.unbounded || !queuedObserved) return;
+			dequeueTransition.reached = true;
+			dequeueTransition.callbackAlreadyStarted = callbackStarted;
+			dequeueTransition.pending = pending;
+			const unbounded = manager.drainDeliveries();
+			drains.unbounded = unbounded;
+			void unbounded.then(
+				() => {
+					drains.unboundedOutcome = "fulfilled";
+				},
+				() => {
+					drains.unboundedOutcome = "rejected";
+				},
+			);
+			const bounded = manager.drainDeliveries({ timeoutMs: 0 });
+			drains.bounded = bounded;
+			void bounded.then(
+				completed => {
+					drains.boundedOutcome = completed ? "fulfilled" : "timed-out";
+				},
+				() => {
+					drains.boundedOutcome = "rejected";
+				},
+			);
+		});
+
+		let heldProducer: Promise<void> | undefined;
+		let healthyProducer: Promise<void> | undefined;
+		let primaryFailure: unknown;
+		let hasPrimaryFailure = false;
+		const cleanupFailures: unknown[] = [];
+		try {
+			heldJobId = manager.register("bash", "held delivery", async () => "held", { id: "held-delivery" });
+			const heldJob = manager.getJob(heldJobId);
+			if (!heldJob) throw new Error("expected held delivery job");
+			heldProducer = heldJob.promise;
+			const healthyJobId = manager.register("bash", "independent healthy job", () => healthyRun.promise);
+			const healthyJob = manager.getJob(healthyJobId);
+			if (!healthyJob) throw new Error("expected independent healthy job");
+			healthyProducer = healthyJob.promise;
+
+			await heldDeliveryStarted.promise;
+			expect(dequeueTransition.reached).toBe(true);
+			expect(dequeueTransition.callbackAlreadyStarted).toBe(false);
+			expect(dequeueTransition.pending).toBe(true);
+			healthyRun.resolve("healthy");
+			await healthyProducer;
+			expect(healthyJob.status).toBe("completed");
+			const boundedDrain = drains.bounded;
+			if (!boundedDrain) throw new Error("change listener did not start the bounded drain");
+			const boundedDrainResult = await boundedDrain;
+			expect(boundedDrainResult).toBe(false);
+			expect(drains.boundedOutcome).toBe("timed-out");
+			expect(drains.unbounded).toBeDefined();
+			expect(drains.unboundedOutcome).toBe("pending");
+
+			releaseHeldDelivery.resolve();
+			const unboundedDrain = drains.unbounded;
+			if (!unboundedDrain) throw new Error("change listener did not start the unbounded drain");
+			expect(await unboundedDrain).toBe(true);
+			expect(drains.unboundedOutcome).toBe("fulfilled");
+			expect(delivered).toEqual([heldJobId, healthyJobId]);
+		} catch (error) {
+			hasPrimaryFailure = true;
+			primaryFailure = error;
+		} finally {
+			releaseHeldDelivery.resolve();
+			healthyRun.resolve("cleanup");
+			const join = async (operation: Promise<unknown>): Promise<void> => {
+				try {
+					await operation;
+				} catch (error) {
+					cleanupFailures.push(error);
+				}
+			};
+			try {
+				unsubscribe();
+			} catch (error) {
+				cleanupFailures.push(error);
+			}
+			if (heldProducer) await join(heldProducer);
+			if (healthyProducer) await join(healthyProducer);
+			await join(manager.waitForAll());
+			if (drains.unbounded) await join(drains.unbounded);
+			if (drains.bounded) await join(drains.bounded);
+			await join(
+				manager.drainDeliveries({ timeoutMs: 250 }).then(drained => {
+					if (!drained) throw new Error("delivery drain did not settle during fixture cleanup");
+				}),
+			);
+			await join(
+				manager.dispose({ timeoutMs: 250 }).then(disposed => {
+					if (!disposed) throw new Error("manager disposal did not settle during fixture cleanup");
+				}),
+			);
+			await join(manager.awaitRetainedDisposalCompletion());
+		}
+		if (hasPrimaryFailure) throw primaryFailure;
+		if (cleanupFailures.length > 0)
+			throw new AggregateError(cleanupFailures, "Failed to settle drain fixture resources.");
+	});
+
+	test("bounded disposal retains an unsettled delivery future", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({
+			onJobComplete: async () => {
+				deliveryStarted.resolve();
+				await releaseDelivery.promise;
+			},
+		});
+		let disposePromise: Promise<boolean> | undefined;
+		let producerCompletion: Promise<void> | undefined;
+		const retainedState: { outcome: "pending" | "fulfilled" | "rejected"; error?: unknown } = { outcome: "pending" };
+		let retainedFuture: Promise<void> | undefined;
+		let retainedObserver: Promise<void> | undefined;
+		let primaryFailure: unknown;
+		let hasPrimaryFailure = false;
+		const cleanupFailures: unknown[] = [];
+		const observeRetainedFuture = (): void => {
+			retainedFuture = manager.awaitRetainedDisposalCompletion();
+			retainedObserver = retainedFuture.then(
+				() => {
+					retainedState.outcome = "fulfilled";
+				},
+				error => {
+					retainedState.outcome = "rejected";
+					retainedState.error = error;
+				},
+			);
+		};
+
+		try {
+			const jobId = manager.register("bash", "held disposal delivery", async () => "payload");
+			const job = manager.getJob(jobId);
+			if (!job) throw new Error("expected held delivery job");
+			producerCompletion = job.promise;
+			await deliveryStarted.promise;
+			await producerCompletion;
+
+			disposePromise = manager.dispose({ timeoutMs: 25 });
+			expect(await disposePromise).toBe(false);
+
+			observeRetainedFuture();
+			const observer = retainedObserver;
+			if (!observer) throw new Error("expected retained-future settlement observer");
+			const retainedWhileCallbackHeld = await Promise.race([
+				observer.then(() => retainedState.outcome),
+				Bun.sleep(25).then(() => "pending" as const),
+			]);
+			expect(retainedWhileCallbackHeld).toBe("pending");
+			expect(retainedState.outcome).toBe("pending");
+			releaseDelivery.resolve();
+			await retainedFuture;
+			await retainedObserver;
+			expect(retainedState.outcome).toBe("fulfilled");
+		} catch (error) {
+			hasPrimaryFailure = true;
+			primaryFailure = error;
+		} finally {
+			releaseDelivery.resolve();
+			const join = async (operation: Promise<unknown>): Promise<void> => {
+				try {
+					await operation;
+				} catch (error) {
+					cleanupFailures.push(error);
+				}
+			};
+			if (producerCompletion) await join(producerCompletion);
+			await join(manager.waitForAll());
+			if (disposePromise) await join(disposePromise);
+			else {
+				await join(
+					manager.dispose({ timeoutMs: 25 }).then(disposed => {
+						if (!disposed) throw new Error("manager disposal did not settle during fixture cleanup");
+					}),
+				);
+			}
+			if (!retainedFuture) observeRetainedFuture();
+			if (retainedFuture) await join(retainedFuture);
+			if (retainedObserver) await join(retainedObserver);
+		}
+		if (hasPrimaryFailure) throw primaryFailure;
+		if (cleanupFailures.length > 0)
+			throw new AggregateError(cleanupFailures, "Failed to settle disposal fixture resources.");
+	});
+
 	// T-R4. `#resolveJobId` auto-allocation used to key only on live-map
 	// membership, so a zero-retention eviction let the next job take the same
 	// `bg_1`. The recycled record then gave the still-pending old delivery a

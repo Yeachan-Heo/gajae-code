@@ -133,6 +133,53 @@ describe("mcp oauth flow", () => {
 		expect(authUrl.searchParams.get("state")).toBe("test-state");
 	});
 
+	it("does not fetch registration metadata from a non-public authorization origin", async () => {
+		const urls: string[] = [];
+		using _hook = hookFetch(input => {
+			urls.push(String(input));
+			return new Response("{}", { status: 200 });
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "http://127.0.0.1/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+		expect(urls.some(url => url.includes("oauth-authorization-server"))).toBe(false);
+	});
+
+	it("does not follow redirects when fetching public registration metadata", async () => {
+		let metadataRedirect: string | undefined;
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			if (url === "https://provider.example/.well-known/oauth-authorization-server") {
+				metadataRedirect = init?.redirect;
+				return new Response(JSON.stringify({ registration_endpoint: "https://provider.example/register" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://provider.example/register") {
+				return new Response(JSON.stringify({ client_id: "cid" }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				authorizationUrl: "https://provider.example/authorize",
+				tokenUrl: "https://provider.example/token",
+			},
+			{},
+		);
+		await flow.generateAuthUrl("state", "http://127.0.0.1:9/callback");
+		expect(metadataRedirect).toBe("error");
+	});
+
 	it("uses configured callbackPath for the local redirect URI", async () => {
 		let observedRedirectUri = "";
 		let tokenRequestBody = "";

@@ -440,6 +440,62 @@ describe("TUI manual viewport paging", () => {
 		}
 	});
 
+	it("preserves the committed frontier after following live from semantic history", async () => {
+		const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
+		const tui = new TUI(term);
+		const transcript = new AnchoredTranscript();
+		for (let index = 0; index < 3; index++) transcript.addRow(`transcript-${index}`, `transcript-${index}`);
+		const working = new Lines(Array.from({ length: 5 }, (_value, index) => `working-${index}`));
+		const status = new Lines(["status"]);
+		tui.addChild(transcript);
+		tui.addChild(working);
+		tui.addChild(status);
+		tui.setViewportAnchorComponent(transcript);
+		tui.setBottomPinnedComponent(status);
+
+		try {
+			tui.start();
+			await settle(term);
+			for (let index = 3; index < 14; index++) transcript.addRow(`transcript-${index}`, `transcript-${index}`);
+			tui.requestRender();
+			await settle(term);
+
+			working.replace([]);
+			tui.requestRender();
+			await settle(term);
+			const committedRows = Array.from({ length: 14 }, (_value, index) => `transcript-${index}`);
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(line => line.startsWith("transcript-")),
+			).toEqual(committedRows);
+
+			expect(tui.revealViewportAnchor("transcript-0", "top")).toBe(true);
+			await settle(term);
+			working.replace(["later-0"]);
+			tui.requestRender();
+			await settle(term);
+
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual(["later-0", "", "", "", "", "status"]);
+
+			working.replace(["later-0", "later-1"]);
+			tui.requestRender();
+			await settle(term);
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(line => line.startsWith("transcript-")),
+			).toEqual(committedRows);
+			expect(visible(term)).toEqual(["later-0", "later-1", "", "", "", "status"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("rebases a nested editor cursor when following a contracted manual viewport with IME reanchoring", async () => {
 		const previousImeCursor = Bun.env.GJC_TUI_IME_CURSOR;
 		Bun.env.GJC_TUI_IME_CURSOR = "1";
