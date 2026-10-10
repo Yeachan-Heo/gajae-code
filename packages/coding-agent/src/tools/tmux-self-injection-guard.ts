@@ -160,8 +160,10 @@ function tokenize(command: string): Token[] {
 		let isWrappedCommand = false;
 
 		if (atCommandStart) {
-			const newWrapper = COMMAND_WRAPPERS_WITH_ARGS[text];
-			const isBuiltinWrapper = COMMAND_WRAPPERS.has(text);
+			// Normalize wrapper name: extract basename from path (e.g., /usr/bin/env -> env)
+			const baseName = text.includes("/") ? text.split("/").pop() || text : text;
+			const newWrapper = COMMAND_WRAPPERS_WITH_ARGS[baseName];
+			const isBuiltinWrapper = COMMAND_WRAPPERS.has(baseName);
 
 			if (CONTROL_WORDS.has(text)) {
 				// Control words reset wrapper state (but not if we're already in a wrapper)
@@ -179,14 +181,14 @@ function tokenize(command: string): Token[] {
 				}
 				// If in a wrapper, keep wrapper active and don't change atCommandStart
 			} else if (newWrapper) {
-				// Track this wrapper for its arguments
-				wrapperCommand = { name: text, spec: newWrapper };
+				// Track this wrapper for its arguments (use baseName for consistent lookup)
+				wrapperCommand = { name: baseName, spec: newWrapper };
 				skipNextArg = false;
 				positionalsPending = newWrapper.hasPositionalArg ? 1 : 0;
 				atCommandStart = false; // Now in wrapper argument mode
 			} else if (isBuiltinWrapper) {
 				// Built-in wrappers
-				wrapperCommand = { name: text, spec: { optionsWithArg: new Set() } };
+				wrapperCommand = { name: baseName, spec: { optionsWithArg: new Set() } };
 				skipNextArg = false;
 				positionalsPending = 0;
 				atCommandStart = false; // Now in wrapper argument mode
@@ -225,19 +227,21 @@ function tokenize(command: string): Token[] {
 			} else if (wrapperCommand && !text.startsWith("-") && !isAssignment(text)) {
 				// We're in a wrapper and this is not an option or assignment
 				// Check if this is itself a wrapper (nested wrappers like 'env sudo')
-				const nestedWrapper = COMMAND_WRAPPERS_WITH_ARGS[text];
-				const isNestedBuiltinWrapper = COMMAND_WRAPPERS.has(text);
+				// Normalize the name to handle path-qualified commands
+				const nestedBaseName = text.includes("/") ? text.split("/").pop() || text : text;
+				const nestedWrapper = COMMAND_WRAPPERS_WITH_ARGS[nestedBaseName];
+				const isNestedBuiltinWrapper = COMMAND_WRAPPERS.has(nestedBaseName);
 
 				if (nestedWrapper) {
-					// Nested wrapper found - set it up as the new wrapper
-					wrapperCommand = { name: text, spec: nestedWrapper };
+					// Nested wrapper found - set it up as the new wrapper (use baseName)
+					wrapperCommand = { name: nestedBaseName, spec: nestedWrapper };
 
 					skipNextArg = false;
 					positionalsPending = nestedWrapper.hasPositionalArg ? 1 : 0;
 					commandStart = true; // The wrapper itself is still a command start
 				} else if (isNestedBuiltinWrapper) {
 					// Nested built-in wrapper found
-					wrapperCommand = { name: text, spec: { optionsWithArg: new Set() } };
+					wrapperCommand = { name: nestedBaseName, spec: { optionsWithArg: new Set() } };
 					skipNextArg = false;
 					positionalsPending = 0;
 					commandStart = true; // The wrapper itself is still a command start

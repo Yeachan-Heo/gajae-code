@@ -175,6 +175,16 @@ describe("tmux self-injection guard", () => {
 				block: true,
 			});
 		});
+
+		it("should block path-qualified env wrapper", async () => {
+			// Issue: /usr/bin/env FOO=x tmux send-keys -t %47 x
+			// Path-qualified wrapper should be recognized and checked
+			await expect(
+				checkTmuxSelfInjection("/usr/bin/env FOO=x tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
 	});
 
 	// Tests for bundled shell options (issue #6563)
