@@ -1533,7 +1533,7 @@ export function createInvocationReconciliation(
 			const preserveDeadlineRecovery =
 				(frame.type === "agent_start" &&
 					(frame as unknown as { preserveDeadlineRecovery?: boolean }).preserveDeadlineRecovery === true) ||
-				(frame.type === "agent_failed" && record.deadlineRecoveryPending === true);
+				((frame.type === "agent_failed" || frame.type === "agent_end") && record.deadlineRecoveryPending === true);
 			if (!preserveDeadlineRecovery) {
 				delete (next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending;
 				delete (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
@@ -6490,7 +6490,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const seams = options.terminalAbortSeams;
 				const handle = seams?.getActivePromptHandle();
 				const epoch = seams?.getTerminalTurnEpoch();
-				if (!seams || !handle || epoch === undefined || !seams.pendingToolExecutions) return;
+				if (!seams || !handle || epoch === undefined) return;
 				const existing = deadlineTerminalizationObservations.get(key);
 				if (existing) return () => cleanupDeadlineTerminalizationObservation(key, existing);
 
@@ -7130,7 +7130,33 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => acceptingGateResolutions,
 			trackGateResolution,
 			options.onInvocationCompletionReconciledForTests,
-			frame => runtime.emitEvent(frame),
+			frame => {
+				// Completion can win the durable transaction while a lifecycle end is
+				// still waiting on it. Both publishers must share the same claim.
+				if (typeof frame.commandId !== "string" || typeof frame.turnId !== "string") return;
+				const correlation = { commandId: frame.commandId, turnId: frame.turnId };
+				if (frame.type !== "agent_end") {
+					if (!hasClaimedTerminalBoundary(correlation)) runtime.emitEvent(frame);
+					return;
+				}
+				const key = lifecycleCorrelationKey(correlation);
+				if (!claimTerminalBoundary(correlation)) {
+					const previouslyPublished = terminalBoundaryClaims.publicationResult(key) === true;
+					if (previouslyPublished) return;
+					terminalBoundaryClaims.releaseClaim(key);
+					if (!claimTerminalBoundary(correlation)) return;
+				}
+				const sequenceBefore = runtime.host.events.sequence;
+				try {
+					runtime.emitEvent(frame);
+					terminalBoundaryClaims.setPublicationResult(key, true);
+				} catch (error) {
+					if (runtime.host.events.sequence > sequenceBefore)
+						terminalBoundaryClaims.setPublicationResult(key, true);
+					else terminalBoundaryClaims.releaseClaim(key);
+					throw error;
+				}
+			},
 			acceptedQueueCancellations,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {

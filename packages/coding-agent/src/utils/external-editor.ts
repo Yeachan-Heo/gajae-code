@@ -6,11 +6,12 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, Snowflake } from "@gajae-code/utils";
+import { $pickCredentialEnv, Snowflake } from "@gajae-code/utils";
 
 /** Returns the user's preferred editor command, or undefined if not configured. */
 export function getEditorCommand(): string | undefined {
-	return $env.VISUAL || $env.EDITOR || undefined;
+	// The editor is executed, so a repository `.env` must not be able to choose it.
+	return $pickCredentialEnv("VISUAL", "EDITOR");
 }
 
 export interface OpenInEditorOptions {

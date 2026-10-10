@@ -8,10 +8,12 @@ import { getWorktreeDir, hashPath, isEnoent, prompt, untilAborted } from "@gajae
 import * as z from "zod/v4";
 import type { Settings } from "../config/settings";
 import githubDescription from "../prompts/tools/github.md" with { type: "text" };
+import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
 import { formatShortSha } from "./gh-format";
 import { type CacheStatus, getOrFetchView, resolveGithubCacheAuthKey } from "./github-cache";
+import { githubMutationTool, isGithubReadOnlyOp } from "./github-side-effect";
 import type { OutputMeta } from "./output-meta";
 import { ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -2591,6 +2593,14 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<GhToolDetails>> {
 		return untilAborted(signal, async () => {
+			if (!isGithubReadOnlyOp(params.op)) {
+				await assertWorkflowMutationAllowed({
+					cwd: this.session.cwd,
+					sessionId: this.session.getSessionId?.() ?? undefined,
+					tool: githubMutationTool,
+					args: params,
+				});
+			}
 			switch (params.op) {
 				case "repo_view":
 					return executeRepoView(this.session, params, signal);

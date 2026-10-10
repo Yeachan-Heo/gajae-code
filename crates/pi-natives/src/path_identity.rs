@@ -1383,6 +1383,64 @@ pub fn canonical_existing_directory_identity(
 	platform::canonical_existing_directory_identity(&path)
 }
 
+#[cfg(any(windows, test))]
+const FILE_CASE_SENSITIVE_SEARCH_FLAG: u32 = 0x0000_0001;
+
+#[cfg(any(windows, test))]
+const fn volume_case_sensitivity_from_flags(file_system_flags: u32) -> Option<bool> {
+	// This is a volume capability, not the current directory's mode. A missing
+	// capability proves case-insensitivity; a present one leaves the mode unknown.
+	if file_system_flags & FILE_CASE_SENSITIVE_SEARCH_FLAG == 0 {
+		Some(false)
+	} else {
+		None
+	}
+}
+
+#[cfg(test)]
+mod volume_case_sensitivity_tests {
+	use super::volume_case_sensitivity_from_flags;
+
+	#[test]
+	fn only_treats_a_volume_as_case_insensitive_when_it_lacks_case_sensitive_search() {
+		assert_eq!(volume_case_sensitivity_from_flags(0), Some(false));
+		assert_eq!(volume_case_sensitivity_from_flags(0x0000_0001), None);
+	}
+}
+
+/// Returns whether the directory's child names are case-sensitive when the
+/// platform can query that property.
+#[napi]
+pub fn directory_case_sensitive(path: String) -> Option<bool> {
+	if path.contains('\0') {
+		return None;
+	}
+	#[cfg(windows)]
+	{
+		platform::directory_case_sensitive(Path::new(&path))
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = path;
+		None
+	}
+}
+
+/// Fold UTF-16 code units with Windows' ordinal case mapping, without Unicode
+/// expansions.
+#[allow(clippy::missing_const_for_fn, reason = "the Windows implementation calls an OS API")]
+#[napi]
+pub fn windows_ordinal_case_fold(value: String) -> String {
+	#[cfg(windows)]
+	{
+		platform::windows_ordinal_case_fold(&value)
+	}
+	#[cfg(not(windows))]
+	{
+		value
+	}
+}
+
 #[cfg(unix)]
 pub(crate) fn verify_descriptor_acl_absent(
 	file: &std::fs::File,
@@ -10724,9 +10782,9 @@ mod platform {
 			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
 			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
 			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
-			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
-			READ_CONTROL, ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID,
-			WRITE_DAC, WRITE_OWNER,
+			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+			GetVolumeInformationByHandleW, OPEN_EXISTING, READ_CONTROL, ReadFile,
+			SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
@@ -10737,7 +10795,7 @@ mod platform {
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
 		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		open_with_transient_retry, sha256,
+		open_with_transient_retry, sha256, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -10746,6 +10804,12 @@ mod platform {
 	unsafe extern "system" {
 		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
 		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+		fn GetFileInformationByHandleEx(
+			file: HANDLE,
+			file_information_class: i32,
+			file_information: *mut c_void,
+			buffer_size: u32,
+		) -> i32;
 	}
 
 	// Test-only fault injection for the exact-replace destination open retry:
@@ -10788,6 +10852,13 @@ mod platform {
 		DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
+	const FILE_CASE_SENSITIVE_INFO_CLASS: i32 = 23;
+	const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x1;
+
+	#[repr(C)]
+	struct FileCaseSensitiveInfo {
+		flags: u32,
+	}
 
 	#[repr(C)]
 	struct HandleRenameInformation {
@@ -10919,6 +10990,75 @@ mod platform {
 		result
 	}
 
+	fn volume_case_sensitivity(handle: HANDLE) -> Option<bool> {
+		let mut file_system_flags = 0;
+		let succeeded = unsafe {
+			GetVolumeInformationByHandleW(
+				handle,
+				null_mut(),
+				0,
+				null_mut(),
+				null_mut(),
+				&mut file_system_flags,
+				null_mut(),
+				0,
+			)
+		};
+		if succeeded == 0 {
+			return None;
+		}
+		volume_case_sensitivity_from_flags(file_system_flags)
+	}
+
+	pub(super) fn directory_case_sensitive(path: &Path) -> Option<bool> {
+		let path_wide = wide(path);
+		let handle = unsafe {
+			CreateFileW(
+				path_wide.as_ptr(),
+				FILE_READ_ATTRIBUTES,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				null(),
+				OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+				null_mut(),
+			)
+		};
+		if handle == INVALID_HANDLE_VALUE {
+			return None;
+		}
+		let result = (|| {
+			let attributes = handle_attributes(handle).ok()?;
+			if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+				return None;
+			}
+
+			let mut information = FileCaseSensitiveInfo { flags: 0 };
+			let succeeded = unsafe {
+				GetFileInformationByHandleEx(
+					handle,
+					FILE_CASE_SENSITIVE_INFO_CLASS,
+					(&mut information as *mut FileCaseSensitiveInfo).cast(),
+					size_of::<FileCaseSensitiveInfo>() as u32,
+				)
+			};
+			if succeeded == 0 {
+				// Fall back only when volume metadata proves case-insensitive lookup.
+				return volume_case_sensitivity(handle);
+			}
+			Some(information.flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+		})();
+		let closed = unsafe { CloseHandle(handle) } != 0;
+		if closed { result } else { None }
+	}
+
+	pub(super) fn windows_ordinal_case_fold(value: &str) -> String {
+		let folded: Vec<u16> = value
+			.encode_utf16()
+			.map(|unit| unsafe { rtl_upcase_unicode_char(unit) })
+			.collect();
+		String::from_utf16(&folded).unwrap_or_else(|_| value.to_owned())
+	}
+
 	#[repr(C)]
 	struct UnicodeString {
 		length:         u16,
@@ -10944,6 +11084,9 @@ mod platform {
 
 	#[link(name = "ntdll")]
 	unsafe extern "system" {
+		#[link_name = "RtlUpcaseUnicodeChar"]
+		fn rtl_upcase_unicode_char(source_character: u16) -> u16;
+
 		fn NtCreateFile(
 			file_handle: *mut HANDLE,
 			desired_access: u32,

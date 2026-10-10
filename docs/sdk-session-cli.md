@@ -54,6 +54,57 @@ results. The broker is started on demand (`ensureBroker`) when discovery is
 absent, and an unavailable broker fails closed with a typed operational error
 (exit 1).
 
+### Attach-only mode
+
+Set `GJC_SDK_BROKER_AUTOSTART=0` when a supervisor (for example a system
+service) owns the broker. Every SDK client entry point — `gjc sdk session`,
+`gjc sdk search`, `gjc sdk spawn`, the SDK and coordinator MCP servers, ACP,
+and session hosts — then only attaches to a live, reusable broker and never
+spawns, retires, or restarts one. When discovery is absent, stale, names a
+dead process, or names a live broker this client cannot reuse, the call fails
+with `broker_unavailable` (exit 1) and leaves the incumbent untouched. Broker
+management refuses too, before any effect: `gjc doctor` broker restart reports
+`attach_only_refused`, and `scripts/restart-sdk-broker.ts` exits with an error
+without closing hosts or stopping the broker. Restart through the supervisor
+instead. Any other value, or an unset variable, keeps on-demand startup. The
+broker entrypoints ignore the variable, so it is safe for broker descendants to
+inherit it. A supervisor that wants its broker's session hosts to stay
+attach-only sets the variable on the broker process as well.
+
+`--attach-only` is the per-invocation flag form on `gjc sdk session …`,
+`gjc sdk search`, `gjc sdk spawn` and `gjc mcp-serve`. `gjc sdk serve` needs
+neither: it only reads broker discovery and never starts a broker.
+
+### Supervised broker: `gjc sdk broker run`
+
+`gjc sdk broker run [--agent-dir <dir>]` is the stable foreground broker
+command for supervisors such as systemd or launchd. It owns the broker for the
+agent directory (default: the configured agent directory; a relative path
+resolves against the current directory) and never detaches: the published
+discovery pid is the supervised process itself.
+
+- It serves until SIGTERM or SIGINT, stops gracefully (discovery is removed),
+  then exits with the signal status: 143 for SIGTERM, 130 for SIGINT. Under
+  systemd, set `SuccessExitStatus=143` so a normal stop is not reported as a
+  failure.
+- It exits 1 without serving when another live broker already owns the agent
+  directory (even one this version cannot reuse), or when startup fails. It
+  never retires the other owner.
+- It exits 1 when it stops abnormally while serving: its discovery root was
+  lost or replaced, or its heartbeat could not be renewed. A requested
+  `broker.shutdown` is a clean stop (exit 0). Use `Restart=on-failure`.
+- Pair it with attach-only clients (`GJC_SDK_BROKER_AUTOSTART=0`) so nothing
+  else starts a competing broker. Set the variable on the broker unit as well
+  if its session hosts should stay attach-only.
+
+```ini
+[Service]
+ExecStart=/path/to/gjc sdk broker run --agent-dir /home/me/.gjc/agent
+Environment=GJC_SDK_BROKER_AUTOSTART=0
+SuccessExitStatus=143
+Restart=on-failure
+```
+
 `--agent-dir` selects the broker state directory. It may appear at the session
 family level before the verb (`gjc sdk session --agent-dir <dir> list`) or on a
 leaf command. `--repo` selects the workspace directory for scoped listing or

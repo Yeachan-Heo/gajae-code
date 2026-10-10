@@ -10,6 +10,7 @@
  *   3. Without a previous value, a failure returns null and DOES NOT cache —
  *      the next poll retries on the next request.
  */
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -451,6 +452,23 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 		const third = anthropicReports(await storage.fetchUsageReports());
 		expect(third).toHaveLength(1);
 		expect(calls).toBe(3);
+	});
+});
+
+describe("SqliteAuthCredentialStore.close", () => {
+	it("finalizes outstanding statements before releasing the database", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "pi-ai-auth-close-"));
+		const database = new Database(path.join(root, "auth.db"));
+		const store = new SqliteAuthCredentialStore(database);
+		const outstanding = database.prepare("SELECT 1 AS value");
+		try {
+			store.close();
+			expect(() => outstanding.get()).toThrow("Database has closed");
+		} finally {
+			outstanding.finalize();
+			store.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
 

@@ -10,45 +10,6 @@ import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manif
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
-
-let cargoBinary: string | undefined;
-
-async function resolveCargoBinary(): Promise<string> {
-	if (cargoBinary) return cargoBinary;
-
-	// Try to find rustup in common locations
-	const possibleRustupPaths = [
-		path.join(Bun.env.CARGO_HOME ?? "", "bin", "rustup"),
-		path.join(process.env.HOME ?? "/root", ".cargo", "bin", "rustup"),
-		"/mnt/offloading/.cargo/bin/rustup",
-	];
-
-	for (const rustupPath of possibleRustupPaths) {
-		if (await Bun.file(rustupPath).exists()) {
-			const result = await $`${rustupPath} which cargo`.quiet().nothrow();
-			if (result.exitCode === 0) {
-				const resolved = result.stdout.toString().trim();
-				if (resolved !== "") {
-					cargoBinary = resolved;
-					return resolved;
-				}
-			}
-		}
-	}
-
-	// Try to run rustup from PATH
-	const result = await $`rustup which cargo`.quiet().nothrow();
-	if (result.exitCode === 0) {
-		const resolved = result.stdout.toString().trim();
-		if (resolved !== "") {
-			cargoBinary = resolved;
-			return resolved;
-		}
-	}
-
-	cargoBinary = "cargo";
-	return "cargo";
-}
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
 const telegramDaemonGenerationGuardFiles = new Set([
 	"scripts/telegram-daemon-generation-guard.ts",
@@ -1613,6 +1574,8 @@ function isInstallPath(changedPath: string): boolean {
 }
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
+	// Changelogs don't constitute runtime changes requiring native build or validation
+	if (isDocOrChangelogPath(changedPath)) return false;
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
 }
 
@@ -1819,14 +1782,7 @@ async function expandCargoDependents(
 	supported: readonly CargoInventoryUnit[],
 	fallbackOnMetadataFailure: boolean,
 ): Promise<CargoInventoryUnit[]> {
-	const resolved = await resolveCargoBinary();
-	const env = { ...process.env };
-	// Ensure the active toolchain bin dir wins over Homebrew's rustup-init shadow on macOS runners.
-	const toolchainBin = path.dirname(resolved);
-	const pathSep = process.platform === "win32" ? ";" : ":";
-	const currentPath = env.PATH ?? env.Path ?? "";
-	env.PATH = currentPath === "" ? toolchainBin : `${toolchainBin}${pathSep}${currentPath}`;
-	const metadata = await $`${resolved} metadata --format-version=1 --no-deps`.cwd(repoRoot).env(env).quiet().nothrow();
+	const metadata = await $`cargo metadata --format-version=1 --no-deps`.cwd(repoRoot).quiet().nothrow();
 	if (metadata.exitCode !== 0) {
 		if (fallbackOnMetadataFailure) return [...supported];
 		throw new Error(`inventory-drift: cargo metadata failed: ${metadata.stderr.toString().trim()}`);
