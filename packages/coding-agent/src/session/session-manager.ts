@@ -17274,6 +17274,18 @@ export class SessionManager {
 		if (observedPersistError && outcome.kind === "closed") {
 			return { kind: "close_unknown", error: observedPersistError };
 		}
+		// Always release managed sidecar cache to prevent file handle leaks on Windows (#6566).
+		// This must happen even if the close is retryable, because the sidecar cache holds
+		// directory handles that prevent temp directory deletion during test cleanup.
+		if (!observedPersistError && !this.#persistWriter && outcome.kind === "closed") {
+			try {
+				this.#releaseManagedSidecarCache();
+			} catch (error) {
+				logger.warn("Failed to release managed sidecar cache during closeStrict", {
+					error: String(error),
+				});
+			}
+		}
 		return outcome;
 	}
 
