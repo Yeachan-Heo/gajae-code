@@ -144,3 +144,15 @@ it("exits 1 when it loses its discovery root, leaving the successor's record int
 	expect(stderr).toContain("stopped abnormally (lost-root");
 	expect(await fs.readFile(file, "utf8")).toBe(successor);
 }, 120_000);
+
+it("exits 1 through the public failure boundary when startup throws", async () => {
+	const dir = await agentDir();
+	// A regular file where the broker state directory must be makes startup throw.
+	await Bun.write(path.join(dir, "sdk"), "not a directory");
+	const run = brokerRun(dir);
+	const [exitCode, stderr] = await Promise.all([run.exited, new Response(run.stderr).text()]);
+	expect(exitCode).toBe(1);
+	expect(stderr).toContain('ERROR {"code":"operation_failed"');
+	// Nothing was published: the blocking file is still the only thing at the state path.
+	expect(await fs.readFile(path.join(dir, "sdk"), "utf8")).toBe("not a directory");
+}, 90_000);
