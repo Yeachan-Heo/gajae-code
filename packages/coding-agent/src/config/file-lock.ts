@@ -1374,7 +1374,6 @@ function ownerGenerationIsDead(owner: FileLockOwnerToken): boolean {
 
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing" | "cleanup_failed";
-
 type LockStaleSnapshot =
 	| { stale: false }
 	| { stale: true; owner: FileLockOwnerToken; identity: GenericFileLockDirIdentity };
@@ -1815,12 +1814,9 @@ async function staleLockSnapshot(
 		throw error;
 	}
 	if (!info) {
-		// A directory without a valid owner record is either a contender between
-		// native directory ownership and metadata publication, or malformed state
-		// with no PID/incarnation/host proof of any process generation. Neither
-		// case carries liveness evidence, so elapsed time and byte stability must
-		// never make this namespace reclaimable: only an independently committed
-		// owner record proving its process generation dead authorizes removal.
+		// An ownerless directory has no generation or liveness proof. Age and
+		// emptiness cannot distinguish interrupted cleanup from a live legacy holder
+		// or a paused acquisition, so every platform fails closed.
 		return { stale: false };
 	}
 
@@ -1862,8 +1858,6 @@ async function staleLockSnapshot(
 	}
 	return { stale: false };
 }
-
-type StaleLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
 
 type RecordedStaleRemovalFailure = {
 	owner: FileLockOwnerToken;
@@ -1908,10 +1902,12 @@ function manualLockCleanupCommand(lockPath: string): string {
 	return `rm -rf -- '${quotedPath}'`;
 }
 
+type FileLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
+
 async function removeStaleLockForAcquire(
 	lockPath: string,
 	snapshot: LockStaleSnapshot,
-): Promise<StaleLockRemovalAttempt> {
+): Promise<FileLockRemovalAttempt> {
 	if (!snapshot.stale) return { removed: false };
 	try {
 		const outcome = await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity);
@@ -2138,7 +2134,9 @@ async function tryAcquireLock(
 			}
 		}
 		if (!publishedSuccessfully) {
-			if (published.reason === "destination_exists") return null;
+			if (published.reason === "destination_exists") {
+				return null;
+			}
 			const failure = new Error(
 				`Failed to publish file lock: ${published.code ?? published.reason ?? "unknown"}.`,
 			) as NodeJS.ErrnoException;

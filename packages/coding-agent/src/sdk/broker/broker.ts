@@ -1587,6 +1587,7 @@ export class Broker {
 	#startupAfterDiscoveryWriteTestHook: (() => Promise<void>) | undefined;
 	#startupPostPublicationDelayMs: number;
 	#completionTask: Promise<void> | null = null;
+	#terminalExit: { mode: BrokerExitMode; reason: BrokerExitReason } | null = null;
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
@@ -4033,6 +4034,10 @@ export class Broker {
 	get completion(): Promise<void> {
 		return this.#completion;
 	}
+	/** Why this broker completed, or null while it is still running. */
+	get terminalExit(): { readonly mode: BrokerExitMode; readonly reason: BrokerExitReason } | null {
+		return this.#terminalExit;
+	}
 	#restartIdentity(): BrokerRestartOwnerIdentity | undefined {
 		const d = this.discovery;
 		if (!d?.incarnation) return undefined;
@@ -4326,6 +4331,7 @@ export class Broker {
 		blockingLockPath?: string,
 	): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
+		this.#terminalExit = { mode, reason };
 		const now = process.hrtime.bigint();
 		const fenceStartedAt = this.#lossAt ?? this.#ambiguousAt;
 		const exitRecord: BrokerExitRecord & Record<string, unknown> = {

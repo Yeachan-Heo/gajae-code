@@ -11,6 +11,8 @@ import {
 const PATHS = [
 	"sdk",
 	"sdk serve",
+	"sdk broker",
+	"sdk broker run",
 	"sdk search",
 	"sdk spawn",
 	"sdk session",
@@ -40,6 +42,8 @@ const PATHS = [
 const OPERATION_FLAGS: Record<string, string[]> = {
 	sdk: [],
 	"sdk serve": ["stdio", "socket", "session", "pending-ceiling"],
+	"sdk broker": [],
+	"sdk broker run": ["agent-dir"],
 	"sdk search": ["attach-only", "agent-dir", "repo", "scope", "limit", "cursor"],
 	"sdk spawn": ["attach-only", "agent-dir", "cwd", "prompt", "model", "profile", "idempotency-key"],
 	"sdk session": ["attach-only", "agent-dir"],
@@ -132,7 +136,7 @@ function command(path: string) {
 }
 
 describe("static SDK/daemon public inventory", () => {
-	test("enumerates exactly the 27 reachable public paths and connects immediate children", () => {
+	test("enumerates exactly the 29 reachable public paths and connects immediate children", () => {
 		expect(PUBLIC_COMMANDS.map(row => row.command.join(" ")).sort()).toEqual([...PATHS].sort());
 		for (const path of PATHS) {
 			const descriptor = command(path);
