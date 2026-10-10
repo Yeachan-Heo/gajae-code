@@ -1359,19 +1359,15 @@ export async function writeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<GuardedWriteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	const write = () =>
-		writeGuardedResolvedJsonAtomic(
-			filePath,
-			{ ...entry, skill },
-			{
-				...options,
-				policy: "cache",
-				advanceSourceRevision: true,
-			},
-		);
-	const result = options?.activeStateScopeLockHeld
-		? await write()
-		: await withActiveStateScopeLock(cwd, sessionScope, write);
+	const result = await writeGuardedResolvedJsonAtomic(
+		filePath,
+		{ ...entry, skill },
+		{
+			...options,
+			policy: "cache",
+			advanceSourceRevision: true,
+		},
+	);
 	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return result;
 }
@@ -1490,29 +1486,25 @@ export async function removeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<DeleteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	const remove = () =>
-		lockResolvedWorkflowTarget(
-			filePath,
-			async () => {
-				const current = await readJsonIfPresent(filePath);
-				const incomingSourceRevision = options?.sourceRevision;
-				if (
-					current !== undefined &&
-					incomingSourceRevision !== undefined &&
-					incomingSourceRevision < persistedSourceRevision(current)
-				) {
-					return { path: filePath, deleted: false };
-				}
-				const deleted = await atomicRemove(filePath);
-				if (deleted) await maybeAudit(filePath, options);
-				if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
-				return { path: filePath, deleted };
-			},
-			options?.lock,
-		);
-	return options?.activeStateScopeLockHeld
-		? await remove()
-		: await withActiveStateScopeLock(cwd, sessionScope, remove);
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const current = await readJsonIfPresent(filePath);
+			const incomingSourceRevision = options?.sourceRevision;
+			if (
+				current !== undefined &&
+				incomingSourceRevision !== undefined &&
+				incomingSourceRevision < persistedSourceRevision(current)
+			) {
+				return { path: filePath, deleted: false };
+			}
+			const deleted = await atomicRemove(filePath);
+			if (deleted) await maybeAudit(filePath, options);
+			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
+			return { path: filePath, deleted };
+		},
+		options?.lock,
+	);
 }
 
 /**
