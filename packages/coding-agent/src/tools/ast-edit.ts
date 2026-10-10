@@ -13,6 +13,7 @@ import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/workflow-m
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
+import { resolveAstEditPreviewWritePaths } from "./ast-edit-write-path";
 import { assertEditableFile } from "./auto-generated-guard";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
@@ -345,7 +346,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						await assertWorkflowMutationRawPathsAllowed({
 							cwd: this.session.cwd,
 							sessionId: this.session.getSessionId?.() ?? undefined,
-							rawPaths: previewedFiles,
+							rawPaths: await resolveAstEditPreviewWritePaths(this.session.cwd, previewedFiles),
 						});
 						for (const filePath of previewedFiles) {
 							await assertEditableFile(resolvePlanPath(this.session, filePath), filePath, this.session.settings);
