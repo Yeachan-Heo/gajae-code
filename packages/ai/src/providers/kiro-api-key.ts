@@ -444,6 +444,7 @@ type KiroStreamEvent =
 	| { type: "toolUseInput"; data: { input: string } }
 	| { type: "toolUseStop"; data: { stop: boolean } }
 	| { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
+	| { type: "completion"; data: { stopReason: string } }
 	| {
 			type: "refusal";
 			data: { stopReason?: string; stopDetails?: { refusal?: { category?: string; explanation?: string } } };
@@ -580,7 +581,12 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 						stopDetails: parsed.stopDetails as { refusal?: { category?: string; explanation?: string } },
 					},
 				});
-				// Normal terminal metadata (stopReason: "COMPLETED", etc.) without refusal data is ignored
+			} else if (typeof parsed.stopReason === "string" && parsed.stopReason.length > 0 && !parsed.stopDetails?.refusal) {
+				// Emit completion event when stopReason is present and there is no refusal
+				events.push({
+					type: "completion",
+					data: { stopReason: parsed.stopReason },
+				});
 			} else if (parsed.error || parsed.Error) {
 				events.push({
 					type: "error",
@@ -807,6 +813,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 		let toolComplete = false; // Track whether the current tool has been completed (has stop flag)
 		let toolcallIndex: number | undefined;
 		const pendingToolCalls: Array<{ input: string; toolCall: ToolCall; index: number }> = [];
+		let completionSeen = false; // Track whether we received a completion event
 
 		try {
 			// Use validated identity snapshot from trust check if available (no second read of getters),
@@ -883,7 +890,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 			// Keep pending text content separate from blocks until confirmation (no refusal)
 			let pendingTextContent = ""; // Buffer text separately from blocks
-			let pendingTextEvents: Array<{ type: "start" | "delta" | "end"; delta?: string; content?: string }> = [];
+			const pendingTextEvents: Array<{ type: "start" | "delta" | "end"; delta?: string; content?: string }> = [];
 			let textContentConfirmed = false; // Track whether text has been committed to blocks
 
 			// Add tool to blocks without emitting events (deferred until stream end)
@@ -1127,11 +1134,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 								firstTokenTime = Date.now();
 							}
 							if (currentTool && currentTool.id !== event.data.toolUseId) {
-						// Only emit previous tool if it was completed
-						if (toolComplete) addToolToBlocks();
-						currentTool = undefined; // Clear the incomplete tool
-						toolComplete = false; // Reset for new tool
-					}
+								// Only emit previous tool if it was completed
+								if (toolComplete) addToolToBlocks();
+								currentTool = undefined; // Clear the incomplete tool
+								toolComplete = false; // Reset for new tool
+							}
 							if (!currentTool) {
 								currentTool = { id: event.data.toolUseId, name: event.data.name, input: event.data.input };
 								toolComplete = false; // New tool starts as incomplete
@@ -1156,7 +1163,11 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (event.data.inputTokens !== undefined) output.usage.input = event.data.inputTokens;
 						if (event.data.outputTokens !== undefined) output.usage.output = event.data.outputTokens;
 						output.usage.totalTokens = output.usage.input + output.usage.output;
-					} else if (event.type === "refusal") {
+					} else if (event.type === "completion") {
+					// Stream completed successfully - mark completion so that if reader.read() errors,
+					// the catch block can commit pending content and include it in the error terminal
+					completionSeen = true;
+				} else if (event.type === "refusal") {
 						const refusalData = event.data as {
 							stopReason?: string;
 							stopDetails?: { refusal?: { category?: string; explanation?: string } };
@@ -1216,9 +1227,9 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						// Use committed blocks or pending text (if not yet committed)
 						const accumulatedText = textContentConfirmed
 							? blocks
-								.filter((b): b is TextContent => b.type === "text")
-								.map(b => b.text)
-								.join("")
+									.filter((b): b is TextContent => b.type === "text")
+									.map(b => b.text)
+									.join("")
 							: pendingTextContent;
 						const errorMsg = sanitizeKiroError(`${event.data.error}: ${event.data.message ?? ""}`, apiKey);
 						const fullErrorMsg = accumulatedText ? `${errorMsg}\n\nPartial output: ${accumulatedText}` : errorMsg;
@@ -1267,28 +1278,62 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
-			// On ordinary errors (including reader.read() throws), emit only COMPLETED tool events
-			// before the error terminal (same semantics as the ordinary-error flush in the event loop).
-			// Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
-			// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
+			if (completionSeen) {
+				// Stream was COMPLETED before the error - commit pending content and publish confirmed blocks
+				consumContent("");
+				commitPendingText();
+				if (currentTool && toolComplete) addToolToBlocks();
+				emitThinking();
+				emitDeferredTextEvents();
+				closeTextBlock();
+				// Emit pending tool call events before error (same as normal flow)
+				for (const { input, toolCall, index } of pendingToolCalls) {
+					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+					stream.push({
+						type: "toolcall_delta",
+						contentIndex: index,
+						delta: input,
+						partial: output,
+					});
+					stream.push({
+						type: "toolcall_end",
+						contentIndex: index,
+						toolCall,
+						partial: output,
+					});
+				}
+				pendingToolCalls.length = 0;
 
-			// Emit all pending tool call events (inline of emitPendingToolCalls logic)
-			for (const { input, toolCall, index } of pendingToolCalls) {
-				stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
-				stream.push({
-					type: "toolcall_delta",
-					contentIndex: index,
-					delta: input,
-					partial: output,
-				});
-				stream.push({
-					type: "toolcall_end",
-					contentIndex: index,
-					toolCall,
-					partial: output,
-				});
+				// Set output.content to confirmed blocks only (text/thinking/toolCall)
+				output.content = blocks.filter(
+					(b): b is TextContent | ThinkingContent | ToolCall =>
+						b.type === "text" || b.type === "thinking" || b.type === "toolCall",
+				);
+			} else {
+				// Stream did NOT complete - emit only COMPLETED tool events before error (current behavior)
+				// On ordinary errors (including reader.read() throws), emit only COMPLETED tool events
+				// before the error terminal (same semantics as the ordinary-error flush in the event loop).
+				// Incomplete currentTool is NOT finalized/emitted (only completed tools in pendingToolCalls flush).
+				// Refusals drop them via clearPendingToolCalls, but ordinary errors preserve content consistency.
+
+				// Emit all pending tool call events (inline of emitPendingToolCalls logic)
+				for (const { input, toolCall, index } of pendingToolCalls) {
+					stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+					stream.push({
+						type: "toolcall_delta",
+						contentIndex: index,
+						delta: input,
+						partial: output,
+					});
+					stream.push({
+						type: "toolcall_end",
+						contentIndex: index,
+						toolCall,
+						partial: output,
+					});
+				}
+				pendingToolCalls.length = 0;
 			}
-			pendingToolCalls.length = 0;
 
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = sanitizeKiroError(error, apiKey);
