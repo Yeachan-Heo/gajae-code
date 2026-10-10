@@ -378,6 +378,36 @@ describe("source-aware drag copy of quotes", () => {
 		const row = rowIndex(md, 30, "echo hello");
 		expect(await dragCopy(md, 30, [0, row], [8, row])).toBe("> echo");
 	});
+
+	test("does not copy a selection of only the quote margin", async () => {
+		expect(await dragCopy("> hello world", 30, [0, 0], [1, 0])).toBeUndefined();
+	});
+
+	test("keeps a blank quoted line inside a quote selection", async () => {
+		expect(await dragCopy("> a\n>\n> b", 30, [0, 0], [29, 2])).toBe("> a\n>\n> b");
+	});
+
+	test("preserves original tabs on covered code rows inside a quote", async () => {
+		const md = "> intro\n>\n> ```\n> a\tb\n> c\n> ```";
+		const row = rowIndex(md, 40, "a   ");
+		expect(await dragCopy(md, 40, [0, row], [39, row])).toBe("> a\tb");
+		expect(await dragCopy(md, 40, [0, row], [39, row + 1])).toBe("> a\tb\n> c");
+	});
+
+	test("preserves a tab at the wrap of a code row inside nested quotes", async () => {
+		const md = "> > ```\n> > abcdefghij\tklmnopqrstuvwxyz0123456789\n> > ```";
+		const rows = renderRows(md, 24);
+		const first = rowIndex(md, 24, "abcdefghij");
+		expect(await dragCopy(md, 24, [0, first], [23, rows.length - 2])).toBe(
+			"> > abcdefghij\tklmnopqrstuvwxyz0123456789",
+		);
+	});
+
+	test("maps each code block of a quote onto its own original lines", async () => {
+		const md = "> ```\n> q\tw\n> ```\n>\n> ```\n> a\tb\n> ```";
+		const row = rowIndex(md, 40, "a   ");
+		expect(await dragCopy(md, 40, [0, row], [39, row])).toBe("> a\tb");
+	});
 });
 
 describe("source-aware drag copy of code blocks", () => {
@@ -456,6 +486,14 @@ describe("source-aware drag copy of code blocks", () => {
 		expect(await dragCopy(md, 40, [0, row], [39, row])).toBe("const x = 1;");
 	});
 
+	test("copies rendered list code when no original tab survives", async () => {
+		// marked expands list-item tabs to four spaces before lexing the item's code,
+		// so the original lex holds no tab to restore; the copy is the rendered row.
+		const md = "- item\n\n  ```\n  a\tb\n  ```";
+		const row = rowIndex(md, 40, "a ");
+		expect(await dragCopy(md, 40, [0, row], [39, row])).toBe(plain(renderRows(md, 40)[row]!).trim());
+	});
+
 	test("copies only selected code content", async () => {
 		const md = "```sh\necho hello\necho world\n```";
 		const row = rowIndex(md, 30, "echo hello");
@@ -501,6 +539,38 @@ describe("source-aware drag copy of tables", () => {
 		const row = rowIndex(md, 40, "alpha");
 		const col = plain(renderRows(md, 40)[row]!).indexOf("alpha");
 		expect(await dragCopy(md, 40, [col, row], [col + 4, row])).toBe("alpha");
+	});
+
+	describe("with a soft-wrapped cell", () => {
+		const wrapped = "| col | v |\n|---|---|\n| alpha beta gamma delta epsilon | x |";
+		const at = (text: string): Point => {
+			const row = rowIndex(wrapped, 24, text);
+			return [plain(renderRows(wrapped, 24)[row]!).indexOf(text), row];
+		};
+
+		test("joins a partial selection across the wrap without presentation newlines", async () => {
+			const [col, row] = at("alpha");
+			const [, next] = at("gamma");
+			expect(await dragCopy(wrapped, 24, [col, row], [col + 10, next])).toBe("alpha beta gamma delta\tx");
+		});
+
+		test("joins every wrapped row of the cell", async () => {
+			const [col, row] = at("alpha");
+			const [, last] = at("epsilon");
+			expect(await dragCopy(wrapped, 24, [col, row], [23, last])).toBe("alpha beta gamma delta epsilon\tx");
+		});
+
+		test("drops cell padding from a single wrapped row", async () => {
+			const [col, row] = at("alpha");
+			expect(await dragCopy(wrapped, 24, [col, row], [23, row])).toBe("alpha beta\tx");
+		});
+
+		test("joins a wrapped header cell", async () => {
+			const md = "| alpha beta gamma delta | v |\n|---|---|\n| 1 | 2 |";
+			const first = rowIndex(md, 20, "alpha beta");
+			const last = rowIndex(md, 20, "delta");
+			expect(await dragCopy(md, 20, [0, first], [19, last])).toBe("alpha beta gamma delta\tv");
+		});
 	});
 
 	test("preserves a literal border character inside a selected cell", async () => {

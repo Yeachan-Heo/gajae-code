@@ -3779,6 +3779,10 @@ export class TUI extends Container {
 			annotation?: CopyRowAnnotation;
 			covered?: boolean;
 			atContentStart?: boolean;
+			/** Selected text per table cell; empty where the selection misses the cell. */
+			cells?: string[];
+			/** Folded into the row above as the soft-wrapped tail of its cells. */
+			merged?: boolean;
 		};
 		const selected: SelectedRow[] = [];
 		const selectionLines = this.#selectionSourceLines();
@@ -3809,25 +3813,22 @@ export class TUI extends Container {
 			const start = annotation ? Math.max(localColumns.start, presentationStart) : localColumns.start;
 			const end = annotation ? Math.min(localColumns.end, annotation.contentEnd) : localColumns.end;
 			let fragment = end > start ? sliceByColumn(plain, (copy?.originColumn ?? 0) + start, end - start, false) : "";
-			if (annotation?.ranges) {
-				fragment = annotation.ranges
-					.map(([rangeStart, rangeEnd]) => {
-						const overlapStart = Math.max(start, rangeStart);
-						const overlapEnd = Math.min(end, rangeEnd);
-						return overlapEnd > overlapStart
-							? sliceByColumn(plain, (copy?.originColumn ?? 0) + overlapStart, overlapEnd - overlapStart, false)
-							: "";
-					})
-					.filter(value => value.length > 0)
-					.join("\t");
-			}
+			// Cell padding is presentation; Markdown cell text never keeps outer spaces.
+			const cells = annotation?.ranges?.map(([rangeStart, rangeEnd]) => {
+				const overlapStart = Math.max(start, rangeStart);
+				const overlapEnd = Math.min(end, rangeEnd);
+				return overlapEnd > overlapStart
+					? sliceByColumn(plain, (copy?.originColumn ?? 0) + overlapStart, overlapEnd - overlapStart, false).trim()
+					: "";
+			});
+			if (cells) fragment = cells.filter(cell => cell.length > 0).join("\t");
 			if (annotation?.fence) fragment = "";
 			const covered = annotation
 				? localColumns.start <= annotation.contentStart && localColumns.end >= annotation.contentEnd
 				: false;
-			// A fully covered rendered code row may restore its row-local original
-			// slice (not the whole logical line), which preserves an original tab.
-			if (covered && annotation?.kind === "code" && !annotation.fence) fragment = annotation.source;
+			// A fully covered rendered code row, nested or not, restores its row-local
+			// original slice (not the whole logical line), which preserves an original tab.
+			if (covered && annotation?.originalCode) fragment = annotation.source;
 			selected.push({
 				line: lineIndex,
 				fragment,
@@ -3835,8 +3836,11 @@ export class TUI extends Container {
 				annotation,
 				covered,
 				atContentStart: annotation ? localColumns.start <= presentationStart : true,
+				...(cells ? { cells } : {}),
 			});
 		}
+		// Nothing but decoration (quote margins, table borders, fences) was selected.
+		if (selected.every(row => row.fragment.length === 0)) return "";
 
 		const groups = new Map<string, { rows: SelectedRow[]; complete: boolean }>();
 		for (const row of selected) {
@@ -3894,11 +3898,39 @@ export class TUI extends Container {
 			}
 			return result;
 		}
+		// A table row that soft-wraps its cells is one source row: fold each wrapped
+		// row's cells into the row it continues, rejoined with the removed source gap.
+		let head: SelectedRow | undefined;
+		let headEnd = -1;
+		for (const row of selected) {
+			const gaps = row.annotation?.cellGaps;
+			const headCells = head?.cells;
+			if (
+				head &&
+				headCells &&
+				row.cells &&
+				gaps &&
+				head.sourceId === row.sourceId &&
+				head.annotation?.token === row.annotation?.token &&
+				headEnd + 1 === row.line
+			) {
+				for (const [cell, text] of row.cells.entries()) {
+					if (!text) continue;
+					headCells[cell] = headCells[cell] ? `${headCells[cell]}${gaps[cell] ?? ""}${text}` : text;
+				}
+				head.fragment = headCells.filter(cell => cell.length > 0).join("\t");
+				row.merged = true;
+				headEnd = row.line;
+				continue;
+			}
+			head = row.cells ? row : undefined;
+			headEnd = row.line;
+		}
 		let result = "";
 		let previous: SelectedRow | undefined;
 		for (const row of selected) {
 			const annotation = row.annotation;
-			if (annotation?.fence || annotation?.ranges?.length === 0) continue;
+			if (row.merged || annotation?.fence || annotation?.ranges?.length === 0) continue;
 			if (previous) {
 				if (
 					annotation?.continuation &&

@@ -42,6 +42,23 @@ const copyTableRanges = (text: string): Array<[number, number]> | undefined => {
 };
 const stripCopyTableRanges = (text: string): string => text.replace(COPY_TABLE_RANGES_REGEX, "");
 
+// A table row that continues the wrapped cells of the row above carries, per
+// cell, the source text the soft wrap removed before that cell's fragment.
+const COPY_TABLE_WRAP_PREFIX = `\x1b_AGJC_COPY_TABLE_WRAP:${copyHintNonce}:`;
+const COPY_TABLE_WRAP_REGEX = new RegExp(COPY_TABLE_WRAP_PREFIX + String.raw`([^\x1b]*)\x1b\\`, "gu");
+const copyTableWrap = (text: string): string[] | undefined => {
+	const match = COPY_TABLE_WRAP_REGEX.exec(text);
+	COPY_TABLE_WRAP_REGEX.lastIndex = 0;
+	if (!match) return undefined;
+	try {
+		const gaps: unknown = JSON.parse(decodeURIComponent(match[1]!));
+		return Array.isArray(gaps) && gaps.every(gap => typeof gap === "string") ? gaps : undefined;
+	} catch {
+		return undefined;
+	}
+};
+const stripCopyTableWrap = (text: string): string => text.replace(COPY_TABLE_WRAP_REGEX, "");
+
 const COPY_QUOTE_DEPTH_PREFIX = `\x1b_AGJC_COPY_QUOTE_DEPTH:${copyHintNonce}:`;
 const COPY_QUOTE_DEPTH_REGEX = new RegExp(COPY_QUOTE_DEPTH_PREFIX + String.raw`(\d+)\x1b\\`, "gu");
 const copyQuoteDepth = (text: string): number => {
@@ -65,12 +82,37 @@ const COPY_QUOTE_CONTINUATION_REGEX = new RegExp(COPY_QUOTE_CONTINUATION_PREFIX 
 const stripCopyQuoteContinuation = (text: string): string => text.replace(COPY_QUOTE_CONTINUATION_REGEX, "");
 const stripCopyHints = (text: string): string =>
 	text.includes("\x1b_AGJC_COPY_")
-		? stripCopyTableRanges(
-				stripCopyCodeRow(stripCopyQuoteDepth(stripCopyQuoteContinuation(text))).replaceAll(COPY_ROW_START, ""),
+		? stripCopyTableWrap(
+				stripCopyTableRanges(
+					stripCopyCodeRow(stripCopyQuoteDepth(stripCopyQuoteContinuation(text))).replaceAll(COPY_ROW_START, ""),
+				),
 			)
 		: text;
-const originalCodeText = (token: Token | undefined): string | undefined =>
-	token?.type === "code" ? token.text : undefined;
+/**
+ * Pair each rendered code token, at any nesting depth, with the original-spelling
+ * text of the code token at the same tree position. A pair is kept only when the
+ * texts agree once tabs are dropped: marked re-expands list-item tabs to its own
+ * stops, so exact tab-replaced equality would refuse every list code block, and a
+ * tab-induced structure change still cannot restore another block's text.
+ */
+const pairOriginalCode = (rendered: unknown, original: unknown, pairs: Map<Token, string>): void => {
+	if (Array.isArray(rendered)) {
+		if (!Array.isArray(original)) return;
+		for (const [index, child] of rendered.entries()) pairOriginalCode(child, original[index], pairs);
+		return;
+	}
+	if (typeof rendered !== "object" || rendered === null || typeof original !== "object" || original === null) return;
+	const token = rendered as Token;
+	const source = original as Token;
+	if (token.type !== source.type) return;
+	if (token.type === "code" && source.type === "code") {
+		const bare = (text: string): string => text.replace(/[\t ]+/gu, " ");
+		if (bare(source.text) === bare(token.text)) pairs.set(token, source.text);
+		return;
+	}
+	if ("tokens" in token) pairOriginalCode(token.tokens, "tokens" in source ? source.tokens : undefined, pairs);
+	if ("items" in token) pairOriginalCode(token.items, "items" in source ? source.items : undefined, pairs);
+};
 const copyQuoteGap = (text: string): string => {
 	const match = COPY_QUOTE_CONTINUATION_REGEX.exec(text);
 	COPY_QUOTE_CONTINUATION_REGEX.lastIndex = 0;
@@ -439,6 +481,8 @@ export class Markdown implements Component {
 	#cachedCopyEnabled = false;
 	/** Original-spelling lex, reused while the text is unchanged (streaming re-renders). */
 	#originalParse?: { source: string; tokens: Token[] };
+	/** Code tokens emitted as code rows while rendering one top-level token, in row order. */
+	#emittedCode: Token[] = [];
 
 	// Cache for rendered output
 	#cachedText?: string;
@@ -558,7 +602,9 @@ export class Markdown implements Component {
 		return result;
 	}
 
-	#emitCodeBlock(lines: string[], code: string, lang: string, codeIndent: string): void {
+	/** `token` is the rendered code token; copy rows map it back to its original text. */
+	#emitCodeBlock(lines: string[], token: Token, code: string, lang: string, codeIndent: string): void {
+		this.#emittedCode.push(token);
 		lines.push(`${this.#theme.codeBlockBorder(`\`\`\`${lang}`)}${COPY_CODE_ROW_PREFIX}open\x1b\\`);
 		const highlighted = this.#highlightCodeBlock(code, lang);
 		if (highlighted) {
@@ -710,6 +756,9 @@ export class Markdown implements Component {
 				? original
 				: undefined;
 		};
+		// Original code text for code blocks at any depth (inside quotes and lists too).
+		const originalCode = new Map<Token, string>();
+		if (copyEnabled) pairOriginalCode(tokens, originalTokens, originalCode);
 
 		// Convert tokens to styled terminal output. When anchoring, record each
 		// top-level token's rendered-line range plus a width-invariant source-text
@@ -735,7 +784,10 @@ export class Markdown implements Component {
 			const nextToken = tokens[i + 1];
 			const tokenStart = renderedLines.length;
 			const units: number[] | undefined = includeAnchors ? [] : undefined;
+			this.#emittedCode = [];
 			const tokenLines = this.#renderToken(token, contentWidth, nextToken?.type, undefined, units);
+			const codeTexts = this.#emittedCode.map(code => originalCode.get(code));
+			this.#emittedCode = [];
 			renderedLines.push(...tokenLines);
 			const raw = "raw" in token && typeof token.raw === "string" ? token.raw : "";
 			const srcLo = srcOffset;
@@ -753,7 +805,9 @@ export class Markdown implements Component {
 				token: i,
 				kind: token.type,
 				tokenSource: (copyEnabled ? originalAt(i)?.raw : undefined) ?? raw,
-				codeSource: copyEnabled && token.type === "code" ? originalCodeText(originalAt(i)) : undefined,
+				// Code rows of every emitted block map, in order, onto their original lines.
+				codeSource:
+					codeTexts.length > 0 && codeTexts.every(text => text !== undefined) ? codeTexts.join("\n") : undefined,
 			});
 		}
 
@@ -773,8 +827,11 @@ export class Markdown implements Component {
 			tokenRow: number;
 			/** The token's rendered row count, set with `tokenSource` on its last row. */
 			tokenRows?: number;
+			/** `source` is the row's original-spelling code slice. */
+			originalCode?: true;
 			codeRow: "open" | "content" | "close" | null;
 			ranges?: Array<[number, number]>;
+			cellGaps?: string[];
 			quoteDepth: number;
 			/** Visible column where a code/table row's own content begins on the logical row. */
 			rowStart: number;
@@ -793,6 +850,7 @@ export class Markdown implements Component {
 				end + rowStart,
 			]);
 			const quoteDepth = copyQuoteDepth(line);
+			const cellGaps = copyTableWrap(line);
 			for (let wrapIndex = 0; wrapIndex < wrapped.length; wrapIndex++) {
 				wrappedCopyRows.push({
 					token: boundary.token,
@@ -806,6 +864,7 @@ export class Markdown implements Component {
 					tokenRow: 0,
 					codeRow,
 					ranges,
+					cellGaps,
 					quoteDepth,
 					rowStart,
 				});
@@ -907,7 +966,7 @@ export class Markdown implements Component {
 				if (!row) continue;
 				row.tokenRow = position;
 				if (!row.continuation) {
-					if (row.codeRow === "content" && boundary.kind === "code") {
+					if (row.codeRow === "content") {
 						codeLine += 1;
 						original = originalCodeLines[codeLine] ?? "";
 						display = replaceTabs(original);
@@ -927,9 +986,10 @@ export class Markdown implements Component {
 				// its complete logical line into every APC payload, and a growing token
 				// must not change rows that are already painted.
 				row.source = row.fragment;
-				if (row.codeRow === "content" && boundary.kind === "code") {
+				if (row.codeRow === "content" && boundary.codeSource !== undefined) {
+					// A wrapped nested code row repeats its quote borders before the code text.
 					const visible = row.continuation
-						? row.fragment
+						? row.fragment.slice(row.quoteDepth * visibleWidth(`${this.#theme.symbols.quoteBorder} `))
 						: row.fragment.slice(row.rowStart + this.#codeBlockIndent);
 					const start = display.indexOf(visible, codeDisplayCursor);
 					if (start >= 0) {
@@ -946,6 +1006,7 @@ export class Markdown implements Component {
 						}
 						if (row.continuation) row.joinGap = original.slice(codeOriginalCursor, originalStart);
 						row.source = original.slice(originalStart, originalEnd);
+						row.originalCode = true;
 						codeOriginalCursor = originalEnd;
 						codeDisplayCursor = displayOffset;
 					}
@@ -987,6 +1048,7 @@ export class Markdown implements Component {
 						...(copy.tokenSource === undefined ? {} : { tokenSource: copy.tokenSource }),
 						tokenRow: copy.tokenRow,
 						...(copy.tokenRows === undefined ? {} : { tokenRows: copy.tokenRows }),
+						...(copy.originalCode ? { originalCode: true } : {}),
 						joinGap: copy.joinGap,
 						contentStart: 0,
 						contentEnd: visibleWidth(content),
@@ -998,6 +1060,7 @@ export class Markdown implements Component {
 						fence: copy.codeRow === "open" || copy.codeRow === "close",
 						quoteDepth: copy.quoteDepth,
 						...(copy.ranges === undefined ? {} : { ranges: copy.ranges }),
+						...(copy.cellGaps === undefined ? {} : { cellGaps: copy.cellGaps }),
 					})
 				: content;
 			const lineWithMargins = leftMargin + annotated + rightMargin;
@@ -1216,7 +1279,7 @@ export class Markdown implements Component {
 				}
 
 				const codeIndent = padding(this.#codeBlockIndent);
-				this.#emitCodeBlock(lines, token.text, token.lang || "", codeIndent);
+				this.#emitCodeBlock(lines, token, token.text, token.lang || "", codeIndent);
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after code blocks (unless space token follows)
 				}
@@ -1283,7 +1346,14 @@ export class Markdown implements Component {
 
 				for (let q = 0; q < renderedQuoteLines.length; q++) {
 					const styledLine = applyQuoteStyle(renderedQuoteLines[q]);
-					const wrappedLines = wrapTextIfNeeded(styledLine, quoteContentWidth);
+					// Every wrapped part of a code row is a code row; wrapping would leave
+					// the trailing hint on the last part only.
+					const codeRow = copyCodeRow(styledLine);
+					const codeRowHint = codeRow ? `${COPY_CODE_ROW_PREFIX}${codeRow}\x1b\\` : "";
+					const wrappedLines = wrapTextIfNeeded(
+						codeRow ? stripCopyCodeRow(styledLine) : styledLine,
+						quoteContentWidth,
+					);
 					const quoteLogical = Bun.stripANSI(styledLine);
 					let quoteCursor = 0;
 					for (let quoteWrapIndex = 0; quoteWrapIndex < wrappedLines.length; quoteWrapIndex++) {
@@ -1295,6 +1365,7 @@ export class Markdown implements Component {
 						lines.push(
 							this.#theme.quoteBorder(`${this.#theme.symbols.quoteBorder} `) +
 								stripCopyQuoteDepth(wrappedLine) +
+								codeRowHint +
 								(quoteWrapIndex > 0
 									? `${COPY_QUOTE_CONTINUATION_PREFIX}${encodeURIComponent(gap.toWellFormed())}\x1b\\`
 									: "") +
@@ -1523,7 +1594,7 @@ export class Markdown implements Component {
 			} else if (token.type === "code") {
 				// Code block in list item
 				const codeIndent = padding(this.#codeBlockIndent);
-				this.#emitCodeBlock(lines, token.text, token.lang || "", codeIndent);
+				this.#emitCodeBlock(lines, token, token.text, token.lang || "", codeIndent);
 			} else {
 				// Other token types - try to render as inline
 				const text = this.#renderInlineTokens([token], styleContext);
@@ -1559,6 +1630,28 @@ export class Markdown implements Component {
 	 */
 	#wrapCellText(text: string, maxWidth: number): string[] {
 		return wrapTextIfNeeded(text, Math.max(1, maxWidth));
+	}
+
+	/**
+	 * Copy hint for physical row `lineIdx` of a wrapped table row: per cell, the
+	 * cell text the soft wrap removed before this row's fragment. The first row
+	 * of a table row (and every row of a stock render) gets none.
+	 */
+	#tableWrapHint(cellTexts: string[], cellLines: string[][], lineIdx: number): string {
+		if (lineIdx === 0 || !copyAnnotationsEnabled()) return "";
+		const gaps = cellTexts.map((text, cell) => {
+			const logical = Bun.stripANSI(text);
+			let cursor = 0;
+			let gap = "";
+			for (const [index, line] of (cellLines[cell] ?? []).slice(0, lineIdx + 1).entries()) {
+				const fragment = Bun.stripANSI(line);
+				const at = logical.indexOf(fragment, cursor);
+				if (index === lineIdx) gap = at < 0 ? "" : logical.slice(cursor, at);
+				if (at >= 0) cursor = at + fragment.length;
+			}
+			return gap.toWellFormed();
+		});
+		return `${COPY_TABLE_WRAP_PREFIX}${encodeURIComponent(JSON.stringify(gaps))}\x1b\\`;
 	}
 
 	/**
@@ -1694,10 +1787,8 @@ export class Markdown implements Component {
 		);
 
 		// Render header with wrapping
-		const headerCellLines: string[][] = token.header.map((cell, i) => {
-			const text = this.#renderInlineTokens(cell.tokens || [], styleContext);
-			return this.#wrapCellText(text, columnWidths[i]);
-		});
+		const headerCellTexts = token.header.map(cell => this.#renderInlineTokens(cell.tokens || [], styleContext));
+		const headerCellLines: string[][] = headerCellTexts.map((text, i) => this.#wrapCellText(text, columnWidths[i]));
 		const headerLineCount = Math.max(...headerCellLines.map(c => c.length));
 
 		for (let lineIdx = 0; lineIdx < headerLineCount; lineIdx++) {
@@ -1716,7 +1807,7 @@ export class Markdown implements Component {
 				return range;
 			});
 			lines.push(
-				`${COPY_ROW_START}${tableLine}${COPY_TABLE_RANGES_PREFIX}${tableRanges.map(range => range.join("-")).join(",")}\x1b\\`,
+				`${COPY_ROW_START}${tableLine}${COPY_TABLE_RANGES_PREFIX}${tableRanges.map(range => range.join("-")).join(",")}\x1b\\${this.#tableWrapHint(headerCellTexts, headerCellLines, lineIdx)}`,
 			);
 		}
 
@@ -1731,10 +1822,8 @@ export class Markdown implements Component {
 		// Render rows with wrapping
 		for (let rowIndex = 0; rowIndex < token.rows.length; rowIndex++) {
 			const row = token.rows[rowIndex];
-			const rowCellLines: string[][] = row.map((cell, i) => {
-				const text = this.#renderInlineTokens(cell.tokens || [], styleContext);
-				return this.#wrapCellText(text, columnWidths[i]);
-			});
+			const rowCellTexts = row.map(cell => this.#renderInlineTokens(cell.tokens || [], styleContext));
+			const rowCellLines: string[][] = rowCellTexts.map((text, i) => this.#wrapCellText(text, columnWidths[i]));
 			const rowLineCount = Math.max(...rowCellLines.map(c => c.length));
 
 			for (let lineIdx = 0; lineIdx < rowLineCount; lineIdx++) {
@@ -1752,7 +1841,7 @@ export class Markdown implements Component {
 					return range;
 				});
 				lines.push(
-					`${COPY_ROW_START}${tableLine}${COPY_TABLE_RANGES_PREFIX}${tableRanges.map(range => range.join("-")).join(",")}\x1b\\`,
+					`${COPY_ROW_START}${tableLine}${COPY_TABLE_RANGES_PREFIX}${tableRanges.map(range => range.join("-")).join(",")}\x1b\\${this.#tableWrapHint(rowCellTexts, rowCellLines, lineIdx)}`,
 				);
 			}
 

@@ -212,6 +212,8 @@ export interface CopyRowAnnotation {
 	tokenRow: number;
 	/** The token's rendered row count; present with `tokenSource` on the last row only. */
 	tokenRows?: number;
+	/** `source` is this code row's original-spelling slice (tabs intact), at any nesting depth. */
+	originalCode?: true;
 	joinGap: string;
 	contentStart: number;
 	contentEnd: number;
@@ -220,6 +222,11 @@ export interface CopyRowAnnotation {
 	fence: boolean;
 	quoteDepth: number;
 	ranges?: Array<[number, number]>;
+	/**
+	 * On a table row that continues the wrapped cells of the row above: per cell,
+	 * the source text the soft wrap removed before this row's fragment.
+	 */
+	cellGaps?: string[];
 }
 
 // APC marker for viewport anchors. Must NOT start with "\x1b_G": that is the
@@ -318,6 +325,7 @@ export function extractCopyRowAnnotation(
 					!isCopyColumn(annotation.tokenRow) ||
 					(annotation.tokenRows !== undefined &&
 						(!isCopyColumn(annotation.tokenRows) || annotation.tokenRow >= annotation.tokenRows)) ||
+					(annotation.originalCode !== undefined && annotation.originalCode !== true) ||
 					typeof annotation.joinGap !== "string" ||
 					!isCopyColumn(annotation.contentStart) ||
 					!isCopyColumn(annotation.contentEnd) ||
@@ -335,7 +343,9 @@ export function extractCopyRowAnnotation(
 									!isCopyColumn(range[0]) ||
 									!isCopyColumn(range[1]) ||
 									range[1] < range[0],
-							)))
+							))) ||
+					(annotation.cellGaps !== undefined &&
+						(!Array.isArray(annotation.cellGaps) || annotation.cellGaps.some(gap => typeof gap !== "string")))
 				)
 					return "";
 				found.value = { sourceId, annotation: annotation as CopyRowAnnotation };
