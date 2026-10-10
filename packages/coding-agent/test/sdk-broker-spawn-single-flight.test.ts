@@ -6,6 +6,8 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
 import Sdk from "../src/commands/sdk";
+import { FileLockAcquireError } from "../src/config/file-lock";
+import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerExitRecord, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
 import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
@@ -640,6 +642,7 @@ it("records a startup exit when acquisition is blocked by a retained removal tra
 	await Bun.write(infoPath, "");
 	const old = new Date(Date.now() - 120_000);
 	await fs.utimes(infoPath, old, old);
+	const sleep = spyOn(Bun, "sleep").mockImplementation(async () => undefined);
 	const stderr: string[] = [];
 	const stderrWrite = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
 		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
@@ -661,9 +664,125 @@ it("records a startup exit when acquisition is blocked by a retained removal tra
 		expect(await readBrokerExitRecord(dir)).toBeUndefined();
 	} finally {
 		stderrWrite.mockRestore();
+		sleep.mockRestore();
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 });
+
+it("records a typed startup-lock refusal when the session-index lock times out", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(
+		new FileLockAcquireError(indexFilePath, blockingLockPath, 600, `held by pid ${process.pid}`),
+	);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({
+			code: "acquire_timeout",
+			lockPath: blockingLockPath,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("records retained session-index transitions as retryable lock unavailability", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const lockPath = path.join(indexDir, "index.jsonl.lock");
+	const transitionPath = path.join(indexDir, "index.jsonl.lock.removing");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(
+		new FileLockAcquireError(
+			indexFilePath,
+			lockPath,
+			600,
+			`held by pid ${process.pid}`,
+			"orphan_transition",
+			transitionPath,
+		),
+	);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({
+			code: "orphan_transition",
+			orphanPath: transitionPath,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath: transitionPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("retries ordinary broker startup after its session-index lock becomes available", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	await Bun.write(
+		path.join(blockingLockPath, "info"),
+		JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner_token: "live-index-owner" }),
+	);
+	const lockUnavailable = Promise.withResolvers<void>();
+	void lockUnavailable.promise.catch(() => undefined);
+	let pollInFlight = false;
+	let lockUnavailableCount = 0;
+	let discoveryWhileBlocked: BrokerDiscovery | null | undefined;
+	const poll = setInterval(() => {
+		if (pollInFlight) return;
+		pollInFlight = true;
+		void readBrokerStartupExitRecord(dir)
+			.then(async record => {
+				if (record?.reason !== "startup-lock-unavailable") return;
+				lockUnavailableCount++;
+				discoveryWhileBlocked = await brokerDiscovery.readBrokerDiscovery(dir);
+				clearInterval(poll);
+				await fs.rm(blockingLockPath, { recursive: true, force: true });
+				lockUnavailable.resolve();
+			})
+			.catch(lockUnavailable.reject)
+			.finally(() => {
+				pollInFlight = false;
+			});
+	}, 25);
+	try {
+		const discovery = await ensureBroker({ agentDir: dir });
+		await lockUnavailable.promise;
+		expect(lockUnavailableCount).toBe(1);
+		expect(discoveryWhileBlocked).toBeNull();
+		expect(discovery.pid).toBeGreaterThan(0);
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toMatchObject({ pid: discovery.pid });
+	} finally {
+		clearInterval(poll);
+		await fs.rm(blockingLockPath, { recursive: true, force: true });
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 45_000);
 
 it("keeps the deadline reason when SIGTERM arrives during its async record fallback", async () => {
 	if (process.platform === "win32") return;

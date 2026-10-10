@@ -48,7 +48,8 @@ export type DoctorBrokerRestartOutcome =
 				| "intent_not_committed"
 				| "spawn_failed"
 				| "spawn_exited_before_publication"
-				| "publication_timeout";
+				| "publication_timeout"
+				| "startup_lock_unavailable";
 			detail?: string;
 	  };
 

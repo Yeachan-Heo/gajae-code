@@ -112,7 +112,13 @@ import {
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { sdkInternalRuntimeImage } from "./runtime";
-import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	SessionIndex,
+	type SessionList,
+	sessionIndexStartupLockOptions,
+} from "./session-index";
 import {
 	type ResolvedScopeV1,
 	resolveScopeRequest,
@@ -3887,7 +3893,15 @@ export class Broker {
 		await this.#reapLockArtifacts();
 		try {
 			this.#throwIfStartupAborted();
-			await this.index.open();
+			await this.index.open(
+				this.#startupCheckpointDeadline === undefined
+					? undefined
+					: sessionIndexStartupLockOptions(
+							this.#startupCheckpointDeadline,
+							this.#startupAbortSignal,
+							this.settings.restartRequestId === undefined ? "ordinary" : "authorized-successor",
+						),
+			);
 			await this.ledger.open();
 			const brokerIdentityKey = await getBrokerIdentityKey(this.settings.agentDir);
 			this.#spawnAuthority = new SpawnAuthorityStore(this.settings.agentDir, brokerIdentityKey);

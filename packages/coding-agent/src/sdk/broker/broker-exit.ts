@@ -50,7 +50,7 @@ export interface BrokerExitRecord {
 export interface BrokerStartupExitRecord {
 	version: 1;
 	mode: "startup";
-	reason: "startup-deadline" | "startup-signal" | "startup-lock-blocked";
+	reason: "startup-deadline" | "startup-signal" | "startup-lock-blocked" | "startup-lock-unavailable";
 	fenceReason: null;
 	fencedForMs: 0;
 	uptimeMs: number;
@@ -59,7 +59,7 @@ export interface BrokerStartupExitRecord {
 	exitCode: 1 | 130 | 143;
 	timeoutMs: number | null;
 	writtenAt: number;
-	/** For lock-blocked reason: path to the retained removal transition. */
+	/** For lock refusal reasons: path to the transition or lock that blocked startup. */
 	blockingLockPath?: string;
 }
 
@@ -170,7 +170,8 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 		record.mode === "startup" &&
 		(record.reason === "startup-deadline" ||
 			record.reason === "startup-signal" ||
-			record.reason === "startup-lock-blocked") &&
+			record.reason === "startup-lock-blocked" ||
+			record.reason === "startup-lock-unavailable") &&
 		record.fenceReason === null &&
 		record.fencedForMs === 0 &&
 		Number.isSafeInteger(record.uptimeMs) &&
@@ -180,12 +181,14 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 		(record.signal === null || record.signal === "SIGINT" || record.signal === "SIGTERM") &&
 		(record.exitCode === 1 || record.exitCode === 130 || record.exitCode === 143) &&
 		(record.timeoutMs === null || (Number.isSafeInteger(record.timeoutMs) && (record.timeoutMs as number) > 0)) &&
-		(record.reason === "startup-lock-blocked"
+		(record.reason === "startup-lock-blocked" || record.reason === "startup-lock-unavailable"
 			? typeof record.blockingLockPath === "string" && record.blockingLockPath.length > 0
 			: record.blockingLockPath === undefined) &&
 		(record.reason === "startup-deadline" || record.reason === "startup-lock-blocked"
 			? record.exitCode === 1 && record.signal === null && record.timeoutMs !== null
-			: record.exitCode === signalExitCode && signalExitCode !== null && record.timeoutMs === null) &&
+			: record.reason === "startup-lock-unavailable"
+				? record.exitCode === 1 && record.signal === null && record.timeoutMs === null
+				: record.exitCode === signalExitCode && signalExitCode !== null && record.timeoutMs === null) &&
 		Number.isSafeInteger(record.writtenAt) &&
 		(record.writtenAt as number) > 0
 	);

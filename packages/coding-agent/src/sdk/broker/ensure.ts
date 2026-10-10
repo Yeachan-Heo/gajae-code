@@ -43,6 +43,8 @@ function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): s
 	if (!record) return undefined;
 	if (record.reason === "startup-lock-blocked")
 		return `SDK broker startup blocked by retained removal transition ${record.blockingLockPath}.`;
+	if (record.reason === "startup-lock-unavailable")
+		return `SDK broker startup could not acquire required lock ${record.blockingLockPath}.`;
 	if (record.reason === "startup-deadline")
 		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
 	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
@@ -675,7 +677,11 @@ function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtu
 	return createFixtureLeaseFromChild(child, () => owner.stop());
 }
 
-async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
+async function ensureBrokerOnce(
+	settings: EnsureBrokerSettings,
+	initiator: EnsureInitiator,
+	retriedStartupLockUnavailable = false,
+): Promise<EnsureOutcome> {
 	const initialDiscoveryDeadline =
 		ensureBrokerTiming.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
 	const priorOwner = owners.get(settings.agentDir);
@@ -982,6 +988,14 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				[failure, cleanupError],
 				"SDK broker discovery and spawned broker cleanup both failed.",
 			);
+		}
+		if (
+			!retriedStartupLockUnavailable &&
+			initiator === "discovery" &&
+			trustedStartupExitRecord?.reason === "startup-lock-unavailable"
+		) {
+			await ensureBrokerTiming.sleep(SPAWN_LOCK_RETRY_DELAY_MS);
+			return ensureBrokerOnce(settings, initiator, true);
 		}
 		throw failure;
 	} finally {

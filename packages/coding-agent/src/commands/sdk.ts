@@ -29,7 +29,7 @@ import {
 	type BrokerStartupExitWriteStatus,
 	writeBrokerStartupExitRecordBounded,
 } from "../sdk/broker/broker-exit";
-import { readBrokerDiscovery } from "../sdk/broker/discovery";
+import { readBrokerDiscovery, readBrokerRestartIntent } from "../sdk/broker/discovery";
 import { type EndpointFileRead, readEndpointFile } from "../sdk/broker/endpoint-authority";
 import {
 	BROKER_DISCOVERY_BUDGET,
@@ -1922,18 +1922,55 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
 		return true;
 	};
+	let startupFenceAcquired = false;
 	try {
 		const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
 			const remainingMs = Math.max(1, deadline - Date.now());
 			const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
-			const watchdogMs =
+			const ordinaryWatchdogMs =
 				Number.isSafeInteger(testWatchdogMs) && testWatchdogMs > 0 && testWatchdogMs <= remainingMs
 					? testWatchdogMs
 					: remainingMs;
-			const startupCheckpointDeadline = performance.now() + watchdogMs - 1_000;
+
+			// Validate the restart intent early to determine the actual watchdog deadline.
+			// This must happen before arming the watchdog so we use the correct deadline.
+			const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
+			const requestIdEnv =
+				typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
+					? restartRequestEnv
+					: undefined;
+
+			let restartRequestId: string | undefined;
+			let effectiveWatchdogMs = ordinaryWatchdogMs;
+
+			if (requestIdEnv !== undefined) {
+				try {
+					const intent = await readBrokerRestartIntent(agentDir);
+					if (
+						intent &&
+						intent.phase === "committed" &&
+						intent.requestId === requestIdEnv &&
+						intent.expiresAt > Date.now()
+					) {
+						restartRequestId = requestIdEnv;
+						// Convert the epoch-based expiresAt deadline to monotonic clock domain.
+						// Intent expiresAt is Date.now()-based; remaining time until expiry is
+						// (expiresAt - Date.now()); add that to performance.now() to get the
+						// monotonic deadline. Leave 1 second headroom for checkpoint writes.
+						const remainingSuccessorMs = Math.max(1, intent.expiresAt - Date.now() - 1_000);
+						if (remainingSuccessorMs > effectiveWatchdogMs) {
+							effectiveWatchdogMs = remainingSuccessorMs;
+						}
+					}
+				} catch {
+					// Ignore read failures; proceed without restart request ID.
+				}
+			}
+
+			const startupCheckpointDeadline = performance.now() + effectiveWatchdogMs - 1_000;
 			const startupWatchdog = setTimeout(() => {
 				startupAbortController.abort();
-				void exitDuringStartup("startup-deadline", 1, null, watchdogMs).then(async started => {
+				void exitDuringStartup("startup-deadline", 1, null, effectiveWatchdogMs).then(async started => {
 					if (!started) {
 						// A prior startup signal owns the exit cause; its postmortem callback
 						// returns after bounded cleanup and preserves the signal status.
@@ -1942,7 +1979,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 					await waitForStartupAbortCleanup();
 					process.exit(1);
 				});
-			}, watchdogMs);
+			}, effectiveWatchdogMs);
 			try {
 				// `gjc sdk broker run` never retires another owner, even one this generation cannot
 				// reuse: any live incumbent is a refusal. Autostart repairs unusable generations.
@@ -1985,11 +2022,9 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				// launcher-supplied environment variable; it is validated here and handed
 				// to Broker as a typed setting, never read a second time inside broker.ts
 				// from process.env directly.
-				const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
-				const restartRequestId =
-					typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
-						? restartRequestEnv
-						: undefined;
+				// Note: restartRequestId and watchdog deadline were already validated earlier
+				// before arming the watchdog.
+				const effectiveCheckpointDeadline = startupCheckpointDeadline;
 				const testPostPublicationDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS ?? 0);
 				const startupPostPublicationDelayMs =
 					Number.isSafeInteger(testPostPublicationDelayMs) &&
@@ -2030,7 +2065,7 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				const candidate = new Broker({
 					agentDir,
 					startupAbortSignal: startupAbortController.signal,
-					startupCheckpointDeadline,
+					startupCheckpointDeadline: effectiveCheckpointDeadline,
 					onStartupReady: () => clearTimeout(startupWatchdog),
 					masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
 						"sdk.masterOrphanGraceMs",
@@ -2066,7 +2101,10 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			}
 		};
 		broker = await withBrokerStartupLock(agentDir, startupOperation, {
-			onAcquired: () => void emitBrokerStartupTestSignal("fence-acquired"),
+			onAcquired: () => {
+				startupFenceAcquired = true;
+				void emitBrokerStartupTestSignal("fence-acquired");
+			},
 			onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
 		});
 	} catch (error) {
@@ -2074,9 +2112,14 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			await finishPendingStartupSignal();
 			return;
 		}
-		// A retained removal transition is an explicit acquire failure, not only
-		// an exhausted ordinary contention timeout.
-		if (error instanceof FileLockAcquireError && error.orphanPath) {
+		// Only a retained transition on the outer startup fence gets its own
+		// blocked reason. Nested resource-lock failures are retryable unavailability.
+		if (
+			error instanceof FileLockAcquireError &&
+			!startupFenceAcquired &&
+			error.code === "orphan_transition" &&
+			error.orphanPath
+		) {
 			await exitDuringStartup(
 				"startup-lock-blocked",
 				1,
@@ -2084,6 +2127,9 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
 				error.orphanPath,
 			);
+		} else if (error instanceof FileLockAcquireError) {
+			// Nested lock failures or non-orphan-transition errors
+			await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.orphanPath ?? error.lockPath);
 		}
 		if (broker) {
 			try {
