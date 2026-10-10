@@ -17,6 +17,16 @@ describe("hostHeaderMatchesBind", () => {
 		expect(hostHeaderMatchesBind(null, bind)).toBe(false);
 	});
 
+	test("treats an omitted Host port as 80 only for a listener on port 80", () => {
+		const bind = parseBind("127.0.0.1:80");
+		expect(hostHeaderMatchesBind("127.0.0.1", bind)).toBe(true);
+		expect(hostHeaderMatchesBind("127.0.0.1:80", bind)).toBe(true);
+		expect(hostHeaderMatchesBind("attacker.example", bind)).toBe(false);
+		expect(hostHeaderMatchesBind("127.0.0.1:8080", bind)).toBe(false);
+		expect(hostHeaderMatchesBind("127.0.0.1", parseBind("127.0.0.1:443"))).toBe(false);
+		expect(hostHeaderMatchesBind("[::1]", parseBind("[::1]:80"))).toBe(true);
+	});
+
 	test("accepts a bracketed IPv6 loopback bind", () => {
 		const bind = parseBind("[::1]:4000");
 		expect(hostHeaderMatchesBind("[::1]:4000", bind)).toBe(true);

@@ -87,18 +87,20 @@ function parseHostPort(raw: string): number | null {
 	return port;
 }
 
-/** Split an HTTP Host header into a hostname and an explicit port. */
-function parseHostHeader(value: string): { hostname: string; port: number } | null {
+/** Split an HTTP Host header into a hostname and an explicit port, if present. */
+function parseHostHeader(value: string): { hostname: string; port: number | null } | null {
 	if (value.startsWith("[")) {
 		const end = value.indexOf("]");
 		if (end <= 1) return null;
 		const rest = value.slice(end + 1);
+		if (rest.length === 0) return { hostname: value.slice(1, end), port: null };
 		if (!rest.startsWith(":")) return null;
 		const port = parseHostPort(rest.slice(1));
 		if (port === null) return null;
 		return { hostname: value.slice(1, end), port };
 	}
 	const colon = value.lastIndexOf(":");
+	if (colon === -1) return { hostname: value, port: null };
 	if (colon <= 0 || value.indexOf(":") !== colon) return null;
 	const port = parseHostPort(value.slice(colon + 1));
 	if (port === null) return null;
@@ -108,19 +110,22 @@ function parseHostHeader(value: string): { hostname: string; port: number } | nu
 }
 
 /**
- * Tokenless loopback brokers accept a request only when its Host header is the
- * bound hostname and port. A DNS-rebound same-origin GET sends the attacker's
- * name and no Origin header.
+ * Tokenless loopback servers accept a request only when its Host header is the
+ * bound hostname and effective port. An omitted port is the HTTP default, 80,
+ * and only matches a listener on port 80. A DNS-rebound same-origin GET sends
+ * the attacker's name and no Origin header.
  */
 export function hostHeaderMatchesBind(hostHeader: string | null, bind: ParsedBind): boolean {
 	if (hostHeader === null) return false;
 	const trimmed = hostHeader.trim();
 	if (trimmed.length === 0 || /[\s@]/.test(trimmed)) return false;
 	const parsed = parseHostHeader(trimmed);
-	if (!parsed) return false;
+	if (!parsed || parsed.hostname.length === 0) return false;
+	const port = parsed.port ?? (bind.port === 80 ? 80 : null);
+	if (port === null) return false;
 	const bindHost = bind.hostname
 		.trim()
 		.toLowerCase()
 		.replace(/^\[|\]$/g, "");
-	return parsed.hostname.toLowerCase() === bindHost && parsed.port === bind.port;
+	return parsed.hostname.toLowerCase() === bindHost && port === bind.port;
 }
