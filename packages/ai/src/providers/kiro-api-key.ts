@@ -1230,8 +1230,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			// Stream is done - commit pending text (safe since no refusal occurred), add pending tool, emit accumulated thinking, etc.
 			// First commit pending text to blocks since stream ended without refusal
 			commitPendingText();
-			// Emit tool if explicitly completed or if stream end (implicit completion)
-			if (currentTool) addToolToBlocks();
+			// Emit tool only if explicitly completed (has stop flag); incomplete tools are discarded at EOF
+			if (currentTool && toolComplete) addToolToBlocks();
 			emitThinking();
 			emitDeferredTextEvents();
 			// Now emit all tool call events in order (safe since no refusal occurred)

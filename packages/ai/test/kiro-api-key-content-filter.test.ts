@@ -276,6 +276,7 @@ describe("Kiro API-key content filter #6150", () => {
 				toolUseId: "tool-1",
 				name: "read_file",
 				input: '{"path":"/etc/passwd"}',
+				stop: true,
 			});
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
@@ -434,7 +435,7 @@ describe("Kiro API-key content filter #6150", () => {
 			// Simulate response with text, tool call, and normal completion metadata
 			const responseBody =
 				JSON.stringify({ content: "I'll read that file" }) +
-				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}' }) +
+				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}', stop: true }) +
 				JSON.stringify({ stopReason: "COMPLETED", usage: { inputTokens: 10, outputTokens: 5 } });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
@@ -782,7 +783,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			const responseBody =
 				JSON.stringify({
 					content: "<thinking>I need to read a file</thinking>Let me read that file for you.",
-				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}' });
+				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}', stop: true });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
 
@@ -1312,7 +1313,10 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 		const emittedEventTypes: string[] = [];
 
 		globalThis.fetch = (async () => {
-			// Tool without stop flag at stream end
+			// Tool without stop flag at stream end, with text so response is not empty
+			const text = JSON.stringify({
+				content: "I cannot complete this request.",
+			});
 			const tool = JSON.stringify({
 				toolUseId: "tool-incomplete",
 				name: "read_file",
@@ -1323,7 +1327,7 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 				stopReason: "COMPLETED",
 				usage: { inputTokens: 5, outputTokens: 2 },
 			});
-			const responseBody = tool + completion;
+			const responseBody = text + tool + completion;
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
 
@@ -1344,9 +1348,9 @@ describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
 
 		// Stream completes normally with done event
 		expect(done).toBeDefined();
-		// But incomplete tool is NOT emitted
-		// NOTE: After adjustment, tools at stream end ARE emitted even without explicit stop
-		// So this test should expect the tool to exist. Removing this assertion as behavior changed.
+		// But incomplete tool is NOT emitted (without explicit stop flag)
+		expect(toolcallStart).toBeUndefined();
+		expect(toolcallEnd).toBeUndefined();
 	});
 });
 
