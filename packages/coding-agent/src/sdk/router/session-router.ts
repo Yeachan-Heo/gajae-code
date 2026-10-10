@@ -1,7 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { logger, pathIdentityKey } from "@gajae-code/utils";
 import { endpointIncarnation, matchesIndexedEndpointFile } from "../broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
@@ -1532,13 +1532,14 @@ export class SessionRouter {
 		const cwd = indexed.locator.cwd;
 		const defaultStateRoot = path.join(cwd, ".gjc", "state");
 		// Locator cwd is already canonical. `stateRoot` remains the host-provided
-		// authority path, so this comparison resolves equivalent paths only for the
-		// state-root identity boundary; cwd never retains lexical symlink spellings.
-		const indexedStateRoot = resolveEquivalentPath(indexed.locator.stateRoot);
+		// authority path, so compare filesystem identity here: case-insensitive
+		// Windows aliases match without rewriting I/O paths, while case-sensitive
+		// directories remain distinct.
+		const indexedStateRoot = pathIdentityKey(indexed.locator.stateRoot);
 		const scope =
-			indexedStateRoot === resolveEquivalentPath(defaultStateRoot)
+			indexedStateRoot === pathIdentityKey(defaultStateRoot)
 				? "default"
-				: indexedStateRoot === resolveEquivalentPath(path.join(defaultStateRoot, "chat"))
+				: indexedStateRoot === pathIdentityKey(path.join(defaultStateRoot, "chat"))
 					? "chat"
 					: undefined;
 		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;

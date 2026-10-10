@@ -9,6 +9,7 @@ import type {
 } from "./broker";
 import { launchAuthorizedBrokerSuccessor, oldOwnerConfirmedExited } from "./daemon-entry";
 import { type BrokerDiscovery, readBrokerDiscovery } from "./discovery";
+import { isBrokerAttachOnly } from "./ensure";
 
 export interface DoctorBrokerRestartOptions {
 	agentDir: string;
@@ -33,6 +34,8 @@ export type DoctorBrokerRestartOutcome =
 			adopted: boolean;
 	  }
 	| { kind: "owner_unavailable"; reason: "no_discovery" | "owner_not_confirmed_live" }
+	/** Attach-only mode: the broker belongs to an external supervisor, so restart through it. */
+	| { kind: "attach_only_refused"; reason: "supervisor_owned" }
 	| { kind: "prepare_refused"; code: string; message: string }
 	| { kind: "commit_refused"; code: string; message: string }
 	| { kind: "old_owner_exit_timeout"; requestId: string; oldOwner: BrokerRestartOwnerIdentity }
@@ -164,6 +167,7 @@ const OLD_OWNER_EXIT_POLL_MS = 50;
  * proven it owns the root -- never here, and never before that proof exists.
  */
 export async function restartBrokerForDoctor(options: DoctorBrokerRestartOptions): Promise<DoctorBrokerRestartOutcome> {
+	if (isBrokerAttachOnly()) return { kind: "attach_only_refused", reason: "supervisor_owned" };
 	const old = await readBrokerDiscovery(options.agentDir);
 	if (!old) return { kind: "owner_unavailable", reason: "no_discovery" };
 	const oldOwner = identity(old);

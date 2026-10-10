@@ -64,6 +64,25 @@ export function resolveEquivalentPath(inputPath: string): string {
 	}
 }
 
+/**
+ * Return a stable key for comparing existing filesystem paths.
+ *
+ * Windows path spelling is not a safe identity: most directories are
+ * case-insensitive, while directories can opt into case-sensitive names. Use
+ * the filesystem object's identity when it is available instead of folding
+ * path text. If the path does not exist or the filesystem has no usable inode,
+ * retain the resolved spelling so distinct case-sensitive paths never alias.
+ */
+export function pathIdentityKey(inputPath: string): string {
+	const resolvedPath = resolveEquivalentPath(inputPath);
+	if (process.platform !== "win32") return resolvedPath;
+	try {
+		const stats = fs.statSync(resolvedPath, { bigint: true });
+		if (stats.ino !== 0n) return JSON.stringify(["win32-file-id", stats.dev.toString(), stats.ino.toString()]);
+	} catch {}
+	return resolvedPath;
+}
+
 export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {
 	const pathApi = platform === "win32" ? path.win32 : path;
 	const resolvedPath = platform === process.platform ? resolveEquivalentPath(inputPath) : pathApi.resolve(inputPath);
@@ -820,7 +839,7 @@ export function getGpuCachePath(): string {
  * cache file without touching the rest of the config root.
  */
 export function getGithubCacheDbPath(): string {
-	const override = process.env.GJC_GITHUB_CACHE_DB;
+	const override = trustedValue("GJC_GITHUB_CACHE_DB", dirs.trustSnapshot)?.trim();
 	if (override) return override;
 	return dirs.rootSubdir(path.join("cache", "github-cache.db"), "cache");
 }

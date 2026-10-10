@@ -150,6 +150,8 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"spawn_failed",
 	"worktree_in_use",
 	"uncertain_after_send",
+	// Attach-only refusal: raised by ensureBroker before any lifecycle request or MCP server.
+	"broker_unavailable",
 ]);
 
 /**

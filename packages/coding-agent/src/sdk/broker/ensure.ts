@@ -6,7 +6,7 @@ import path from "node:path";
 import packageJson from "../../../package.json" with { type: "json" };
 import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
-import { SdkClient } from "../client/client";
+import { SdkClient, SdkClientError } from "../client/client";
 import { type BrokerStartupExitRecord, clearBrokerStartupExitRecord, readBrokerStartupExitRecord } from "./broker-exit";
 import {
 	type BrokerDiscovery,
@@ -1017,9 +1017,36 @@ function startEnsure(settings: EnsureBrokerSettings, initiator: EnsureInitiator)
 	return entry;
 }
 
-/** Starts the detached broker entrypoint when discovery has no live owner. */
+/**
+ * Attach-only client mode. When `GJC_SDK_BROKER_AUTOSTART=0`, `ensureBroker`
+ * never spawns, retires or restarts a broker: it returns a live, reusable
+ * discovery or fails with `broker_unavailable`. Hosts that supervise their own
+ * broker (for example a system service) set it for every client they run. The
+ * broker entrypoints never call `ensureBroker`, so they ignore the variable and
+ * their descendants may inherit it.
+ */
+export const SDK_BROKER_AUTOSTART_ENV = "GJC_SDK_BROKER_AUTOSTART";
+
+export function isBrokerAttachOnly(env: NodeJS.ProcessEnv = process.env): boolean {
+	return env[SDK_BROKER_AUTOSTART_ENV] === "0";
+}
+
+async function attachExistingBroker(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
+	const discovery = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (discovery && (await isBrokerReusable(discovery))) return discovery;
+	throw new SdkClientError(
+		"broker_unavailable",
+		`SDK broker is not running and ${SDK_BROKER_AUTOSTART_ENV}=0 forbids starting one.`,
+	);
+}
+
+/**
+ * Starts the detached broker entrypoint when discovery has no live owner. In
+ * attach-only mode (`SDK_BROKER_AUTOSTART_ENV`) it only attaches.
+ */
 export function ensureBroker(settings: EnsureBrokerSettings): Promise<BrokerDiscovery> {
 	const resolvedSettings = { ...settings, agentDir: path.resolve(settings.agentDir) };
+	if (isBrokerAttachOnly()) return attachExistingBroker(resolvedSettings);
 	const inFlight = ensureInFlight.get(resolvedSettings.agentDir) ?? startEnsure(resolvedSettings, "discovery");
 	return inFlight.discovery;
 }

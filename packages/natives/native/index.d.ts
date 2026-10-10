@@ -1101,6 +1101,12 @@ export interface DiffStreamResult {
  */
 export declare function diffWords(oldText: string, newText: string): Array<DiffChange>
 
+/**
+ * Returns whether the directory's child names are case-sensitive when the
+ * platform can query that property.
+ */
+export declare function directoryCaseSensitive(path: string): boolean | null
+
 export interface DoctorJournalCreateResult {
   authority?: DoctorJournalAuthority
   sideEffectStarted: boolean
@@ -3020,6 +3026,12 @@ export interface WindowsJobMemoryProbeResult {
   call?: string
   code?: string
 }
+
+/**
+ * Fold UTF-16 code units with Windows' ordinal case mapping, without Unicode
+ * expansions.
+ */
+export declare function windowsOrdinalCaseFold(value: string): string
 
 /** Profiling results returned to JavaScript. */
 export interface WorkProfile {

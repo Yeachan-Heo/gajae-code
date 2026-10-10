@@ -6,6 +6,7 @@ import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
+import { assertLoopbackCdpUrl } from "./browser/cdp-url";
 import { isChromeProfileExecutableForLaunch, isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
 import { chromeUserDataRoots, type DiscoveryEnv, defaultDiscoveryEnv } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
@@ -245,7 +246,13 @@ async function resolveBrowserKind(
 ): Promise<BrowserKind> {
 	const app = params.app;
 	if (app?.cdp_url) {
-		return { kind: "connected", cdpUrl: app.cdp_url.replace(/\/+$/, "") };
+		const cdpUrl = app.cdp_url.replace(/\/+$/, "");
+		try {
+			assertLoopbackCdpUrl(cdpUrl);
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
+		return { kind: "connected", cdpUrl };
 	}
 	if (app?.browser === "chrome") {
 		return resolveChromeProfileKind(app, session, signal, discoveryEnv);

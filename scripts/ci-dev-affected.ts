@@ -1574,6 +1574,8 @@ function isInstallPath(changedPath: string): boolean {
 }
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
+	// Changelogs don't constitute runtime changes requiring native build or validation
+	if (isDocOrChangelogPath(changedPath)) return false;
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
 }
 
