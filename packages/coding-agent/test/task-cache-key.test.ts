@@ -214,23 +214,20 @@ describe("task fork-context provider identity", () => {
 		return paths;
 	}
 	async function removeTempTree(dir: string): Promise<void> {
-		for (const entry of await fsPromises.readdir(dir, { withFileTypes: true })) {
-			const entryPath = path.join(dir, entry.name);
-			if (entry.isDirectory() && !entry.isSymbolicLink()) {
-				await removeTempTree(entryPath);
-			} else {
-				try {
-					await fsPromises.rm(entryPath, { force: true });
-				} catch (error) {
-					throw new Error(`Failed to remove entry ${entryPath}`, { cause: error });
+		// Retry recursive removal with backoff in case lock directories are still being cleaned up
+		let lastError: unknown;
+		for (let attempts = 0; attempts < 10; attempts++) {
+			try {
+				await fsPromises.rm(dir, { recursive: true, force: true });
+				return;
+			} catch (error) {
+				lastError = error;
+				if (attempts < 9) {
+					await Bun.sleep(10 * (attempts + 1));
 				}
 			}
 		}
-		try {
-			await fsPromises.rmdir(dir);
-		} catch (error) {
-			throw new Error(`Failed to remove directory ${dir}`, { cause: error });
-		}
+		throw new Error(`Failed to remove directory ${dir}`, { cause: lastError });
 	}
 
 	afterEach(async () => {
