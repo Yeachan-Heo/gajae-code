@@ -8869,7 +8869,7 @@ export class AgentSession {
 													options?.continueQueuedOnly !== true ||
 														acceptance.consumedQueuedMessages.length > 0,
 												);
-												if (startsQueuedSuccessor) {
+												if (startsQueuedSuccessor && startsOwn) {
 													this.#defaultFallbackChain().resetAttemptBudget();
 													this.#escapedNonAsciiManagedRetries = 0;
 													this.#escapedNonAsciiExhaustedModelKeys.clear();
