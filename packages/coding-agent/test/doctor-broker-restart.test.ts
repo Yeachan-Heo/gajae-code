@@ -377,6 +377,8 @@ describe("doctor broker restart protocol", () => {
 		if (cleanupFailed) throw cleanupError;
 	}, 45_000);
 
+
+
 	it("restartBrokerForDoctor refuses in attach-only mode and leaves the live owner untouched", async () => {
 		const { dir, broker, discovery } = await fixture();
 		const prior = process.env.GJC_SDK_BROKER_AUTOSTART;
