@@ -200,25 +200,6 @@ describe("task fork-context provider identity", () => {
 		}
 		return paths;
 	}
-	async function retryWithBackoff<T>(
-		operation: () => Promise<T>,
-		maxAttempts: number = 5,
-		initialDelayMs: number = 10,
-	): Promise<T> {
-		let lastError: unknown;
-		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			try {
-				return await operation();
-			} catch (error) {
-				lastError = error;
-				if (attempt < maxAttempts - 1) {
-					const delayMs = initialDelayMs * Math.pow(2, attempt);
-					await new Promise(resolve => setTimeout(resolve, delayMs));
-				}
-			}
-		}
-		throw lastError;
-	}
 	async function removeTempTree(dir: string): Promise<void> {
 		for (const entry of await fsPromises.readdir(dir, { withFileTypes: true })) {
 			const entryPath = path.join(dir, entry.name);
@@ -226,14 +207,14 @@ describe("task fork-context provider identity", () => {
 				await removeTempTree(entryPath);
 			} else {
 				try {
-					await retryWithBackoff(() => fsPromises.rm(entryPath, { force: true }), 5, 10);
+					await fsPromises.rm(entryPath, { force: true });
 				} catch (error) {
 					throw new Error(`Failed to remove entry ${entryPath}`, { cause: error });
 				}
 			}
 		}
 		try {
-			await retryWithBackoff(() => fsPromises.rmdir(dir), 5, 10);
+			await fsPromises.rmdir(dir);
 		} catch (error) {
 			throw new Error(`Failed to remove directory ${dir}`, { cause: error });
 		}
