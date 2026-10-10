@@ -8432,12 +8432,11 @@ export class AgentSession {
 				if (this.#enforceRewindBeforeYield()) {
 					return;
 				}
-				// SDK terminal settlement must not wait on a filesystem stop-hook read
-				// when this session has no active deep-interview workflow to continue.
+				// Always check the filesystem state for active deep-interview workflows.
+				// The in-memory marker may not be assigned if observational synchronization fails,
+				// but the persisted workflow state remains authoritative on disk.
 				const deepInterviewResult =
-					terminalSdkOwnership && !activeDeepInterviewAtAgentEnd
-						? "not_applicable"
-						: await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch);
+					await this.#checkActiveDeepInterviewCompletion(msg, agentEndGeneration, agentEndOwnerEpoch);
 				if (deepInterviewResult !== "not_applicable") {
 					return;
 				}

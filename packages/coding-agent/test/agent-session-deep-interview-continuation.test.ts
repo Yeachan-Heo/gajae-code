@@ -783,4 +783,35 @@ describe("AgentSession deep-interview continuation", () => {
 		]);
 		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 	});
+
+	it("preserves the durable deep-interview stop check when in-memory marker is absent but filesystem has active workflow", async () => {
+		// Setup: activate deep-interview on the filesystem
+		await activateWorkflow("deep-interview");
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		// Simulate sync failure by clearing the in-memory marker
+		// while keeping the filesystem state intact
+		const buildSkillStopOutput = skillState.buildSkillStopOutput;
+		const stopOutputSpy = vi.spyOn(skillState, "buildSkillStopOutput").mockImplementation(async options => {
+			// This reads from disk and returns the filesystem state
+			const result = await buildSkillStopOutput(options);
+			return result;
+		});
+
+		// Emit a terminal stop event
+		await emitAssistantStop(100);
+
+		// Verify that buildSkillStopOutput was called (the filesystem was checked)
+		// This proves that #checkActiveDeepInterviewCompletion() was called
+		expect(stopOutputSpy).toHaveBeenCalled();
+
+		// Verify that continuation was scheduled due to the filesystem check
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+
+		// Verify that the continuation reminder was added
+		const [reminder] = developerReminders();
+		expect(reminder).toContain("deep-interview workflow is still active");
+
+		stopOutputSpy.mockRestore();
+	});
 });
