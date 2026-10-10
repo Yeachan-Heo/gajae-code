@@ -13,6 +13,40 @@ const COMMAND_WRAPPERS = new Set(["eval", "exec", "command", "builtin", "nohup",
 const CONTROL_WORDS = new Set(["then", "do", "else", "fi", "done", "esac"]);
 const MAX_INDIRECTION_DEPTH = 4;
 
+// Wrapper commands and their options that take an argument.
+// These are used to properly skip over option arguments so the next word
+// in command position is recognized as the actual command.
+interface WrapperSpec {
+	// Option flags that take exactly one argument (e.g., "-u NAME")
+	optionsWithArg: Set<string>;
+	// Special positional argument handling (e.g., timeout takes a DURATION)
+	hasPositionalArg?: boolean;
+}
+
+const COMMAND_WRAPPERS_WITH_ARGS: Record<string, WrapperSpec> = {
+	"env": {
+		optionsWithArg: new Set(["-u", "-C", "-S"]),
+	},
+	"sudo": {
+		optionsWithArg: new Set(["-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "-s", "-i"]),
+	},
+	"timeout": {
+		hasPositionalArg: true, // timeout DURATION command
+	},
+	"nice": {
+		optionsWithArg: new Set(["-n"]),
+	},
+	"xargs": {
+		optionsWithArg: new Set(["-E", "-I", "-J", "-L", "-n", "-P", "-R", "-s", "-t", "-x", "-d", "-0"]),
+	},
+	"stdbuf": {
+		optionsWithArg: new Set(["-i", "-o", "-e"]),
+	},
+	"setsid": {
+		optionsWithArg: new Set(["-c", "-w"]),
+	},
+};
+
 export interface TmuxSelfInjectionResult {
 	block: boolean;
 	reason?: string;
@@ -51,32 +85,69 @@ function tokenize(command: string): Token[] {
 	let quoted = false;
 	let quote: "'" | '"' | undefined;
 	let atCommandStart = true;
-	let wrapperPending = false;
-	let previous = "";
+	let wrapperCommand: { name: string; spec: WrapperSpec } | undefined;
+	let skipNextArg = false;
+	let positionalsPending = 0;
 
 	const flush = () => {
 		if (text.length === 0) return;
-		const token: Token = { text, quoted, commandStart: atCommandStart };
-		tokens.push(token);
+
+		let commandStart = atCommandStart;
+
 		if (atCommandStart) {
-			if (isAssignment(text) || CONTROL_WORDS.has(text) || wrapperPending) {
+			const newWrapper = COMMAND_WRAPPERS_WITH_ARGS[text];
+			const isBuiltinWrapper = COMMAND_WRAPPERS.has(text);
+
+			if (isAssignment(text) || CONTROL_WORDS.has(text)) {
+				// Assignments and control words reset wrapper state
+				wrapperCommand = undefined;
+				skipNextArg = false;
+				positionalsPending = 0;
 				atCommandStart = true;
-			} else if (COMMAND_WRAPPERS.has(text)) {
-				atCommandStart = true;
-				wrapperPending = true;
-			} else if (text === "sudo" || text === "env") {
-				atCommandStart = true;
-				wrapperPending = true;
-			} else {
+			} else if (newWrapper) {
+				// Track this wrapper for its arguments
+				wrapperCommand = { name: text, spec: newWrapper };
+				skipNextArg = false;
+				positionalsPending = newWrapper.hasPositionalArg ? 1 : 0;
+				atCommandStart = false; // Now in wrapper argument mode
+			} else if (isBuiltinWrapper) {
+				// Built-in wrappers
+				wrapperCommand = { name: text, spec: { optionsWithArg: new Set() } };
+				skipNextArg = false;
+				positionalsPending = 0;
+				atCommandStart = false; // Now in wrapper argument mode
+			} else if (wrapperCommand) {
+				// This is the command being wrapped - mark it as a command start
+				wrapperCommand = undefined;
+				skipNextArg = false;
+				positionalsPending = 0;
+				commandStart = true; // The wrapped command is a command start
 				atCommandStart = false;
-				wrapperPending = false;
+			} else {
+				// Regular command
+				atCommandStart = false;
 			}
-		} else if (wrapperPending) {
-			// A wrapper's options and option arguments are not command names.
-			// The first ordinary word after them is handled by the special case
-			// below when the next token is seen.
-			atCommandStart = false;
+		} else {
+			// Not at command start
+			if (text.startsWith("-")) {
+				// This is an option, don't touch skipNextArg yet; it will be consumed by the next argument
+			} else if (skipNextArg) {
+				// This is an option argument, not part of wrapper logic
+				skipNextArg = false;
+			} else if (positionalsPending > 0) {
+				// This is a positional argument like timeout's DURATION
+				positionalsPending--;
+			} else if (wrapperCommand && !text.startsWith("-")) {
+				// We're in a wrapper and this is not an option - it's the wrapped command
+				wrapperCommand = undefined;
+				skipNextArg = false;
+				commandStart = true; // The wrapped command is a command start
+			}
 		}
+
+		const token: Token = { text, quoted, commandStart };
+		tokens.push(token);
+
 		text = "";
 		quoted = false;
 	};
@@ -107,29 +178,29 @@ function tokenize(command: string): Token[] {
 		}
 		if (/\s/.test(ch)) {
 			flush();
-			previous = ch;
 			continue;
 		}
 		if (isSeparator(ch)) {
 			flush();
 			atCommandStart = true;
-			wrapperPending = false;
-			previous = ch;
+			wrapperCommand = undefined;
+			skipNextArg = false;
+			positionalsPending = 0;
 			continue;
 		}
-		// `sudo -u user tmux` and `env FOO=bar tmux` need the wrapped command
-		// recognized. Options, option arguments, and environment assignments
-		// stay outside command position.
-		if (text.length === 0 && wrapperPending && previous && /\s/.test(previous)) {
-			if (text.length === 0 && ch === "-") {
-				// The option itself is not a command; its argument is also skipped.
-				atCommandStart = false;
+
+		text += ch;
+
+		// After building a token, check if it's an option that needs an argument
+		if (!atCommandStart && wrapperCommand && text.startsWith("-")) {
+			const nextChar = command[index + 1];
+			if (!nextChar || /\s/.test(nextChar) || isSeparator(nextChar)) {
+				// This option is complete; check if it takes an argument
+				if (wrapperCommand.spec.optionsWithArg.has(text)) {
+					skipNextArg = true;
+				}
 			}
 		}
-		if (text.length === 0 && wrapperPending && atCommandStart) {
-			atCommandStart = true;
-		}
-		text += ch;
 	}
 	flush();
 	return tokens;
@@ -195,10 +266,45 @@ function collectShellPayloads(tokens: Token[]): string[] {
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
 		if (!token.commandStart || !SHELL_RUNNERS.has(token.text)) continue;
+
+		// Scan for -c options in the shell invocation.
+		// Look for patterns like:
+		// - bash -c 'payload'
+		// - bash -ce 'payload' (bundled option)
+		// - bash -c -e 'payload' (separate options)
+		// POSIX shells stop option parsing at the first non-option argument,
+		// so after we see a non-option word (script name), any flags are arguments to that script.
+
+		let seenOperand = false;
+
 		for (let cursor = index + 1; cursor < tokens.length && !tokens[cursor].commandStart; cursor++) {
-			if (tokens[cursor].text === "-c" && tokens[cursor + 1]?.quoted) {
-				payloads.push(tokens[cursor + 1].text);
-				break;
+			const word = tokens[cursor].text;
+
+			// Once we see a non-option word (not starting with -), that's the script name.
+			// Any further flags are arguments to that script, not shell options.
+			if (!word.startsWith("-")) {
+				seenOperand = true;
+				break; // Stop scanning for -c after the first operand
+			}
+
+			// Check for -c option (standalone or bundled like -ce, -ec, etc.)
+			if (word === "-c" || (word.startsWith("-") && word.includes("c"))) {
+				// Found a -c option (or an option containing c)
+				// The payload is the next non-option word
+				for (let payloadCursor = cursor + 1; payloadCursor < tokens.length && !tokens[payloadCursor].commandStart; payloadCursor++) {
+					const payloadWord = tokens[payloadCursor].text;
+
+					// Skip over any other options
+					if (payloadWord.startsWith("-")) {
+						continue;
+					}
+
+					// Found the first non-option word; this should be the payload
+					if (tokens[payloadCursor].quoted) {
+						payloads.push(payloadWord);
+					}
+					break; // Only take the first payload for this -c
+				}
 			}
 		}
 	}
@@ -265,6 +371,40 @@ function assignedTmuxSocket(tokens: Token[], commandIndex: number): string | und
 	return undefined;
 }
 
+/**
+ * Check if the given index is part of a `command -v` or `command -V` lookup.
+ * Such invocations are not executions, so tmux commands within them don't run.
+ */
+function isCommandLookup(tokens: Token[], targetIndex: number): boolean {
+	// Backtrack through all tokens to find if we're in a `command -v` sequence
+	// Look for the pattern: command -v/V ... target
+	for (let commandIdx = 0; commandIdx < targetIndex; commandIdx++) {
+		if (!tokens[commandIdx].commandStart || tokens[commandIdx].text !== "command") {
+			continue;
+		}
+
+		// Found a "command" token, look for -v or -V after it and before the target
+		let hasLookupFlag = false;
+		for (let i = commandIdx + 1; i < targetIndex; i++) {
+			const token = tokens[i].text;
+			if (token === "-v" || token === "-V") {
+				hasLookupFlag = true;
+				break;
+			}
+			// Stop if we hit another command start before finding -v/-V
+			if (tokens[i].commandStart) {
+				break;
+			}
+		}
+
+		if (hasLookupFlag) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 const defaultResolvePaneId: TmuxPaneResolver = async ({ socketArgs, target, env }) => {
 	const processHandle = Bun.spawn(["tmux", ...socketArgs, "display-message", "-p", "-t", target, "#{pane_id}"], {
 		env,
@@ -299,6 +439,8 @@ export async function checkTmuxSelfInjection(
 	for (let index = 0; index < tokens.length; index++) {
 		if (!tokens[index].commandStart || (tokens[index].text !== "tmux" && !tokens[index].text.endsWith("/tmux")))
 			continue;
+		// Skip tmux invocations that are part of a `command -v` lookup (not execution)
+		if (isCommandLookup(tokens, index)) continue;
 		const invocation = parseInvocation(tokens.slice(index + 1));
 		if (!invocation || !INPUT_VERBS.has(invocation.verb)) continue;
 		const assignedSocket = assignedTmuxSocket(tokens, index);

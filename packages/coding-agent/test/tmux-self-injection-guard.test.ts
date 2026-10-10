@@ -117,4 +117,151 @@ describe("tmux self-injection guard", () => {
 	it("does not treat read-only inspection as injection", async () => {
 		await expect(checkTmuxSelfInjection("tmux list-panes -t demo", options)).resolves.toEqual({ block: false });
 	});
+
+	// Tests for wrapper commands (issue #6563)
+	describe("wrapper commands", () => {
+		it("should block env wrapper with option taking argument", async () => {
+			await expect(checkTmuxSelfInjection("env -u FOO tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block sudo wrapper with option taking argument", async () => {
+			await expect(checkTmuxSelfInjection("sudo -u root tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block sudo with -E flag", async () => {
+			await expect(checkTmuxSelfInjection("sudo -E tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block timeout wrapper", async () => {
+			await expect(checkTmuxSelfInjection("timeout 5 tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block nice wrapper", async () => {
+			await expect(checkTmuxSelfInjection("nice tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block nice wrapper with -n option", async () => {
+			await expect(
+				checkTmuxSelfInjection("nice -n 10 tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block xargs wrapper", async () => {
+			await expect(
+				checkTmuxSelfInjection("xargs tmux send-keys -t %47 <<< x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block stdbuf wrapper", async () => {
+			await expect(
+				checkTmuxSelfInjection("stdbuf -o line tmux send-keys -t %47 x", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block setsid wrapper", async () => {
+			await expect(checkTmuxSelfInjection("setsid tmux send-keys -t %47 x", options)).resolves.toMatchObject({
+				block: true,
+			});
+		});
+	});
+
+	// Tests for bundled shell options (issue #6563)
+	describe("bundled shell options", () => {
+		it("should block bash with bundled -ce option", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -ce 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block bash with bundled -ec option", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -ec 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+
+		it("should block bash with separate -c and -e options", async () => {
+			await expect(
+				checkTmuxSelfInjection("bash -c -e 'tmux send-keys -t %47 x'", options),
+			).resolves.toMatchObject({
+				block: true,
+			});
+		});
+	});
+
+	// Tests for command -v lookups (issue #6563)
+	describe("command -v lookups", () => {
+		it("should allow command -v lookup", async () => {
+			await expect(checkTmuxSelfInjection("command -v tmux send-keys", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("should allow command -V lookup", async () => {
+			await expect(checkTmuxSelfInjection("command -V tmux send-keys", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+	});
+
+	// Tests for must-stay-allowed cases (issue #6563)
+	describe("must-stay-allowed cases", () => {
+		it("should allow env -u tmux where tmux is the unset variable", async () => {
+			await expect(
+				checkTmuxSelfInjection("env -u tmux send-keys -t %47 x", options),
+			).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("should allow sudo -u tmux where tmux is a user name", async () => {
+			await expect(checkTmuxSelfInjection("sudo -u tmux send-keys -t %47 x", options)).resolves.toEqual({
+				block: false,
+			});
+		});
+
+		it("should allow bash script with -ce after operand", async () => {
+			const scriptPath = "/tmp/gjc-6563-safe.sh";
+			await Bun.write(scriptPath, "echo safe\n");
+			try {
+				await expect(
+					checkTmuxSelfInjection(`bash ${scriptPath} -ce 'tmux send-keys -t %47 x'`, options),
+				).resolves.toEqual({
+					block: false,
+				});
+			} finally {
+				await Bun.file(scriptPath).delete();
+			}
+		});
+
+		it("should allow quoted text sent to different pane", async () => {
+			await expect(
+				checkTmuxSelfInjection(
+					'tmux send-keys -t %99 "echo \'; tmux send-keys -t %47\'"',
+					options,
+				),
+			).resolves.toEqual({
+				block: false,
+			});
+		});
+	});
 });
