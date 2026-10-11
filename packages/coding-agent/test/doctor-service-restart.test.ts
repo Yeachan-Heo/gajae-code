@@ -45,6 +45,7 @@ async function startBroker(agentDir: string): Promise<{ pid: number }> {
 async function doctor(
 	agentDir: string,
 	args: string[],
+	extraEnv: Record<string, string> = {},
 ): Promise<{ report: DoctorReport; code: number; output: string }> {
 	const child = Bun.spawn(
 		[process.execPath, "--no-env-file", `--config=${config}`, cli, "doctor", "--json", ...args],
@@ -57,6 +58,7 @@ async function doctor(
 				BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
 				NO_COLOR: "1",
 				GJC_DOCTOR_DEBUG: path.join(agentDir, "restart-debug.log"),
+				...extraEnv,
 			},
 			stdin: "ignore",
 			stdout: "pipe",
@@ -146,6 +148,35 @@ describe("doctor service.restart-owned", () => {
 			} as unknown as Bun.Subprocess);
 		expect(published?.token && result.output.includes(published.token)).toBeFalsy();
 	}, 180_000);
+
+	test("refuses to restart a supervisor-owned broker in attach-only mode before any effect", async () => {
+		const agentDir = await agentDirectory();
+		const before = await startBroker(agentDir);
+		const rootId = resolveDoctorRoot("agent", agentDir).rootId;
+		const result = await doctor(
+			agentDir,
+			[
+				"--check",
+				"service",
+				"--fix",
+				"--repair",
+				"service.restart-owned",
+				"--target",
+				serviceTargetId(rootId, "broker"),
+				"--allow-risk",
+				"service-interruption",
+				"--yes",
+			],
+			{ GJC_SDK_BROKER_AUTOSTART: "0" },
+		);
+		expect(result.report.repairs[0]).toMatchObject({
+			state: "blocked",
+			reasonCode: "attach_only_refused:supervisor_owned",
+			sideEffectStarted: false,
+		});
+		// The supervised incumbent keeps serving under the same identity.
+		expect((await readBrokerDiscovery(agentDir))?.pid).toBe(before.pid);
+	}, 60_000);
 
 	test("refuses a restart with no owner record without creating service state", async () => {
 		const agentDir = await agentDirectory();

@@ -552,6 +552,52 @@ test("SdkClient owns request timeout, reconnect backoff, and absolute deadline d
 	});
 });
 
+test("a request deadline expires only its own shared connection waiter", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		try {
+			const expired = client.global("session.create", {}, { idempotencyKey: "expired", deadline: clock.now + 5 });
+			const waiter = client.global("session.list", {}, { deadline: clock.now + 50 });
+			const socket = FakeWebSocket.instances[0]!;
+			clock.advanceBy(5);
+			await expect(expired).rejects.toMatchObject({ code: "timeout", transport: true });
+			expect(socket.sent).toHaveLength(0);
+			expect(socket.closeCalls).toHaveLength(0);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			socket.open();
+			socket.message({ type: "hello", connectionId: "shared" });
+			for (let index = 0; index < 4; index++) await flush();
+			const frame = sent(socket);
+			expect(frame.operation).toBe("session.list");
+			socket.message({ type: "broker_response", id: frame.id, ok: true, result: { sessions: [] } });
+			await expect(waiter).resolves.toMatchObject({ result: { sessions: [] } });
+			expect(socket.sent).toHaveLength(1);
+		} finally {
+			await client.close();
+		}
+	});
+});
+
+test("a request deadline bounds the reply after connection setup", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 100 });
+		try {
+			const request = client.global("session.create", {}, { idempotencyKey: "bounded", deadline: clock.now + 10 });
+			const socket = FakeWebSocket.instances[0]!;
+			clock.advanceBy(6);
+			socket.open();
+			socket.message({ type: "hello", connectionId: "bounded" });
+			for (let index = 0; index < 4; index++) await flush();
+			expect(socket.sent).toHaveLength(1);
+			clock.advanceBy(4);
+			await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+			expect(client.getSentRecord(sent(socket).id as string)).toMatchObject({ idempotencyKey: "bounded" });
+		} finally {
+			await client.close();
+		}
+	});
+});
+
 test("SdkClient isolates reconnect observers from transport settlement", async () => {
 	await withFakeTransport(async clock => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 1, reconnectBackoffMs: 10 });

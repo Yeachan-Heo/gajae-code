@@ -276,6 +276,150 @@ describe("task artifact owner read-only access", () => {
 		).toThrow("task_artifact_owner_locator_invalid");
 	});
 
+	it("rejects a final manifest session reassociation after capturing the original manifest", async () => {
+		const fixture = await makeOwnerFixture();
+		const writer = openFixtureOwner(fixture);
+		const originalManifest = writer.readExpected(OWNER_MANIFEST);
+		if (!originalManifest) throw new Error("fixture owner manifest unexpectedly absent");
+		const reassociatedSessionId = `${fixture.sessionId}-reassociated`;
+		const replacementManifest = Buffer.from(
+			`${JSON.stringify({ ...fixture.locator, sessionId: reassociatedSessionId })}\n`,
+			"utf8",
+		);
+		const manifestPath = `${ownerRelativePath(fixture.locator.ownerId)}/${OWNER_MANIFEST}`;
+		const originalReadExpected = ManagedSessionDescendantStore.prototype.readExpected;
+		const originalClose = ManagedSessionDescendantStore.prototype.close;
+		let manifestReads = 0;
+		let replacementPublished = false;
+		let rootStoreCloseCalls = 0;
+		const readSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath: string,
+		) {
+			const snapshot = originalReadExpected.call(this, relativePath);
+			if (this.dir === fixture.context.sessionsRoot && relativePath === manifestPath) {
+				manifestReads++;
+				if (manifestReads === 1) {
+					writer.replaceExpected(OWNER_MANIFEST, replacementManifest, originalManifest);
+					replacementPublished = true;
+				}
+			}
+			return snapshot;
+		});
+		const closeSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "close").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+		) {
+			if (this.dir === fixture.context.sessionsRoot) rootStoreCloseCalls++;
+			return originalClose.call(this);
+		});
+		const nativeRemovalSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		const storeRemovalSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
+		try {
+			expect(() =>
+				captureTaskArtifactOwnerDeletionEvidence(fixture.context, fixture.sessionId, fixture.locator),
+			).toThrow("task_artifact_owner_session_mismatch");
+			expect(replacementPublished).toBe(true);
+			expect(manifestReads).toBe(2);
+			const persistedManifest = JSON.parse(
+				fs.readFileSync(path.join(fixture.ownerPath, OWNER_MANIFEST), "utf8"),
+			) as {
+				sessionId: string;
+				ownerId: string;
+				directoryDev: string;
+				directoryIno: string;
+			};
+			expect(persistedManifest).toEqual({ ...fixture.locator, sessionId: reassociatedSessionId });
+			expect(await Bun.file(path.join(fixture.ownerPath, "artifact.bin")).text()).toBe("owner-payload");
+			expect(fs.existsSync(fixture.ownerPath)).toBe(true);
+			expect(nativeRemovalSpy).not.toHaveBeenCalled();
+			expect(storeRemovalSpy).not.toHaveBeenCalled();
+			expect(rootStoreCloseCalls).toBe(1);
+		} finally {
+			readSpy.mockRestore();
+			closeSpy.mockRestore();
+			nativeRemovalSpy.mockRestore();
+			storeRemovalSpy.mockRestore();
+			writer.close();
+		}
+	});
+
+	it("rejects reassociation between root and owner-store reads and closes the refused owner store", async () => {
+		const fixture = await makeOwnerFixture();
+		const writer = openFixtureOwner(fixture);
+		const originalManifest = writer.readExpected(OWNER_MANIFEST);
+		if (!originalManifest) throw new Error("fixture owner manifest unexpectedly absent");
+		const reassociatedSessionId = `${fixture.sessionId}-reassociated`;
+		const replacementManifest = Buffer.from(
+			`${JSON.stringify({ ...fixture.locator, sessionId: reassociatedSessionId })}\n`,
+			"utf8",
+		);
+		const rootStore = newSessionRootStore(fixture.context);
+		const manifestPath = `${ownerRelativePath(fixture.locator.ownerId)}/${OWNER_MANIFEST}`;
+		const originalReadExpected = ManagedSessionDescendantStore.prototype.readExpected;
+		const originalClose = ManagedSessionDescendantStore.prototype.close;
+		let rootManifestReads = 0;
+		let ownerManifestReads = 0;
+		let replacementPublished = false;
+		let ownerStoreCloseCalls = 0;
+		let rootStoreCloseCalls = 0;
+		const readSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath: string,
+		) {
+			const snapshot = originalReadExpected.call(this, relativePath);
+			if (this.dir === fixture.context.sessionsRoot && relativePath === manifestPath) {
+				rootManifestReads++;
+				if (rootManifestReads === 1) {
+					writer.replaceExpected(OWNER_MANIFEST, replacementManifest, originalManifest);
+					replacementPublished = true;
+				}
+			} else if (this.dir === fixture.ownerPath && relativePath === OWNER_MANIFEST) {
+				ownerManifestReads++;
+			}
+			return snapshot;
+		});
+		const closeSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "close").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+		) {
+			if (this.dir === fixture.ownerPath) ownerStoreCloseCalls++;
+			if (this.dir === fixture.context.sessionsRoot) rootStoreCloseCalls++;
+			return originalClose.call(this);
+		});
+		const nativeRemovalSpy = vi.spyOn(native, "exactRemoveDirectoryTree");
+		const storeRemovalSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "removeTreeExpectedWithParentIdentity");
+		try {
+			expect(() => openOwnerStore(fixture.context, rootStore, fixture.locator, fixture.sessionId)).toThrow(
+				"task_artifact_owner_session_mismatch",
+			);
+			expect(replacementPublished).toBe(true);
+			expect(rootManifestReads).toBe(1);
+			expect(ownerManifestReads).toBe(1);
+			expect(ownerStoreCloseCalls).toBe(1);
+			const persistedManifest = JSON.parse(
+				fs.readFileSync(path.join(fixture.ownerPath, OWNER_MANIFEST), "utf8"),
+			) as {
+				sessionId: string;
+				ownerId: string;
+				directoryDev: string;
+				directoryIno: string;
+			};
+			expect(persistedManifest).toEqual({ ...fixture.locator, sessionId: reassociatedSessionId });
+			expect(await Bun.file(path.join(fixture.ownerPath, "artifact.bin")).text()).toBe("owner-payload");
+			expect(fs.existsSync(fixture.ownerPath)).toBe(true);
+			expect(nativeRemovalSpy).not.toHaveBeenCalled();
+			expect(storeRemovalSpy).not.toHaveBeenCalled();
+			rootStore.close();
+			expect(rootStoreCloseCalls).toBe(1);
+		} finally {
+			readSpy.mockRestore();
+			closeSpy.mockRestore();
+			nativeRemovalSpy.mockRestore();
+			storeRemovalSpy.mockRestore();
+			rootStore.close();
+			writer.close();
+		}
+	});
+
 	it("rejects a noncanonical profile and session or manifest identity substitutions", async () => {
 		const fixture = await makeOwnerFixture();
 		const badProfile = { ...fixture.context, profileAgentDir: "relative-profile" };

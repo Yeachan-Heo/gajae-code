@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+## [0.18.8] - 2026-10-08
+
+### Added
+
+- Kiro OAuth now imports social-login profile metadata into requests and model discovery, refreshes imported social tokens through Kiro's auth service, and forwards reasoning effort while separating inline thinking from answer text.
+
+- `AuthStorage.forkConfigOwner()` captures independently scoped configuration keys while retaining shared credential storage, runtime keys, OAuth rotation, and session selectors. Scoped reset and final release do not replace parent or unowned configuration authority.
+
+- Add execution-local custom API callback registries for both `stream` and `streamSimple`. Explicit scopes never fall back to process-wide registrations, and snapshots retain their own callback mappings.
+
+- Added `getStreamIdleTimeoutRemediationMs()`, the `PI_STREAM_IDLE_TIMEOUT_MS` value to suggest after an idle-watchdog abort: always longer than both the active override and the longest built-in provider fallback.
+
+### Changed
+
+- Codex requests now send originator/User-Agent header `codex_cli_rs`, and the OAuth default originator changed from `opencode` to `codex_cli_rs`.
+
+### Fixed
+
+- Kiro streams now surface explicit content-filter refusal messages with category and explanation instead of the generic "no tokens" error when a refusal is detected. Both bearer token (via `messageMetadataEvent`) and API-key (`ksk_`, via `metadataEvent`) paths are supported, with proper provider safety-stop minting. Text is streamed incrementally unless a thinking block precedes it, in which case the entire answer (after thinking) is buffered until the stream end; tool calls are emitted only at stream end (#6150).
+
+- Remove hardcoded 272K context window override from Codex GPT-6 models, allowing them to inherit actual API limits from models.dev (1.05M context window).
+
+- Extend Anthropic's default stream idle window to 10 minutes so long reasoning pauses are less likely to be mistaken for a dead stream; the existing idle-timeout override remains available.
+
+- Fixed Anthropic requests with hidden thinking (`thinking.display: "omitted"`, set by `hideThinkingBlock`) failing with "Anthropic stream stalled while waiting for the next event" whenever the model thought for longer than one idle window. In that mode Anthropic streams nothing but `ping` keepalives until the thinking block ends, and pings did not count as progress. Pings now count as progress while a thinking block of a non-summarized request is open, bounded at three idle windows (30 min at the default) so a proxy that only pings still times out.
+
+- A tokenless auth broker rejects credential requests whose Host header is not the loopback bind.
+
+- Codex error details stored from a failed response no longer keep a reflected bearer token.
+
+- Warn in production when a transient Codex stream-close salvage is refused, including bounded event descriptors for diagnosis.
+
+- Retry Codex Responses streams once when a request timeout leaves only incomplete tool-call output.
+
+- Fix Cursor provider's context occupancy reporting: include cache tokens (cacheRead and cacheWrite) in the totalTokens calculation so context occupancy percentage and estimated costs are reported correctly instead of always showing zero.
+
+- Cursor's bundled models now carry token prices instead of zero rates, allowing usage reports to calculate estimated session costs.
+
+- Preserve exact stored-literal discovery cache provenance across session-local credential selection changes while continuing to invalidate credential availability.
+
+- An OAuth error callback with a different state no longer cancels the in-flight login.
+
+- Keep same-instance OAuth refresh leases held until every concurrent attempt releases them.
+
+- Recover rejected OAuth access tokens before expiry by retrying authentication failures once through the existing refresh lease, adopting peer-rotated broker credentials, and propagating canceled health checks without caching them as credential failures.
+- Fence command-key resolutions to their configuration generation so retired lookups cannot return stale credential values.
+
+- Isolate configuration fallback resolvers and evidence generations by their actual owner, copy resolver authority on configuration forks, and prevent stale disposers from removing replacement resolvers.
+- Keep stored command-key resolution coalesced across sibling configuration changes while shared credential-row replacement invalidates stale resolution and matching. Credentials, runtime selectors, and OAuth registration/dispatch remain shared.
+- Invalidate observed owned absence on a later fallback grant, resolver reinstall, or fallback-only fork release, while preserving the initial unobserved resolver setup and terminal owner-local evidence.
+
+- Replace Atomics.wait() with Bun.sleepSync() and add a 2-second timeout to tool-choice capability cache lock acquisition to prevent indefinite waits during concurrent process contention.
+
+- Preserve a fixed content-filter diagnostic for incomplete responses in the shared OpenAI Responses parser without changing truncation guards or retry/fallback authority.
+
+- Reject disposed or serialized registry capabilities before provider dispatch, and reject custom registrations that collide with built-in API names, including Kiro.
+
 ## [0.18.7] - 2026-10-04
 
 ### Fixed

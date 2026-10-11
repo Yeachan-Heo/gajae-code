@@ -14,6 +14,7 @@ import {
 	runSessionHost,
 	watchSessionHostBrokerLiveness,
 } from "../src/commands/sdk";
+import { acquireFileLock } from "../src/config/file-lock";
 import { Settings } from "../src/config/settings";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
@@ -46,7 +47,7 @@ import {
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
-import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-index";
+import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
 import { readSdkBrokerDiscovery } from "../src/sdk/client/discovery";
@@ -6147,6 +6148,55 @@ test("broker records the resolved worktree state root and preserves pre-child pr
 			effectIntent: {
 				stateRoot: path.join(worktreeRoot, ".gjc", "state"),
 				childOwnershipEstablished: false,
+			},
+		});
+
+		const baseline = await broker.index.append({
+			type: "host_registered",
+			sessionId: "unrelated-session",
+			locator: { cwd: repo, worktreeRoot: null, stateRoot: path.join(repo, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+		});
+		const { checksum: _baselineChecksum, ...baselineEvent } = baseline;
+		const pendingRegistration: Omit<SessionIndexEvent, "checksum"> = {
+			...baselineEvent,
+			indexSeq: baseline.indexSeq + 1,
+			sessionId: "concurrent-worktree-owner",
+			locator: {
+				cwd: worktreeRoot,
+				worktreeRoot,
+				stateRoot: path.join(worktreeRoot, ".gjc", "state"),
+			},
+			ts: Date.now(),
+		};
+		const registration = { ...pendingRegistration, checksum: sessionIndexChecksum(pendingRegistration) };
+		const indexPath = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+		const releaseIndexLock = await acquireFileLock(indexPath);
+		const refreshSpy = vi.spyOn(broker.index, "refresh");
+		let concurrentCreate: Promise<BrokerResponse> | undefined;
+		try {
+			concurrentCreate = broker.handleRequest(
+				"session.create",
+				{
+					cwd: repo,
+					stateRoot: path.join(repo, ".gjc", "state"),
+					target: { worktree: { enabled: true, name: worktreeName } },
+				},
+				"concurrent-worktree-registration",
+			);
+			await waitFor(async () => (refreshSpy.mock.calls.length > 0 ? true : undefined), "locked worktree refresh");
+			await fs.appendFile(indexPath, `${JSON.stringify(registration)}\n`);
+		} finally {
+			await releaseIndexLock();
+			refreshSpy.mockRestore();
+		}
+		if (!concurrentCreate) throw new Error("Expected concurrent worktree creation request");
+		expect(await concurrentCreate).toMatchObject({
+			ok: false,
+			error: {
+				code: "worktree_in_use",
+				message: expect.stringContaining("concurrent-worktree-owner"),
 			},
 		});
 	} finally {

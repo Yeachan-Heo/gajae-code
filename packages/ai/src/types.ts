@@ -761,7 +761,11 @@ export interface Usage {
 }
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
-export type AssistantErrorKind = "provider_safety_stop" | "local_snapshot_failure" | "local_buffer_overflow";
+export type AssistantErrorKind =
+	| "provider_safety_stop"
+	| "local_empty_response"
+	| "local_snapshot_failure"
+	| "local_buffer_overflow";
 /**
  * Structured, shape-only staging-buffer overflow diagnostic carried on the
  * terminal `AssistantMessage`. Attached only by the agent runtime from its own

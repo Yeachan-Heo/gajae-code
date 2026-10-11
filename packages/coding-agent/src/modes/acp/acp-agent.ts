@@ -38,6 +38,8 @@ import {
 } from "@agentclientprotocol/sdk";
 import { getAgentDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
+import { PROJECT_PROGRESS_SNAPSHOT_SCHEMA, type ProjectProgressSnapshot } from "../../progress/progress-contract";
+import { PROGRESS_COMMAND_ACP_DESCRIPTION, renderProgressSnapshot } from "../../progress/render-progress";
 import {
 	ACP_SESSION_RECONNECT,
 	type AcpProviderRegistration,
@@ -258,6 +260,8 @@ type PendingAttachment = { epoch: number; task: Promise<void> };
 
 type PromptAdmissionSettlement = { kind: "cancelled" } | { kind: "rejected"; error: AcpSdkAdapterError };
 type PromptAdmissionReservation = {
+	/** Held by a model-free builtin (`/progress`) answered locally; no host turn exists to abort. */
+	localCommand?: true;
 	cancelled?: boolean;
 	settlement?: PromptAdmissionSettlement;
 	wake: () => void;
@@ -526,9 +530,12 @@ function pageItems(value: unknown): unknown[] {
 	return Array.isArray(page?.items) ? page.items : [];
 }
 
+/** Builtin `/progress`: answered locally from the read-only `session.progress` SDK query, never a model turn. */
+const ACP_PROGRESS_COMMAND: AvailableCommand = { name: "progress", description: PROGRESS_COMMAND_ACP_DESCRIPTION };
+
 /** Build the ACP command palette from the shared builtins and live SDK skill state. */
 export function acpAvailableCommandsFromSkills(query: unknown): AvailableCommand[] {
-	const commands = new Map<string, AvailableCommand>();
+	const commands = new Map<string, AvailableCommand>([[ACP_PROGRESS_COMMAND.name, ACP_PROGRESS_COMMAND]]);
 	for (const item of pageItems(query)) {
 		const skill = object(item);
 		if (typeof skill?.name !== "string" || !skill.name) continue;
@@ -1508,6 +1515,22 @@ export function acpSkillInvocation(blocks: PromptRequest["prompt"]): { name: str
 	return { name: match[1], args: match[2]?.trim() ?? "" };
 }
 
+/**
+ * Recognize the builtin `/progress` command only when it is the complete, single text
+ * prompt. Like the TUI (`allowArgs: false`), `/progress <args>` is not the command.
+ */
+export function isAcpProgressCommand(blocks: PromptRequest["prompt"]): boolean {
+	return blocks.length === 1 && blocks[0]?.type === "text" && blocks[0].text.trim() === "/progress";
+}
+
+/** Render the `session.progress` query result as the plain-text `/progress` view. */
+export function acpProgressReportText(query: unknown): string {
+	const snapshot = object(pageItems(query)[0]);
+	if (snapshot?.schema !== PROJECT_PROGRESS_SNAPSHOT_SCHEMA)
+		throw new AcpSdkAdapterError("unavailable", "SDK session.progress response omitted the progress snapshot.");
+	return renderProgressSnapshot(snapshot as unknown as ProjectProgressSnapshot).join("\n");
+}
+
 /** Convert every ACP prompt block the agent advertises without silently discarding context. */
 export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 	text: string;
@@ -2398,6 +2421,38 @@ export class AcpAgent implements Agent {
 		}
 	}
 
+	/**
+	 * Read-only builtin `/progress`: answered from the session.progress query instead of a
+	 * model turn. It owns prompt admission (`pendingPromptAdmission`) from the query until its
+	 * response is published, so a concurrent prompt is refused as `conflict` exactly as it is
+	 * while a model turn is active. `cancel` and session teardown settle that reservation
+	 * through the existing admission paths; this command observes it and stops publishing.
+	 */
+	async #runProgressCommand(sessionId: string, record: SessionRecord): Promise<PromptResponse> {
+		const { promise: woken, resolve: wake } = Promise.withResolvers<void>();
+		const reservation: PromptAdmissionReservation = { localCommand: true, wake, woken };
+		// Replaces a follow-up reservation this prompt already consumed; `#submitPrompt` only
+		// clears the reservation it installed, so ownership stays with this command.
+		record.pendingPromptAdmission = reservation;
+		try {
+			const query = record.adapter.query("session.progress");
+			void query.catch(() => undefined);
+			const result = await Promise.race([query.then(value => ({ value })), woken.then(() => undefined)]);
+			const settlement = reservation.settlement;
+			if (settlement?.kind === "rejected") throw settlement.error;
+			if (settlement?.kind === "cancelled" || reservation.cancelled || !result) return { stopReason: "cancelled" };
+			const text = acpProgressReportText(result.value);
+			await this.#publishSessionUpdate(
+				sessionId,
+				{ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } },
+				record.adapter,
+			);
+			return { stopReason: "end_turn" };
+		} finally {
+			if (record.pendingPromptAdmission === reservation) record.pendingPromptAdmission = undefined;
+		}
+	}
+
 	async #waitForPromptSettlement(
 		waiter: PromptWaiter,
 		admissionReservation: PromptAdmissionReservation,
@@ -2482,6 +2537,7 @@ export class AcpAgent implements Agent {
 			);
 			return { stopReason: "end_turn" };
 		}
+		if (isAcpProgressCommand(params.prompt)) return await this.#runProgressCommand(params.sessionId, record);
 		// The SDK transport hard-caps a single request frame at 256 KiB and answers an
 		// oversize frame by closing the socket (CloseCode::Size, crates/gjc-sdk/src/server.rs),
 		// which surfaces to the client as an opaque `connection_closed` mid-turn. Reject
@@ -2969,6 +3025,7 @@ export class AcpAgent implements Agent {
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
 		record.cancelRequested = true;
+		const localCommand = !record.activePrompt && record.pendingPromptAdmission?.localCommand === true;
 		this.#settlePendingPromptAdmission(record, { kind: "cancelled" });
 		// C04 terminal abort: an external client cancel stops the current turn
 		// (`scope:"turn"`, the default, matching the SDK `turn.abort` default and
@@ -2976,6 +3033,12 @@ export class AcpAgent implements Agent {
 		// subagents and background tasks stopped opts in with
 		// `_meta.gjc.abortScope: "owned"` (or `GJC_ACP_ABORT_SCOPE=owned`).
 		const scope = resolveAcpAbortScope(params._meta, process.env);
+		// The current turn is a model-free builtin answered locally: settling its reservation
+		// above cancels it, and the host has no turn to abort.
+		if (localCommand && scope === "turn") {
+			record.cancelRequested = false;
+			return;
+		}
 		const waiter = record.activePrompt;
 		const waiterWasUnacknowledged = waiter !== undefined && !waiter.acknowledged;
 		const waiterWasBeforeActivity = waiter !== undefined && !waiter.observedTurnActivity;

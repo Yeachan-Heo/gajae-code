@@ -9162,6 +9162,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			},
 			{ stage: "ensure", error: new Error("token-secret"), code: "broker_bootstrap_failed" },
 			{
+				stage: "ensure",
+				error: new SdkClientError("broker_unavailable", "attach-only refusal"),
+				code: "broker_unavailable",
+				message: "SDK broker is unavailable.",
+			},
+			{
 				stage: "read",
 				error: new UnsupportedStateVersionError("/secret/path", 2),
 				code: "broker_discovery_unsupported",

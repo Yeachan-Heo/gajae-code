@@ -19,6 +19,8 @@ interface FakeAcpBuiltinSession {
 	sessionId: string;
 	credentialSessionId: string;
 	sessionName: string;
+	userModelSelectionMarks: number;
+	markUserModelSelection(): void;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	thinkingLevel: ThinkingLevel | undefined;
 	memoryBackend: AgentSession["memoryBackend"];
@@ -119,6 +121,10 @@ function createRuntime() {
 		sessionId: "fake-session-id",
 		credentialSessionId: "fake-credential-session-id",
 		sessionName: "Fake Session",
+		userModelSelectionMarks: 0,
+		markUserModelSelection() {
+			this.userModelSelectionMarks += 1;
+		},
 		_todoPhases: [],
 		thinkingLevel: ThinkingLevel.Low,
 		thinkingLevelCalls: [],
@@ -860,8 +866,20 @@ describe("ACP builtin slash commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/model executor xai/grok-4.5", runtime);
 
 		expect(result).toEqual({ consumed: true });
+		expect(session.userModelSelectionMarks).toBe(0);
 		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({});
 		expect(output[0]).toContain("requires an explicit effort suffix");
+	});
+
+	it("model: does not fence a rejected role selector", async () => {
+		const { output, runtime, session } = createRuntime();
+
+		const result = await executeAcpBuiltinSlashCommand("/model executor unknown-selector", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(session.userModelSelectionMarks).toBe(0);
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({});
+		expect(output[0]).toContain("Unknown model: unknown-selector");
 	});
 
 	it("model: accepts explicit Grok effort for argument-based assignment", async () => {
@@ -895,6 +913,11 @@ describe("ACP builtin slash commands", () => {
 		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
 		const modelBefore = session.model;
 		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+		let marksAtCredentialProbe = 0;
+		spyOn(session.modelRegistry, "getApiKey").mockImplementation(async () => {
+			marksAtCredentialProbe = session.userModelSelectionMarks;
+			return "test-api-key";
+		});
 		let titleNotified = 0;
 		let configNotified = 0;
 		runtime.notifyTitleChanged = () => {
@@ -907,6 +930,8 @@ describe("ACP builtin slash commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/model executor anthropic/claude-3-5-sonnet:low", runtime);
 
 		expect(result).toEqual({ consumed: true });
+		expect(session.userModelSelectionMarks).toBe(1);
+		expect(marksAtCredentialProbe).toBe(0);
 		expect(setModelSpy).not.toHaveBeenCalled();
 		expect(session.model).toBe(modelBefore);
 		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({

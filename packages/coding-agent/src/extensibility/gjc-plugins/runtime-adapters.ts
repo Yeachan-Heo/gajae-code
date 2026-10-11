@@ -149,21 +149,81 @@ const initialTemporaryRoots = initialProcessEnvironment.then(async environment =
 	}
 	return [...roots];
 });
-const initialNodeAuthorities = initialProcessEnvironment.then(async environment => {
-	const authorities = new Map<string, string>();
+
+/** Startup identity of a file: the object `hashStableFile` must still be reading. */
+export interface StableFileIdentity {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
+/**
+ * Startup identity of every canonical `node` on PATH, keyed by realpath. Only
+ * `stat` runs at startup; the digest is computed on first use from a descriptor
+ * whose identity must still match this snapshot, so a later replacement cannot
+ * become launch authority.
+ */
+const initialNodeIdentities = initialProcessEnvironment.then(async environment => {
+	const identities = new Map<string, StableFileIdentity>();
 	const temporaryRoots = await initialTemporaryRoots;
 	for (const pathEntry of (environment.get("PATH") ?? "").split(path.delimiter).filter(path.isAbsolute)) {
 		const lexical = path.join(pathEntry, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			const real = await fs.realpath(lexical);
+			// A temporary root is writable by other local users and by checkouts the user
+			// never vetted, so a `node` resolved there never becomes launch authority.
 			if (temporaryRoots.some(root => isWithin(root, real))) continue;
-			authorities.set(real, await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES));
+			if (identities.has(real)) continue;
+			const stat = await fs.stat(real);
+			identities.set(real, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeMs: stat.mtimeMs,
+				ctimeMs: stat.ctimeMs,
+			});
 		} catch {
-			// Missing or unstable startup candidates do not become authority.
+			// Missing startup candidates do not become authority.
 		}
 	}
-	return authorities;
+	return identities;
 });
+
+/**
+ * First-use digests of startup Node candidates, keyed by realpath. Successful and
+ * in-flight digests stay memoized; a failed attempt is evicted so a transient error
+ * (e.g. EMFILE) can be retried against the same startup identity.
+ */
+const initialNodeHashes = new Map<string, Promise<string | undefined>>();
+
+/**
+ * Digest of a `node` that was on PATH at startup, or `undefined` when the path
+ * was not a startup candidate or no longer is the startup file object.
+ */
+export function getInitialNodeHash(realPath: string): Promise<string | undefined> {
+	const cached = initialNodeHashes.get(realPath);
+	if (cached) return cached;
+
+	const attempt = initialNodeIdentities.then(async identities => {
+		const identity = identities.get(realPath);
+		if (!identity) return undefined;
+		try {
+			return await hashStableFile(realPath, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, identity);
+		} catch {
+			// Do not memoize failed attempts to allow retries on transient errors
+			// (e.g., EMFILE on file open/read). Remove the pending entry so the next
+			// call can retry the operation with the same startup identity.
+			initialNodeHashes.delete(realPath);
+			return undefined;
+		}
+	});
+	// Memoize the in-flight attempt so only one concurrent operation runs, but
+	// the entry may be deleted if the operation fails (to allow retry).
+	initialNodeHashes.set(realPath, attempt);
+	return attempt;
+}
 
 async function snapshotExistingFile(filePath: string): Promise<FileSnapshot | null> {
 	try {
@@ -416,11 +476,28 @@ const STABLE_HASH_CHUNK_BYTES = 1024 * 1024;
  * on PATH; buffering each interpreter (~120 MiB) held its full bytes in the
  * session process until exit.
  */
-export async function hashStableFile(filePath: string, label: string, maxBytes: number): Promise<string> {
+export async function hashStableFile(
+	filePath: string,
+	label: string,
+	maxBytes: number,
+	expected?: StableFileIdentity,
+): Promise<string> {
 	const handle = await fs.open(filePath, fs.constants.O_RDONLY);
 	try {
 		const before = await handle.stat();
 		if (!before.isFile()) throw new Error(`${label} is not a regular file`);
+		// Checked on the opened descriptor, so the digest belongs to the expected
+		// file object even if the path is swapped around the open.
+		if (
+			expected &&
+			(before.dev !== expected.dev ||
+				before.ino !== expected.ino ||
+				before.size !== expected.size ||
+				before.mtimeMs !== expected.mtimeMs ||
+				before.ctimeMs !== expected.ctimeMs)
+		) {
+			throw new Error(`${label} is not the expected file`);
+		}
 		if (before.size > maxBytes) throw new Error(`${label} exceeds its byte limit`);
 		const hash = createHash("sha256");
 		const chunk = Buffer.allocUnsafe(STABLE_HASH_CHUNK_BYTES);
@@ -515,7 +592,7 @@ async function isInitialManagedNodeLauncherPath(
 	const real = await fs.realpath(executablePath);
 	if (untrustedRoots.some(root => isWithin(root, real))) return false;
 	if ((await initialTemporaryRoots).some(root => isWithin(root, real))) return false;
-	const expected = (await initialNodeAuthorities).get(real);
+	const expected = await getInitialNodeHash(real);
 	if (!expected) return false;
 	return (await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES)) === expected;
 }
@@ -671,7 +748,7 @@ async function prepareVerifiedStdioLaunch(input: {
 		true,
 	);
 	const launcherReal = await fs.realpath(input.launcherPath);
-	const expectedLauncherHash = (await initialNodeAuthorities).get(launcherReal);
+	const expectedLauncherHash = await getInitialNodeHash(launcherReal);
 	if (!expectedLauncherHash || sha256(launcherBytes) !== expectedLauncherHash) {
 		throw new Error("Plugin MCP Node interpreter drifted from startup authority");
 	}

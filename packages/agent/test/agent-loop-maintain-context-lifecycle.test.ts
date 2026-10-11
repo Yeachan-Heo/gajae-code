@@ -126,7 +126,12 @@ it("settles a provider that resolves after cancellation wins the factory race", 
 	await factoryStarted.promise;
 	controller.abort();
 	await drain;
-	await stream.result();
+	const messages = await stream.result();
+	const terminal = messages.at(-1);
+	expect(terminal).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	if (terminal?.role === "assistant") {
+		expect(terminal.transportFailure?.providerCode).not.toBe("empty_response");
+	}
 
 	const lateStream = new AssistantMessageEventStream();
 	const lateMessage = createAssistantMessage([{ type: "text", text: "late" }]);
@@ -166,7 +171,12 @@ it("settles a late provider even when iterator acquisition throws synchronously"
 	await factoryStarted.promise;
 	controller.abort();
 	await drain;
-	await stream.result();
+	const messages = await stream.result();
+	const terminal = messages.at(-1);
+	expect(terminal).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	if (terminal?.role === "assistant") {
+		expect(terminal.transportFailure?.providerCode).not.toBe("empty_response");
+	}
 
 	const lateStream = new AssistantMessageEventStream();
 	const lateMessage = createAssistantMessage([{ type: "text", text: "late" }]);

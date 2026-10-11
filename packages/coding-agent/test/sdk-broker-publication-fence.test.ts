@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { FileLockAcquireError } from "../src/config/file-lock";
 import { Broker, setAmbiguityGraceForTest, setPublicationObservationForTest } from "../src/sdk/broker/broker";
 import {
 	type BrokerExitWriterTestBarrier,
@@ -166,6 +167,81 @@ test("a lost-root exit logs and persists one structured fence reason", async () 
 		warn.mockRestore();
 	}
 });
+
+test("a retained transition that blocks heartbeat renewal persists its reason and path", async () => {
+	const broker = await startBroker();
+	const lockTarget = path.join(broker.settings.agentDir, "sdk", "sessions", "index.jsonl");
+	const blockingLockPath = `${lockTarget}.lock.removing`;
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	const infoPath = path.join(blockingLockPath, "info");
+	await Bun.write(infoPath, "");
+	const old = new Date(Date.now() - 120_000);
+	await fs.utimes(infoPath, old, old);
+	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats");
+	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 20)).toBe(true);
+		expect(checkpoint).toHaveBeenCalled();
+
+		const record = await readBrokerExitRecord(broker.settings.agentDir);
+		expect(record).toMatchObject({
+			mode: "owned-root",
+			reason: "heartbeat-renewal-blocked",
+			fenceReason: null,
+			blockingLockPath,
+			signal: null,
+		});
+		const exitLog = warn.mock.calls.find(([message]) => message === "sdk broker: exiting");
+		expect(exitLog?.[1]).toMatchObject({
+			message: `blocked by retained removal transition ${blockingLockPath}`,
+			blockingLockPath,
+		});
+	} finally {
+		checkpoint.mockRestore();
+		warn.mockRestore();
+	}
+}, 10_000);
+
+test("a blocked heartbeat renewal does not replace a prior publication fence exit cause", async () => {
+	const broker = await startBroker();
+	const lockTarget = path.join(broker.settings.agentDir, "sdk", "sessions", "index.jsonl");
+	const blockingLockPath = `${lockTarget}.lock.removing`;
+	const error = new FileLockAcquireError(
+		lockTarget,
+		`${lockTarget}.lock`,
+		1,
+		`orphan transition retained at ${blockingLockPath}`,
+		"orphan_transition",
+		blockingLockPath,
+	);
+	const checkpointResult = Promise.withResolvers<number>();
+	const checkpoint = vi
+		.spyOn(broker.index, "checkpointLiveHeartbeats")
+		.mockImplementation(() => checkpointResult.promise);
+	setAmbiguityGraceForTest(broker, 60_000);
+	try {
+		for (let attempt = 0; checkpoint.mock.calls.length === 0 && attempt < 200; attempt++) await Bun.sleep(5);
+		expect(checkpoint).toHaveBeenCalledTimes(1);
+
+		setPublicationObservationForTest(broker, "ambiguous");
+		await Bun.sleep(WATCHDOG_CADENCE_MS * 2);
+		checkpointResult.reject(error);
+		expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 2)).toBe(false);
+
+		setAmbiguityGraceForTest(broker, 0);
+		expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 20)).toBe(true);
+		const record = await readBrokerExitRecord(broker.settings.agentDir);
+		expect(record).toMatchObject({
+			mode: "lost-root",
+			reason: "ownership-fence-expired",
+			fenceReason: "observation-ambiguous",
+		});
+		expect(record).not.toHaveProperty("blockingLockPath");
+	} finally {
+		checkpointResult.resolve(0);
+		checkpoint.mockRestore();
+	}
+}, 10_000);
 
 test("a signal stop persists its reason without synchronous fsync", async () => {
 	const broker = await startBroker();

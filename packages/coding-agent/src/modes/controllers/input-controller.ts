@@ -42,6 +42,7 @@ import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 import { focusedUiOwnsInterrupt } from "../utils/interrupt-ownership";
 import { matchesAppInterrupt } from "../utils/keybinding-matchers";
+import { createUnforwardedOptionChordWarner } from "../utils/macos-option-forwarding";
 
 const QUEUE_SELECTOR_NAVIGATION_ACTIONS = [
 	"tui.select.up",
@@ -96,6 +97,8 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	/** Session id with an automatic-title request pending, if any. */
+	#autoTitleInFlightSessionId: string | undefined;
 	#deferredSubmission?: {
 		text: string;
 		images?: InteractiveModeContext["pendingImages"];
@@ -816,6 +819,12 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => this.#executeAction("app.message.queue");
 		this.#registerCommandPaletteAction("app.message.queue", queue, true);
+		this.ctx.editor.onUnforwardedOptionChord ??= createUnforwardedOptionChordWarner({
+			platform: process.platform,
+			terminalProgram: Bun.env.TERM_PROGRAM,
+			formatKeyHint: key => this.ctx.keybindings.formatKeyHint(key),
+			showWarning: message => this.ctx.showWarning(message),
+		});
 
 		this.ctx.editor.onViewportPageScroll = direction => this.ctx.ui.scrollViewportPages(direction);
 		this.ctx.editor.onViewportFollowLive = () => {
@@ -1172,6 +1181,7 @@ export class InputController {
 				return;
 			}
 			this.ctx.queueCompactionMessage(text, "steer", composer);
+			this.#titleQueuedCompactionText(text);
 			return;
 		}
 
@@ -1181,6 +1191,9 @@ export class InputController {
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.ctx.session.isStreaming) {
 			invalidateSessionTitleGeneration(this.ctx.sessionManager);
+			// A turn started by a skill command has no user message yet, so the
+			// first typed message can arrive here instead of the idle path.
+			this.maybeGenerateSessionTitle(text);
 			if (this.#canModifyComposer(composer)) {
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
@@ -1209,32 +1222,7 @@ export class InputController {
 		// First, move any pending bash components to chat
 		this.ctx.flushPendingBashComponents();
 
-		// Generate session title on first message
-		const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-		if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) {
-			const registry = this.ctx.session.modelRegistry;
-			generateSessionTitle(
-				text,
-				registry,
-				this.ctx.settings,
-				this.ctx.session.credentialSessionId,
-				this.ctx.session.model,
-				provider => this.ctx.session.agent.metadataForProvider(provider),
-			)
-				.then(async title => {
-					if (title) {
-						const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
-						if (applied) {
-							setSessionTerminalTitle(
-								this.ctx.sessionManager.getSessionName()!,
-								this.ctx.sessionManager.getCwd(),
-							);
-							this.ctx.updateEditorBorderColor();
-						}
-					}
-				})
-				.catch(() => {});
-		}
+		this.maybeGenerateSessionTitle(text);
 
 		if (this.ctx.onInputCallback) {
 			// Include any pending images from clipboard paste
@@ -1312,7 +1300,7 @@ export class InputController {
 		});
 
 		// Stop the TUI (restore terminal to normal mode)
-		this.ctx.ui.stop();
+		this.ctx.ui.suspend();
 
 		// Send SIGTSTP to process group (pid=0 means all processes in group)
 		process.kill(0, "SIGTSTP");
@@ -1638,6 +1626,51 @@ export class InputController {
 	}
 
 	/**
+	 * Generate the automatic session title from the first user message. Called
+	 * from the editor submit and queue-shortcut paths (idle and streaming) and
+	 * from interactive startup messages; it is a no-op once the session has a
+	 * user message, a name, or a title request already in flight. The result is
+	 * bound to the session that requested it: a completion that lands after the
+	 * session was replaced (New Session, switch, resume) is discarded.
+	 */
+	maybeGenerateSessionTitle(text: string): void {
+		if (this.ctx.sessionManager.getSessionName()) return;
+		const sessionId = this.ctx.sessionManager.getSessionId();
+		if (this.#autoTitleInFlightSessionId === sessionId) return;
+		if ($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) return;
+		if (this.ctx.session.messages.some((m: AgentMessage) => m.role === "user")) return;
+		// Keep locally intercepted command arguments away from the title model.
+		if (this.ctx.session.isLocallyHandledSlashCommand(text)) return;
+		this.#autoTitleInFlightSessionId = sessionId;
+		generateSessionTitle(
+			text,
+			this.ctx.session.modelRegistry,
+			this.ctx.settings,
+			this.ctx.session.credentialSessionId,
+			this.ctx.session.model,
+			provider => this.ctx.session.agent.metadataForProvider(provider),
+		)
+			.then(async title => {
+				if (!title || this.ctx.sessionManager.getSessionId() !== sessionId) return;
+				const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
+				if (applied) {
+					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
+					this.ctx.updateEditorBorderColor();
+				}
+			})
+			.catch(() => {})
+			.finally(() => {
+				if (this.#autoTitleInFlightSessionId === sessionId) this.#autoTitleInFlightSessionId = undefined;
+			});
+	}
+
+	/** Title text accepted into the compaction queue; skill commands replay through the skill path and are not titled. */
+	#titleQueuedCompactionText(text: string): void {
+		if (parseSkillInvocations(text, this.ctx.skillCommands ?? new Map()).length > 0) return;
+		this.maybeGenerateSessionTitle(text);
+	}
+
+	/**
 	 * Dispatch skill slash invocation(s) (`/skill:<name>`) through custom messages
 	 * using the supplied `streamingBehavior`. Returns true if the text contains a
 	 * recognised canonical skill command or command chain and was dispatched. A
@@ -1745,6 +1778,7 @@ export class InputController {
 				return;
 			}
 			this.ctx.queueCompactionMessage(text, "followUp");
+			this.#titleQueuedCompactionText(text);
 			return;
 		}
 
@@ -1759,6 +1793,7 @@ export class InputController {
 					followUpQueuePolicy: "sequential",
 				}),
 			);
+			this.maybeGenerateSessionTitle(text);
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.ui.requestRender();
 			return;
@@ -1770,6 +1805,7 @@ export class InputController {
 			return;
 		}
 
+		this.maybeGenerateSessionTitle(text);
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");
@@ -2526,7 +2562,7 @@ export class InputController {
 		let ttyHandle: fs.FileHandle | null = null;
 		try {
 			ttyHandle = await this.#openEditorTerminalHandle();
-			this.ctx.ui.stop();
+			this.ctx.ui.suspend();
 
 			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
 				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]

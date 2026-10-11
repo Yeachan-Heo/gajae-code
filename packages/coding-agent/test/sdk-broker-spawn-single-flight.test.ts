@@ -2,9 +2,10 @@ import { expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import path from "node:path";
+import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
+import Sdk from "../src/commands/sdk";
 import { readBrokerExitRecord, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
 import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
@@ -630,6 +631,39 @@ it("kills a broker bootstrap that outlives the startup fence deadline", async ()
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 15_000);
+
+it("records a startup exit when acquisition is blocked by a retained removal transition", async () => {
+	const dir = await temp();
+	const blockingLockPath = path.join(dir, "sdk", "broker.startup.lock.removing");
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	const infoPath = path.join(blockingLockPath, "info");
+	await Bun.write(infoPath, "");
+	const old = new Date(Date.now() - 120_000);
+	await fs.utimes(infoPath, old, old);
+	const stderr: string[] = [];
+	const stderrWrite = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({ reason: "orphan_transition", orphanPath: blockingLockPath });
+
+		expect(stderr.join("")).toContain(`blocked by retained removal transition ${blockingLockPath}`);
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-blocked",
+			blockingLockPath,
+			timeoutMs: BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
+			exitCode: 1,
+			signal: null,
+		});
+		expect(await readBrokerExitRecord(dir)).toBeUndefined();
+	} finally {
+		stderrWrite.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
 
 it("keeps the deadline reason when SIGTERM arrives during its async record fallback", async () => {
 	if (process.platform === "win32") return;

@@ -1,3 +1,5 @@
+import { isBrokerAttachOnly, SDK_BROKER_AUTOSTART_ENV } from "../packages/coding-agent/src/sdk/broker/ensure";
+
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 5_000;
 const SHUTDOWN_POLL_INTERVAL_MS = 50;
 
@@ -112,6 +114,12 @@ export async function restartSdkBroker(
 	if (!Number.isSafeInteger(gracefulTimeoutMs) || gracefulTimeoutMs <= 0) {
 		throw new Error("gracefulTimeoutMs must be a positive safe integer.");
 	}
+	// Attach-only: an external supervisor owns this broker. Refuse before closing hosts
+	// or stopping the incumbent, because no replacement may be started from here.
+	if (isBrokerAttachOnly())
+		throw new Error(
+			`SDK broker restart refused: ${SDK_BROKER_AUTOSTART_ENV}=0 means an external supervisor owns the broker; restart it through that supervisor.`,
+		);
 
 	const previous = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
 	let closedSessionIds: string[] | undefined;

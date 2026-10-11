@@ -7,6 +7,7 @@ import { truncateTail } from "../session/streaming-output";
 import { lookupOwnedRegistration } from "../session/terminal-abort";
 import { BashTool } from "./bash";
 import type { ToolSession } from "./index";
+import { assertMonitorMutationAllowed } from "./monitor-mutation";
 import { ToolError } from "./tool-errors";
 import { TOOL_TIMEOUTS } from "./tool-timeouts";
 
@@ -136,6 +137,12 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		if (!manager) {
 			throw new ToolError("Async execution is disabled; the monitor tool is unavailable in this session.");
 		}
+
+		await assertMonitorMutationAllowed({
+			cwd: this.session.cwd,
+			sessionId: this.session.getSessionId?.() ?? undefined,
+			command: params.command,
+		});
 
 		const persistent = params.persistent ?? false;
 		const label = buildMonitorLabel(params);

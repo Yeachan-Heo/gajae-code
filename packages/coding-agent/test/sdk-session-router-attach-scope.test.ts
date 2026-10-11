@@ -22,16 +22,20 @@ const SESSION_IDS = ["scoped-session", "unrelated-session"] as const;
 async function scopedRouterFixture(
 	sessionIds?: readonly string[],
 	attachFilter?: (sessionId: string) => boolean,
+	stateRootCaseVariant = false,
 ): Promise<{
 	attached: string[];
 	closed: string[];
+	repo: string;
 	router: SessionRouter;
+	stateRoot: string;
 	stop: () => Promise<void>;
 }> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-attach-scope-"));
 	tempDirs.push(repo);
 	const agentDir = path.join(repo, ".gjc", "agent");
 	const stateRoot = path.join(repo, ".gjc", "state");
+	const indexedStateRoot = stateRootCaseVariant ? path.join(repo, ".GJC", "STATE") : stateRoot;
 	const endpointDir = path.join(stateRoot, "sdk");
 	fs.mkdirSync(endpointDir, { recursive: true });
 
@@ -53,7 +57,7 @@ async function scopedRouterFixture(
 			indexSeq: 1,
 			sessions: SESSION_IDS.map(sessionId => ({
 				sessionId,
-				locator: { cwd: repo, worktreeRoot: null, stateRoot },
+				locator: { cwd: repo, worktreeRoot: null, stateRoot: indexedStateRoot },
 				endpointGeneration: 1,
 				pid: 42,
 				endpointMtimeMs: endpointMtimeMs.get(sessionId),
@@ -90,7 +94,7 @@ async function scopedRouterFixture(
 		},
 	});
 	await router.start();
-	return { attached, closed, router, stop: async () => await router.stop() };
+	return { attached, closed, repo, router, stateRoot: indexedStateRoot, stop: async () => await router.stop() };
 }
 
 test("an unscoped Router attaches to every live indexed session", async () => {
@@ -123,6 +127,24 @@ test("a Router scoped to one session never attaches to an unrelated live session
 	const { attached, stop } = await scopedRouterFixture(["scoped-session"]);
 	try {
 		expect(attached).toEqual(["scoped-session"]);
+	} finally {
+		await stop();
+	}
+});
+
+test("a Router matches state-root casing only when Windows resolves it to the same filesystem object", async () => {
+	if (process.platform !== "win32") return;
+
+	const { attached, repo, stateRoot, stop } = await scopedRouterFixture(undefined, undefined, true);
+	try {
+		const canonicalStats = fs.statSync(path.join(repo, ".gjc", "state"), { bigint: true });
+		let sameFilesystemObject = false;
+		try {
+			const aliasStats = fs.statSync(stateRoot, { bigint: true });
+			sameFilesystemObject = canonicalStats.dev === aliasStats.dev && canonicalStats.ino === aliasStats.ino;
+		} catch {}
+
+		expect([...attached].sort()).toEqual(sameFilesystemObject ? [...SESSION_IDS].sort() : []);
 	} finally {
 		await stop();
 	}

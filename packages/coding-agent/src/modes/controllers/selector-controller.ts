@@ -1612,7 +1612,7 @@ export class SelectorController {
 	}
 
 	async #handleCredentialImport(): Promise<void> {
-		this.ctx.showStatus("Scanning for existing Claude Code / Codex CLI credentials…");
+		this.ctx.showStatus("Scanning for existing Claude Code / Codex CLI / Kiro CLI credentials…");
 		const preview = await runExternalCredentialAutoImport({
 			authStorage: {
 				importCredentialIfAbsent: async () => ({
@@ -2494,17 +2494,20 @@ export class SelectorController {
 	 * default) then refresh the status surfaces. Rethrows so callers surface errors.
 	 */
 	async #applyModelProfile(profileName: string, persistDefault: boolean): Promise<void> {
+		this.ctx.session.markUserModelSelection();
 		const profileLabel = formatModelProfileDisplayLabel(
 			this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
 		);
-		await activateModelProfile(
-			{
-				session: this.ctx.session,
-				modelRegistry: this.ctx.session.modelRegistry,
-				settings: this.ctx.settings,
-				profileName,
-			},
-			{ persistDefault },
+		await this.ctx.session.withSdkControlMutation(() =>
+			activateModelProfile(
+				{
+					session: this.ctx.session,
+					modelRegistry: this.ctx.session.modelRegistry,
+					settings: this.ctx.settings,
+					profileName,
+				},
+				{ persistDefault },
+			),
 		);
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
@@ -2779,6 +2782,7 @@ export class SelectorController {
 							await this.ctx.session.setModelTemporary(model, thinkingLevel, {
 								cause: "temporary-operation",
 								reason: "other",
+								onMutationStarted: () => this.ctx.session.markUserModelSelection(),
 							});
 							this.ctx.session.setDefaultFallbackRuntimeModel(
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
@@ -2816,6 +2820,7 @@ export class SelectorController {
 								selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
 									? selectedSelector.slice(0, -thinkingLevel.length - 1)
 									: selectedSelector;
+							if (includesRoleAgent && !includesDefault) this.ctx.session.markUserModelSelection();
 
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
@@ -2938,6 +2943,7 @@ export class SelectorController {
 							}
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
+							this.ctx.session.markUserModelSelection();
 							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
 							const materializedProfile = materializeActiveModelProfileAssignments({
 								session: this.ctx.session,
@@ -3677,12 +3683,15 @@ export class SelectorController {
 			return;
 		}
 
-		await activateModelProfile({
-			session: this.ctx.session,
-			modelRegistry: this.ctx.session.modelRegistry,
-			settings: this.ctx.settings,
-			profileName: recommendedProfile.name,
-		});
+		this.ctx.session.markUserModelSelection();
+		await this.ctx.session.withSdkControlMutation(() =>
+			activateModelProfile({
+				session: this.ctx.session,
+				modelRegistry: this.ctx.session.modelRegistry,
+				settings: this.ctx.settings,
+				profileName: recommendedProfile.name,
+			}),
+		);
 	}
 
 	async #handleOAuthLogin(providerId: string, options?: OAuthSelectorOptions): Promise<void> {

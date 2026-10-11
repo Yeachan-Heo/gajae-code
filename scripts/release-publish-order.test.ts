@@ -468,6 +468,12 @@ describe("immutable stable release contracts", () => {
 
 		expect(parseReleaseCli(["watch"])).toEqual({ mode: "watch" });
 		expect(parseReleaseCli(["1.2.3"])).toEqual({ mode: "release", version: "1.2.3" });
+		expect(parseReleaseCli(["backmerge", "1.2.3"])).toEqual({ mode: "backmerge", version: "1.2.3" });
+		expect(() => parseReleaseCli(["backmerge"])).toThrow("exactly one exact stable X.Y.Z version");
+		expect(() => parseReleaseCli(["backmerge", "v1.2.3"])).toThrow("exactly one exact stable X.Y.Z version");
+		expect(() => parseReleaseCli(["backmerge", "1.2.3", "--dry-run"])).toThrow(
+			"exactly one exact stable X.Y.Z version",
+		);
 		expect(() => parseReleaseCli(["watch", "--verbose"])).toThrow("exactly one argument");
 		expect(() => parseReleaseCli(["1.2.3", "--dry-run"])).toThrow("exactly one argument");
 	});
@@ -498,6 +504,8 @@ describe("immutable stable release contracts", () => {
 		expect(releaseScript).toContain("Cannot parse CI run query");
 		expect(releaseScript).toContain("headSha");
 		expect(releaseScript).toContain("await watchCI(`v${version}`)");
+		expect(releaseScript).toContain("git -C /tmp/gjc-backmerge merge refs/remotes/origin/tags/v${version}");
+		expect(releaseScript).not.toContain("git -C /tmp/gjc-backmerge merge origin/main");
 		expect(assertionIndex).toBeGreaterThan(-1);
 		expect(assertionIndex).toBeLessThan(commitIndex);
 	});

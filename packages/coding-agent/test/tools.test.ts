@@ -5,13 +5,17 @@ import * as path from "node:path";
 import * as url from "node:url";
 import * as zlib from "node:zlib";
 import type { AgentToolContext } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@gajae-code/coding-agent/config/settings";
 import { EditTool } from "@gajae-code/coding-agent/edit";
+import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { saveAgentBashOriginalArtifact } from "@gajae-code/coding-agent/session/agent-session";
-import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridge";
 import type { FoldAdapter } from "@gajae-code/coding-agent/session/fold-coordinator";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { type PreparedNewSession, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	OutputSink,
@@ -204,33 +208,140 @@ function createZipArchive(entries: ArchiveFixtureEntry[]): Buffer {
 	return Buffer.concat([...localParts, centralDirectory, endOfCentralDirectory]);
 }
 
-let artifactCounter = 0;
+const testSessionManagers: SessionManager[] = [];
+
 function createTestToolSession(
 	cwd: string,
 	settings: Settings = Settings.isolated(),
 	overrides: Partial<ToolSession> = {},
+	sessionManager?: SessionManager,
 ): ToolSession {
-	const sessionFile = path.join(cwd, "session.jsonl");
-	const sessionDir = path.join(cwd, "session");
+	const owner = sessionManager ?? SessionManager.create(cwd, SessionManager.explicitDestination(cwd));
+	if (!sessionManager) testSessionManagers.push(owner);
 	return {
 		cwd,
 		hasUI: false,
-		getSessionFile: () => sessionFile,
+		getSessionId: () => owner.getSessionId(),
+		getSessionFile: () => owner.getSessionFile() ?? null,
 		getSessionSpawns: () => "*",
-		getArtifactsDir: () => sessionDir,
-		allocateOutputArtifact: async (toolType: string) => {
-			fs.mkdirSync(sessionDir, { recursive: true });
-			const id = `artifact-${++artifactCounter}`;
-			return { id, path: path.join(sessionDir, `${id}.${toolType}.log`) };
-		},
+		getArtifactsDir: () => owner.getArtifactsDir(),
+		getArtifactManager: () => owner.getArtifactManager(),
+		captureArtifactPublication: () => owner.captureArtifactPublication(),
 		settings,
 		...overrides,
 	};
 }
 
-function createTestToolContext(toolNames: string[]): AgentToolContext {
+function getTestArtifactsDir(session: ToolSession): string {
+	const artifactsDir = session.getArtifactsDir?.();
+	if (artifactsDir === undefined || artifactsDir === null) {
+		throw new Error("Expected the test session to provide an artifacts directory.");
+	}
+	return artifactsDir;
+}
+
+interface HeldFilesystemStat {
+	started: Promise<void>;
+	release(): void;
+	restore(): void;
+}
+
+function holdFilesystemStatAfterResult(targetPath: string): HeldFilesystemStat {
+	const releaseHeldStat = Promise.withResolvers<void>();
+	const heldStatStarted = Promise.withResolvers<void>();
+	const originalStat = fs.promises.stat.bind(fs.promises);
+	let held = false;
+	function interceptedStat(filePath: fs.PathLike): Promise<fs.Stats>;
+	function interceptedStat(
+		filePath: fs.PathLike,
+		options?: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry?: true | undefined },
+	): Promise<fs.Stats>;
+	function interceptedStat(
+		filePath: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry?: true | undefined },
+	): Promise<fs.BigIntStats>;
+	function interceptedStat(
+		filePath: fs.PathLike,
+		options: fs.StatOptions & { bigint?: false | undefined; throwIfNoEntry: false },
+	): Promise<fs.Stats | undefined>;
+	function interceptedStat(
+		filePath: fs.PathLike,
+		options: fs.StatOptions & { bigint: true; throwIfNoEntry: false },
+	): Promise<fs.BigIntStats | undefined>;
+	function interceptedStat(
+		filePath: fs.PathLike,
+		options: fs.StatOptions & { throwIfNoEntry?: true | undefined },
+	): Promise<fs.Stats | fs.BigIntStats>;
+	function interceptedStat(
+		filePath: fs.PathLike,
+		options?: fs.StatOptions,
+	): Promise<fs.Stats | fs.BigIntStats | undefined>;
+	async function interceptedStat(
+		filePath: fs.PathLike,
+		options?: fs.StatOptions,
+	): Promise<fs.Stats | fs.BigIntStats | undefined> {
+		const result = await originalStat(filePath, options);
+		if (filePath === targetPath && !held) {
+			held = true;
+			heldStatStarted.resolve();
+			await releaseHeldStat.promise;
+		}
+		return result;
+	}
+	const statSpy = vi.spyOn(fs.promises, "stat").mockImplementation(interceptedStat);
 	return {
-		sessionManager: SessionManager.inMemory(),
+		started: heldStatStarted.promise,
+		release: () => releaseHeldStat.resolve(),
+		restore: () => statSpy.mockRestore(),
+	};
+}
+
+async function readDirectoryBytes(directory: string): Promise<Map<string, Uint8Array<ArrayBuffer>>> {
+	if (!fs.existsSync(directory)) return new Map();
+	const entries = new Map<string, Uint8Array<ArrayBuffer>>();
+	for (const name of (await fs.promises.readdir(directory)).sort()) {
+		entries.set(name, await Bun.file(path.join(directory, name)).bytes());
+	}
+	return entries;
+}
+
+function artifactIdsInText(text: string): string[] {
+	return Array.from(text.matchAll(/artifact:\/\/([A-Za-z0-9_-]+)/g), match => match[1]).filter(
+		(id): id is string => id !== undefined,
+	);
+}
+
+async function findExactPublishedArtifact(
+	manager: SessionManager,
+	text: string,
+	expectedContent: string,
+): Promise<{ id: string; path: string } | undefined> {
+	for (const id of artifactIdsInText(text)) {
+		const artifactPath = await manager.getArtifactPath(id);
+		if (artifactPath && (await Bun.file(artifactPath).text()) === expectedContent) {
+			return { id, path: artifactPath };
+		}
+	}
+	return undefined;
+}
+
+async function closeTestToolSessions(): Promise<void> {
+	const errors: unknown[] = [];
+	for (const manager of testSessionManagers.splice(0)) {
+		try {
+			await manager.close();
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	if (errors.length > 0) throw new AggregateError(errors, "Failed to close test session managers.");
+}
+
+function createTestToolContext(toolNames: string[]): AgentToolContext {
+	const sessionManager = SessionManager.inMemory();
+	testSessionManagers.push(sessionManager);
+	return {
+		sessionManager,
 		modelRegistry: {
 			find: () => undefined,
 			getAll: () => [],
@@ -292,8 +403,9 @@ describe("Coding Agent Tools", () => {
 		findTool = wrapToolWithMetaNotice(new FindTool(session));
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await closeTestToolSessions();
 
 		// Clean up test directory
 		fs.rmSync(testDir, { recursive: true, force: true });
@@ -782,12 +894,12 @@ describe("Coding Agent Tools", () => {
 		it("should write to a new local:// path under the session local root", async () => {
 			const localPath = "local://handoffs/new-output.json";
 			const content = '{"ok":true}\n';
-			const expectedPath = path.join(testDir, "session", "local", "handoffs", "new-output.json");
+			const expectedPath = path.join(getTestArtifactsDir(session), "local", "handoffs", "new-output.json");
 
 			const result = await writeTool.execute("test-call-4-local", { path: localPath, content });
 
 			expect(getTextOutput(result)).toContain(
-				`Successfully wrote ${content.length} bytes to session/local/handoffs/new-output.json`,
+				`Successfully wrote ${content.length} bytes to ${path.relative(testDir, expectedPath)}`,
 			);
 			expect(fs.existsSync(expectedPath)).toBe(true);
 			expect(fs.readFileSync(expectedPath, "utf-8")).toBe(content);
@@ -1108,7 +1220,7 @@ function b() {
 
 		it("should resolve local:// destination paths for mv commands", async () => {
 			const sourcePath = path.join(testDir, "move-source.json");
-			const targetPath = path.join(testDir, "session", "local", "moved-via-bash.json");
+			const targetPath = path.join(getTestArtifactsDir(session), "local", "moved-via-bash.json");
 			fs.writeFileSync(sourcePath, '{"move":true}\n');
 
 			await bashTool.execute("test-call-8-local-mv", { command: `mv ${sourcePath} local://moved-via-bash.json` });
@@ -1147,7 +1259,8 @@ function b() {
 
 		it("should keep only the tail of truncated output by default and write the full artifact", async () => {
 			const result = await bashTool.execute("test-call-8-artifact", {
-				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'",
+				command:
+					"printf 'HEAD\\n'; i=1; while [ \"$i\" -le 6000 ]; do printf 'middle-%05d\\n' \"$i\"; i=$((i + 1)); done; printf 'TAIL\\n'",
 			});
 			const output = getTextOutput(result);
 			const truncation = result.details?.meta?.truncation;
@@ -1160,9 +1273,9 @@ function b() {
 			const artifactId = truncation?.artifactId;
 			expect(artifactId).toBeDefined();
 			if (artifactId) {
-				const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
-				expect(fs.existsSync(artifactPath)).toBe(true);
-				const artifact = fs.readFileSync(artifactPath, "utf-8");
+				const artifactPath = path.join(getTestArtifactsDir(session), `${artifactId}.bash.log`);
+				expect(await Bun.file(artifactPath).exists()).toBe(true);
+				const artifact = await Bun.file(artifactPath).text();
 				expect(artifact).toContain("HEAD");
 				expect(artifact).toContain("middle-03000");
 				expect(artifact).toContain("TAIL");
@@ -1170,17 +1283,22 @@ function b() {
 		});
 
 		it("publishes truncated output through managed storage without a writable path", async () => {
-			const manager = new ArtifactManager(path.join(testDir, "managed-artifacts"));
-			const tool = wrapToolWithMetaNotice(
-				new BashTool(
-					createTestToolSession(testDir, Settings.isolated(), {
-						allocateOutputArtifact: async () => ({ id: "reserved-managed-id" }),
-						getArtifactManager: () => manager,
-					}),
-				),
+			const agentDir = path.join(testDir, "managed-agent");
+			fs.mkdirSync(agentDir, { recursive: true });
+			const manager = SessionManager.create(testDir, SessionManager.managedDestination(testDir, agentDir));
+			testSessionManagers.push(manager);
+			await manager.ensureOnDisk();
+			const managedSession = createTestToolSession(
+				testDir,
+				Settings.isolated(),
+				{ allocateOutputArtifact: undefined },
+				manager,
 			);
+			expect(managedSession.allocateOutputArtifact).toBeUndefined();
+			const tool = wrapToolWithMetaNotice(new BashTool(managedSession));
 			const result = await tool.execute("test-call-managed-artifact", {
-				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..400}; printf 'TAIL\\n'",
+				command:
+					"printf 'HEAD\\n'; i=1; while [ \"$i\" -le 400 ]; do printf 'middle-%05d\\n' \"$i\"; i=$((i + 1)); done; printf 'TAIL\\n'",
 			});
 			const truncation = result.details?.meta?.truncation;
 			const artifactId = truncation?.artifactId;
@@ -1188,9 +1306,8 @@ function b() {
 			expect(getTextOutput(result)).not.toContain("HEAD");
 			expect(getTextOutput(result)).toContain("TAIL");
 			expect(artifactId).toBeDefined();
-			expect(artifactId).not.toBe("reserved-managed-id");
 			if (!artifactId) throw new Error("expected managed artifact id");
-			const artifactPath = await manager.getPath(artifactId);
+			const artifactPath = await manager.getArtifactPath(artifactId);
 			expect(artifactPath).not.toBeNull();
 			const artifact = await Bun.file(artifactPath!).text();
 			expect(artifact).toContain("HEAD");
@@ -1216,146 +1333,742 @@ function b() {
 			expect(unavailableSummary.artifactFailureDiagnostic).toBeUndefined();
 		});
 
-		it("preserves typed capped and unavailable original-artifact outcomes", async () => {
+		it("publishes capped original output through the real session publisher", async () => {
 			const originalText = "界".repeat(Math.floor(DEFAULT_ARTIFACT_MAX_BYTES / 3) + 1);
 			const retainedPrefix = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES);
 			const originalBytes = Buffer.byteLength(originalText, "utf-8");
 			const expectedOmittedBytes = originalBytes - retainedPrefix.bytes;
-			let savedContent: string | undefined;
-			let savedType: string | undefined;
 			let cappedResult: BashOriginalArtifactSaveResult | undefined;
-			const artifactManager = new ArtifactManager(path.join(testDir, "manager-artifacts"));
-			const managerSession = createTestToolSession(testDir, Settings.isolated(), {
-				getArtifactManager: () =>
-					({
-						save: async (content: string, type: string) => {
-							savedContent = content;
-							savedType = type;
-							return artifactManager.save(content, type);
-						},
-					}) as unknown as ArtifactManager,
-			});
-			await saveBashOriginalArtifactForTests(managerSession, originalText, result => {
-				cappedResult = result;
-			});
-			expect(cappedResult).toEqual({
-				status: "saved",
-				artifactId: "0",
-				complete: false,
-				omittedBytes: expectedOmittedBytes,
-			});
-			expect(savedContent).toBe(originalText);
-			expect(Buffer.byteLength(savedContent ?? "", "utf-8")).toBe(originalBytes);
-			expect(savedType).toBe("bash-original");
-			expect(retainedPrefix.bytes).toBeLessThanOrEqual(DEFAULT_ARTIFACT_MAX_BYTES);
-			expect(retainedPrefix.bytes).toBe(DEFAULT_ARTIFACT_MAX_BYTES - 1);
-			expect(expectedOmittedBytes).toBe(3);
-			expect(Buffer.byteLength(retainedPrefix.text, "utf-8")).toBe(retainedPrefix.bytes);
+			const manager = SessionManager.inMemory();
+			try {
+				const managerSession = createTestToolSession(
+					testDir,
+					Settings.isolated(),
+					{ getArtifactManager: undefined, allocateOutputArtifact: undefined },
+					manager,
+				);
+				await saveBashOriginalArtifactForTests(managerSession, originalText, result => {
+					cappedResult = result;
+				});
+				if (cappedResult?.status !== "saved") {
+					throw new Error("expected capped original output to be saved by the session publisher");
+				}
+				expect(cappedResult).toEqual({
+					status: "saved",
+					artifactId: "0",
+					complete: false,
+					omittedBytes: expectedOmittedBytes,
+				});
+				expect(retainedPrefix.bytes).toBe(DEFAULT_ARTIFACT_MAX_BYTES - 1);
+				expect(expectedOmittedBytes).toBe(3);
+				expect(Buffer.byteLength(retainedPrefix.text, "utf-8")).toBe(retainedPrefix.bytes);
 
-			const persistedPath = path.join(testDir, "manager-artifacts", "0.bash-original.log");
-			expect(fs.existsSync(persistedPath)).toBe(true);
-			expect(fs.readFileSync(persistedPath, "utf-8")).toBe(
-				`${retainedPrefix.text}\n[artifact truncated after ${retainedPrefix.bytes} bytes; omitted at least ${expectedOmittedBytes} bytes]\n`,
-			);
-			if (cappedResult?.status === "saved" && !cappedResult.complete) {
 				const reference = formatArtifactReference(cappedResult.artifactId, cappedResult.omittedBytes);
 				expect(reference).toContain("retained output");
 				expect(reference).toContain("omitted by the artifact storage cap");
 				expect(reference).not.toContain("full output");
+
+				const artifactPath = await manager.getArtifactPath(cappedResult.artifactId);
+				expect(artifactPath).not.toBeNull();
+				if (!artifactPath) throw new Error("expected a resolvable session artifact URI");
+				expect(path.basename(artifactPath)).toBe("0.bash-original.log");
+				expect(await Bun.file(artifactPath).text()).toBe(
+					`${retainedPrefix.text}\n[artifact truncated after ${retainedPrefix.bytes} bytes; omitted at least ${expectedOmittedBytes} bytes]\n`,
+				);
+				expect(Buffer.byteLength(originalText, "utf-8")).toBe(originalBytes);
+			} finally {
+				await manager.close();
 			}
-
-			let unavailableResult: BashOriginalArtifactSaveResult | undefined;
-			const unavailableSession = createTestToolSession(testDir, Settings.isolated(), {
-				getArtifactManager: undefined,
-				allocateOutputArtifact: undefined,
-			});
-			await saveBashOriginalArtifactForTests(unavailableSession, "original", result => {
-				unavailableResult = result;
-			});
-			expect(unavailableResult).toEqual({ status: "unavailable" });
 		});
 
-		it("does not expose nonpersistent user-bang artifact ids", async () => {
-			let savedType: string | undefined;
-			const result = await saveAgentBashOriginalArtifact(
-				{
-					saveArtifact: async (_content, type) => {
-						savedType = type;
-						return "memory-only-id";
-					},
-					getArtifactPath: async () => null,
-				},
-				"raw user-bang output",
+		it("publishes foreground Bash output through the invocation-bound session publisher", async () => {
+			const sessionFile = path.join(testDir, "bash-publisher.jsonl");
+			await Bun.write(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "bash-publisher", timestamp: "0", cwd: testDir })}\n`,
 			);
-
-			expect(savedType).toBe("bash-original");
-			expect(result).toEqual({ status: "unavailable" });
-			expect(JSON.stringify(result)).not.toContain("artifact://");
+			const manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			try {
+				const expectedOutput = `START\n${"界".repeat(6_000)}\nEND\n`;
+				const tool = wrapToolWithMetaNotice(
+					new BashTool(
+						createTestToolSession(
+							testDir,
+							Settings.isolated({ "tools.artifactHeadBytes": 8, "tools.artifactTailBytes": 8 }),
+							{ getArtifactManager: undefined, allocateOutputArtifact: undefined },
+							manager,
+						),
+					),
+				);
+				const result = await tool.execute("bash-publisher-call", {
+					command:
+						"printf 'START\\n'; i=0; while [ \"$i\" -lt 6000 ]; do printf '界'; i=$((i + 1)); done; printf '\\nEND\\n'",
+				});
+				const artifactId = result.details?.meta?.truncation?.artifactId;
+				expect(artifactId).toBeDefined();
+				if (!artifactId) throw new Error("Expected a session-published Bash artifact");
+				const artifactPath = await manager.getArtifactPath(artifactId);
+				expect(artifactPath).toBe(path.join(sessionFile.slice(0, -6), `${artifactId}.bash.log`));
+				expect(await Bun.file(artifactPath!).bytes()).toEqual(Buffer.from(expectedOutput, "utf8"));
+				expect(await Bun.file(artifactPath!).text()).toBe(expectedOutput);
+			} finally {
+				await manager.close();
+			}
 		});
 
-		it("writes short original output through an allocated artifact path", async () => {
-			const originalText = "deterministic original payload\n";
-			const allocationSession = createTestToolSession(testDir, Settings.isolated(), {
-				getArtifactManager: undefined,
-				allocateOutputArtifact: async toolType => {
-					const artifactId = "allocated-bash-original";
-					const artifactPath = path.join(testDir, "session", `${artifactId}.${toolType}.log`);
-					fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
-					return { id: artifactId, path: artifactPath };
-				},
-			});
+		it("reports a real session publisher failure and genuine publisher unavailability", async () => {
+			const blockedArtifactDirectory = path.join(testDir, "blocked-artifact-directory");
+			await Bun.write(blockedArtifactDirectory, "not a directory");
+			const sessionFile = `${blockedArtifactDirectory}.jsonl`;
+			await Bun.write(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "publisher-failure", timestamp: "0", cwd: testDir })}\n`,
+			);
+			const manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			try {
+				let failedResult: BashOriginalArtifactSaveResult | undefined;
+				const managerSession = createTestToolSession(
+					testDir,
+					Settings.isolated(),
+					{ getArtifactManager: undefined, allocateOutputArtifact: undefined },
+					manager,
+				);
+				await saveBashOriginalArtifactForTests(managerSession, "original", result => {
+					failedResult = result;
+				});
+				expect(failedResult?.status).toBe("failed");
+				if (failedResult?.status !== "failed") throw new Error("expected real artifact publisher failure");
+				expect(failedResult.diagnostic).toBe(`Unsafe managed directory: ${blockedArtifactDirectory}`);
+				expect(await Bun.file(blockedArtifactDirectory).text()).toBe("not a directory");
 
-			const artifactId = await saveBashOriginalArtifactForTests(allocationSession, originalText);
-			expect(artifactId).toBe("allocated-bash-original");
-			if (!artifactId) throw new Error("expected allocated original artifact id");
-			const artifactPath = path.join(testDir, "session", `${artifactId}.bash-original.log`);
-			expect(fs.readFileSync(artifactPath, "utf-8")).toBe(originalText);
+				let unavailableResult: BashOriginalArtifactSaveResult | undefined;
+				const unavailableSession = createTestToolSession(testDir, Settings.isolated(), {
+					captureArtifactPublication: undefined,
+					getArtifactManager: undefined,
+					allocateOutputArtifact: undefined,
+				});
+				await saveBashOriginalArtifactForTests(unavailableSession, "original", result => {
+					unavailableResult = result;
+				});
+				expect(unavailableResult).toEqual({ status: "unavailable" });
+			} finally {
+				await manager.close();
+			}
 		});
+
+		it("does not expose ids from a retired session artifact publisher", async () => {
+			const sessionFile = path.join(testDir, "retired-publisher.jsonl");
+			await Bun.write(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "retired-publisher", timestamp: "0", cwd: testDir })}\n`,
+			);
+			const manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			let prepared: PreparedNewSession | undefined;
+			try {
+				const publication = manager.captureArtifactPublication();
+				prepared = await manager.prepareFork();
+				if (!prepared) throw new Error("expected a prepared successor session");
+				manager.commitPreparedNewSession(prepared);
+				prepared = undefined;
+
+				const result = await saveAgentBashOriginalArtifact(publication, "raw output from a retired publisher");
+				expect(result.status).toBe("failed");
+				if (result.status !== "failed") throw new Error("expected retired publication to fail closed");
+				expect(result.diagnostic).toContain("Session artifact continuation is no longer authorized.");
+				expect(JSON.stringify(result)).not.toContain("artifact://");
+			} finally {
+				if (prepared) await manager.discardPreparedNewSession(prepared);
+				await manager.close();
+			}
+		});
+
+		it("publishes direct SDK Bash originals only to the session active at execution entry", async () => {
+			const bashCwd = path.join(testDir, "sdk-bash-cwd");
+			fs.mkdirSync(bashCwd);
+			const changedFile = path.join(bashCwd, "output.txt");
+			const git = (...args: string[]): void => {
+				const result = Bun.spawnSync(["git", "-C", bashCwd, ...args], { stdout: "pipe", stderr: "pipe" });
+				if (result.exitCode !== 0) {
+					throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString("utf8")}`);
+				}
+			};
+			git("init", "--quiet");
+			git("config", "user.name", "GJC test");
+			git("config", "user.email", "gjc-test@example.invalid");
+			await Bun.write(changedFile, "baseline\n");
+			git("add", "--", "output.txt");
+			git("commit", "--quiet", "-m", "baseline");
+			const expectedOriginal = `${Array.from({ length: 6_000 }, (_, index) => `changed-${index}-界`).join("\n")}\n`;
+			await Bun.write(changedFile, expectedOriginal);
+			const bashCommand = "git diff --no-color --unified=0 -- output.txt";
+			const expectedDiff = Bun.spawnSync(
+				["git", "-C", bashCwd, "diff", "--no-color", "--unified=0", "--", "output.txt"],
+				{ stdout: "pipe", stderr: "pipe" },
+			).stdout.toString("utf8");
+			const sessionFile = path.join(testDir, "sdk-bash-session.jsonl");
+			await Bun.write(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "sdk-bash-source", timestamp: "0", cwd: bashCwd })}\n`,
+			);
+			const manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			const authStorage = await AuthStorage.create(path.join(testDir, "sdk-bash-auth.db"));
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("expected bundled Anthropic test model");
+			const hookStarted = Promise.withResolvers<void>();
+			const releaseHook = Promise.withResolvers<void>();
+			let holdHook = false;
+			let created: CreateAgentSessionResult | undefined;
+			let prepared: PreparedNewSession | undefined;
+			const captureSpy = vi.spyOn(manager, "captureArtifactPublication");
+			try {
+				created = await createAgentSession({
+					cwd: bashCwd,
+					agentDir: testDir,
+					authStorage,
+					model,
+					sessionManager: manager,
+					settings: Settings.isolated({ "shellMinimizer.enabled": true, "compaction.enabled": false }),
+					disableExtensionDiscovery: true,
+					extensions: [
+						pi => {
+							pi.on("user_bash", async event => {
+								if (!holdHook || event.command !== bashCommand) return;
+								holdHook = false;
+								hookStarted.resolve();
+								await releaseHook.promise;
+							});
+						},
+					],
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					notificationHostModeSupported: false,
+					sdkHostModeSupported: false,
+				});
+				captureSpy.mockClear();
+
+				const sourceResult = await created.session.executeBash(bashCommand);
+				const sourceArtifactId = /\[raw output: artifact:\/\/([^\]\s]+)\]/u.exec(sourceResult.output)?.[1];
+				expect(sourceArtifactId).toBeDefined();
+				if (!sourceArtifactId) throw new Error("expected direct SDK Bash to publish its minimized original output");
+				const sourceArtifactPath = await manager.getArtifactPath(sourceArtifactId);
+				expect(sourceArtifactPath).toBe(
+					path.join(sessionFile.slice(0, -6), `${sourceArtifactId}.bash-original.log`),
+				);
+				if (!sourceArtifactPath) throw new Error("expected direct SDK Bash original artifact path");
+				expect(await Bun.file(sourceArtifactPath).bytes()).toEqual(Buffer.from(expectedDiff, "utf8"));
+				expect(captureSpy).toHaveBeenCalledTimes(1);
+
+				prepared = await manager.prepareFork();
+				if (!prepared?.sessionFile) throw new Error("expected a prepared SDK successor session");
+				const successorSessionFile = prepared.sessionFile;
+				const successorArtifactsDir = successorSessionFile.slice(0, -6);
+				const readSuccessorInventory = async (): Promise<Map<string, Uint8Array<ArrayBuffer> | null>> => {
+					const inventory = new Map<string, Uint8Array<ArrayBuffer> | null>();
+					const visit = async (relativeDirectory: string): Promise<void> => {
+						const entries = fs.readdirSync(path.join(successorArtifactsDir, relativeDirectory), {
+							withFileTypes: true,
+						});
+						entries.sort((left, right) => left.name.localeCompare(right.name));
+						for (const entry of entries) {
+							const relativePath = path.join(relativeDirectory, entry.name);
+							if (entry.isDirectory()) {
+								inventory.set(`${relativePath}/`, null);
+								await visit(relativePath);
+							} else if (entry.isFile()) {
+								inventory.set(
+									relativePath,
+									await Bun.file(path.join(successorArtifactsDir, relativePath)).bytes(),
+								);
+							} else {
+								throw new Error(`unexpected successor artifact entry: ${relativePath}`);
+							}
+						}
+					};
+					if (fs.existsSync(successorArtifactsDir)) await visit("");
+					return inventory;
+				};
+				const successorInventoryBefore = await readSuccessorInventory();
+				expect(successorInventoryBefore.get(`${sourceArtifactId}.bash-original.log`)).toEqual(
+					Buffer.from(expectedDiff, "utf8"),
+				);
+				expect(successorInventoryBefore.has(`.artifact-id-${sourceArtifactId}`)).toBe(true);
+				captureSpy.mockClear();
+
+				holdHook = true;
+				const staleExecution = created.session.executeBash(bashCommand);
+				await hookStarted.promise;
+				expect(captureSpy).toHaveBeenCalledTimes(1);
+				manager.commitPreparedNewSession(prepared);
+				prepared = undefined;
+				releaseHook.resolve();
+				const staleResult = await staleExecution;
+				expect(staleResult.output).toContain("File: output.txt");
+				expect(staleResult.output).toContain("Bash output artifact save failed");
+				expect(staleResult.output).not.toContain("artifact://");
+				expect(await readSuccessorInventory()).toEqual(successorInventoryBefore);
+
+				const successorResult = await created.session.executeBash(bashCommand);
+				const successorArtifactId = /\[raw output: artifact:\/\/([^\]\s]+)\]/u.exec(successorResult.output)?.[1];
+				expect(successorArtifactId).toBeDefined();
+				if (!successorArtifactId) throw new Error("expected fresh successor Bash original publication");
+				expect(successorArtifactId).not.toBe(sourceArtifactId);
+				const successorArtifactPath = await manager.getArtifactPath(successorArtifactId);
+				expect(successorArtifactPath).toBe(
+					path.join(successorArtifactsDir, `${successorArtifactId}.bash-original.log`),
+				);
+				if (!successorArtifactPath) throw new Error("expected successor Bash original artifact path");
+				expect(await Bun.file(successorArtifactPath).bytes()).toEqual(Buffer.from(expectedDiff, "utf8"));
+				const inheritedArtifactPath = await manager.getArtifactPath(sourceArtifactId);
+				expect(inheritedArtifactPath).toBe(
+					path.join(successorArtifactsDir, `${sourceArtifactId}.bash-original.log`),
+				);
+				if (!inheritedArtifactPath) throw new Error("expected inherited source Bash original artifact path");
+				expect(await Bun.file(inheritedArtifactPath).bytes()).toEqual(Buffer.from(expectedDiff, "utf8"));
+				expect(captureSpy).toHaveBeenCalledTimes(2);
+			} finally {
+				releaseHook.resolve();
+				if (prepared) await manager.discardPreparedNewSession(prepared);
+				captureSpy.mockRestore();
+				if (created) await created.session.dispose();
+				else await manager.close();
+				authStorage.close();
+			}
+		}, 30_000);
+
+		it("executes Bash with a captured original publisher across async preparation and session commit", async () => {
+			const firstCwd = path.join(testDir, "first-cwd");
+			const heldCwd = path.join(testDir, "held-cwd");
+			fs.mkdirSync(firstCwd);
+			fs.mkdirSync(heldCwd);
+			const sessionFile = path.join(testDir, "session.jsonl");
+			await Bun.write(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "bash-capture-source", timestamp: "0", cwd: testDir })}\n`,
+			);
+			const manager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			let prepared: PreparedNewSession | undefined;
+			const heldStat = holdFilesystemStatAfterResult(heldCwd);
+			const captureSpy = vi.spyOn(manager, "captureArtifactPublication");
+			try {
+				prepared = await manager.prepareFork();
+				if (!prepared?.sessionFile) throw new Error("expected an uncommitted successor session");
+				const successorSessionFile = prepared.sessionFile;
+				const successorArtifactsDir = successorSessionFile.slice(0, -6);
+				const readSuccessorInventory = async (): Promise<Map<string, Uint8Array<ArrayBuffer>>> => {
+					const names = fs.existsSync(successorArtifactsDir) ? fs.readdirSync(successorArtifactsDir).sort() : [];
+					const inventory = new Map<string, Uint8Array<ArrayBuffer>>();
+					for (const name of names) {
+						inventory.set(name, await Bun.file(path.join(successorArtifactsDir, name)).bytes());
+					}
+					return inventory;
+				};
+				const successorInventoryBefore = await readSuccessorInventory();
+				const settings = Settings.isolated({
+					"tools.artifactTailBytes": 8,
+					"tools.artifactHeadBytes": 8,
+				});
+				const bridgeFor = (): ClientBridge =>
+					({
+						capabilities: { terminal: true },
+						createTerminal: async ({ command, cwd }: { command: string; cwd: string }) => {
+							const child = Bun.spawn(["bash", "-lc", command], { cwd, stdout: "pipe", stderr: "pipe" });
+							const output = Promise.all([
+								new Response(child.stdout).text(),
+								new Response(child.stderr).text(),
+							]).then(([stdout, stderr]) => stdout + stderr);
+							return {
+								terminalId: "test-terminal",
+								currentOutput: async () => ({ output: await output, truncated: false }),
+								waitForExit: async () => ({ exitCode: await child.exited }),
+								kill: async () => {
+									child.kill();
+								},
+								release: async () => {},
+							};
+						},
+					}) as unknown as ClientBridge;
+				const createBashSession = (cwd: string): ToolSession =>
+					createTestToolSession(
+						cwd,
+						settings,
+						{
+							getClientBridge: bridgeFor,
+						},
+						manager,
+					);
+				const originalCommand = (label: string): string =>
+					`printf '${label}\\n'; i=0; while [ "$i" -lt 6000 ]; do printf '界'; i=$((i + 1)); done; printf '\\nEND\\n'`;
+				const firstOriginal = `FIRST\n${"界".repeat(6_000)}\nEND\n`;
+				const firstTool = new BashTool(createBashSession(firstCwd));
+				const firstResult = await firstTool.execute("bash-original-before-commit", {
+					command: originalCommand("FIRST"),
+				});
+				const firstArtifactId = firstResult.details?.meta?.truncation?.artifactId;
+				expect(firstArtifactId).toBeDefined();
+				if (!firstArtifactId) throw new Error("expected a saved original-output reference");
+				const firstArtifactPath = await manager.getArtifactPath(firstArtifactId);
+				expect(firstArtifactPath).not.toBeNull();
+				if (!firstArtifactPath) throw new Error("expected the source session artifact path");
+				expect(path.basename(firstArtifactPath)).toBe(`${firstArtifactId}.bash-original.log`);
+				expect(firstArtifactPath).toBe(path.join(sessionFile.slice(0, -6), `${firstArtifactId}.bash-original.log`));
+				expect(await Bun.file(firstArtifactPath).text()).toBe(firstOriginal);
+				expect(captureSpy).toHaveBeenCalledTimes(1);
+
+				const secondTool = new BashTool(createBashSession(heldCwd));
+				const secondExecution = secondTool.execute("bash-original-after-commit", {
+					command: originalCommand("SECOND"),
+				});
+				await heldStat.started;
+				expect(captureSpy).toHaveBeenCalledTimes(2);
+				manager.commitPreparedNewSession(prepared);
+				prepared = undefined;
+				heldStat.release();
+				const secondResult = await secondExecution;
+				const secondText = getTextOutput(secondResult);
+				expect(secondText).toContain("Bash output artifact save failed");
+				expect(secondText).not.toContain(`artifact://${firstArtifactId}`);
+				const successorInventoryAfter = await readSuccessorInventory();
+				expect(successorInventoryAfter).toEqual(successorInventoryBefore);
+				for (const [name] of successorInventoryBefore) {
+					expect(await Bun.file(path.join(successorArtifactsDir, name)).text()).not.toContain("SECOND");
+				}
+			} finally {
+				heldStat.release();
+				heldStat.restore();
+				captureSpy.mockRestore();
+				if (prepared) await manager.discardPreparedNewSession(prepared);
+				await manager.close();
+			}
+		});
+		it(
+			"keeps real Bash and Monitor publishers bound across preparation and session commits",
+			async () => {
+				type PublicationMode = "native-foreground" | "managed-foreground" | "async-background" | "monitor";
+				const modes: PublicationMode[] = ["native-foreground", "managed-foreground", "async-background", "monitor"];
+
+				for (const mode of modes) {
+					AsyncJobManager.resetForTests();
+					const modeDir = path.join(testDir, mode);
+					const heldCwd = path.join(modeDir, "held-cwd");
+					fs.mkdirSync(heldCwd, { recursive: true });
+					const manager = SessionManager.create(modeDir, SessionManager.explicitDestination(modeDir));
+					await manager.ensureOnDisk();
+					const sessionFile = manager.getSessionFile();
+					if (!sessionFile) throw new Error(`expected persisted session for ${mode}`);
+
+					const deliveries: Array<{ jobId: string; text: string }> = [];
+					const asyncManager =
+						mode === "native-foreground"
+							? undefined
+							: new AsyncJobManager({
+									onJobComplete: async (jobId, text) => {
+										deliveries.push({ jobId, text });
+									},
+								});
+					if (asyncManager) AsyncJobManager.setInstance(asyncManager);
+					const settings = Settings.isolated({
+						"async.enabled": mode === "async-background" || mode === "monitor",
+						"bash.autoBackground.enabled": false,
+						"tools.artifactHeadBytes": 8,
+						"tools.artifactTailBytes": 8,
+					});
+					const captureSpy = vi.spyOn(manager, "captureArtifactPublication");
+					const expectedOutput = (label: string): string => `${label}\n${"界".repeat(400)}\nEND\n`;
+					const commandFor = (label: string): string =>
+						`printf '${label}\\n'; i=0; while [ "$i" -lt 400 ]; do printf '界'; i=$((i + 1)); done; printf '\\nEND\\n'`;
+					const runInvocation = async (
+						label: string,
+						cwd?: string,
+					): Promise<{ text: string; artifactIds: string[] }> => {
+						const session = createTestToolSession(modeDir, settings, {}, manager);
+						const tool = new BashTool(session);
+						const wrappedTool = wrapToolWithMetaNotice(tool);
+						const command = commandFor(label);
+						const callId = `publisher-${mode}-${label}`;
+						let managedForegroundCompletion: Promise<void> | undefined;
+						let unsubscribeManagedForeground: (() => void) | undefined;
+						if (mode === "managed-foreground") {
+							if (!asyncManager) throw new Error("Managed foreground fixture requires an async job manager");
+							const existingJobIds = new Set(asyncManager.getJobsSnapshot().jobs.map(job => job.id));
+							const captureRegisteredJob = (): void => {
+								for (const entry of asyncManager.getJobsSnapshot().jobs) {
+									if (entry.kind !== "bash" || existingJobIds.has(entry.id)) continue;
+									existingJobIds.add(entry.id);
+									const job = asyncManager.getJob(entry.id);
+									if (!job) continue;
+									managedForegroundCompletion = job.promise;
+									unsubscribeManagedForeground?.();
+									return;
+								}
+							};
+							unsubscribeManagedForeground = asyncManager.onChange(captureRegisteredJob);
+						}
+						if (mode === "monitor") {
+							if (!asyncManager) throw new Error("Monitor fixture requires an async job manager");
+							const rawLines: string[] = [];
+							const started = await tool.startMonitorJob(
+								{ command, cwd },
+								{ onRawLine: line => rawLines.push(line) },
+							);
+							const job = asyncManager.getJob(started.jobId);
+							if (!job) throw new Error("expected the Monitor job in its actual manager");
+							await job.promise;
+							await asyncManager.drainDeliveries({ timeoutMs: 1 });
+							expect(rawLines.join("\n")).toContain(label);
+							const delivery = deliveries.find(item => item.jobId === started.jobId);
+							if (!delivery) throw new Error("expected Monitor's actual job completion delivery");
+							return { text: delivery.text, artifactIds: artifactIdsInText(delivery.text) };
+						}
+
+						if (mode === "async-background") {
+							if (!asyncManager) throw new Error("Async Bash fixture requires an async job manager");
+							const result = await wrappedTool.execute(callId, { command, cwd, async: true });
+							const jobId = result.details?.async?.jobId;
+							if (!jobId) throw new Error("expected the actual async Bash job id");
+							const job = asyncManager.getJob(jobId);
+							if (!job) throw new Error("expected the async Bash job in its actual manager");
+							await job.promise;
+							await asyncManager.drainDeliveries({ timeoutMs: 1 });
+							const delivery = deliveries.find(item => item.jobId === jobId);
+							if (!delivery) throw new Error("expected async Bash's actual job completion delivery");
+							return { text: delivery.text, artifactIds: artifactIdsInText(delivery.text) };
+						}
+
+						try {
+							const result = await wrappedTool.execute(callId, { command, cwd });
+							const text = getTextOutput(result);
+							if (mode === "managed-foreground") {
+								if (!managedForegroundCompletion)
+									throw new Error("expected the actual managed foreground job completion promise");
+								await managedForegroundCompletion;
+							}
+							return { text, artifactIds: artifactIdsInText(text) };
+						} finally {
+							unsubscribeManagedForeground?.();
+						}
+					};
+
+					let prepared: PreparedNewSession | undefined;
+					let heldStat: HeldFilesystemStat | undefined;
+					try {
+						const original = await runInvocation("SOURCE-A");
+						expect(captureSpy).toHaveBeenCalledTimes(1);
+						expect(original.text).toContain("END");
+						const sourceArtifact = await findExactPublishedArtifact(
+							manager,
+							original.text,
+							expectedOutput("SOURCE-A"),
+						);
+						expect(sourceArtifact).toBeDefined();
+						if (!sourceArtifact) throw new Error(`expected real SOURCE-A artifact for ${mode}`);
+						const sourceArtifactsDir = sessionFile.slice(0, -6);
+						const sourceInventory = await readDirectoryBytes(sourceArtifactsDir);
+						const artifactMarkerNames = [...sourceInventory.keys()].filter(name => name.includes(".artifact-id"));
+						expect(artifactMarkerNames.length).toBeGreaterThan(0);
+
+						prepared = await manager.prepareFork();
+						if (!prepared?.sessionFile) throw new Error(`expected a fork candidate for ${mode}`);
+						const successorSessionId = prepared.sessionId;
+						const successorSessionFile = prepared.sessionFile;
+						const successorArtifactsDir = successorSessionFile.slice(0, -6);
+						const successorInventory = await readDirectoryBytes(successorArtifactsDir);
+						expect(successorInventory).toEqual(sourceInventory);
+						for (const markerName of artifactMarkerNames) {
+							expect(successorInventory.get(markerName)).toEqual(sourceInventory.get(markerName));
+						}
+						const inheritedArtifactBytes = successorInventory.get(path.basename(sourceArtifact.path));
+						expect(inheritedArtifactBytes).toEqual(await Bun.file(sourceArtifact.path).bytes());
+
+						heldStat = holdFilesystemStatAfterResult(heldCwd);
+						const retainedInvocation = runInvocation("RETAINED-A", heldCwd);
+						await heldStat.started;
+						expect(captureSpy).toHaveBeenCalledTimes(2);
+						manager.commitPreparedNewSession(prepared);
+						prepared = undefined;
+						expect(manager.getSessionId()).toBe(successorSessionId);
+						heldStat.release();
+
+						const retained = await retainedInvocation;
+						expect(retained.text).toContain("END");
+						expect(retained.text).toContain("Bash output artifact writer failed");
+						expect(retained.text).toContain("Session artifact continuation is no longer authorized.");
+						expect(retained.artifactIds).toEqual([]);
+						const successorAfterRetained = await readDirectoryBytes(successorArtifactsDir);
+						expect(successorAfterRetained).toEqual(successorInventory);
+						for (const [name, bytes] of successorInventory) {
+							expect(await Bun.file(path.join(successorArtifactsDir, name)).bytes()).toEqual(bytes);
+						}
+
+						const successor = await runInvocation("SUCCESSOR-B");
+						expect(captureSpy).toHaveBeenCalledTimes(3);
+						expect(successor.text).toContain("END");
+						expect(successor.artifactIds.length).toBeGreaterThan(0);
+						const successorArtifact = await findExactPublishedArtifact(
+							manager,
+							successor.text,
+							expectedOutput("SUCCESSOR-B"),
+						);
+						expect(successorArtifact).toBeDefined();
+						if (!successorArtifact) throw new Error(`expected real SUCCESSOR-B artifact for ${mode}`);
+						expect(successorArtifact.id).not.toBe(sourceArtifact.id);
+						expect(successorArtifact.path.startsWith(`${successorArtifactsDir}${path.sep}`)).toBe(true);
+						const inheritedAPath = await manager.getArtifactPath(sourceArtifact.id);
+						expect(inheritedAPath).not.toBeNull();
+						if (!inheritedAPath) throw new Error(`expected inherited SOURCE-A artifact after ${mode} commit`);
+						expect(await Bun.file(inheritedAPath).bytes()).toEqual(await Bun.file(sourceArtifact.path).bytes());
+					} finally {
+						heldStat?.release();
+						heldStat?.restore();
+						if (prepared) await manager.discardPreparedNewSession(prepared);
+						if (asyncManager) await asyncManager.dispose();
+						AsyncJobManager.resetForTests();
+						captureSpy.mockRestore();
+						await manager.close();
+					}
+				}
+			},
+			{ timeout: 45000 },
+		);
 
 		it("surfaces artifact writer diagnostics on successful Bash results", async () => {
-			const failingTool = wrapToolWithMetaNotice(
-				new BashTool(
-					createTestToolSession(testDir, Settings.isolated(), {
-						allocateOutputArtifact: async () => ({
-							id: "writer-failure",
-							path: path.join(testDir, "missing-bash-artifact-parent", "output.log"),
-						}),
-					}),
-				),
+			const baselineSession = createTestToolSession(testDir);
+			const captureArtifactPublication = baselineSession.captureArtifactPublication;
+			if (!captureArtifactPublication) throw new Error("expected a session artifact publisher");
+			const baselinePublication = captureArtifactPublication();
+			const baselineId = await baselinePublication("enabled publisher baseline", "bash");
+			expect(baselineId).toBeDefined();
+			if (!baselineId) throw new Error("expected genuine enabled publisher baseline");
+			const getArtifactManager = baselineSession.getArtifactManager;
+			if (!getArtifactManager) throw new Error("expected the session artifact manager accessor");
+			const baselineManager = getArtifactManager();
+			if (!baselineManager) throw new Error("expected baseline artifact manager");
+			const baselinePath = await baselineManager.getPath(baselineId);
+			expect(baselinePath).not.toBeNull();
+			if (!baselinePath) throw new Error("expected the published baseline artifact path");
+			expect(path.basename(baselinePath)).toBe(`${baselineId}.bash.log`);
+			expect(await Bun.file(baselinePath).text()).toBe("enabled publisher baseline");
+			const blockedArtifactDirectory = path.join(testDir, "missing-bash-artifact-parent");
+			await Bun.write(blockedArtifactDirectory, "not a directory");
+			const blockedSessionFile = `${blockedArtifactDirectory}.jsonl`;
+			await Bun.write(
+				blockedSessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "writer-failure", timestamp: "0", cwd: testDir })}\n`,
 			);
-			const result = await failingTool.execute("test-writer-failure", {
-				command: "printf 'x%.0s' {1..2000}",
-			});
-			const text = getTextOutput(result);
+			const manager = await SessionManager.open(
+				blockedSessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
+			try {
+				const failingTool = wrapToolWithMetaNotice(
+					new BashTool(
+						createTestToolSession(
+							testDir,
+							Settings.isolated(),
+							{ allocateOutputArtifact: undefined, getArtifactManager: undefined },
+							manager,
+						),
+					),
+				);
+				const result = await failingTool.execute("test-writer-failure", {
+					command: 'i=0; while [ "$i" -lt 2000 ]; do printf x; i=$((i + 1)); done',
+				});
+				const text = getTextOutput(result);
 
-			expect(text).toContain("Artifact storage failed");
-			expect(text).toContain("create:");
-			expect(text).not.toContain("Read artifact://writer-failure");
+				expect(text).toContain(
+					`Bash output artifact writer failed: Unsafe managed directory: ${blockedArtifactDirectory}`,
+				);
+				expect(text).not.toContain("Read artifact://");
+				expect(await Bun.file(blockedArtifactDirectory).text()).toBe("not a directory");
+			} finally {
+				await manager.close();
+			}
 		});
 
 		it("surfaces artifact writer diagnostics on failed Bash results", async () => {
-			const failingTool = new BashTool(
-				createTestToolSession(testDir, Settings.isolated(), {
-					allocateOutputArtifact: async () => ({
-						id: "writer-failure-command",
-						path: path.join(testDir, "missing-bash-failure-parent", "output.log"),
-					}),
-				}),
+			const baselineSession = createTestToolSession(testDir);
+			const captureArtifactPublication = baselineSession.captureArtifactPublication;
+			if (!captureArtifactPublication) throw new Error("expected a session artifact publisher");
+			const baselinePublication = captureArtifactPublication();
+			const baselineId = await baselinePublication("enabled publisher baseline", "bash");
+			expect(baselineId).toBeDefined();
+			if (!baselineId) throw new Error("expected genuine enabled publisher baseline");
+			const getArtifactManager = baselineSession.getArtifactManager;
+			if (!getArtifactManager) throw new Error("expected the session artifact manager accessor");
+			const baselineManager = getArtifactManager();
+			if (!baselineManager) throw new Error("expected baseline artifact manager");
+			const baselinePath = await baselineManager.getPath(baselineId);
+			expect(baselinePath).not.toBeNull();
+			if (!baselinePath) throw new Error("expected the published baseline artifact path");
+			expect(path.basename(baselinePath)).toBe(`${baselineId}.bash.log`);
+			expect(await Bun.file(baselinePath).text()).toBe("enabled publisher baseline");
+
+			const blockedArtifactDirectory = path.join(testDir, "missing-bash-failure-parent");
+			await Bun.write(blockedArtifactDirectory, "not a directory");
+			const blockedSessionFile = `${blockedArtifactDirectory}.jsonl`;
+			await Bun.write(
+				blockedSessionFile,
+				`${JSON.stringify({ type: "session", version: 5, id: "writer-failure-command", timestamp: "0", cwd: testDir })}\n`,
 			);
-
-			let caught: unknown;
+			const manager = await SessionManager.open(
+				blockedSessionFile,
+				SessionManager.explicitDestination(testDir),
+				new FileSessionStorage(),
+			);
 			try {
-				await failingTool.execute("test-writer-failure-command", {
-					command: "printf 'x%.0s' {1..2000}; exit 7",
-				});
-			} catch (error) {
-				caught = error;
-			}
+				const failingTool = new BashTool(
+					createTestToolSession(
+						testDir,
+						Settings.isolated(),
+						{ allocateOutputArtifact: undefined, getArtifactManager: undefined },
+						manager,
+					),
+				);
 
-			expect(caught).toBeInstanceOf(Error);
-			const message = caught instanceof Error ? caught.message : String(caught);
-			expect(message).toContain("Bash output artifact writer failed: create:");
-			expect(message).not.toContain("artifact://writer-failure-command");
+				let caught: unknown;
+				try {
+					await failingTool.execute("test-writer-failure-command", {
+						command: 'i=0; while [ "$i" -lt 2000 ]; do printf x; i=$((i + 1)); done; exit 7',
+					});
+				} catch (error) {
+					caught = error;
+				}
+
+				expect(caught).toBeInstanceOf(Error);
+				const message = caught instanceof Error ? caught.message : String(caught);
+				expect(message).toContain(
+					`Bash output artifact writer failed: Unsafe managed directory: ${blockedArtifactDirectory}`,
+				);
+				expect(message).toContain("Command exited with code 7");
+				expect(message).not.toContain("artifact://");
+				expect(await Bun.file(blockedArtifactDirectory).text()).toBe("not a directory");
+			} finally {
+				await manager.close();
+			}
 		});
 
 		it("propagates writer diagnostics through truncation notices", () => {
@@ -1406,7 +2119,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-noisy-exit", {
-					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 7",
+					command:
+						"printf 'HEAD\\n'; i=1; while [ \"$i\" -le 6000 ]; do printf 'middle-%05d\\n' \"$i\"; i=$((i + 1)); done; printf 'TAIL\\n'; exit 7",
 				});
 			} catch (error) {
 				caught = error;
@@ -1418,9 +2132,9 @@ function b() {
 			const artifactId = /artifact:\/\/([A-Za-z0-9_-]+)/.exec(message)?.[1];
 			expect(artifactId).toBeDefined();
 			if (!artifactId) throw new Error("expected noisy-exit artifact id");
-			const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
-			expect(fs.existsSync(artifactPath)).toBe(true);
-			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			const artifactPath = path.join(getTestArtifactsDir(session), `${artifactId}.bash.log`);
+			expect(await Bun.file(artifactPath).exists()).toBe(true);
+			const artifact = await Bun.file(artifactPath).text();
 			expect(artifact).toContain("HEAD");
 			expect(hasInteriorMiddleLine(artifact)).toBe(true);
 			expect(artifact).toContain("TAIL");
@@ -1436,7 +2150,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await configuredTool.execute("test-call-9-configured-noisy-exit", {
-					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 23",
+					command:
+						"printf 'HEAD\\n'; i=1; while [ \"$i\" -le 6000 ]; do printf 'middle-%05d\\n' \"$i\"; i=$((i + 1)); done; printf 'TAIL\\n'; exit 23",
 				});
 			} catch (error) {
 				caught = error;
@@ -1453,7 +2168,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-timeout-status-precedence", {
-					command: "printf 'x%.0s' {1..6000}; printf '\nCommand aborted\n'; sleep 5",
+					command:
+						"i=0; while [ \"$i\" -lt 6000 ]; do printf x; i=$((i + 1)); done; printf '\\nCommand aborted\\n'; sleep 5",
 					timeout: 1,
 				});
 			} catch (error) {
@@ -1472,7 +2188,8 @@ function b() {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-noisy-timeout", {
-					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; sleep 5",
+					command:
+						"printf 'HEAD\\n'; i=1; while [ \"$i\" -le 6000 ]; do printf 'middle-%05d\\n' \"$i\"; i=$((i + 1)); done; sleep 5",
 					timeout: 1,
 				});
 			} catch (error) {
@@ -1485,9 +2202,9 @@ function b() {
 			const artifactId = /artifact:\/\/([A-Za-z0-9_-]+)/.exec(message)?.[1];
 			expect(artifactId).toBeDefined();
 			if (!artifactId) throw new Error("expected noisy-timeout artifact id");
-			const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
-			expect(fs.existsSync(artifactPath)).toBe(true);
-			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			const artifactPath = path.join(getTestArtifactsDir(session), `${artifactId}.bash.log`);
+			expect(await Bun.file(artifactPath).exists()).toBe(true);
+			const artifact = await Bun.file(artifactPath).text();
 			expect(artifact).toContain("HEAD");
 			expect(hasInteriorMiddleLine(artifact)).toBe(true);
 		});
@@ -1511,9 +2228,6 @@ function b() {
 							// and flakily backgrounds an instant command.
 							"bash.autoBackground.thresholdMs": 30_000,
 						}),
-						{
-							getSessionId: () => "test-session",
-						},
 					),
 				),
 			);
@@ -1544,9 +2258,6 @@ function b() {
 							"bash.autoBackground.enabled": true,
 							"bash.autoBackground.thresholdMs": 10,
 						}),
-						{
-							getSessionId: () => "test-session",
-						},
 					),
 				),
 			);
@@ -1585,7 +2296,6 @@ function b() {
 						"bash.autoBackground.enabled": true,
 						"bash.autoBackground.thresholdMs": 0,
 					}),
-					{ getSessionId: () => "test-session" },
 				),
 			);
 
@@ -1607,13 +2317,11 @@ function b() {
 				},
 			});
 			AsyncJobManager.setInstance(asyncJobManager);
-			const tool = new BashTool(
-				createTestToolSession(
-					testDir,
-					Settings.isolated({ "async.enabled": true, "bash.autoBackground.enabled": false }),
-					{ getSessionId: () => "test-session" },
-				),
+			const asyncSession = createTestToolSession(
+				testDir,
+				Settings.isolated({ "async.enabled": true, "bash.autoBackground.enabled": false }),
 			);
+			const tool = new BashTool(asyncSession);
 			const middle = Array.from({ length: 400 }, (_, index) => `middle-${String(index).padStart(5, "0")}`).join(
 				"\\n",
 			);
@@ -1664,9 +2372,9 @@ function b() {
 			expect(monitorArtifactIds).toHaveLength(1);
 
 			for (const artifactId of [asyncArtifactIds[0]!, monitorArtifactIds[0]!]) {
-				const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
-				expect(fs.existsSync(artifactPath)).toBe(true);
-				const artifact = fs.readFileSync(artifactPath, "utf-8");
+				const artifactPath = path.join(getTestArtifactsDir(asyncSession), `${artifactId}.bash.log`);
+				expect(await Bun.file(artifactPath).exists()).toBe(true);
+				const artifact = await Bun.file(artifactPath).text();
 				expect(artifact).toContain("HEAD");
 				expect(hasInteriorMiddleLine(artifact, 50, 350)).toBe(true);
 				expect(artifact).toContain("TAIL");
@@ -1693,7 +2401,6 @@ function b() {
 							"bash.autoBackground.thresholdMs": 30_000,
 						}),
 						{
-							getSessionId: () => "test-session",
 							registerForegroundFoldParticipant: adapter => {
 								foldAdapter = adapter;
 								return () => {
@@ -1768,7 +2475,6 @@ function b() {
 							"bash.autoBackground.enabled": false,
 						}),
 						{
-							getSessionId: () => "test-session",
 							registerForegroundFoldParticipant: adapter => {
 								foldAdapter = adapter;
 								return () => {
@@ -1827,9 +2533,6 @@ function b() {
 							"bash.autoBackground.enabled": true,
 							"bash.autoBackground.thresholdMs": 60_000,
 						}),
-						{
-							getSessionId: () => "test-session",
-						},
 					),
 				),
 			);
@@ -1890,7 +2593,8 @@ function b() {
 				const promise = bashTool.execute(
 					"test-call-10-abort",
 					{
-						command: "printf 'x%.0s' {1..2000}; printf '\nREADY\n'; sleep 60",
+						command:
+							"i=0; while [ \"$i\" -lt 2000 ]; do printf x; i=$((i + 1)); done; printf '\\nREADY\\n'; sleep 60",
 						timeout: 30,
 					},
 					controller.signal,
@@ -1918,7 +2622,7 @@ function b() {
 		it("should throw an actionable error when cwd does not exist", async () => {
 			const nonexistentCwd = "/this/directory/definitely/does/not/exist/12345";
 
-			const bashToolWithBadCwd = new BashTool(createTestToolSession(nonexistentCwd));
+			const bashToolWithBadCwd = new BashTool({ ...session, cwd: nonexistentCwd });
 
 			await expect(bashToolWithBadCwd.execute("test-call-11", { command: "echo test" })).rejects.toThrow(
 				/Working directory does not exist: .*Pass an existing directory as `cwd`.*the command was not run/,
@@ -2558,7 +3262,8 @@ describe("edit tool CRLF handling", () => {
 		editTool = new EditTool(createTestToolSession(testDir));
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		await closeTestToolSessions();
 		fs.rmSync(testDir, { recursive: true, force: true });
 
 		// Restore original edit variant

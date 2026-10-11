@@ -93,6 +93,10 @@ function baseOpts(observer: () => Promise<Observation>) {
 		maxIterations: 6,
 		emit: async (severity: Severity, kind: string, evidence: Record<string, unknown>) => {
 			if (kind === "operate_blocked") lifecycle = "blocked";
+			if (kind === "operate_observation_window_ended") {
+				lifecycle = evidence.lifecycle === "submitted" ? "submitted" : "observing";
+				blockers.length = 0;
+			}
 			if (kind === "operate_finalized") {
 				lifecycle = evidence.completed === true ? "completed" : "blocked";
 				if (Array.isArray(evidence.blockers))
@@ -187,12 +191,19 @@ describe("operate() autonomous lifecycle (AC-9 e2e + data-loss + red-team)", () 
 		expect(await readReceiptIndex(root, SID, "completion")).toHaveLength(0);
 	});
 
-	it("B3: never finalizes on loop-exhaustion without an observed completion", async () => {
+	it("keeps an active owner observing when this call exhausts its observation budget", async () => {
 		const observer = scriptedObserver([obs({ ownerLive: true, observedSignals: ["working"] })]);
 		const res = await operate("spin without completing", { ...baseOpts(observer), maxIterations: 3 });
 		expect(res.completed).toBe(false);
-		expect(res.lifecycle).toBe("blocked");
-		expect(res.blockers).toContain("no-observed-completion");
+		expect(res.lifecycle).toBe("observing");
+		expect(res.blockers).toEqual([]);
+		expect(res.iterations).toBe(3);
 		expect(await readReceiptIndex(root, SID, "completion")).toHaveLength(0);
+		const events = await readEvents(root, SID, 0);
+		expect(events.map(event => event.kind)).toContain("operate_observation_window_ended");
+		expect(events.map(event => event.kind)).not.toContain("operate_blocked");
+		const windowEndEvent = events.find(event => event.kind === "operate_observation_window_ended");
+		expect(windowEndEvent?.state.lifecycle).toBe("observing");
+		expect(windowEndEvent?.state.blockers).toEqual([]);
 	});
 });

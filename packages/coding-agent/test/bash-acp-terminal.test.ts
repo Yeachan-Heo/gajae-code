@@ -42,7 +42,9 @@ function makeSession(bridge: ClientBridge, options: SessionOptions = {}): ToolSe
 			...stubBashExecutorSettings,
 		},
 		getClientBridge: () => bridge,
-		getArtifactManager: options.saveArtifact ? () => ({ save: options.saveArtifact }) : undefined,
+		captureArtifactPublication: options.saveArtifact
+			? () => (content: string, type: string) => options.saveArtifact!(content, type)
+			: undefined,
 	} as unknown as ToolSession;
 }
 

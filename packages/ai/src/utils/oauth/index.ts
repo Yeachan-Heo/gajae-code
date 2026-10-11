@@ -538,6 +538,7 @@ export async function getOAuthApiKey(
 				expiresAt: creds.expires,
 				email: creds.email,
 				accountId: creds.accountId,
+				profileArn: creds.profileArn,
 			})
 		: creds.access;
 	return { newCredentials: creds, apiKey };

@@ -1,14 +1,15 @@
 import { Buffer } from "node:buffer";
 import { CODEX_BASE_URL } from "../providers/openai-codex/constants";
-import type {
-	CredentialRankingStrategy,
-	UsageAmount,
-	UsageFetchContext,
-	UsageFetchParams,
-	UsageLimit,
-	UsageProvider,
-	UsageReport,
-	UsageWindow,
+import {
+	type CredentialRankingStrategy,
+	type UsageAmount,
+	UsageAuthenticationError,
+	type UsageFetchContext,
+	type UsageFetchParams,
+	type UsageLimit,
+	type UsageProvider,
+	type UsageReport,
+	type UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
 import { toNumber } from "./shared";
@@ -379,12 +380,16 @@ export const openaiCodexUsageProvider: UsageProvider = {
 		let payload: unknown;
 		try {
 			const response = await ctx.fetch(url, { headers, signal: params.signal });
+			if (response.status === 401) {
+				throw new UsageAuthenticationError(params.provider);
+			}
 			if (!response.ok) {
 				ctx.logger?.warn("Codex usage request failed", { status: response.status, provider: params.provider });
 				return null;
 			}
 			payload = await response.json();
 		} catch (error) {
+			if (error instanceof UsageAuthenticationError) throw error;
 			ctx.logger?.warn("Codex usage request error", { provider: params.provider, error: String(error) });
 			return null;
 		}

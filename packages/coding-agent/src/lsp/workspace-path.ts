@@ -6,7 +6,30 @@ function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
+/** Drive-letter root such as `C:\`. A UNC share root is not a drive root. */
+function windowsDriveLetter(root: string): string | null {
+	const match = /^([A-Za-z]):[\\/]$/.exec(root);
+	return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * A Windows drive root already ends in a separator. Prefixing another one
+ * (`C:\` + `\`) matches nothing on that volume, so compare the drive letter.
+ * Same-volume paths stay inside, including `\\?\C:\`. Other drives and UNC
+ * shares do not.
+ */
+function sameWindowsDrive(driveRoot: string, candidate: string): boolean {
+	const letter = windowsDriveLetter(driveRoot);
+	if (!letter) return false;
+	const normalized = candidate.replace(/\//g, "\\");
+	const extended = /^\\\\\?\\([A-Za-z]):\\/.exec(normalized);
+	if (extended) return extended[1].toLowerCase() === letter;
+	if (normalized.startsWith("\\\\")) return false;
+	return path.win32.parse(normalized).root.toLowerCase() === `${letter}:\\`;
+}
+
 function escapes(root: string, candidate: string): boolean {
+	if (windowsDriveLetter(root)) return !sameWindowsDrive(root, candidate);
 	return candidate !== root && !candidate.startsWith(`${root}${path.sep}`);
 }
 

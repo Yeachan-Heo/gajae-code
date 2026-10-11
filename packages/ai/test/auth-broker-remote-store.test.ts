@@ -246,6 +246,63 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		});
 	});
 
+	test("adopts a fresh peer rotation already present in the broker snapshot", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const initialEntry = remote.snapshot.credentials[0]!;
+		expect(initialEntry.credential.type).toBe("oauth");
+		if (initialEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		store!.updateAuthCredential(initialEntry.id, mintOAuthCredential("peer", Date.now() + 60 * 60_000));
+		await storage!.reload();
+		await remote.refreshSnapshot();
+		const refreshRequest = vi.spyOn(client, "refreshCredential");
+
+		const refreshed = await remote.refreshOAuthCredential("anthropic", initialEntry.id, initialEntry.credential);
+
+		expect(refreshRequest).not.toHaveBeenCalled();
+		expect(refreshed).toMatchObject({ access: "access-peer", refresh: REMOTE_REFRESH_SENTINEL });
+		expect(remote.snapshot.credentials[0]?.credential).toMatchObject({ type: "oauth", access: "access-peer" });
+	});
+
+	test("adopts a peer rotation that races the broker refresh request", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const initialEntry = remote.snapshot.credentials[0]!;
+		expect(initialEntry.credential.type).toBe("oauth");
+		if (initialEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		const expectedRevision = initialEntry.revision;
+		expect(typeof expectedRevision).toBe("number");
+		const refreshCredential = client.refreshCredential.bind(client);
+		const refreshRequest = vi.spyOn(client, "refreshCredential").mockImplementation(async (id, signal, revision) => {
+			expect(revision).toBe(expectedRevision);
+			const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+			try {
+				peerStore.updateAuthCredential(id, mintOAuthCredential("peer", Date.now() + 60 * 60_000));
+			} finally {
+				peerStore.close();
+			}
+			return refreshCredential(id, signal, revision);
+		});
+		const refresh = vi.spyOn(oauthUtils, "refreshOAuthToken");
+
+		const refreshed = await remote.refreshOAuthCredential("anthropic", initialEntry.id, initialEntry.credential);
+
+		expect(refreshRequest).toHaveBeenCalledTimes(1);
+		expect(refresh).not.toHaveBeenCalled();
+		expect(refreshed).toMatchObject({ access: "access-peer", refresh: REMOTE_REFRESH_SENTINEL });
+		expect(remote.snapshot.credentials[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-peer",
+		});
+		expect(store!.listAuthCredentials("anthropic")[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "access-peer",
+			refresh: "refresh-peer",
+		});
+	});
+
 	test("preserves a broker refresh error when reconciliation reload fails, then recovers on a later reload", async () => {
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });

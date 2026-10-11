@@ -154,7 +154,8 @@ export function openOwnerStore(
 	);
 	try {
 		assertOwnerIdentity(ownerStore, locator);
-		readOwnerManifest(ownerStore, locator, OWNER_MANIFEST);
+		const finalManifest = readOwnerManifest(ownerStore, locator, OWNER_MANIFEST);
+		if (finalManifest.sessionId !== sessionId) throw new Error("task_artifact_owner_session_mismatch");
 		return ownerStore;
 	} catch (error) {
 		ownerStore.close();
@@ -232,6 +233,8 @@ export function captureTaskArtifactOwnerDeletionEvidence(
 		// This refuses to capture during publication; it does not revoke independent open descriptors.
 		if (ownerTreeHasPendingManagedPublication(treeSnapshot))
 			throw new Error("task_artifact_owner_writer_not_quiescent");
+		const finalManifest = readOwnerManifest(rootStore, locator);
+		if (finalManifest.sessionId !== sessionId) throw new Error("task_artifact_owner_session_mismatch");
 		const parentAfter = rootStore.captureDirectoryIdentity(OWNER_DIRECTORY);
 		if (!sameOwnerParentIdentity(parentIdentity, parentAfter))
 			throw new Error("task_artifact_owner_parent_changed_during_capture");

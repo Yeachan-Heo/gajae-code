@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { redactCrashSecrets } from "@gajae-code/utils";
 
 const CRASH_DIAGNOSTICS_ENV = "GJC_CRASH_DIAGNOSTICS";
 const CRASH_DIAGNOSTICS_DIR_ENV = "GJC_CRASH_DIAGNOSTICS_DIR";
@@ -169,7 +170,7 @@ export async function writeCrashReport(
 		pid: process.pid,
 		cwd: options.cwd ?? process.cwd(),
 		...classification,
-		stderrPreview: input.stderr ? trimStartBytes(input.stderr, STDERR_PREVIEW_BYTES) : undefined,
+		stderrPreview: input.stderr ? trimStartBytes(redactCrashSecrets(input.stderr), STDERR_PREVIEW_BYTES) : undefined,
 		spawnError: input.spawnError === undefined ? undefined : stringifyError(input.spawnError),
 	};
 	const enabled = crashDiagnosticsEnabled(options.env);

@@ -109,6 +109,10 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		scopedModels: [],
+		markUserModelSelection: vi.fn(),
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		modelRegistry: createRegistry(options),
 		configuredChains: {} as Record<string, readonly string[]>,
 		getConfiguredModelChain(role: string): readonly string[] | undefined {

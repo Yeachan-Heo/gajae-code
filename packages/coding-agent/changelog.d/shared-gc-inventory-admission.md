@@ -1,0 +1,2 @@
+### Fixed
+- Bound shared GC count/collect inventories across each read-only receipt read, discovery call and protocol inspection, including unrelated entries and repeated passes. Preserve genuine leased publication quotas, authority fences and descriptor admission; report capacity refusal rather than omitting targets. This does not establish full GC traversal/read/hash admission or writer quiescence.

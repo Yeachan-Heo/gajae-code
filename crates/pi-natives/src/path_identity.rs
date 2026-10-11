@@ -21,6 +21,58 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::task;
+
+#[cfg(any(windows, test))]
+#[repr(align(4))]
+struct WindowsSid([u8; 16]);
+
+#[cfg(any(windows, test))]
+const WINDOWS_BUILTIN_ADMINISTRATORS_SID: WindowsSid = WindowsSid([
+	0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+]);
+
+/// Windows may create a managed root while elevated, leaving it owned by the
+/// built-in Administrators group. The DACL is validated separately before use.
+#[cfg(any(windows, test))]
+fn is_trusted_windows_owner_sid(
+	mut owner_matches_sid: impl FnMut(&[u8]) -> bool,
+	current_user_sid: &[u8],
+) -> bool {
+	owner_matches_sid(current_user_sid)
+		|| owner_matches_sid(WINDOWS_BUILTIN_ADMINISTRATORS_SID.0.as_slice())
+}
+
+#[cfg(test)]
+mod windows_owner_sid_tests {
+	use super::{WINDOWS_BUILTIN_ADMINISTRATORS_SID, is_trusted_windows_owner_sid};
+
+	const CURRENT_USER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00];
+	const UNTRUSTED_OWNER_SID: [u8; 12] =
+		[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x16, 0x00, 0x00, 0x00];
+	const BUILTIN_ADMINISTRATORS_SID: [u8; 16] = [
+		0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00,
+		0x00,
+	];
+	const NEARBY_UNTRUSTED_GROUP_SID: [u8; 16] = [
+		0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x30, 0x02, 0x00,
+		0x00,
+	];
+
+	fn is_trusted_owner(owner_sid: &[u8]) -> bool {
+		is_trusted_windows_owner_sid(|trusted_sid| trusted_sid == owner_sid, &CURRENT_USER_SID)
+	}
+
+	#[test]
+	fn accepts_current_user_and_builtin_administrators_but_rejects_other_owners() {
+		assert_eq!(WINDOWS_BUILTIN_ADMINISTRATORS_SID.0, BUILTIN_ADMINISTRATORS_SID,);
+		assert!(is_trusted_owner(&CURRENT_USER_SID));
+		assert!(is_trusted_owner(&BUILTIN_ADMINISTRATORS_SID));
+		assert!(!is_trusted_owner(&UNTRUSTED_OWNER_SID));
+		assert!(!is_trusted_owner(&NEARBY_UNTRUSTED_GROUP_SID));
+	}
+}
+
 /// Classification of a read-only retained-publication observation.
 #[napi(object)]
 pub struct NativeBrokerPublicationObservation {
@@ -1331,6 +1383,64 @@ pub fn canonical_existing_directory_identity(
 	platform::canonical_existing_directory_identity(&path)
 }
 
+#[cfg(any(windows, test))]
+const FILE_CASE_SENSITIVE_SEARCH_FLAG: u32 = 0x0000_0001;
+
+#[cfg(any(windows, test))]
+const fn volume_case_sensitivity_from_flags(file_system_flags: u32) -> Option<bool> {
+	// This is a volume capability, not the current directory's mode. A missing
+	// capability proves case-insensitivity; a present one leaves the mode unknown.
+	if file_system_flags & FILE_CASE_SENSITIVE_SEARCH_FLAG == 0 {
+		Some(false)
+	} else {
+		None
+	}
+}
+
+#[cfg(test)]
+mod volume_case_sensitivity_tests {
+	use super::volume_case_sensitivity_from_flags;
+
+	#[test]
+	fn only_treats_a_volume_as_case_insensitive_when_it_lacks_case_sensitive_search() {
+		assert_eq!(volume_case_sensitivity_from_flags(0), Some(false));
+		assert_eq!(volume_case_sensitivity_from_flags(0x0000_0001), None);
+	}
+}
+
+/// Returns whether the directory's child names are case-sensitive when the
+/// platform can query that property.
+#[napi]
+pub fn directory_case_sensitive(path: String) -> Option<bool> {
+	if path.contains('\0') {
+		return None;
+	}
+	#[cfg(windows)]
+	{
+		platform::directory_case_sensitive(Path::new(&path))
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = path;
+		None
+	}
+}
+
+/// Fold UTF-16 code units with Windows' ordinal case mapping, without Unicode
+/// expansions.
+#[allow(clippy::missing_const_for_fn, reason = "the Windows implementation calls an OS API")]
+#[napi]
+pub fn windows_ordinal_case_fold(value: String) -> String {
+	#[cfg(windows)]
+	{
+		platform::windows_ordinal_case_fold(&value)
+	}
+	#[cfg(not(windows))]
+	{
+		value
+	}
+}
+
 #[cfg(unix)]
 pub(crate) fn verify_descriptor_acl_absent(
 	file: &std::fs::File,
@@ -1802,6 +1912,16 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 		return NativeDirectoryTreeResult::failure("io_error");
 	}
 	platform::snapshot_directory_tree(Path::new(&path))
+}
+
+/// Capture native root metadata only after proving a directory has no entries.
+/// Enumeration stops at the first non-dot child; no child is opened or read.
+#[napi]
+pub fn snapshot_empty_directory(path: String) -> NativeDirectoryTreeResult {
+	if path.contains('\0') {
+		return NativeDirectoryTreeResult::failure("io_error");
+	}
+	platform::snapshot_empty_directory(Path::new(&path))
 }
 
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
@@ -6807,6 +6927,187 @@ pub(crate) mod platform {
 		}
 	}
 
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_is_empty(fd: libc::c_int) -> Result<bool, &'static str> {
+		let current = c".";
+		// SAFETY: `fd` is live and `.` resolves the same directory with an independent
+		// stream offset for this bounded observation.
+		let duplicate = unsafe {
+			libc::openat(
+				fd,
+				current.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if duplicate < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		// SAFETY: ownership of the live duplicate transfers to DIR on success.
+		let directory = unsafe { libc::fdopendir(duplicate) };
+		if directory.is_null() {
+			let error = std::io::Error::last_os_error();
+			// SAFETY: fdopendir failed, so this branch still owns the descriptor.
+			unsafe { libc::close(duplicate) };
+			return Err(security_code(&error));
+		}
+		loop {
+			clear_errno();
+			// SAFETY: the DIR pointer is live until its matching closedir call.
+			let entry = unsafe { libc::readdir(directory) };
+			if entry.is_null() {
+				let errno = current_errno();
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::closedir(directory) };
+				return if errno == 0 {
+					Ok(true)
+				} else {
+					Err(security_code(&std::io::Error::from_raw_os_error(errno)))
+				};
+			}
+			// SAFETY: readdir returned a live dirent with a NUL-terminated name.
+			let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+			if name != b"." && name != b".." {
+				// Stop immediately: do not retain, stat, open, or descend into this child.
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::closedir(directory) };
+				return Ok(false);
+			}
+		}
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_entry_from_fd(fd: libc::c_int) -> Result<NativeDirectoryTreeEntry, &'static str> {
+		// SAFETY: zero initializes this output-only C stat structure before fstat fills
+		// it.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the descriptor is live and the initialized output struct is writable.
+		if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+			return Err("not_directory");
+		}
+		Ok(entry_from_stat(String::new(), &stat, "directory", None))
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	fn directory_entry_at(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<NativeDirectoryTreeEntry, &'static str> {
+		// SAFETY: zero initializes this output-only C stat structure before fstatat
+		// fills it.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: the parent descriptor and name are live, and the output struct is
+		// writable.
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
+		{
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		match stat.st_mode & libc::S_IFMT {
+			libc::S_IFLNK => return Err("reparse_point"),
+			libc::S_IFDIR => {},
+			_ => return Err("not_directory"),
+		}
+		Ok(entry_from_stat(String::new(), &stat, "directory", None))
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+	pub(super) fn snapshot_empty_directory(path: &Path) -> NativeDirectoryTreeResult {
+		let (parent_fd, name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let parent = unsafe { File::from_raw_fd(parent_fd) };
+		let parent_entry = match directory_entry_from_fd(parent.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		// SAFETY: the live descriptor, where used, and NUL-terminated path remain
+		// valid.
+		let root_fd = unsafe {
+			libc::openat(
+				parent.as_raw_fd(),
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if root_fd < 0 {
+			return NativeDirectoryTreeResult::failure(
+				security_code(&std::io::Error::last_os_error()),
+			);
+		}
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let root = unsafe { File::from_raw_fd(root_fd) };
+		let root_entry = match directory_entry_from_fd(root.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		match directory_is_empty(root.as_raw_fd()) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+
+		let (final_parent_fd, final_name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		// SAFETY: ownership of the live descriptor transfers to File exactly once.
+		let final_parent = unsafe { File::from_raw_fd(final_parent_fd) };
+		let final_parent_entry = match directory_entry_from_fd(final_parent.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if final_name != name
+			|| final_parent_entry.dev != parent_entry.dev
+			|| final_parent_entry.ino != parent_entry.ino
+		{
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		match directory_is_empty(root.as_raw_fd()) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		let current_root = match directory_entry_from_fd(root.as_raw_fd()) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		let named_root = match directory_entry_at(final_parent.as_raw_fd(), &final_name) {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if current_root != root_entry || named_root != root_entry {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		NativeDirectoryTreeResult::success(NativeDirectoryTreeSnapshot {
+			root_dev: root_entry.dev.clone(),
+			root_ino: root_entry.ino.clone(),
+			entries:  vec![root_entry],
+		})
+	}
+
+	#[cfg(not(any(
+		target_os = "linux",
+		target_os = "android",
+		target_os = "macos",
+		target_os = "ios"
+	)))]
+	pub(super) fn snapshot_empty_directory(_: &Path) -> NativeDirectoryTreeResult {
+		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
+	}
+
 	fn snapshot_fd(
 		fd: libc::c_int,
 		relative: &str,
@@ -10481,9 +10782,9 @@ mod platform {
 			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
 			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
 			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
-			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
-			READ_CONTROL, ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID,
-			WRITE_DAC, WRITE_OWNER,
+			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+			GetVolumeInformationByHandleW, OPEN_EXISTING, READ_CONTROL, ReadFile,
+			SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
@@ -10494,7 +10795,7 @@ mod platform {
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
 		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		open_with_transient_retry, sha256,
+		open_with_transient_retry, sha256, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -10503,6 +10804,12 @@ mod platform {
 	unsafe extern "system" {
 		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
 		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+		fn GetFileInformationByHandleEx(
+			file: HANDLE,
+			file_information_class: i32,
+			file_information: *mut c_void,
+			buffer_size: u32,
+		) -> i32;
 	}
 
 	// Test-only fault injection for the exact-replace destination open retry:
@@ -10545,6 +10852,13 @@ mod platform {
 		DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
+	const FILE_CASE_SENSITIVE_INFO_CLASS: i32 = 23;
+	const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x1;
+
+	#[repr(C)]
+	struct FileCaseSensitiveInfo {
+		flags: u32,
+	}
 
 	#[repr(C)]
 	struct HandleRenameInformation {
@@ -10676,6 +10990,75 @@ mod platform {
 		result
 	}
 
+	fn volume_case_sensitivity(handle: HANDLE) -> Option<bool> {
+		let mut file_system_flags = 0;
+		let succeeded = unsafe {
+			GetVolumeInformationByHandleW(
+				handle,
+				null_mut(),
+				0,
+				null_mut(),
+				null_mut(),
+				&mut file_system_flags,
+				null_mut(),
+				0,
+			)
+		};
+		if succeeded == 0 {
+			return None;
+		}
+		volume_case_sensitivity_from_flags(file_system_flags)
+	}
+
+	pub(super) fn directory_case_sensitive(path: &Path) -> Option<bool> {
+		let path_wide = wide(path);
+		let handle = unsafe {
+			CreateFileW(
+				path_wide.as_ptr(),
+				FILE_READ_ATTRIBUTES,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				null(),
+				OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+				null_mut(),
+			)
+		};
+		if handle == INVALID_HANDLE_VALUE {
+			return None;
+		}
+		let result = (|| {
+			let attributes = handle_attributes(handle).ok()?;
+			if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+				return None;
+			}
+
+			let mut information = FileCaseSensitiveInfo { flags: 0 };
+			let succeeded = unsafe {
+				GetFileInformationByHandleEx(
+					handle,
+					FILE_CASE_SENSITIVE_INFO_CLASS,
+					(&mut information as *mut FileCaseSensitiveInfo).cast(),
+					size_of::<FileCaseSensitiveInfo>() as u32,
+				)
+			};
+			if succeeded == 0 {
+				// Fall back only when volume metadata proves case-insensitive lookup.
+				return volume_case_sensitivity(handle);
+			}
+			Some(information.flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+		})();
+		let closed = unsafe { CloseHandle(handle) } != 0;
+		if closed { result } else { None }
+	}
+
+	pub(super) fn windows_ordinal_case_fold(value: &str) -> String {
+		let folded: Vec<u16> = value
+			.encode_utf16()
+			.map(|unit| unsafe { rtl_upcase_unicode_char(unit) })
+			.collect();
+		String::from_utf16(&folded).unwrap_or_else(|_| value.to_owned())
+	}
+
 	#[repr(C)]
 	struct UnicodeString {
 		length:         u16,
@@ -10701,6 +11084,9 @@ mod platform {
 
 	#[link(name = "ntdll")]
 	unsafe extern "system" {
+		#[link_name = "RtlUpcaseUnicodeChar"]
+		fn rtl_upcase_unicode_char(source_character: u16) -> u16;
+
 		fn NtCreateFile(
 			file_handle: *mut HANDLE,
 			desired_access: u32,
@@ -12388,9 +12774,15 @@ mod platform {
 		let result = if owner.is_null() {
 			Err("acl_unavailable")
 		} else {
-			// SAFETY: GetSecurityInfo returned owner within the live security
-			// descriptor; `sid` is a validated current-user SID.
-			let owner_matches = unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } != 0;
+			let owner_matches = super::is_trusted_windows_owner_sid(
+				|trusted_sid| {
+					// SAFETY: `owner` is returned by GetSecurityInfo within the live
+					// descriptor. `trusted_sid` is either the validated current-user SID or
+					// the fixed, well-formed BUILTIN Administrators SID.
+					unsafe { EqualSid(owner, trusted_sid.as_ptr().cast_mut().cast()) != 0 }
+				},
+				sid,
+			);
 			if !owner_matches {
 				Ok(OwnerOnlyAclState::OwnerMismatch)
 			} else {
@@ -13106,6 +13498,70 @@ mod platform {
 		Ok(())
 	}
 
+	fn directory_handle_is_empty(handle: HANDLE) -> Result<bool, &'static str> {
+		let mut restart_scan = 1u8;
+		loop {
+			let mut buffer = vec![0u8; 1024];
+			// SAFETY: zero is a valid initial NT I/O status block and the kernel writes it
+			// only through this exclusive, properly aligned mutable reference.
+			let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+			// SAFETY: `handle` remains open, `buffer` is writable for its checked u32
+			// length, and `status` outlives the synchronous NT call. Requesting a single
+			// record bounds enumeration without accumulating directory names.
+			let result = unsafe {
+				NtQueryDirectoryFile(
+					handle,
+					null_mut(),
+					null_mut(),
+					null_mut(),
+					&mut status,
+					buffer.as_mut_ptr().cast(),
+					buffer.len() as u32,
+					FILE_ID_BOTH_DIRECTORY_INFORMATION,
+					1,
+					null_mut(),
+					restart_scan,
+				)
+			};
+			restart_scan = 0;
+			if result == STATUS_NO_MORE_FILES {
+				return Ok(true);
+			}
+			if result < 0 || status.information > buffer.len() {
+				return Err("io_error");
+			}
+			let used = status.information;
+			if used == 0 {
+				return Err("io_error");
+			}
+			let minimum = std::mem::offset_of!(FileIdBothDirectoryInformation, file_name);
+			let name_length_offset =
+				std::mem::offset_of!(FileIdBothDirectoryInformation, file_name_length);
+			if used < minimum {
+				return Err("io_error");
+			}
+			let length_end = name_length_offset
+				.checked_add(size_of::<u32>())
+				.ok_or("io_error")?;
+			let name_length = u32::from_le_bytes(
+				buffer
+					.get(name_length_offset..length_end)
+					.ok_or("io_error")?
+					.try_into()
+					.map_err(|_| "io_error")?,
+			) as usize;
+			if name_length % size_of::<u16>() != 0 || name_length > used - minimum {
+				return Err("io_error");
+			}
+			let name_end = minimum.checked_add(name_length).ok_or("io_error")?;
+			let name = buffer.get(minimum..name_end).ok_or("io_error")?;
+			if name == [b'.', 0] || name == [b'.', 0, b'.', 0] {
+				continue;
+			}
+			return Ok(false);
+		}
+	}
+
 	fn tree_entry_matches(
 		handle: HANDLE,
 		expected: &NativeDirectoryTreeEntry,
@@ -13322,6 +13778,69 @@ mod platform {
 			result?;
 		}
 		Ok(())
+	}
+
+	pub(super) fn snapshot_empty_directory(path: &Path) -> NativeDirectoryTreeResult {
+		let root = match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
+			Ok(root) => root,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let initial_entry = match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		match directory_handle_is_empty(root.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+
+		let reopened = match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
+			Ok(reopened) => reopened,
+			Err(result) => {
+				return NativeDirectoryTreeResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let (Some(parent), Some(reopened_parent)) = (root.parent(), reopened.parent()) else {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		};
+		match handles_same_object_checked(parent, reopened_parent) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("identity_mismatch"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		match handles_same_object_checked(root.target, reopened.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("identity_mismatch"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		match directory_handle_is_empty(root.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeDirectoryTreeResult::failure("directory_not_empty"),
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		}
+		let current_entry = match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		let named_entry = match tree_entry(reopened.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => return NativeDirectoryTreeResult::failure(code),
+		};
+		if current_entry != initial_entry || named_entry != initial_entry {
+			return NativeDirectoryTreeResult::failure("identity_mismatch");
+		}
+		NativeDirectoryTreeResult::success(NativeDirectoryTreeSnapshot {
+			root_dev: initial_entry.dev.clone(),
+			root_ino: initial_entry.ino.clone(),
+			entries:  vec![initial_entry],
+		})
 	}
 
 	pub(super) fn snapshot_directory_tree(path: &Path) -> NativeDirectoryTreeResult {
@@ -13545,6 +14064,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn snapshot_directory_tree(_: &Path) -> NativeDirectoryTreeResult {
+		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
+	}
+	pub(super) fn snapshot_empty_directory(_: &Path) -> NativeDirectoryTreeResult {
 		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
 	}
 	pub(super) fn exact_remove_directory_tree_with_mode(
@@ -15855,6 +16377,253 @@ mod exact_replace_path_tests {
 		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
 	}
 }
+
+#[cfg(all(test, unix))]
+mod sdk_readiness_lifecycle_tests {
+	use std::{
+		fs,
+		os::unix::fs::{MetadataExt, symlink},
+		path::{Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{ExactFileIdentity, PATH_IDENTITY_HOOK_TEST_LOCK, platform, sha256};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new(base: &Path) -> Self {
+			loop {
+				let path = base.join(format!(
+					"gjc-sdk-readiness-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				match fs::create_dir(&path) {
+					Ok(()) => return Self(path),
+					Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+					Err(error) => panic!("create readiness temp directory: {error}"),
+				}
+			}
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn identity(path: &Path) -> ExactFileIdentity {
+		let metadata = fs::metadata(path).expect("stat readiness file");
+		let parent =
+			fs::metadata(path.parent().expect("readiness parent")).expect("stat readiness parent");
+		ExactFileIdentity {
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        Some(parent.dev()),
+			parent_ino:        Some(parent.ino()),
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(".readiness-cleanup".to_owned()),
+			sha256:            Some(sha256(&fs::read(path).expect("read readiness identity bytes"))),
+			allow_hard_link:   false,
+			require_hard_link: false,
+		}
+	}
+
+	fn seed(root: &Path) -> (PathBuf, PathBuf) {
+		let sdk = root.join("agent").join("sdk");
+		fs::create_dir_all(&sdk).expect("create nested SDK directory");
+		let staged = sdk.join("ready.staged");
+		let ready = sdk.join("ready.json");
+		fs::write(&staged, b"new readiness").expect("seed staged readiness");
+		fs::write(&ready, b"old readiness").expect("seed existing readiness");
+		(staged, ready)
+	}
+
+	fn assert_entries(parent: &Path, expected: &[&str]) {
+		let mut actual = fs::read_dir(parent)
+			.expect("list readiness namespace")
+			.map(|entry| entry.expect("read readiness entry").file_name())
+			.collect::<Vec<_>>();
+		actual.sort();
+		let mut expected = expected
+			.iter()
+			.map(|name| std::ffi::OsString::from(*name))
+			.collect::<Vec<_>>();
+		expected.sort();
+		assert_eq!(actual, expected, "unexpected readiness namespace debris");
+	}
+
+	fn replace_and_cleanup(real_root: &Path, operation_root: &Path) {
+		let (real_staged, real_ready) = seed(real_root);
+		let staged = operation_root.join("agent/sdk/ready.staged");
+		let ready = operation_root.join("agent/sdk/ready.json");
+		let expected_source = identity(&real_staged);
+		let expected_destination = identity(&real_ready);
+		let result =
+			platform::exact_replace_path(&staged, &ready, &expected_source, &expected_destination);
+		assert!(result.ok, "replace readiness: {:?}", result.code);
+		assert_eq!(fs::read(&real_ready).expect("read published readiness"), b"new readiness");
+		assert!(!real_staged.exists(), "staged readiness must disappear");
+		let parent = real_ready.parent().expect("SDK directory");
+		// Exact replacement deliberately retains the descriptor-scrubbed predecessor.
+		let scrubbed_name = format!(
+			".gjc-exact-replace-destination-{:x}-{:x}",
+			expected_destination.ino,
+			std::process::id()
+		);
+		assert_entries(parent, &["ready.json", &scrubbed_name]);
+		let scrubbed = parent.join(&scrubbed_name);
+		assert!(
+			fs::symlink_metadata(&scrubbed)
+				.expect("stat scrubbed predecessor")
+				.is_file()
+		);
+		assert_eq!(fs::read(&scrubbed).expect("read scrubbed predecessor"), b"");
+
+		let published = identity(&real_ready);
+		assert_eq!((published.dev, published.ino), (expected_source.dev, expected_source.ino));
+		let result = platform::exact_unlink_direct(&ready, &published);
+		assert!(result.ok, "clean readiness: {:?}", result.code);
+		assert!(!real_ready.exists(), "published readiness must disappear");
+		assert_entries(parent, &[&scrubbed_name]);
+		assert_eq!(fs::read(scrubbed).expect("read retained scrubbed predecessor"), b"");
+	}
+
+	#[test]
+	fn readiness_replace_then_direct_cleanup_under_temp_dir() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let temporary = TempDir::new(&std::env::temp_dir());
+		// Keep the lexical temp path: macOS alias translation must run in the native
+		// walk.
+		replace_and_cleanup(&temporary.0, &temporary.0);
+	}
+
+	#[test]
+	fn readiness_replace_and_direct_cleanup_refuse_symlinks() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		for case in ["ancestor", "source_leaf", "destination_leaf"] {
+			let temporary = TempDir::new(&std::env::temp_dir());
+			let (staged, ready) = seed(&temporary.0);
+			let expected_source = identity(&staged);
+			let expected_destination = identity(&ready);
+			let parent = ready.parent().expect("SDK directory");
+			let alias = if case == "ancestor" {
+				temporary.0.join("alias")
+			} else {
+				parent.join("alias")
+			};
+			let (operation_staged, operation_ready, cleanup_path, cleanup_identity) = match case {
+				"ancestor" => {
+					symlink(temporary.0.join("agent"), &alias).expect("create symlink ancestor");
+					(
+						alias.join("sdk/ready.staged"),
+						alias.join("sdk/ready.json"),
+						alias.join("sdk/ready.json"),
+						&expected_destination,
+					)
+				},
+				"source_leaf" => {
+					symlink(&staged, &alias).expect("create source symlink leaf");
+					(alias.clone(), ready.clone(), alias.clone(), &expected_source)
+				},
+				_ => {
+					symlink(&ready, &alias).expect("create destination symlink leaf");
+					(staged.clone(), alias.clone(), alias.clone(), &expected_destination)
+				},
+			};
+			let replaced = platform::exact_replace_path(
+				&operation_staged,
+				&operation_ready,
+				&expected_source,
+				&expected_destination,
+			);
+			assert!(!replaced.ok, "replace must refuse {case}");
+			assert_eq!(
+				replaced.code.as_deref(),
+				Some(if case == "ancestor" {
+					"reparse_point"
+				} else {
+					"identity_mismatch"
+				})
+			);
+			let cleaned = platform::exact_unlink_direct(&cleanup_path, cleanup_identity);
+			assert!(!cleaned.ok, "cleanup must refuse {case}");
+			assert_eq!(cleaned.code.as_deref(), Some("reparse_point"));
+			assert_eq!(fs::read(&staged).expect("read untouched staged readiness"), b"new readiness");
+			assert_eq!(fs::read(&ready).expect("read untouched old readiness"), b"old readiness");
+			assert!(
+				fs::symlink_metadata(alias)
+					.expect("stat refused symlink")
+					.file_type()
+					.is_symlink()
+			);
+			let mut expected_entries = vec!["ready.staged", "ready.json"];
+			if case != "ancestor" {
+				expected_entries.push("alias");
+			}
+			assert_entries(parent, &expected_entries);
+		}
+	}
+
+	#[test]
+	fn readiness_replace_and_direct_cleanup_refuse_wrong_parent_or_identity() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		for wrong_parent in [true, false] {
+			let temporary = TempDir::new(&std::env::temp_dir());
+			let (staged, ready) = seed(&temporary.0);
+			let mut expected_source = identity(&staged);
+			let mut expected_destination = identity(&ready);
+			let expected_code = if wrong_parent {
+				let other_parent = fs::metadata(&temporary.0).expect("stat unrelated parent");
+				for identity in [&mut expected_source, &mut expected_destination] {
+					identity.parent_dev = Some(other_parent.dev());
+					identity.parent_ino = Some(other_parent.ino());
+				}
+				"parent_mismatch"
+			} else {
+				expected_destination.ino = expected_destination.ino.wrapping_add(1);
+				"identity_mismatch"
+			};
+			let replaced =
+				platform::exact_replace_path(&staged, &ready, &expected_source, &expected_destination);
+			assert!(!replaced.ok);
+			assert_eq!(replaced.code.as_deref(), Some(expected_code));
+			let cleaned = platform::exact_unlink_direct(&ready, &expected_destination);
+			assert!(!cleaned.ok);
+			assert_eq!(cleaned.code.as_deref(), Some(expected_code));
+			assert_eq!(fs::read(&staged).expect("read untouched staged readiness"), b"new readiness");
+			assert_eq!(fs::read(&ready).expect("read untouched old readiness"), b"old readiness");
+			assert_entries(ready.parent().expect("SDK directory"), &["ready.staged", "ready.json"]);
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn readiness_replace_then_direct_cleanup_through_tmp_lexical_alias() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let temporary = TempDir::new(Path::new("/private/tmp"));
+		let lexical = Path::new("/tmp").join(temporary.0.file_name().expect("temp directory name"));
+		// Identities come from /private/tmp; only native operations receive /tmp.
+		replace_and_cleanup(&temporary.0, &lexical);
+	}
+}
+
 #[cfg(test)]
 mod sha256_tests {
 	use std::io::{self, Read};

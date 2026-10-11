@@ -1369,10 +1369,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#getProfileAvailableModels(): Model[] {
-		const getAvailableForProfileActivation = this.#modelRegistry.getAvailableForProfileActivation;
-		return typeof getAvailableForProfileActivation === "function"
-			? getAvailableForProfileActivation.call(this.#modelRegistry)
-			: this.#modelRegistry.getAvailable();
+		return this.#modelRegistry.getAvailable();
 	}
 
 	#createProfileResolutionRegistry(availableModels: readonly Model[]) {

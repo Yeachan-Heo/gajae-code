@@ -77,6 +77,7 @@ import {
 	symbolKindToIcon,
 	uriToFile,
 } from "./utils";
+import { assertInsideWorkspace } from "./workspace-path";
 
 export type { LspServerStatus } from "./client";
 export type { LspToolDetails } from "./types";
@@ -347,6 +348,17 @@ interface FileRenamePair {
  * For files this is a single pair. For directories this walks every regular file underneath
  * and produces a parallel pair anchored at the new directory root.
  */
+/**
+ * POSIX `/` contains every absolute path, and the shared helper's prefix for
+ * it is `//`, so skip containment there. A Windows drive root is only that
+ * volume, so it is checked. Any other platform root keeps the previous skip.
+ */
+function workspaceRootSkipsContainment(root: string): boolean {
+	if (root === "/") return true;
+	if (/^[A-Za-z]:[\\/]$/.test(root)) return false;
+	return root === path.parse(root).root;
+}
+
 async function enumerateRenamePairs(
 	source: string,
 	dest: string,
@@ -1522,6 +1534,23 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							existing.discarded += discardedNew;
 						}
 					}
+				}
+			}
+
+			// Reject every path this rename will write before the first write. Check the
+			// caller signal after each await, including the last one.
+			const cwd = this.session.cwd;
+			throwIfAborted(signal);
+			const workspaceRoot = await fs.promises.realpath(cwd);
+			throwIfAborted(signal);
+			if (!workspaceRootSkipsContainment(workspaceRoot)) {
+				await assertInsideWorkspace(cwd, source);
+				throwIfAborted(signal);
+				await assertInsideWorkspace(cwd, dest);
+				throwIfAborted(signal);
+				for (const uri of acceptedByUri.keys()) {
+					await assertInsideWorkspace(cwd, uriToFile(uri));
+					throwIfAborted(signal);
 				}
 			}
 

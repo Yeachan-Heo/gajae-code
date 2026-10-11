@@ -142,6 +142,7 @@ export async function operate(goal: string, opts: OperateOptions): Promise<Opera
 				lifecycle = "finalizing";
 				break;
 			}
+			lifecycle = accepted ? "observing" : "submitted";
 			continue;
 		}
 
@@ -182,11 +183,18 @@ export async function operate(goal: string, opts: OperateOptions): Promise<Opera
 		return { completed: false, lifecycle, iterations, classifications, vanishReceiptIds, blockers };
 	}
 
-	// B3: never finalize on loop-exhaustion — require an explicit observed completion.
+	// An observation budget bounds this invocation, not the work itself. Keep active
+	// sessions nonterminal so a caller can resume observation without treating a slow
+	// but healthy owner as a failure. Completion still requires an explicit signal.
 	if (lifecycle !== "finalizing") {
-		blockers.push("no-observed-completion");
-		await emit("critical", "operate_blocked", { blockers });
-		return { completed: false, lifecycle: "blocked", iterations, classifications, vanishReceiptIds, blockers };
+		await emit("info", "operate_observation_window_ended", {
+			lifecycle,
+			iterations,
+			lastClassification: classifications.at(-1) ?? null,
+			completionObserved: false,
+			resumeWith: "observe",
+		});
+		return { completed: false, lifecycle, iterations, classifications, vanishReceiptIds, blockers };
 	}
 
 	const finalize = await runFinalize({

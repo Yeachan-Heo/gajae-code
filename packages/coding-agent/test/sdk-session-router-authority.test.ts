@@ -3227,3 +3227,73 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 });
+
+for (const outcome of ["success", "throw", "cancel", "teardown"] as const) {
+	test(`Router absolute deadline handles late ${outcome}`, async () => {
+		let now = Date.now();
+		const deadline = now + 100;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		let fixture: RouterFixture | undefined;
+		try {
+			fixture = await routerFixture({
+				onRequest: async frame => {
+					if (frame.type !== "register_provider") return { events: [] };
+					now = deadline;
+					if (outcome === "throw") throw new Error("late transport error");
+					if (outcome === "cancel") throw new DOMException("late cancellation", "AbortError");
+					if (outcome === "teardown") await fixture?.router.stop();
+					return { ok: true, result: { leaseId: "late-lease" } };
+				},
+			});
+			const request = fixture.router.request(
+				fixture.sessionId,
+				{
+					type: "register_provider",
+					id: "deadline-registration",
+					capability: "permission",
+					idempotencyKey: "registration-key",
+				},
+				1,
+				undefined,
+				{ deadline },
+			);
+			if (outcome === "throw") await expect(request).rejects.toThrow("late transport error");
+			else if (outcome === "cancel") await expect(request).rejects.toBeInstanceOf(DOMException);
+			else
+				await expect(request).rejects.toMatchObject({
+					code: "uncertain_after_send",
+					details: { id: "deadline-registration", idempotencyKey: "registration-key" },
+				});
+			expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toHaveLength(1);
+		} finally {
+			clock.mockRestore();
+			await fixture?.router.stop();
+		}
+	});
+}
+
+for (const outcome of ["timeout", "throw", "cancel"] as const) {
+	test(`Router transport preparation ${outcome} never dispatches registration`, async () => {
+		const fixture = await routerFixture();
+		let now = Date.now();
+		const deadline = now + 100;
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const failure =
+			outcome === "cancel" ? new DOMException("connect cancelled", "AbortError") : new Error("connect failed");
+		fixture.clients[0]!.client.connect = async () => {
+			if (outcome === "timeout") now = deadline;
+			else throw failure;
+		};
+		try {
+			const request = fixture.router.request(fixture.sessionId, { type: "register_provider" }, 1, undefined, {
+				deadline,
+			});
+			if (outcome === "timeout") await expect(request).rejects.toMatchObject({ phase: "pre_send" });
+			else await expect(request).rejects.toBe(failure);
+			expect(fixture.clients[0]?.requests.filter(frame => frame.type === "register_provider")).toHaveLength(0);
+		} finally {
+			clock.mockRestore();
+			await fixture.router.stop();
+		}
+	});
+}

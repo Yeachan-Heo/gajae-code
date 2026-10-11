@@ -373,3 +373,28 @@ test("rejects a failed continuation page", async () => {
 		}),
 	).rejects.toMatchObject({ code: "unavailable", message: "broker unavailable" });
 });
+
+test("attach-only refuses before closing hosts, stopping the incumbent or starting a replacement", async () => {
+	const prior = process.env.GJC_SDK_BROKER_AUTOSTART;
+	process.env.GJC_SDK_BROKER_AUTOSTART = "0";
+	const effects: string[] = [];
+	try {
+		await expect(
+			restartSdkBroker(
+				{ agentDir: "/agent", closeSessionHosts: true },
+				deps({
+					readDiscovery: async () => (effects.push("read"), discovery(1, "darwin:1:0")),
+					listSessionHosts: async () => (effects.push("list"), ["host-1"]),
+					closeSession: async () => void effects.push("close"),
+					shutdown: async () => void effects.push("shutdown"),
+					signal: () => void effects.push("signal"),
+					ensure: async () => (effects.push("ensure"), discovery(2, "darwin:2:0")),
+				}),
+			),
+		).rejects.toThrow("GJC_SDK_BROKER_AUTOSTART=0 means an external supervisor owns the broker");
+		expect(effects).toEqual([]);
+	} finally {
+		if (prior === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+		else process.env.GJC_SDK_BROKER_AUTOSTART = prior;
+	}
+});

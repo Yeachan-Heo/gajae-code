@@ -44,6 +44,35 @@ describe("AuthStorage config-override apiKey", () => {
 		]);
 	}
 
+	test("session selectors preserve exact stored literal cache provenance", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const provider = "fixture-literal-cache";
+		await authStorage.set(provider, [
+			{ type: "api_key", key: ["fixture", "wrong"].join("-") },
+			{ type: "api_key", key: ["fixture", "selected"].join("-") },
+		]);
+		const row = authStorage.listCredentialInventory(provider)[1];
+		if (!row) throw new Error("Expected selected literal credential row");
+		const selector = { kind: "id" as const, value: String(row.id) };
+		const evidence = authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector);
+		expect(evidence).toBeDefined();
+		const generation = authStorage.getGeneration();
+		authStorage.setSessionCredentialSelector("literal-cache-session", provider, selector);
+		expect(authStorage.getGeneration()).toBeGreaterThan(generation);
+		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
+		authStorage.setSessionCredentialAuto(provider, "literal-cache-session");
+		expect(authStorage.getGeneration()).toBeGreaterThan(generation + 1);
+		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
+		authStorage.clearSessionCredentialSelector(provider, "literal-cache-session");
+		expect(authStorage.getGeneration()).toBeGreaterThan(generation + 2);
+		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
+		authStorage.markSessionCredentialUnavailable("literal-cache-session", provider, selector);
+		expect(authStorage.getGeneration()).toBeGreaterThan(generation + 3);
+		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBe(evidence);
+		authStorage.setRuntimeApiKey(provider, ["fixture", "override"].join("-"));
+		expect(authStorage.getStoredLiteralApiKeyEvidenceGeneration(provider, selector)).toBeUndefined();
+	});
+
 	test("setConfigApiKey beats OAuth access token for getApiKey", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
 			if (!authStorage) throw new Error("test setup failed");
@@ -232,6 +261,34 @@ describe("AuthStorage config-override apiKey", () => {
 
 			// Unowned callers continue to observe the latest process-wide registration.
 			expect(await authStorage.getApiKey("anthropic")).toBe("second-key");
+		});
+	});
+
+	test("owned fallback lookup is strict, copied by forks, and protected from stale disposers", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const ownerA = {};
+			const ownerB = {};
+			const ownerWithoutFallback = {};
+			const removeGlobal = authStorage.setFallbackResolver(() => "global-fallback");
+			const removeA1 = authStorage.setFallbackResolver(() => "owner-a-v1", ownerA);
+			const forkA = authStorage.forkConfigOwner(ownerA);
+			const removeA2 = authStorage.setFallbackResolver(() => "owner-a-v2", ownerA);
+			removeA1();
+			const removeB1 = authStorage.setFallbackResolver(() => "owner-b-v1", ownerB);
+			const removeB2 = authStorage.setFallbackResolver(() => "owner-b-v2", ownerB);
+			removeB1();
+
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerA })).toBe("owner-a-v2");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: forkA })).toBe("owner-a-v1");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerB })).toBe("owner-b-v2");
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerWithoutFallback })).toBeUndefined();
+
+			removeA2();
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerA })).toBeUndefined();
+			removeGlobal();
+			removeB2();
+			authStorage.releaseConfigOwner(forkA);
 		});
 	});
 

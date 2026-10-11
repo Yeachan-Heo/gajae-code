@@ -210,6 +210,8 @@ type CoordinatorBrokerStage = "ensure" | "read" | "connect" | "request" | "close
 function toCoordinatorBrokerError(stage: CoordinatorBrokerStage, error: unknown): SdkClientError {
 	if (stage === "request" && error instanceof SdkClientError) return error;
 	if (stage === "ensure") {
+		// Attach-only mode refuses with the public unavailability code; keep it.
+		if (error instanceof SdkClientError && error.code === "broker_unavailable") return error;
 		if (error instanceof AggregateError)
 			return new SdkClientError(
 				"broker_cleanup_unverified",

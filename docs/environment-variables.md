@@ -37,6 +37,8 @@ Step 6 does not execute those files. Each is scanned line by line for literal `e
 
 Because the scan is per line and has no notion of shell block structure, it does not reflect whether an assignment would actually run. An assignment nested in an `if` or a function body is read exactly like a top-level one, so a value you guarded behind something like `if [ -n "$CI" ]` in `~/.zshrc` still reaches `$env` unconditionally. Only assignments that do not start their own line — for example one packed after `case ... in` on the same line — are missed.
 
+`NODE_TLS_REJECT_UNAUTHORIZED` is never taken from the project `.env` (step 2): a project declaration is removed from the process environment at startup, including one Bun already loaded, so a repository cannot turn off TLS certificate verification. A value exported by the launching shell or set in a user-owned file (steps 3-6) is still honored.
+
 Keys are used exactly as written. A `PI_`-prefixed key in a `.env` file is not mirrored to its `GJC_` counterpart, or the reverse — where both spellings are accepted it is because the reading code asks for both names.
 
 ---
@@ -135,14 +137,16 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 
 ### External CLI credential import roots
 
-`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code and Codex CLI credentials on disk. Both CLIs relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. This is what makes an account selected by an external account switcher (which launches the shell with these variables set) the account gjc imports.
+`gjc setup credentials`, the TUI "import existing credentials" action, and the startup auto-import discover Claude Code, Codex CLI, and Kiro CLI social-login credentials on disk. Claude Code and Codex CLI relocate their own config root through the environment, so gjc follows the same variables instead of assuming the home-directory default. Kiro CLI stores social tokens in its local `data.sqlite3`; GJC reads only the `auth_kv` entry and never modifies that database.
 
 | Variable             | Used for                                                              | Required when                                        | Notes / precedence                                                                                                                                     |
 | -------------------- | --------------------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLAUDE_CONFIG_DIR`  | Directory holding Claude Code's `.credentials.json`                   | Claude Code's config root is not `~/.claude`         | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.claude`.                 |
 | `CODEX_HOME`         | Directory holding Codex CLI's `auth.json`                             | Codex CLI's home is not `~/.codex`                   | Read through `$credentialEnv` (project `.env` cannot redirect it). Must be absolute; relative or blank values fall back to `~/.codex`.                  |
+| `XDG_DATA_HOME`      | Kiro CLI data directory on Linux                                       | Kiro CLI data root is not `~/.local/share`            | Read through `$credentialEnv`; relative or blank values fall back to `~/.local/share`. GJC reads `kiro-cli/data.sqlite3` from this directory.                 |
+| `LOCALAPPDATA`       | Kiro CLI data directory on Windows                                     | Kiro CLI data root is not `%LOCALAPPDATA%`            | Read through `$credentialEnv`; relative or blank values fall back to `~/AppData/Local`. GJC reads `kiro-cli/data.sqlite3` from this directory.                  |
 
-Redacted summaries name the variable (`Claude Code ($CLAUDE_CONFIG_DIR/.credentials.json)`), never the resolved path. macOS Keychain discovery is unaffected: it is still only consulted when no credential file is found.
+Redacted summaries name environment redirects, never resolved paths. Kiro CLI's default database path is `~/Library/Application Support/kiro-cli/data.sqlite3` on macOS, `~/.local/share/kiro-cli/data.sqlite3` on Linux, and `%LOCALAPPDATA%/kiro-cli/data.sqlite3` on Windows. macOS Keychain discovery is unaffected: it is still only consulted when no Claude Code credential file is found.
 
 ---
 
@@ -289,11 +293,12 @@ providers:
 
 This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support is disabled by default, so the host terminal or tmux retains wheel and selection behavior. Add `set -g mouse on` to your own `~/.tmux.conf` when you want tmux copy-mode scrolling.
 
-Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release. Double-click selects the word under the cursor and triple-click selects the row; both copy on release, and dragging afterwards extends by whole words or rows. Because GJC owns the mouse while this is on, the terminal's own selection is reached with a modifier held — Option on macOS, Shift on most other terminals. That modifier makes the host terminal keep the click instead of forwarding it, so GJC never sees it and does not copy: whether the resulting selection reaches the clipboard is entirely the host terminal's own copy-on-select behavior, which is off by default in most terminals. GJC's own selection is the one that copies automatically.
+Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release. Over assistant Markdown the copy is the original Markdown rather than the painted glyphs: wrapped prose is rejoined, fully selected blocks copy their original Markdown (code with its tabs, quotes with `>`), a selection inside one code block drops the fences and indent, and a partial table selection copies tab-separated cells. Holding a drag while scrolling the wheel, or resting it on the top or bottom transcript row, extends the selection through scrolled history. Double-click selects the word under the cursor and triple-click selects the row; both copy on release, and dragging afterwards extends by whole words or rows. Because GJC owns the mouse while this is on, the terminal's own selection is reached with a modifier held — Option on macOS, Shift on most other terminals. That modifier makes the host terminal keep the click instead of forwarding it, so GJC never sees it and does not copy: whether the resulting selection reaches the clipboard is entirely the host terminal's own copy-on-select behavior, which is off by default in most terminals. GJC's own selection is the one that copies automatically.
 
 | Variable | Behavior |
 | --- | --- |
 | `GJC_LAUNCH_POLICY` | Launch policy for `--tmux` startup: `tmux` (default) or `direct` (skip the tmux session) |
+| `GJC_NO_TMUX` | `1` or `true` (exact spelling) has the same effect as `GJC_LAUNCH_POLICY=direct`. A `GJC_LAUNCH_POLICY` of `tmux` or `direct` wins over it. |
 | `GJC_TMUX_SESSION` | Explicit tmux session name override for `--tmux` startup. Use a unique value (for example `GJC_TMUX_SESSION=gjc-fresh-$(date +%s) gjc --tmux`) to force a fresh named session. |
 | `GJC_TMUX_COMMAND` | tmux binary/name override for every GJC tmux flow. This is not a shell command line; include only the executable path/name, not flags. |
 | `GJC_TMUX_PROFILE` | Set `0`/`false`/`off` to apply only the required ownership tags and skip the scroll/mouse/clipboard profile |
@@ -397,7 +402,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS` | Positive integer override (default 300000)           |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`    | Non-negative integer override (default 5)            |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS`  | Positive integer base backoff override (default 500) |
-| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer OpenAI stream idle timeout override. Unset: 120s, except xAI Grok / Grok Build providers and Grok model ids on any OpenAI-compatible host use 300s (same floor as Anthropic long-reasoning). `0` disables. LM Studio keeps the shared idle timeout, but its first-event window is 300s by default to allow local model loading/prefill; `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` overrides that window. |
+| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer stream idle timeout override (also applies to Anthropic). Unset: 120s generally, 600s for Anthropic long-reasoning gaps, and 300s for xAI Grok / Grok Build and Grok models on OpenAI-compatible hosts. `0` disables. LM Studio keeps the shared idle timeout, but its first-event window is 300s by default to allow local model loading/prefill; `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` overrides that window. |
 
 ### Cursor provider debug
 
@@ -519,6 +524,8 @@ Extra conditional behavior:
 | `GJC_FORCE_IMAGE_PROTOCOL`    | Forces supported image protocol (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) where used            |
 | `GJC_ALLOW_SIXEL_PASSTHROUGH` | Allows SIXEL passthrough when `GJC_FORCE_IMAGE_PROTOCOL=sixel`                                      |
 | `GJC_NO_PTY`                  | If `1`, disables interactive PTY path for bash tool                                                |
+| `GJC_SKIP_NOFILE_CHECK` | macOS only. `1` or `true` (exact spelling) skips the startup check that warns when `ulimit -n` is below `4096`. |
+| `GJC_CLEANUP_DEADLINE_MS` | How long a signal, fatal-error, broken-pipe, or `quit()` exit waits for in-flight shutdown cleanup before it exits anyway (default `5000`). Finite values `>= 0` are honored, and values above `2147483647` are lowered to it. Empty, negative, or non-numeric values fall back to the default. |
 | `GJC_SESSION_CONTEXT_BUDGET_BYTES` | Overrides the synchronous session-context materialization budget in bytes (default `536870912` = 512 MiB, ceiling `8589934592` = 8 GiB). Only a canonical positive-integer value is honored; anything invalid (empty, non-numeric, negative, zero, overflowing a safe integer, or above the ceiling) fail-closes to the 512 MiB default with a warning. Raise it above your measured session size to suppress the `SessionContextTooLargeError` preflight, or lower it to restore the old tight bound. |
 
 LSP project configuration may control declarative matching, activation, and capabilities, but it cannot define a command, arguments, executable, client factory, initialization options, or opaque server settings. Trusted user-wide configuration outside the project—including the recommended `~/.gjc/agent/lsp.*` files and supported legacy user locations—can override LSP launches and server options; automatic discovery uses trusted external executables and rejects project-owned lexical paths as well as symlink-resolved project binaries.
@@ -563,8 +570,8 @@ export GJC_WORKTREE_DIR='/Volumes/dev/worktrees/{repo}'
 | `CLAUDE_BASH_NO_LOGIN`      | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
 | `PI_SHELL_PREFIX`           | Optional command prefix wrapper                                                |
 | `CLAUDE_CODE_SHELL_PREFIX`  | Legacy alias fallback for `PI_SHELL_PREFIX`                                    |
-| `VISUAL`                   | Preferred external editor command                                              |
-| `EDITOR`                   | Fallback external editor command                                               |
+| `VISUAL`                   | Preferred external editor command (ignored when declared in a project `.env`)  |
+| `EDITOR`                   | Fallback external editor command (ignored when declared in a project `.env`)   |
 
 Current implementation: `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` are resolved first, then the `PI_*` and `CLAUDE_*` aliases above. Both are boolean-like: only `1`/`Y`/`TRUE`/`YES`/`ON` (case-insensitive) enable them, so an explicit `GJC_BASH_NO_LOGIN=0` keeps the login shell even when a legacy alias is truthy. The shell prefix is read from `PI_SHELL_PREFIX`/`CLAUDE_CODE_SHELL_PREFIX` only; `GJC_SHELL_PREFIX` is not currently honored.
 
@@ -605,6 +612,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `GJC_FORCE_IMAGE_PROTOCOL` | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) |
 | `GJC_TUI_KEYBOARD_PROTOCOL` | Enhanced keyboard input (Kitty keyboard protocol + xterm modifyOtherKeys). Enabled by default; set `0` / `false` to leave the keyboard in its default mode. GJC automatically skips the modifyOtherKeys fallback on Windows and Apple Terminal because it breaks CJK/Hangul IME composition there; use the full opt-out for other affected terminals such as Android Termius. |
 | `GJC_TUI_SYNCHRONIZED_OUTPUT` | Synchronized-output framing (`CSI ?2026h/l`) is enabled by default. Set `0` / `false` / `off` / `no` before starting or restarting GJC to remove that framing for terminal parsers that render it incorrectly. This is a process-wide compatibility and diagnostic switch, not tmux/Byobu client detection or per-client negotiation. Disabling it may expose visible tearing; return to the default after diagnosis unless the client requires the workaround. |
+| `GJC_TUI_WIDTH_SETTLE_MS` | Trailing debounce in ms before the full repaint that repairs the transcript after a terminal width change (default `1000`; `0` turns the settled repair off). Read once when the TUI starts. A negative or non-numeric value falls back to the default. `PI_TUI_WIDTH_SETTLE_MS` is the legacy alias. |
 
 ---
 

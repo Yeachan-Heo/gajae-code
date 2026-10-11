@@ -257,6 +257,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/natives/test/windows-runtime-install.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
@@ -1327,6 +1328,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/test/sdk-session-directory.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-index-lock-contention.test.ts",
+			"packages/coding-agent/test/file-lock-signed-identity.test.ts",
 			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
 			"packages/coding-agent/src/config/file-lock.ts",
 			// Session-state lock / empty-delete receipt GC bind the native identity
@@ -1392,6 +1394,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("check:@gajae-code/coding-agent");
 		expect(keys).toContain("cli-smoke");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
+	});
+
+	test("a deleted test in a non-runtime package does not schedule CLI smoke or native build", () => {
+		const tasks = planTargetedTasks(
+			["packages/example/test/deleted.test.ts"],
+			[...targetingPackages, ...packages],
+			testFiles,
+		);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toEqual(["check:@gajae-code/example"]);
+		expect(keys).not.toContain("cli-smoke");
+		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
 	});
 
 	test("the live RLM e2e test gets native artifacts for skipped import-time setup", () => {

@@ -44,7 +44,8 @@
  * WHERE it runs. `sdk.flushWorktreeOnDeadline` still defaults to on, but the
  * implicit default applies only in a LINKED worktree (`gitDir !== commonDir`) —
  * what agent/paseo sessions run in, and the #5583 field report. In the user's
- * primary checkout an autosave needs an explicit opt-in.
+ * primary checkout an autosave needs an explicit opt-in from the user/global
+ * config or a runtime override. A project `.gjc` file is not that opt-in.
  */
 
 import * as fsp from "node:fs/promises";
@@ -66,9 +67,10 @@ export interface PromptDeadlineFlushOptions {
 	/** Active session's agent directory, used to keep volatile broker state out of the WIP commit. */
 	readonly agentDir?: string;
 	/**
-	 * Whether the caller resolved `sdk.flushWorktreeOnDeadline` to `true` from a
-	 * value the user actually wrote, rather than from the schema default. Only an
-	 * explicit opt-in may autosave outside a linked worktree.
+	 * Whether the caller resolved `sdk.flushWorktreeOnDeadline` to `true` from the
+	 * user/global config or a runtime override, rather than from the schema
+	 * default or a project `.gjc` file. Only that opt-in may autosave outside a
+	 * linked worktree.
 	 */
 	readonly explicitOptIn?: boolean;
 	/**
@@ -162,6 +164,76 @@ function isLinkedWorktree(repository: git.GitRepository): boolean {
 	return path.resolve(repository.gitDir) !== path.resolve(repository.commonDir);
 }
 
+const DEADLINE_FLUSH_SETTING = "sdk.flushWorktreeOnDeadline";
+
+/**
+ * The settings view both deadline hosts already hold. `get` is the merged value
+ * (global, then project, then runtime override, otherwise the schema default).
+ * `getGlobal` and `getOverride` are the layers a project file cannot write.
+ */
+export interface DeadlineFlushSettings {
+	get(path: typeof DEADLINE_FLUSH_SETTING): unknown;
+	getAgentDir?(): string | undefined;
+	getGlobal?(path: typeof DEADLINE_FLUSH_SETTING): unknown;
+	getOverride?(path: typeof DEADLINE_FLUSH_SETTING): unknown;
+}
+
+/**
+ * True only when the user wrote `sdk.flushWorktreeOnDeadline: true` in a runtime
+ * override or the global config. The schema default and a project `.gjc` file
+ * do not count: `Settings.has()` sees the merged view, so a repo-shipped `true`
+ * would otherwise open the primary-checkout gate.
+ */
+export function explicitDeadlineFlushOptIn(settings: DeadlineFlushSettings | undefined): boolean {
+	if (!settings) return false;
+	if (typeof settings.getOverride === "function") {
+		const override = settings.getOverride(DEADLINE_FLUSH_SETTING);
+		if (override !== undefined) return override === true;
+	}
+	if (typeof settings.getGlobal === "function") return settings.getGlobal(DEADLINE_FLUSH_SETTING) === true;
+	return false;
+}
+
+/**
+ * Whether this deadline must not autosave.
+ *
+ * A runtime override wins, then the user/global value. A project file cannot
+ * cancel either one. A project `false` still opts out when the user has not
+ * written the key.
+ */
+export function deadlineFlushSuppressed(settings: DeadlineFlushSettings | undefined): boolean {
+	if (!settings) return false;
+	if (typeof settings.getOverride === "function") {
+		const override = settings.getOverride(DEADLINE_FLUSH_SETTING);
+		if (override === false) return true;
+		if (override === true) return false;
+	}
+	if (typeof settings.getGlobal === "function") {
+		const globalValue = settings.getGlobal(DEADLINE_FLUSH_SETTING);
+		if (globalValue === false) return true;
+		if (globalValue === true) return false;
+	}
+	return settings.get(DEADLINE_FLUSH_SETTING) === false;
+}
+
+/**
+ * Deadline-host entry for the worktree autosave. Both the session runtime and
+ * the notification bus call this so the opt-in decision cannot drift.
+ */
+export async function autosaveWorktreeOnPromptDeadline(
+	cwd: string,
+	settings: DeadlineFlushSettings | undefined,
+	options?: { readonly isCurrent?: () => boolean; readonly signal?: AbortSignal },
+): Promise<PromptDeadlineFlushResult | undefined> {
+	if (deadlineFlushSuppressed(settings)) return undefined;
+	return flushWorktreeOnPromptDeadline(cwd, {
+		agentDir: settings?.getAgentDir?.(),
+		explicitOptIn: explicitDeadlineFlushOptIn(settings),
+		isCurrent: options?.isCurrent,
+		signal: options?.signal,
+	});
+}
+
 /**
  * Commit any uncommitted work in the worktree owning `cwd`.
  *
@@ -195,7 +267,8 @@ export async function flushWorktreeOnPromptDeadline(
 		if (!explicitOptIn && !isLinkedWorktree(repository)) {
 			logger.debug(
 				`sdk: prompt deadline worktree autosave skipped; ${worktreeRoot} is a primary checkout the session does ` +
-					`not own. Set sdk.flushWorktreeOnDeadline to true to autosave here anyway.`,
+					`not own. Set sdk.flushWorktreeOnDeadline to true in the user config or a runtime override to ` +
+					`autosave here anyway.`,
 			);
 			return undefined;
 		}

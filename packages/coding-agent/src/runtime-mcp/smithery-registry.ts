@@ -1,4 +1,5 @@
 import { logger } from "@gajae-code/utils";
+import { type AddressResolver, validatePublicHttpUrl } from "../web/insane/url-guard";
 import type { MCPServerConfig } from "./types";
 
 const SMITHERY_REGISTRY_BASE_URL = "https://registry.smithery.ai";
@@ -289,6 +290,20 @@ function chooseConnection(
 	return null;
 }
 
+export async function resolveSmitheryServerConfig(
+	qualifiedName: string,
+	selected: { connection: SmitheryConnection; useDirectHttp: boolean },
+	options?: { resolver?: AddressResolver },
+): Promise<MCPServerConfig | null> {
+	let useDirectHttp = selected.useDirectHttp;
+	const deploymentUrl = selected.connection.deploymentUrl;
+	if (useDirectHttp && selected.connection.type === "http" && deploymentUrl) {
+		const checked = await validatePublicHttpUrl(deploymentUrl, { resolver: options?.resolver });
+		if (!checked.ok) useDirectHttp = false;
+	}
+	return createConfig(qualifiedName, { connection: selected.connection, useDirectHttp });
+}
+
 function createConfig(
 	qualifiedName: string,
 	selected: { connection: SmitheryConnection; useDirectHttp: boolean },
@@ -297,6 +312,7 @@ function createConfig(
 		return {
 			type: "http",
 			url: selected.connection.deploymentUrl,
+			publicNetwork: true,
 		};
 	}
 
@@ -335,7 +351,10 @@ async function fetchServerDetailsFromEntry(
 	return null;
 }
 
-function toSearchResult(entry: SmitherySearchEntry, details: SmitheryServerDetails): SmitherySearchResult | null {
+async function toSearchResult(
+	entry: SmitherySearchEntry,
+	details: SmitheryServerDetails,
+): Promise<SmitherySearchResult | null> {
 	if (!entry.id) return null;
 	const qualifiedName = normalizeQualifiedName(
 		details.qualifiedName ?? entry.qualifiedName ?? `${entry.namespace}/${entry.slug}`,
@@ -343,7 +362,7 @@ function toSearchResult(entry: SmitherySearchEntry, details: SmitheryServerDetai
 	const selected = chooseConnection(details);
 	if (!selected) return null;
 
-	const config = createConfig(qualifiedName, selected);
+	const config = await resolveSmitheryServerConfig(qualifiedName, selected);
 	if (!config) return null;
 
 	const requiredInputs = getSchemaInputs(selected.connection.configSchema);
@@ -450,7 +469,7 @@ export async function searchSmitheryRegistry(
 			try {
 				const details = await fetchServerDetailsFromEntry(entry, { apiKey: options?.apiKey });
 				if (!details) return null;
-				return toSearchResult(entry, details);
+				return await toSearchResult(entry, details);
 			} catch (error) {
 				detailFailures.push({
 					identity: getEntryIdentityKey(entry) ?? entry.id ?? "unknown",

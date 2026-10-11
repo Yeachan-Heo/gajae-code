@@ -103,6 +103,11 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 // files for the credential-only snapshot.
 const projectSnapshot = loadProjectEnv();
 const projectEnv = projectSnapshot.values;
+
+/** Project dotenv as it was when this module loaded, before a later `chdir` or file delete. */
+export function startupProjectEnvSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
+	return projectSnapshot;
+}
 const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
 const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
 const declaredHome = projectEnv[declaredHomeKey];
@@ -183,8 +188,35 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	return trimmed;
 }
 
+/**
+ * Process-wide transport-security switches a repository must not be able to flip.
+ * `NODE_TLS_REJECT_UNAUTHORIZED=0` disables certificate verification for every
+ * fetch in the process, so a project `.env` pairing it with a proxy would expose
+ * provider credentials to whoever answers the proxy.
+ */
+const PROJECT_DENIED_ENV_NAMES = ["NODE_TLS_REJECT_UNAUTHORIZED"] as const;
+
+// Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
+// (same provenance rule as the credential snapshot) and never copy it below.
+// Bun reads this switch per TLS connection, so removing it here restores
+// verification for every connection the process opens afterwards.
+for (const name of PROJECT_DENIED_ENV_NAMES) {
+	const key = canonicalEnvKey(name);
+	const declared = projectEnv[key];
+	if (declared === undefined) continue;
+	const runtime = Bun.env[name];
+	if (
+		runtime !== undefined &&
+		(projectSnapshot.dynamic.has(key) || runtime === declared || runtime.trim() === declared)
+	) {
+		delete Bun.env[name];
+	}
+}
+const projectDeniedKeys = new Set<string>(PROJECT_DENIED_ENV_NAMES.map(canonicalEnvKey));
+
 for (const file of [projectEnv, agentEnv, piEnv, homeEnv, homeShellEnv]) {
 	for (const key in file) {
+		if (file === projectEnv && projectDeniedKeys.has(key)) continue;
 		if (!Bun.env[key]) {
 			Bun.env[key] = file[key];
 		}

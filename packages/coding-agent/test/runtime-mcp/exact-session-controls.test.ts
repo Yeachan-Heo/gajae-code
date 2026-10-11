@@ -57,6 +57,28 @@ function connection(name: string, calls: string[]): MCPServerConnection {
 	};
 }
 
+describe("pool lease request handler", () => {
+	test("keeps the physical roots handler on the lease facade", async () => {
+		const physical = connection("pooled", []);
+		const onRequest = async (method: string) => {
+			throw new Error(`rejected ${method}`);
+		};
+		const pool = new MCPConnectionPool({ connect: async () => physical });
+		const lease = await pool.acquire("pooled", physical.config, {
+			sessionId: "session-1",
+			capabilityProfile: "tools-only",
+			onRequest,
+		});
+		try {
+			const handler = lease.connectionForLease().transport.onRequest;
+			expect(typeof handler).toBe("function");
+			await expect(handler!("roots/list", undefined)).rejects.toThrow(/rejected roots\/list/);
+		} finally {
+			await lease.release();
+		}
+	});
+});
+
 describe("exact-config MCP session controls", () => {
 	test("capability attachment is revocable and session-identity scoped", () => {
 		const first = {} as AgentSession;

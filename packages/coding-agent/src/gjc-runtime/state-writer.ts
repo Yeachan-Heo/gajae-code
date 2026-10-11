@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import * as nodeFs from "node:fs";
+import type * as nodeFs from "node:fs";
 import { constants as fsConstants, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
@@ -310,19 +310,33 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 	return envelope as T;
 }
 
-export async function detectWorkflowEnvelopeIntegrityMismatch(
-	filePath: string,
-): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
-	const current = await readJsonIfPresent(filePath);
-	if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
-	const receipt = (current as Record<string, unknown>).receipt;
+export type WorkflowEnvelopeChecksumStatus = "absent" | "match" | "mismatch";
+
+/** Compare a parsed envelope to its writer-stamped `content_sha256`, when one is present. */
+export function workflowEnvelopeChecksumStatus(value: unknown): WorkflowEnvelopeChecksumStatus {
+	const checksum = workflowEnvelopeChecksumPair(value);
+	if (!checksum) return "absent";
+	return checksum.actual === checksum.expected ? "match" : "mismatch";
+}
+
+function workflowEnvelopeChecksumPair(value: unknown): { expected: string; actual: string } | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const receipt = (value as Record<string, unknown>).receipt;
 	if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return undefined;
 	const checksum = (receipt as Record<string, unknown>).content_sha256;
 	if (!checksum || typeof checksum !== "object" || Array.isArray(checksum)) return undefined;
 	const expected = (checksum as Record<string, unknown>).value;
 	if (typeof expected !== "string" || !expected) return undefined;
-	const actual = workflowEnvelopeContentSha256(current);
-	return actual === expected ? undefined : { path: filePath, expected, actual };
+	return { expected, actual: workflowEnvelopeContentSha256(value) };
+}
+
+export async function detectWorkflowEnvelopeIntegrityMismatch(
+	filePath: string,
+): Promise<WorkflowEnvelopeIntegrityMismatch | undefined> {
+	const current = await readJsonIfPresent(filePath);
+	const checksum = workflowEnvelopeChecksumPair(current);
+	if (!checksum || checksum.actual === checksum.expected) return undefined;
+	return { path: filePath, expected: checksum.expected, actual: checksum.actual };
 }
 
 function safeString(value: unknown): string {
@@ -1370,9 +1384,16 @@ export async function removeActiveEntry(
 	);
 }
 
-export async function readActiveEntries(
+/**
+ * Read every per-skill active entry. Unreadable JSON propagates; a parsed record
+ * that is not a skill entry (not an object, or without a `skill`) is skipped, or
+ * rejected when `strict` is set so status-bearing readers can tell an existing
+ * but unusable authoritative entry apart from a deleted one.
+ */
+async function readActiveEntriesFromDir(
 	cwd: string,
-	sessionScope?: string | ActiveSessionScope,
+	sessionScope: string | ActiveSessionScope | undefined,
+	strict: boolean,
 ): Promise<SkillActiveEntry[]> {
 	const dir = activeStateDir(path.resolve(cwd), sessionScope);
 	let names: string[];
@@ -1385,13 +1406,36 @@ export async function readActiveEntries(
 	const entries: SkillActiveEntry[] = [];
 	for (const name of names.sort()) {
 		if (!name.endsWith(".json")) continue;
-		const raw = await readJsonIfPresent(path.join(dir, name));
-		if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-		const skill = safeString((raw as SkillActiveEntry).skill).trim();
-		if (!skill) continue;
+		const filePath = path.join(dir, name);
+		const raw = await readJsonIfPresent(filePath);
+		if (raw === undefined) continue;
+		const skill = isPlainObject(raw) ? safeString(raw.skill).trim() : "";
+		if (!skill) {
+			if (strict) throw new Error(`active entry at ${filePath} is not a skill entry record`);
+			continue;
+		}
 		entries.push(raw as SkillActiveEntry);
 	}
 	return entries;
+}
+
+export async function readActiveEntries(
+	cwd: string,
+	sessionScope?: string | ActiveSessionScope,
+): Promise<SkillActiveEntry[]> {
+	return readActiveEntriesFromDir(cwd, sessionScope, false);
+}
+
+/**
+ * Failure-observable counterpart of `readActiveEntries`: an entry file that exists
+ * but holds no usable skill entry throws instead of being skipped, so its absence
+ * from the result always means the entry does not exist.
+ */
+export async function readActiveEntriesStrict(
+	cwd: string,
+	sessionScope?: string | ActiveSessionScope,
+): Promise<SkillActiveEntry[]> {
+	return readActiveEntriesFromDir(cwd, sessionScope, true);
 }
 
 export async function rebuildActiveSnapshot(

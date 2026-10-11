@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { streamGoogle } from "../src/providers/google";
+import type { Model } from "../src/types";
 import {
 	appendTransportFailureContext,
 	finalizeErrorMessage,
@@ -137,6 +139,60 @@ describe("HTTP 400 request dump sanitization", () => {
 		expect(saved.match(/xxxxxxxxxxxxxxxx/g)?.length).toBe(53_125);
 		expect(Buffer.byteLength(saved)).toBeLessThan(900_000);
 		expect(saved).toContain('"disposition": "send-all"');
+	});
+
+	it("redacts Google and Cloudflare auth headers before writing the HTTP 400 dump", async () => {
+		await useTempAgentDir();
+		const googApiKeySecret = "synthetic-x-goog-api-key-secret";
+		const cloudflareSecret = "synthetic-cf-aig-authorization-secret";
+		const visibleRequestId = "visible-dump-request-id";
+		const model: Model<"google-generative-ai"> = {
+			id: "gemini-2.5-pro",
+			name: "Gemini 2.5 Pro",
+			api: "google-generative-ai",
+			provider: "google",
+			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 8_192,
+		};
+
+		const result = await streamGoogle(
+			model,
+			{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+			{
+				apiKey: googApiKeySecret,
+				headers: {
+					"cf-aig-authorization": `Bearer ${cloudflareSecret}`,
+					"x-request-id": visibleRequestId,
+				},
+				fetch: async () =>
+					new Response(JSON.stringify({ error: { message: "invalid request" } }), {
+						status: 400,
+						headers: { "content-type": "application/json" },
+					}),
+			},
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		const message = result.errorMessage ?? "";
+		expect(message).not.toContain(googApiKeySecret);
+		expect(message).not.toContain(cloudflareSecret);
+		const filePath = /raw-http-request=(.+)$/m.exec(message)?.[1];
+		if (filePath === undefined) {
+			throw new Error(`expected a raw HTTP dump path, got: ${message}`);
+		}
+		const saved = await fs.readFile(filePath, "utf-8");
+		const parsed = JSON.parse(saved) as { headers?: Record<string, string> };
+
+		expect(parsed.headers?.["x-goog-api-key"]).toBe("[redacted]");
+		expect(parsed.headers?.["cf-aig-authorization"]).toBe("[redacted]");
+		expect(parsed.headers?.["x-request-id"]).toBe(visibleRequestId);
+		expect(saved).not.toContain(googApiKeySecret);
+		expect(saved).not.toContain(cloudflareSecret);
+		expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
 	});
 });
 

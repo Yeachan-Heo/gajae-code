@@ -822,6 +822,34 @@ function secureOwnerOnlyFileDescriptor(
 	if (!result.ok) throw new Error(`Owner-only security rejected ${pathname}: ${result.code}`);
 }
 
+/**
+ * Replace an explicit session file. Creation mode `0600` does not install a
+ * Windows owner-only DACL, so this applies and verifies the same native path a
+ * primary transcript uses when it has no managed security context. POSIX mode
+ * stays `0600`.
+ */
+export function writeExplicitOwnerOnlyTextSync(pathname: string, content: string): void {
+	const fd = fs.openSync(
+		pathname,
+		fs.constants.O_WRONLY | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0),
+		0o600,
+	);
+	try {
+		secureOwnerOnlyFileDescriptor(pathname, fd, "apply", undefined);
+		fs.ftruncateSync(fd, 0);
+		const bytes = Buffer.from(content, "utf8");
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+			if (written === 0) throw new Error("Short write");
+			offset += written;
+		}
+		secureOwnerOnlyFileDescriptor(pathname, fd, "verify", undefined);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
 /** Reject a symlink/junction/reparse component before a storage path is created or opened. */
 function assertNoReparsePath(pathname: string): void {
 	const resolved = path.resolve(pathname);
@@ -2073,7 +2101,8 @@ export class FileSessionStorage implements SessionStorage {
 
 	writeTextSync(fpath: string, content: string): void {
 		this.ensureDirSync(path.dirname(fpath));
-		fs.writeFileSync(fpath, content);
+		// New fork and branch transcripts are created here.
+		writeExplicitOwnerOnlyTextSync(fpath, content);
 	}
 
 	readTextSync(fpath: string): string {
@@ -3454,9 +3483,11 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 		this.#length = nextLength;
 	}
 
+	// Memory storage retains this view, so expose only visible bytes, never capacity.
+	// Appends write after each published prefix; growth switches backing buffers.
 	#writeCurrent(bytesWritten: number): void {
 		this.#writeCalls++;
-		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, this.#length)));
+		this.#storage.writeBytesOwnedSync(this.#path, this.#bytes.subarray(0, this.#length));
 		this.#bytesWritten += bytesWritten;
 	}
 
@@ -3472,7 +3503,7 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 		}
 		this.#buffer.copy(this.#bytes, this.#length, 0, pendingBytes);
 		this.#writeCalls++;
-		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, nextLength)));
+		this.#storage.writeBytesOwnedSync(this.#path, this.#bytes.subarray(0, nextLength));
 		this.#length = nextLength;
 		this.#bufferedBytes = 0;
 		this.#bytesWritten += pendingBytes;
@@ -3822,6 +3853,23 @@ export class MemorySessionStorage implements SessionStorage {
 				new SessionDeleteVerificationError("containment", "Transcript is outside the sessions root"),
 			);
 		}
+		if (
+			[
+				target.taskArtifactOwnerStorageContext,
+				target.taskArtifactOwnerDeletionEvidence,
+				target.taskArtifactOwnerRetirementOutcome,
+				target.taskArtifactOwnerTranscriptDeleted,
+				target.deferTaskArtifactOwnerRetirement,
+				target.taskArtifactOwnerRetired,
+				target.taskArtifactOwnerRetirementContinuation,
+				target.taskArtifactOwnerPayloadRetired,
+				target.taskArtifactOwnerNamespaceRetained,
+			].some(value => value !== undefined)
+		) {
+			return Promise.reject(
+				new SessionDeleteVerificationError("artifacts", "task_artifact_owner_memory_backend_unsupported"),
+			);
+		}
 		const entry = this.#files.get(transcriptPath);
 		if (!entry) return Promise.resolve({ kind: "deleted" });
 		const snapshot = this.readSnapshotSync(transcriptPath);
@@ -3853,6 +3901,21 @@ export class MemorySessionStorage implements SessionStorage {
 		}
 		if (path.resolve(header.cwd) !== path.resolve(cwd)) {
 			return Promise.reject(new SessionDeleteVerificationError("cwd", "Transcript header cwd mismatch"));
+		}
+		let ownerLocator: TaskArtifactOwnerLocator | undefined;
+		try {
+			ownerLocator = taskArtifactOwnerLocatorFromTranscriptBytes(snapshot.bytes, sessionId);
+		} catch (error) {
+			return Promise.reject(
+				new SessionDeleteVerificationError("artifacts", "task_artifact_owner_memory_backend_unsupported", {
+					cause: toError(error),
+				}),
+			);
+		}
+		if (ownerLocator) {
+			return Promise.reject(
+				new SessionDeleteVerificationError("artifacts", "task_artifact_owner_memory_backend_unsupported"),
+			);
 		}
 		// Compatible artifact semantics: the memory backend models no directories, so
 		// a key at the artifact path is a non-directory sibling that must fail closed

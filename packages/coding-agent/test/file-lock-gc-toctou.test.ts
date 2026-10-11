@@ -1071,16 +1071,14 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	});
 
 	test.skipIf(process.platform === "win32")(
-		"adopts and finishes an aged scrubbed removal transition instead of wedging",
+		"adopts and finishes an aged empty removal transition instead of wedging",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "state.json");
 			const lockDir = `${lockedFile}.lock`;
 			const detachedPath = `${lockDir}.removing`;
-			const infoPath = path.join(detachedPath, "info");
 			await fs.mkdir(detachedPath);
-			await Bun.write(infoPath, "");
 			const old = new Date(Date.now() - 120_000);
-			await fs.utimes(infoPath, old, old);
+			await fs.utimes(detachedPath, old, old);
 			let entered = false;
 
 			await withFileLock(
@@ -1124,15 +1122,13 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	];
 	test.each(
 		invalidOrphanAdoptionReceipts,
-	)("keeps an aged scrubbed transition when adoption returns %s", async (_label, makeReceipt) => {
+	)("keeps an aged empty transition when adoption returns %s", async (_label, makeReceipt) => {
 		const lockedFile = path.join(await makeTemp(), "state.json");
 		const lockDir = `${lockedFile}.lock`;
 		const detachedPath = `${lockDir}.removing`;
-		const infoPath = path.join(detachedPath, "info");
 		await fs.mkdir(detachedPath);
-		await Bun.write(infoPath, "");
 		const old = new Date(Date.now() - 120_000);
-		await fs.utimes(infoPath, old, old);
+		await fs.utimes(detachedPath, old, old);
 		let exactRemoveCalls = 0;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
@@ -1293,7 +1289,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 	);
 
 	test.skipIf(process.platform === "win32")(
-		"keeps contending when a dead transition owner cannot be reclaimed and reports it at exhaustion (#6253)",
+		"retries a refused dead transition and reports its retained adoption generation (#6253)",
 		async () => {
 			const lockedFile = path.join(await makeTemp(), "dead-transition-refused.json");
 			const detachedPath = `${lockedFile}.lock.removing`;
@@ -1325,15 +1321,17 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			).catch(error => error);
 			expect(failure).toBeInstanceOf(FileLockAcquireError);
 			expect(failure).toMatchObject({
-				code: "acquire_timeout",
-				reason: "acquire_timeout",
+				code: "orphan_transition",
+				reason: "orphan_transition",
 				attempts: 2,
-				holder: expect.stringContaining("blocked by abandoned removal transition"),
+				orphanPath: detachedPath,
+				holder: expect.stringContaining("orphan transition retained"),
 			});
 			expect(entered).toBe(false);
 			expect(removalAttempts).toBe(2);
 			expect(await fs.exists(detachedPath)).toBe(true);
 			expect(await fs.readFile(path.join(detachedPath, "info"), "utf8")).toBe(retainedInfo);
+			expect(await Bun.file(`${detachedPath}.owner`).json()).toMatchObject({ owner: { pid: process.pid } });
 		},
 	);
 

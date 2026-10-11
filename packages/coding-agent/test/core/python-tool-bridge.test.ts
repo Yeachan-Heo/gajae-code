@@ -73,6 +73,49 @@ describe("Python tool bridge HTTP server", () => {
 		}
 	});
 
+	it("does not dispatch a body that finishes after unregister or abort", async () => {
+		const calls: FakeCall[] = [];
+		const readTool = makeFakeTool("read", calls, { content: [{ type: "text", text: "x" }] });
+		const session = makeSession(new Map([["read", readTool]]));
+		const info = await ensurePyToolBridge();
+		const capability = crypto.randomUUID();
+		const controller = new AbortController();
+		const unregister = registerPyToolBridge("stale-session", capability, {
+			toolSession: session,
+			signal: controller.signal,
+		});
+		const encoder = new TextEncoder();
+		const payload = JSON.stringify({ session: "stale-session", name: "read", args: {} });
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		const body = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				controller.enqueue(encoder.encode(payload.slice(0, 2)));
+				await gate;
+				controller.enqueue(encoder.encode(payload.slice(2)));
+				controller.close();
+			},
+		});
+		const pending = fetch(`${info.url}/v1/tool`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${capability}`,
+			},
+			body,
+			duplex: "half",
+		});
+		await Bun.sleep(30);
+		unregister();
+		controller.abort();
+		release();
+		const res = await pending;
+		expect(res.status).toBe(403);
+		expect(calls).toHaveLength(0);
+	});
+
 	it("rejects an unregistered capability", async () => {
 		const info = await ensurePyToolBridge();
 		const res = await call(info, crypto.randomUUID(), { session: "missing", name: "read", args: {} });

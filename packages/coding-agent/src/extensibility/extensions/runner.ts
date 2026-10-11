@@ -51,6 +51,8 @@ import {
 import {
 	getExtensionHandlerRegistrationOrder,
 	getFunctionHookRegistration,
+	getProviderRequestHandlerProvider,
+	isSdkLifecycleObserver,
 	readConstrainedFunctionHookFile,
 } from "./function-hooks-internal";
 import type {
@@ -325,6 +327,7 @@ export class ExtensionRunner {
 	#getArtifactRangeFn: ExtensionContextActions["getArtifactRange"] = undefined;
 
 	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
+	#getProjectProgressFn: ExtensionContextActions["getProjectProgress"] = undefined;
 	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
 	#onSessionEventFn: ExtensionContextActions["onSessionEvent"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
@@ -482,6 +485,7 @@ export class ExtensionRunner {
 		this.#getArtifactRangeFn = contextActions.getArtifactRange;
 
 		this.#getJobsFn = contextActions.getJobs;
+		this.#getProjectProgressFn = contextActions.getProjectProgress;
 		this.#onJobFoldFn = contextActions.onJobFold;
 		this.#onSessionEventFn = contextActions.onSessionEvent;
 		this.#sdkControlFn = contextActions.sdkControl;
@@ -848,6 +852,7 @@ export class ExtensionRunner {
 			getArtifactRange: (id, offset, length) => this.#getArtifactRangeFn?.(id, offset, length),
 
 			getJobs: () => this.#getJobsFn?.(),
+			...(this.#getProjectProgressFn ? { getProjectProgress: this.#getProjectProgressFn } : {}),
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
@@ -867,6 +872,7 @@ export class ExtensionRunner {
 				...(this.#getExtensionsFn ? ["getExtensions"] : []),
 				...(this.#getArtifactRangeFn ? ["getArtifactRange"] : []),
 				...(this.#getJobsFn ? ["getJobs"] : []),
+				...(this.#getProjectProgressFn ? ["getProjectProgress"] : []),
 				...(this.#onJobFoldFn ? ["onJobFold"] : []),
 				...(this.#sdkControlFn ? ["sdkControl"] : []),
 				...(this.#invokeSkillFn ? ["invokeSkill"] : []),
@@ -914,6 +920,13 @@ export class ExtensionRunner {
 		const wildcard = this.#handlersByEvent.get("*") ?? [];
 		const matches: IndexedHandler[] = [];
 		for (const indexed of [...exact, ...wildcard]) {
+			const provider = getProviderRequestHandlerProvider(indexed.handler);
+			if (
+				event.type === "before_provider_request" &&
+				provider !== undefined &&
+				this.createContext().model?.provider !== provider
+			)
+				continue;
 			const registration = getFunctionHookRegistration(indexed.handler);
 			if (!registration) {
 				if (includeLegacyToolHandlers && indexed.registrationOrder >= 0 && exact.includes(indexed))
@@ -1072,7 +1085,8 @@ export class ExtensionRunner {
 		if (handlers.length === 0) return { action: "continue", event };
 		const includesLegacy = handlers.some(indexed => getFunctionHookRegistration(indexed.handler) === undefined);
 		if (includesLegacy) this.#requireScopeOrFailClosed(options.scope, event.type);
-		this.#markAttemptExecuted(options.scope);
+		if (handlers.some(indexed => event.type !== "agent_start" || !isSdkLifecycleObserver(indexed.handler)))
+			this.#markAttemptExecuted(options.scope);
 		const functionHookDepth = this.#functionHookDepth.getStore() ?? 0;
 		if (functionHookDepth >= 16) {
 			const reason = "Function hook re-entry depth exceeded";

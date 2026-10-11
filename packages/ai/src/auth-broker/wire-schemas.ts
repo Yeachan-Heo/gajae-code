@@ -203,6 +203,7 @@ export const credentialRefreshRequestSchema = z
 	.object({
 		clientId: z.string().optional(),
 		clientSecret: z.string().optional(),
+		expectedRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 	})
 	.strict();
 

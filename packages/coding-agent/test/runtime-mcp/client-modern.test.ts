@@ -484,6 +484,30 @@ describe("MRTR input_required", () => {
 		}
 	});
 
+	it("does not answer roots/list when the connection request handler rejects it", async () => {
+		const rootsResult = {
+			resultType: "input_required",
+			requestState: "roots-state-denied",
+			inputRequests: { roots1: { method: "roots/list" } },
+		};
+		const fixture = startModernFixture({ onCall: () => ({ result: rootsResult }) });
+		const connection = await connectToServer("modern", httpConfig(fixture.url, "2026-07-28"), {
+			onRequest: async method => {
+				throw Object.assign(new Error(`Unsupported server request: ${method}`), { code: -32601 });
+			},
+		});
+		try {
+			await expect(callTool(connection, "echo", { text: "hi" })).rejects.toThrow(
+				/Unsupported server request: roots\/list/,
+			);
+			const calls = fixture.requests.filter(request => request.body.method === "tools/call");
+			expect(calls).toHaveLength(1);
+			expect(JSON.stringify(calls[0]?.body)).not.toContain("file://");
+		} finally {
+			await disconnectServer(connection);
+		}
+	});
+
 	it("fails explicitly without retrying when roots are mixed with elicitation and no handler is available", async () => {
 		const mixedResult = {
 			resultType: "input_required",

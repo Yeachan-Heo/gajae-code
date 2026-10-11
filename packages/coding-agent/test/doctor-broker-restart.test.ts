@@ -283,6 +283,24 @@ describe("doctor broker restart protocol", () => {
 		if (outcome.kind === "owner_unavailable") expect(outcome.reason).toBe("no_discovery");
 	});
 
+	it("restartBrokerForDoctor refuses in attach-only mode and leaves the live owner untouched", async () => {
+		const { dir, broker, discovery } = await fixture();
+		const prior = process.env.GJC_SDK_BROKER_AUTOSTART;
+		process.env.GJC_SDK_BROKER_AUTOSTART = "0";
+		try {
+			const outcome = await restartBrokerForDoctor({ agentDir: dir, requestId: "attach-only", deadlineMs: 1_000 });
+			expect(outcome).toEqual({ kind: "attach_only_refused", reason: "supervisor_owned" });
+			// No restart was prepared or committed: no durable intent, the same owner keeps serving.
+			expect(await readBrokerRestartIntent(dir)).toBeNull();
+			expect((await broker.handleRequest("session.list", {})).ok).toBe(true);
+			expect(discovery.pid).toBe(process.pid);
+		} finally {
+			if (prior === undefined) delete process.env.GJC_SDK_BROKER_AUTOSTART;
+			else process.env.GJC_SDK_BROKER_AUTOSTART = prior;
+			await broker.stop();
+		}
+	});
+
 	it("restartBrokerForDoctor returns a busy owner's refusal as prepare_refused through the SDK client", async () => {
 		const { dir, broker } = await fixture();
 		await broker.index.append({

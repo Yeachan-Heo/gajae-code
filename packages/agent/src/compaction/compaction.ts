@@ -983,6 +983,23 @@ export function boundConversationTextForSummary(
 	return fitsBudget(bareMarker) ? bareMarker : "";
 }
 
+/** Convert a stored summary the same way as conversation text, for the outbound prompt only. */
+function outboundSummaryText(text: string, convert: ConvertToLlm): string {
+	const [message] = convert([
+		{
+			role: "user",
+			content: [{ type: "text", text }],
+			timestamp: 0,
+		},
+	]);
+	if (!message) return text;
+	if (typeof message.content === "string") return message.content;
+	for (const block of message.content) {
+		if (block.type === "text") return block.text;
+	}
+	return text;
+}
+
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model,
@@ -1009,10 +1026,12 @@ export async function generateSummary(
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(currentMessages);
 	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
 
-	// Build the prompt with conversation wrapped in tags
+	// Build the prompt with conversation wrapped in tags.
+	// The stored summary stays unchanged; only this outbound copy is converted.
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+		const outboundPreviousSummary = outboundSummaryText(previousSummary, options?.convertToLlm ?? convertToLlm);
+		promptText += `<previous-summary>\n${outboundPreviousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(options?.extraContext);
 	promptText += basePrompt;

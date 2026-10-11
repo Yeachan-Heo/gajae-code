@@ -409,7 +409,7 @@ export class TodoCommandController {
 			current.length > 0 ? phasesToMarkdown(current) : "# Todos\n- [ ] (replace this with your tasks)\n";
 
 		const fileHandle = await this.#openTtyHandle();
-		this.ctx.ui.stop();
+		this.ctx.ui.suspend();
 		try {
 			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = fileHandle
 				? [fileHandle.fd, fileHandle.fd, fileHandle.fd]

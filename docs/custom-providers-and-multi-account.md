@@ -79,6 +79,8 @@ A direct-broker client has no local hard-removal targets for individual rows, so
 
 The explicit checker probes active stored rows sequentially, then checks synthetic runtime/config/environment API-key sources sequentially. OAuth checks refresh an expired credential before probing when possible. Plain `/usage` never turns a presentation refresh into a provider request.
 
+Codex usage probes also recover an HTTP 401 on an unexpired OAuth token: adopt a peer's newer credential or renew through the credential store, then retry the probe once. This applies to both explicit checks and ordinary network usage retrieval. Concurrent local refreshes share the existing refresh lease, and a lease-persisted token is not written a second time over a newer peer rotation. A repeated 401 or failed renewal is reported as an authentication failure, not an unknown/no-data reading; the checker does not disable the account. HTTP 403, rate limits, server errors, and transport failures do not trigger this renewal path.
+
 ### `gjc accounts` command grammar
 
 The command is intentionally payload-free and has four actions:

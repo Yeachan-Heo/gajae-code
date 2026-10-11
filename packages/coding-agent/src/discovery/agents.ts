@@ -79,7 +79,12 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 		scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "project" }),
 	);
 	const userScans = getUserPathCandidates(ctx, "skills").map(dir =>
-		scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "user" }),
+		scanSkillsFromDir(ctx, {
+			dir,
+			providerId: PROVIDER_ID,
+			level: "user",
+			allowExternalUserSkillSymlinks: ctx.allowExternalUserSkillSymlinks,
+		}),
 	);
 
 	const results = await Promise.all([...projectScans, ...userScans]);

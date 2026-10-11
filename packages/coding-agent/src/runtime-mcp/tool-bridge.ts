@@ -15,8 +15,10 @@ import type {
 	RenderResultOptions,
 } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
+import { wrapUntrustedContent } from "../tools/fetch";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { callTool } from "./client";
+import { GJC_PLUGIN_MCP_PROVIDER } from "./plugin-mcp-name-filter";
 import type { MCPPoolLease } from "./pool";
 import { renderMCPCall, renderMCPResult } from "./render";
 import type {
@@ -140,7 +142,9 @@ function buildResult(
 	provider?: string,
 	providerName?: string,
 ): CustomToolResult<MCPToolDetails> {
-	const text = formatMCPContent(result.content);
+	const body = formatMCPContent(result.content);
+	const visible = result.isError ? `Error: ${body}` : body;
+	const text = wrapUntrustedContent(visible);
 	const details: MCPToolDetails = {
 		serverName,
 		mcpToolName,
@@ -149,9 +153,6 @@ function buildResult(
 		provider,
 		providerName,
 	};
-	if (result.isError) {
-		return { content: [{ type: "text", text: `Error: ${text}` }], details };
-	}
 	return { content: [{ type: "text", text }], details };
 }
 
@@ -251,6 +252,8 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpToolName: string;
 	/** Server name */
 	readonly mcpServerName: string;
+	/** True when this tool came from a repository GJC plugin bundle. */
+	readonly gjcPluginBundle: boolean;
 
 	private connection: MCPServerConnection;
 	#noReplay = false;
@@ -295,6 +298,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = resolvedConnection.name;
+		this.gjcPluginBundle = resolvedConnection._source?.provider === GJC_PLUGIN_MCP_PROVIDER;
 	}
 
 	renderCall(args: unknown, _options: RenderResultOptions, theme: Theme) {
@@ -381,6 +385,8 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpToolName: string;
 	/** Server name */
 	readonly mcpServerName: string;
+	/** True when this tool came from a repository GJC plugin bundle. */
+	readonly gjcPluginBundle: boolean;
 	readonly #fallbackProvider: string | undefined;
 	readonly #fallbackProviderName: string | undefined;
 	#noReplay = false;
@@ -425,6 +431,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
 		this.mcpToolName = tool.name;
 		this.mcpServerName = serverName;
+		this.gjcPluginBundle = source?.provider === GJC_PLUGIN_MCP_PROVIDER;
 		this.#fallbackProvider = source?.provider;
 		this.#fallbackProviderName = source?.providerName;
 		this.#noReplay = options?.noReplay === true;

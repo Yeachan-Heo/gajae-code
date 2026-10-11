@@ -1,5 +1,5 @@
 /**
- * Discover and import existing Claude Code / Codex CLI credentials.
+ * Discover and import existing Claude Code, Codex CLI, and Kiro CLI credentials.
  *
  * This is the testable core behind `gjc setup credentials` (CLI, primary entry)
  * and the TUI provider-onboarding "import existing credentials" action. It never
@@ -12,7 +12,10 @@
  *     Keychain (`Claude Code-credentials`), and env vars.
  *   - Codex CLI: `$CODEX_HOME/auth.json` (defaults to `~/.codex/auth.json`;
  *     OAuth `tokens` block or stored `OPENAI_API_KEY`), and env vars.
+ *   - Kiro CLI social OAuth: `data.sqlite3` in the platform's app-data directory,
+ *     read-only from `auth_kv` key `kirocli:social:token`.
  */
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,20 +24,22 @@ import { $credentialEnv, isEnoent } from "@gajae-code/utils";
 import { redactSecret } from "./provider-onboarding";
 
 /** gjc provider ids that external credentials map onto. */
-export type ExternalProvider = "anthropic" | "openai-codex";
+export type ExternalProvider = "anthropic" | "openai-codex" | "kiro";
 
 /** Where a discovered credential came from. */
-export type CredentialOrigin = "claude-code-file" | "claude-code-keychain" | "codex-file";
+export type CredentialOrigin = "claude-code-file" | "claude-code-keychain" | "codex-file" | "kiro-cli-social";
 
 export const AUTO_IMPORT_OAUTH_PROVIDER_ORIGINS: Record<ExternalProvider, ReadonlySet<CredentialOrigin>> = {
 	anthropic: new Set<CredentialOrigin>(["claude-code-file", "claude-code-keychain"]),
 	"openai-codex": new Set<CredentialOrigin>(["codex-file"]),
+	kiro: new Set<CredentialOrigin>(["kiro-cli-social"]),
 };
 
 /** Human labels for providers, used in redacted summaries. */
 export const EXTERNAL_PROVIDER_LABELS: Record<ExternalProvider, string> = {
 	anthropic: "Claude (Anthropic)",
 	"openai-codex": "Codex (ChatGPT)",
+	kiro: "Kiro",
 };
 
 /** A credential that can be safely imported into gjc's store. */
@@ -98,6 +103,8 @@ export interface DiscoveryOptions {
 	 * or `null` when no entry exists.
 	 */
 	readClaudeKeychain?: () => Promise<string | null>;
+	/** Absolute Kiro CLI data.sqlite3 override, primarily for tests and embedders. */
+	kiroCliDatabasePath?: string;
 }
 
 export type CredentialUpserter = (provider: string, credential: AuthCredential) => unknown | Promise<unknown>;
@@ -131,6 +138,7 @@ interface CodexAuthFile {
 
 const ANTHROPIC_ENV_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] as const;
 const OPENAI_ENV_KEYS = ["OPENAI_API_KEY"] as const;
+const KIRO_CLI_SOCIAL_TOKEN_KEY = "kirocli:social:token";
 
 // ─── JWT helpers (best-effort identity/expiry extraction) ────────────────────
 
@@ -368,6 +376,154 @@ async function discoverCodex(home: ResolvedExternalDir, result: CredentialDiscov
 	pushOutcome(result, parseCodexAuth(raw, `Codex CLI (${displayPath})`));
 }
 
+interface KiroCliSocialToken {
+	access_token?: unknown;
+	refresh_token?: unknown;
+	expires_at?: unknown;
+	profile_arn?: unknown;
+	provider?: unknown;
+}
+
+function parseKiroCliExpiry(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		if (value > 1_000_000_000_000) return value;
+		if (value > 1_000_000_000) return value * 1000;
+		return undefined;
+	}
+	if (typeof value !== "string" || value.trim().length === 0) return undefined;
+	const numericValue = Number(value);
+	if (Number.isFinite(numericValue)) return parseKiroCliExpiry(numericValue);
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseKiroCliSocialToken(raw: string, source: string): ImportableCredential | SkippedCredential {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw) as KiroCliSocialToken;
+	} catch (err) {
+		return { origin: "kiro-cli-social", source, reason: sanitizedFailureReason("malformed credential file", err) };
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return { origin: "kiro-cli-social", source, reason: "unsupported token shape (root is not an object)" };
+	}
+	const token = parsed as KiroCliSocialToken;
+	const access = nonEmptyString(token.access_token);
+	const refresh = nonEmptyString(token.refresh_token);
+	const profileArn = nonEmptyString(token.profile_arn);
+	const provider = nonEmptyString(token.provider);
+	if (!access || !refresh || !profileArn || !provider) {
+		return { origin: "kiro-cli-social", source, reason: "incomplete Kiro social OAuth token metadata" };
+	}
+	const expiresAt = parseKiroCliExpiry(token.expires_at);
+	const credential: OAuthCredential = {
+		type: "oauth",
+		access,
+		refresh,
+		expires: expiresAt ?? Date.now(),
+		profileArn,
+	};
+	return {
+		provider: "kiro",
+		origin: "kiro-cli-social",
+		source,
+		kind: "oauth",
+		...(expiresAt === undefined ? {} : { expiresAt }),
+		redactedToken: redactSecret(access),
+		credential,
+	};
+}
+
+function resolveKiroCliDatabasePath(
+	homeDir: string,
+	platform: NodeJS.Platform,
+	env: Record<string, string | undefined>,
+): string {
+	if (platform === "darwin") {
+		return path.join(homeDir, "Library", "Application Support", "kiro-cli", "data.sqlite3");
+	}
+	if (platform === "win32") {
+		const localAppData = nonEmptyString(env.LOCALAPPDATA);
+		const dataDir =
+			localAppData && path.isAbsolute(localAppData) ? localAppData : path.join(homeDir, "AppData", "Local");
+		return path.join(dataDir, "kiro-cli", "data.sqlite3");
+	}
+	const xdgDataHome = nonEmptyString(env.XDG_DATA_HOME);
+	const dataDir = xdgDataHome && path.isAbsolute(xdgDataHome) ? xdgDataHome : path.join(homeDir, ".local", "share");
+	return path.join(dataDir, "kiro-cli", "data.sqlite3");
+}
+
+async function discoverKiroCliSocialCredential(
+	homeDir: string,
+	platform: NodeJS.Platform,
+	pathEnv: Record<string, string | undefined>,
+	databasePathOverride: string | undefined,
+	result: CredentialDiscoveryResult,
+): Promise<void> {
+	const source = "Kiro CLI (social login)";
+	if (databasePathOverride && !path.isAbsolute(databasePathOverride)) {
+		result.skipped.push({ origin: "kiro-cli-social", source, reason: "Kiro CLI database path must be absolute" });
+		return;
+	}
+	const databasePath = databasePathOverride ?? resolveKiroCliDatabasePath(homeDir, platform, pathEnv);
+	let database: Database | undefined;
+	try {
+		const stat = await fs.stat(databasePath);
+		if (!stat.isFile()) {
+			result.skipped.push({ origin: "kiro-cli-social", source, reason: "Kiro CLI database is not a regular file" });
+			return;
+		}
+	} catch (err) {
+		if (!isEnoent(err)) {
+			result.skipped.push({
+				origin: "kiro-cli-social",
+				source,
+				reason: sanitizedFailureReason("unreadable credential file", err),
+			});
+		}
+		return;
+	}
+
+	try {
+		database = new Database(databasePath, { readonly: true, create: false, strict: true });
+		database.run("PRAGMA busy_timeout = 1000");
+		const authTable = database
+			.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+			.get("auth_kv");
+		if (!authTable) {
+			result.skipped.push({ origin: "kiro-cli-social", source, reason: "Kiro CLI database is missing auth_kv" });
+			return;
+		}
+		const row = database.prepare("SELECT value FROM auth_kv WHERE key = ?").get(KIRO_CLI_SOCIAL_TOKEN_KEY) as {
+			value?: unknown;
+		} | null;
+		if (!row) return;
+		const value =
+			typeof row.value === "string"
+				? row.value
+				: row.value instanceof Uint8Array
+					? new TextDecoder().decode(row.value)
+					: undefined;
+		if (value === undefined) {
+			result.skipped.push({
+				origin: "kiro-cli-social",
+				source,
+				reason: "Kiro CLI token value has an unsupported type",
+			});
+			return;
+		}
+		pushOutcome(result, parseKiroCliSocialToken(value, source));
+	} catch (err) {
+		result.skipped.push({
+			origin: "kiro-cli-social",
+			source,
+			reason: sanitizedFailureReason("unreadable credential file", err),
+		});
+	} finally {
+		database?.close();
+	}
+}
+
 // ─── Environment hints ───────────────────────────────────────────────────────
 
 function discoverEnvironment(env: Record<string, string | undefined>, result: CredentialDiscoveryResult): void {
@@ -421,8 +577,8 @@ function resolveExternalDir(
 }
 
 /**
- * Discover Claude Code and Codex CLI credentials across files, the macOS
- * Keychain, and environment variables. Never throws for individual unreadable or
+ * Discover Claude Code, Codex CLI, and Kiro CLI credentials across their local
+ * stores and environment variables. Never throws for individual unreadable or
  * malformed sources — those land in {@link CredentialDiscoveryResult.skipped}.
  */
 export async function discoverExternalCredentials(options: DiscoveryOptions = {}): Promise<CredentialDiscoveryResult> {
@@ -436,11 +592,16 @@ export async function discoverExternalCredentials(options: DiscoveryOptions = {}
 		? { dir: options.codexHome, display: "$CODEX_HOME" }
 		: resolveExternalDir("CODEX_HOME", options.env, path.join(homeDir, ".codex"), "~/.codex");
 	const result: CredentialDiscoveryResult = { importable: [], skipped: [], environment: [] };
+	const kiroPathEnv = options.env ?? {
+		LOCALAPPDATA: $credentialEnv("LOCALAPPDATA"),
+		XDG_DATA_HOME: $credentialEnv("XDG_DATA_HOME"),
+	};
 	await discoverClaudeCode(
 		{ configDir: claudeConfigDir, platform, readClaudeKeychain: options.readClaudeKeychain },
 		result,
 	);
 	await discoverCodex(codexHome, result);
+	await discoverKiroCliSocialCredential(homeDir, platform, kiroPathEnv, options.kiroCliDatabasePath, result);
 	discoverEnvironment(env, result);
 	return result;
 }
@@ -487,6 +648,16 @@ function hasAutoImportOAuthProviderOrigin(credential: ImportableCredential): boo
 }
 
 export function isAutoImportOAuthCredential(credential: ImportableCredential, now: number = Date.now()): boolean {
+	const refreshableKiroSocialCredential =
+		credential.provider === "kiro" &&
+		credential.origin === "kiro-cli-social" &&
+		credential.kind === "oauth" &&
+		credential.credential.type === "oauth" &&
+		credential.credential.access.length > 0 &&
+		credential.credential.refresh.length > 0 &&
+		typeof credential.credential.profileArn === "string" &&
+		credential.credential.profileArn.length > 0;
+	if (refreshableKiroSocialCredential) return true;
 	return (
 		hasAutoImportOAuthProviderOrigin(credential) &&
 		typeof credential.expiresAt === "number" &&

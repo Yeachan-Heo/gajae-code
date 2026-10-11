@@ -148,9 +148,11 @@ function buildAnthropicDiscoveryHeaders(apiKey: string): Record<string, string> 
 	const headers: Record<string, string> = {
 		"anthropic-version": "2023-06-01",
 		"anthropic-dangerous-direct-browser-access": "true",
-		"anthropic-beta": ANTHROPIC_OAUTH_BETA,
 	};
 	if (oauthToken) {
+		// Claude Code identity betas are OAuth-only; API-key requests carrying them are
+		// classified as Claude Code usage and excluded from API credit grants.
+		headers["anthropic-beta"] = ANTHROPIC_OAUTH_BETA;
 		headers.Authorization = `Bearer ${apiKey}`;
 	} else {
 		headers["x-api-key"] = apiKey;

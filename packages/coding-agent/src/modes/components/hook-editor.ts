@@ -146,7 +146,7 @@ export class HookEditorComponent extends Container {
 
 		const currentText = this.#editor.getExpandedText();
 		try {
-			this.#tui.stop();
+			this.#tui.suspend();
 			const result = await openInEditor(editorCmd, currentText);
 			if (result !== null) {
 				this.#editor.setText(result);

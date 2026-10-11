@@ -11,6 +11,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { createSdkRunCapability } from "../src/session/sdk-run-capability-internal";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
@@ -124,6 +125,59 @@ describe("AgentSession auto-retry busy recovery", () => {
 		expect(await agent.resourceLedger.waitForSettlement(handles[1]!, { graceMs: 100 })).toEqual({
 			status: "settled",
 		});
+	});
+
+	it("propagates the admitted SDK run token through a queued steer continuation", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const mock = createMockModel({ responses: [{ content: ["first response"] }, { content: ["second response"] }] });
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const extensionEvents: ExtensionEvent[] = [];
+		const firstEndEntered = Promise.withResolvers<void>();
+		const releaseFirstEnd = Promise.withResolvers<void>();
+		let holdFirstEnd = true;
+		const extensionRunner = {
+			emitBeforeAgentStart: async () => undefined,
+			hasHandlers: () => false,
+			emit: async (event: ExtensionEvent) => {
+				extensionEvents.push(event);
+				if (event.type === "agent_end" && holdFirstEnd) {
+					holdFirstEnd = false;
+					firstEndEntered.resolve();
+					await releaseFirstEnd.promise;
+				}
+			},
+		} as never;
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+
+		const firstPrompt = session.sendUserMessage("SDK prompt", {
+			sdkRunCapability: createSdkRunCapability("regression-command:regression-turn"),
+		} as never);
+		await firstEndEntered.promise;
+		const queuedSteer = session.sendCustomMessage(
+			{ customType: "regression", content: "queued steer", display: false, attribution: "agent" },
+			{ deliverAs: "steer" },
+		);
+		releaseFirstEnd.resolve();
+		await firstPrompt;
+		await queuedSteer;
+		await session.waitForIdle();
+
+		const starts = extensionEvents.filter(event => event.type === "agent_start");
+		expect(starts).toHaveLength(2);
+		expect(starts[1]).toMatchObject({ sdkRunToken: "regression-command:regression-turn" });
 	});
 
 	it("does not wedge when auto_retry_start extension delivery rejects", async () => {

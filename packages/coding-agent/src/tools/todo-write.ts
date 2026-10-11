@@ -135,6 +135,15 @@ function normalizeInProgressTask(phases: TodoPhase[]): void {
 export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
 
 export function getLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPhase[] {
+	return findLatestTodoPhasesFromEntries(entries) ?? [];
+}
+
+/**
+ * Latest persisted todo list on the branch, terminal items included. `undefined`
+ * means no todo state was ever persisted; an empty array is an authoritative
+ * empty list (for example after a bare `/todo rm`).
+ */
+export function findLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPhase[] | undefined {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
@@ -154,7 +163,7 @@ export function getLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPha
 		return clonePhases(details.phases as TodoPhase[]);
 	}
 
-	return [];
+	return undefined;
 }
 
 function resolveTaskOrError(

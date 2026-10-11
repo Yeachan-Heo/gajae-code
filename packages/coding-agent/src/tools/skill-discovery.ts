@@ -1,6 +1,7 @@
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import {
 	describeDisabledSkillScopes,
 	describeNoSkillMatch,
@@ -93,6 +94,10 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 				source,
 				limit: input.limit,
 				policy: this.#getRuntimeSkillPolicy(),
+				allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+					trustUserSkills: this.#session.settings.getGlobal("skills.trustUserSkills"),
+					enablePiUser: this.#session.settings.getGlobal("skills.enablePiUser"),
+				}),
 			});
 			const details: SkillDiscoveryToolDetails = {
 				candidates: result.candidates,

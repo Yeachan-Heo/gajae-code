@@ -144,10 +144,10 @@ describe("owner-dispatched recover / validate / operate", () => {
 		const operate = (res.evidence as Record<string, unknown>).operate as Record<string, unknown>;
 		expect(operate).toBeTruthy();
 		expect(Array.isArray(operate.classifications)).toBe(true);
-		// git observer never reports completion here, so the bounded loop blocks rather than finalizing.
-		expect(operate.lifecycle).toBe("blocked");
-		// The owner persists the loop's terminal lifecycle (not stale).
-		expect((res.state as Record<string, unknown>).lifecycle).toBe("blocked");
+		// git observer never reports completion here; exhausting the observation budget keeps the active owner observing (nonterminal) instead of finalizing.
+		expect(operate.lifecycle).toBe("observing");
+		// The owner persists the loop's resulting lifecycle (not stale).
+		expect((res.state as Record<string, unknown>).lifecycle).toBe("observing");
 		// Every emitted event carries the owner's lease identity (no hardcoded "operate" writer).
 		const events = await readEvents(root, SID, 0);
 		expect(events.length).toBeGreaterThan(0);

@@ -44,6 +44,8 @@ export interface LoadContext {
 	bypassCache?: boolean;
 	/** Owning session settings for provider policy decisions. */
 	settings?: Settings;
+	/** User-owned permission to follow skill links outside a user scan root. */
+	allowExternalUserSkillSymlinks?: boolean;
 }
 
 /**

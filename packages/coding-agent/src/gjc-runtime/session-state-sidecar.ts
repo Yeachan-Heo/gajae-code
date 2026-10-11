@@ -22,6 +22,7 @@ import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir, sessionRuntimeStatePath } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
+import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import {
 	isValidOwnerIntent,
 	lifecyclePaths,
@@ -52,9 +53,9 @@ export const GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV = "GJC_COORDINATOR_S
  * children. The process environment is deliberately scrubbed synchronously even when the
  * key is malformed, so a rejected launch cannot leak it to descendants.
  */
-const coordinatorSidecarSigningBootstrapUrl = process.env[GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL_ENV]?.trim();
+const coordinatorSidecarSigningBootstrapUrl = trustedCoordinatorEnv(GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL_ENV);
 const coordinatorSidecarSigningKeyBootstrap = await (async (): Promise<string | undefined> => {
-	if (!coordinatorSidecarSigningBootstrapUrl) return process.env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	if (!coordinatorSidecarSigningBootstrapUrl) return trustedCoordinatorEnv(GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV);
 	try {
 		const response = await fetch(coordinatorSidecarSigningBootstrapUrl);
 		if (!response.ok) return undefined;

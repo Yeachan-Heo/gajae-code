@@ -11,6 +11,8 @@ import {
 const PATHS = [
 	"sdk",
 	"sdk serve",
+	"sdk broker",
+	"sdk broker run",
 	"sdk search",
 	"sdk spawn",
 	"sdk session",
@@ -40,12 +42,15 @@ const PATHS = [
 const OPERATION_FLAGS: Record<string, string[]> = {
 	sdk: [],
 	"sdk serve": ["stdio", "socket", "session", "pending-ceiling"],
-	"sdk search": ["agent-dir", "repo", "scope", "limit", "cursor"],
-	"sdk spawn": ["agent-dir", "cwd", "prompt", "model", "profile", "idempotency-key"],
-	"sdk session": ["agent-dir"],
-	"sdk session list": ["agent-dir", "repo", "scope"],
-	"sdk session inspect": ["agent-dir", "repo"],
+	"sdk broker": [],
+	"sdk broker run": ["agent-dir"],
+	"sdk search": ["attach-only", "agent-dir", "repo", "scope", "limit", "cursor"],
+	"sdk spawn": ["attach-only", "agent-dir", "cwd", "prompt", "model", "profile", "idempotency-key"],
+	"sdk session": ["attach-only", "agent-dir"],
+	"sdk session list": ["attach-only", "agent-dir", "repo", "scope"],
+	"sdk session inspect": ["attach-only", "agent-dir", "repo"],
 	"sdk session send": [
+		"attach-only",
 		"agent-dir",
 		"repo",
 		"json-input",
@@ -56,8 +61,9 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"wait",
 		"timeout-ms",
 	],
-	"sdk session status": ["agent-dir", "repo", "timeout-ms"],
+	"sdk session status": ["attach-only", "agent-dir", "repo", "timeout-ms"],
 	"sdk session tail": [
+		"attach-only",
 		"agent-dir",
 		"repo",
 		"cursor",
@@ -67,9 +73,17 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"all-events",
 		"timeout-ms",
 	],
-	"sdk session retire": ["agent-dir", "json-input", "json-input-file", "json-input-stdin", "idempotency-key"],
+	"sdk session retire": [
+		"attach-only",
+		"agent-dir",
+		"json-input",
+		"json-input-file",
+		"json-input-stdin",
+		"idempotency-key",
+	],
 	"sdk session raw": [],
 	"sdk session raw control": [
+		"attach-only",
 		"agent-dir",
 		"json-input",
 		"json-input-file",
@@ -80,6 +94,7 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"timeout-ms",
 	],
 	"sdk session raw query": [
+		"attach-only",
 		"agent-dir",
 		"repo",
 		"json-input",
@@ -90,6 +105,7 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"timeout-ms",
 	],
 	"sdk session raw global": [
+		"attach-only",
 		"agent-dir",
 		"json-input",
 		"json-input-file",
@@ -120,7 +136,7 @@ function command(path: string) {
 }
 
 describe("static SDK/daemon public inventory", () => {
-	test("enumerates exactly the 27 reachable public paths and connects immediate children", () => {
+	test("enumerates exactly the 29 reachable public paths and connects immediate children", () => {
 		expect(PUBLIC_COMMANDS.map(row => row.command.join(" ")).sort()).toEqual([...PATHS].sort());
 		for (const path of PATHS) {
 			const descriptor = command(path);

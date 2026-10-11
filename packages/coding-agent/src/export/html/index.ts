@@ -7,6 +7,7 @@ import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/
 import { SessionManager } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
 import { cssColorOrFallback } from "./css-color";
+import { openHtmlExportDestination } from "./html-export-destination";
 import { TEMPLATE } from "./template.generated";
 
 export interface ExportOptions {
@@ -169,11 +170,6 @@ const HTML_EXPORT_SOURCE_OPEN_FLAGS =
 	syncFs.constants.O_NONBLOCK |
 	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
 
-const HTML_EXPORT_DESTINATION_OPEN_FLAGS =
-	syncFs.constants.O_WRONLY |
-	syncFs.constants.O_CREAT |
-	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
-
 function sameFileIdentity(left: syncFs.BigIntStats, right: syncFs.BigIntStats): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
@@ -193,7 +189,7 @@ async function openHtmlExportDescriptors(
 			}
 			await assertExportDoesNotAliasSource(sourcePath, outputPath);
 		}
-		destination = syncFs.openSync(outputPath, HTML_EXPORT_DESTINATION_OPEN_FLAGS, 0o666);
+		destination = openHtmlExportDestination(outputPath);
 		if (source !== undefined) {
 			const sourceIdentity = syncFs.fstatSync(source, { bigint: true });
 			const destinationIdentity = syncFs.fstatSync(destination, { bigint: true });

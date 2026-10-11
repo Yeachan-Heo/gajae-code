@@ -77,6 +77,26 @@ interface KernelStartOptions extends KernelLifecycleOptions {
 	env?: Record<string, string | undefined>;
 	runtimeOptions?: PythonRuntimeOptions;
 	settings?: Settings;
+	/** @internal Synchronously registers the actual spawned kernel before startup callbacks run. */
+	onKernelCreated?: (kernel: PythonKernel) => void;
+	/** @internal Routes partial-start cleanup through the executor's retained ownership. */
+	onStartupFailure?: (kernel: PythonKernel) => Promise<void>;
+}
+
+export type PythonKernelStartupCleanupFailure =
+	| { kind: "unconfirmed"; result: KernelShutdownResult }
+	| { kind: "rejected"; error: unknown };
+
+/** Startup failed after a real runner was created and physical cleanup failed. */
+export class PythonKernelStartError extends Error {
+	constructor(
+		readonly kernel: PythonKernel,
+		readonly startupError: unknown,
+		readonly cleanupFailure: PythonKernelStartupCleanupFailure,
+	) {
+		super("Python kernel startup failed and runner cleanup was not confirmed", { cause: startupError });
+		this.name = "PythonKernelStartError";
+	}
 }
 
 interface KernelShutdownOptions {
@@ -106,6 +126,13 @@ function throwIfAborted(signal: AbortSignal | undefined, fallbackReason: string)
 	const reason = signal.reason;
 	if (reason instanceof Error) throw reason;
 	throw createAbortError("AbortError", typeof reason === "string" ? reason : fallbackReason);
+}
+
+function throwIfLifecycleEnded(lifecycle: KernelLifecycleOptions, message: string): void {
+	throwIfAborted(lifecycle.signal, message);
+	if (lifecycle.deadlineMs !== undefined && lifecycle.deadlineMs <= Date.now()) {
+		throw createAbortError("TimeoutError", `${message} timed out`);
+	}
 }
 
 async function waitForLifecycle<T>(
@@ -244,6 +271,7 @@ export class PythonKernel {
 	#alive = true;
 	#disposed = false;
 	#shutdownConfirmed = false;
+	#shutdownPromise: Promise<KernelShutdownResult> | null = null;
 	#exitedPromise: Promise<number> | null = null;
 	#exitCode: number | null = null;
 	#stderrTail = "";
@@ -255,6 +283,7 @@ export class PythonKernel {
 	}
 
 	static async start(options: KernelStartOptions): Promise<PythonKernel> {
+		throwIfLifecycleEnded(options, "Python kernel startup");
 		const availability = await logger.time(
 			"PythonKernel.start:availabilityCheck",
 			checkPythonKernelAvailability,
@@ -263,17 +292,20 @@ export class PythonKernel {
 			{ signal: options.signal, deadlineMs: options.deadlineMs },
 			options.settings,
 		);
+		throwIfLifecycleEnded(options, "Python kernel startup");
 		if (!availability.ok) {
 			throw new Error(availability.reason ?? "Python kernel unavailable");
 		}
 
 		const settings = options.settings ?? (await Settings.init());
+		throwIfLifecycleEnded(options, "Python kernel startup");
 		const { env: shellEnv } = settings.getShellConfig();
 		const baseEnv = filterEnv(shellEnv);
 		const runtime = await ensurePythonRuntime(options.cwd, baseEnv, options.runtimeOptions, {
 			signal: options.signal,
 			deadlineMs: options.deadlineMs,
 		});
+		throwIfLifecycleEnded(options, "Python kernel startup");
 		const spawnEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
 			if (typeof value === "string") spawnEnv[key] = value;
@@ -286,6 +318,7 @@ export class PythonKernel {
 		spawnEnv.PYTHONIOENCODING = "utf-8";
 
 		const scriptPath = await ensureRunnerScript();
+		throwIfLifecycleEnded(options, "Python kernel startup");
 		const kernel = new PythonKernel(Snowflake.next());
 
 		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
@@ -302,25 +335,40 @@ export class PythonKernel {
 		kernel.#proc = proc;
 		kernel.#stdin = proc.stdin;
 		kernel.#exitedPromise = proc.exited;
-		void kernel.#exitedPromise.then(code => {
-			kernel.#exitCode = code;
-			kernel.#alive = false;
-			kernel.#abortPendingExecutions(`Python kernel exited with code ${code}`, { kernelKilled: true });
-		});
-
-		kernel.#startReader(proc.stdout as ReadableStream<Uint8Array>);
-		kernel.#startStderrDrain(proc.stderr as ReadableStream<Uint8Array>);
-
-		const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
-		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
 
 		try {
+			options.onKernelCreated?.(kernel);
+			void kernel.#exitedPromise.then(code => {
+				kernel.#exitCode = code;
+				kernel.#alive = false;
+				kernel.#abortPendingExecutions(`Python kernel exited with code ${code}`, { kernelKilled: true });
+			});
+
+			kernel.#startReader(proc.stdout as ReadableStream<Uint8Array>);
+			kernel.#startStderrDrain(proc.stderr as ReadableStream<Uint8Array>);
+
+			const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
+			const startupBudget = Math.min(
+				getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS,
+				STARTUP_TIMEOUT_MS,
+			);
 			const initScript = buildInitScript(options.cwd, options.env);
 			await kernel.#executeWithBudget(initScript, startup.signal, startupBudget, "Python kernel init");
 			await kernel.#executeWithBudget(PYTHON_PRELUDE, startup.signal, startupBudget, "Python kernel prelude");
 			return kernel;
 		} catch (err) {
-			await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS }).catch(() => {});
+			let cleanupFailure: PythonKernelStartupCleanupFailure | undefined;
+			try {
+				if (options.onStartupFailure) {
+					await options.onStartupFailure(kernel);
+				} else {
+					const result = await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS });
+					if (!result.confirmed) cleanupFailure = { kind: "unconfirmed", result };
+				}
+			} catch (cleanupError) {
+				cleanupFailure = { kind: "rejected", error: cleanupError };
+			}
+			if (cleanupFailure) throw new PythonKernelStartError(kernel, err, cleanupFailure);
 			throw err;
 		}
 	}
@@ -475,9 +523,27 @@ export class PythonKernel {
 		}
 	}
 
-	async shutdown(options?: KernelShutdownOptions): Promise<KernelShutdownResult> {
-		if (this.#shutdownConfirmed) return { confirmed: true };
+	shutdown(options?: KernelShutdownOptions): Promise<KernelShutdownResult> {
+		if (this.#shutdownConfirmed) return Promise.resolve({ confirmed: true });
+		if (this.#shutdownPromise) return this.#shutdownPromise;
 
+		const { promise, resolve, reject } = Promise.withResolvers<KernelShutdownResult>();
+		this.#shutdownPromise = promise;
+		void promise.then(
+			() => {
+				if (this.#shutdownPromise === promise) this.#shutdownPromise = null;
+			},
+			() => {
+				if (this.#shutdownPromise === promise) this.#shutdownPromise = null;
+			},
+		);
+		void Promise.resolve()
+			.then(() => this.#shutdown(options))
+			.then(resolve, reject);
+		return promise;
+	}
+
+	async #shutdown(options?: KernelShutdownOptions): Promise<KernelShutdownResult> {
 		this.#alive = false;
 		this.#abortPendingExecutions("Python kernel shutdown", { kernelKilled: true });
 

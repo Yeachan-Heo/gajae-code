@@ -277,7 +277,7 @@ describe("plugin MCP public-network boundary", () => {
 		expect(calls.slice(2).every(call => call.sessionId === "session-123")).toBe(true);
 	});
 
-	test("leaves ordinary user-configured HTTP transports unchanged", async () => {
+	test("keeps ordinary user HTTP transports on the configured URL", async () => {
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async (_input, init) => {
 			const request = JSON.parse(String(init?.body)) as { id: string | number };
 			return Response.json({ jsonrpc: "2.0", id: request.id, result: { ok: true } });
@@ -287,7 +287,7 @@ describe("plugin MCP public-network boundary", () => {
 
 		await expect(transport.request("tools/list")).resolves.toEqual({ ok: true });
 		expect(String(fetchSpy.mock.calls[0]?.[0])).toBe("http://127.0.0.1/mcp");
-		expect(fetchSpy.mock.calls[0]?.[1]?.redirect).toBeUndefined();
+		expect(fetchSpy.mock.calls[0]?.[1]?.redirect).toBe("manual");
 		await transport.close();
 	});
 });

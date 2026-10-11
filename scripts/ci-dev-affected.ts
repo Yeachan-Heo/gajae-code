@@ -658,6 +658,7 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-index-lock-contention.test.ts" ||
+		changedPath === "packages/coding-agent/test/file-lock-signed-identity.test.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/process-incarnation.ts" ||
 		changedPath === "packages/coding-agent/src/config/file-lock.ts" ||
 		// The session-state lock and empty-delete receipt GC consume the native
@@ -1573,6 +1574,8 @@ function isInstallPath(changedPath: string): boolean {
 }
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
+	// Changelogs don't constitute runtime changes requiring native build or validation
+	if (isDocOrChangelogPath(changedPath)) return false;
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
 }
 

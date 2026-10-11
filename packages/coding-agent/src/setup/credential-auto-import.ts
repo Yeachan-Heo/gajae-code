@@ -36,7 +36,11 @@ export const CREDENTIAL_AUTO_IMPORT_RETRY_WARNING =
 export const CREDENTIAL_AUTO_IMPORT_STATE_UNREADABLE_WARNING =
 	"Credential import preference could not be read. External credential discovery was skipped; use /provider to import credentials manually.";
 
-export type CredentialAutoImportSourceLabel = "claude-code-file" | "claude-code-keychain" | "codex-file";
+export type CredentialAutoImportSourceLabel =
+	| "claude-code-file"
+	| "claude-code-keychain"
+	| "codex-file"
+	| "kiro-cli-social";
 export type CredentialAutoImportTrigger = "startup" | "bare-login" | "setup-cli";
 export type InitialImportResolution = "accepted" | "declined";
 export type CredentialAutoImportStateProblem =
@@ -259,16 +263,18 @@ export interface CredentialAutoImportResult {
 	globalDiscoveryFailure?: CredentialAutoImportFailure;
 }
 
-const CREDENTIAL_AUTO_IMPORT_PROMPT_PROVIDERS: readonly ExternalProvider[] = ["anthropic", "openai-codex"];
+const CREDENTIAL_AUTO_IMPORT_PROMPT_PROVIDERS: readonly ExternalProvider[] = ["anthropic", "openai-codex", "kiro"];
 const CREDENTIAL_AUTO_IMPORT_PROMPT_ORIGINS: readonly CredentialOrigin[] = [
 	"claude-code-file",
 	"claude-code-keychain",
 	"codex-file",
+	"kiro-cli-social",
 ];
 const CREDENTIAL_AUTO_IMPORT_ORIGIN_LABELS: Record<CredentialOrigin, string> = {
 	"claude-code-file": "Claude Code file",
 	"claude-code-keychain": "Claude Code Keychain",
 	"codex-file": "Codex CLI file",
+	"kiro-cli-social": "Kiro CLI social login",
 };
 const CREDENTIAL_AUTO_IMPORT_FAILURE_CLASSES = new Set(Object.values(CredentialAutoImportFailureClass));
 
@@ -413,7 +419,10 @@ export function buildCredentialAutoImportNotice(
 		...new Set(result.imported.map(c => EXTERNAL_PROVIDER_LABELS[c.provider as ExternalProvider] ?? c.provider)),
 	];
 	const success = `Imported ${result.imported.length} external OAuth credential(s) into gjc: ${providers.join(", ")}.`;
-	return `${success}\n${CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING}`;
+	const mayRotateExternalRefreshToken = result.imported.some(
+		credential => credential.provider === "anthropic" || credential.provider === "openai-codex",
+	);
+	return mayRotateExternalRefreshToken ? `${success}\n${CREDENTIAL_AUTO_IMPORT_ROTATION_WARNING}` : success;
 }
 
 export function formatCredentialAutoImportResult(result: CredentialAutoImportResult): string[] {

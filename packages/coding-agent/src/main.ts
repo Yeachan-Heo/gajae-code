@@ -475,6 +475,11 @@ type StartupModelProfileArgs = {
 	preferCachedDefaultProfile?: boolean;
 };
 
+type StartupModelProfileFailure = {
+	profileName: string;
+	error: ModelProfileCredentialError | UnknownModelProfileError;
+};
+
 function staleDefaultProfileMessage(error: UnknownModelProfileError, profileCatalogRefreshUnavailable = false): string {
 	const refreshNotice = profileCatalogRefreshUnavailable
 		? " The online profile catalog could not be refreshed; continuing with the last accepted catalog."
@@ -488,6 +493,8 @@ async function applyStartupModelProfilesWithPolicy(
 	onUnknownDefault?: (error: UnknownModelProfileError, profileCatalogRefreshUnavailable: boolean) => void,
 ): Promise<void> {
 	let profileCatalogRefreshUnavailable = false;
+	let profilePassFailures: StartupModelProfileFailure[] = [];
+	let unhandledProfileName: string | undefined;
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
@@ -496,50 +503,66 @@ async function applyStartupModelProfilesWithPolicy(
 			tolerateCredentialError?: boolean;
 			tolerateUnknownDefault?: boolean;
 			runtimeBindingsOnly?: boolean;
+			userSelectionRevision?: number;
 		} = {},
 	): Promise<boolean> => {
-		try {
+		const isCurrent =
+			options.userSelectionRevision === undefined
+				? undefined
+				: () => args.session.getUserModelSelectionRevision() === options.userSelectionRevision;
+		if (isCurrent && !isCurrent()) return false;
+		const apply = async (): Promise<boolean> => {
+			if (isCurrent && !isCurrent()) return false;
 			if (options.runtimeBindingsOnly) {
-				await applyModelProfileRuntimeBindings({
-					session: args.session,
-					modelRegistry: args.modelRegistry,
-					settings: args.settings,
-					profileName,
-				});
+				await applyModelProfileRuntimeBindings(
+					{
+						session: args.session,
+						modelRegistry: args.modelRegistry,
+						settings: args.settings,
+						profileName,
+					},
+					isCurrent,
+				);
 			} else {
 				await activateModelProfile(
 					{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-					{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+					{
+						persistDefault,
+						thinkingLevelOverride: options.thinkingLevelOverride,
+						isCurrent,
+					},
 				);
 			}
 			return true;
+		};
+		try {
+			return isCurrent ? await args.session.withSdkControlMutation(apply) : await apply();
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError && (onCredentialError || options.tolerateCredentialError)) {
-				// The toast/stderr warning is transient; keep a log record so a session
-				// left on the provisional model can be diagnosed afterwards.
+				profilePassFailures.push({ profileName, error });
 				logger.warn("Startup model profile not applied: missing provider credentials", {
 					profile: profileName,
 					errorClass: error.name,
 					providers: error.providers,
 					role: error.role,
 				});
-				if (onCredentialError) onCredentialError(error);
-				else process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
+				if (!onCredentialError) process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
 				return false;
 			}
 			if (error instanceof UnknownModelProfileError && options.tolerateUnknownDefault) {
+				profilePassFailures.push({ profileName, error });
 				logger.warn("Startup model profile not applied: unknown profile", {
 					profile: profileName,
 					errorClass: error.name,
 					catalogRefreshUnavailable: profileCatalogRefreshUnavailable,
 				});
-				if (onUnknownDefault) onUnknownDefault(error, profileCatalogRefreshUnavailable);
-				else
+				if (!onUnknownDefault)
 					process.stderr.write(
 						`${chalk.yellow(`Warning: ${staleDefaultProfileMessage(error, profileCatalogRefreshUnavailable)}`)}\n`,
 					);
 				return false;
 			}
+			unhandledProfileName = profileName;
 			throw error;
 		}
 	};
@@ -559,9 +582,16 @@ async function applyStartupModelProfilesWithPolicy(
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
-	const applyConfiguredProfiles = async (allowMissingDefault: boolean): Promise<boolean> => {
+	let modelSelectionChangedDuringRecovery = false;
+	const applyConfiguredProfiles = async (
+		allowMissingDefault: boolean,
+		profileNames?: ReadonlySet<string>,
+		userSelectionRevision?: number,
+	): Promise<boolean> => {
+		profilePassFailures = [];
+		unhandledProfileName = undefined;
 		let applied = true;
-		if (defaultProfile) {
+		if (defaultProfile && (!profileNames || profileNames.has(defaultProfile))) {
 			applied =
 				(await applyProfile(defaultProfile, false, {
 					thinkingLevelOverride: args.settings.has("defaultThinkingLevel")
@@ -569,37 +599,141 @@ async function applyStartupModelProfilesWithPolicy(
 						: undefined,
 					tolerateCredentialError: tolerateDefaultProfileFailure,
 					tolerateUnknownDefault:
-						allowMissingDefault && (onUnknownDefault !== undefined || tolerateDefaultProfileFailure),
+						onUnknownDefault !== undefined || (allowMissingDefault && tolerateDefaultProfileFailure),
 					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
+					userSelectionRevision,
 				})) && applied;
 		}
-		if (args.parsedArgs.mpreset) {
-			applied = (await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true)) && applied;
+		if (args.parsedArgs.mpreset && (!profileNames || profileNames.has(args.parsedArgs.mpreset))) {
+			applied =
+				(await applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true, {
+					userSelectionRevision,
+				})) && applied;
 		}
 		return applied;
 	};
+	const profilesFromFirstFailure = (failedProfiles: ReadonlySet<string>): ReadonlySet<string> => {
+		const orderedProfiles = [defaultProfile, args.parsedArgs.mpreset].filter(
+			(name): name is string => name !== undefined,
+		);
+		const firstFailureIndex = orderedProfiles.findIndex(name => failedProfiles.has(name));
+		return firstFailureIndex === -1 ? failedProfiles : new Set(orderedProfiles.slice(firstFailureIndex));
+	};
+	const applyFailedProfiles = async (
+		failedProfiles: ReadonlySet<string>,
+		userSelectionRevision: number,
+	): Promise<boolean> => {
+		const applied = await applyConfiguredProfiles(true, failedProfiles, userSelectionRevision);
+		if (
+			applied &&
+			defaultProfile !== undefined &&
+			failedProfiles.has(defaultProfile) &&
+			args.parsedArgs.mpreset !== undefined &&
+			!failedProfiles.has(args.parsedArgs.mpreset)
+		) {
+			return applyProfile(args.parsedArgs.mpreset, args.parsedArgs.default === true, { userSelectionRevision });
+		}
+		return applied;
+	};
+	const refreshAuthAndCatalog = async (continueOnRefreshError: boolean): Promise<void> => {
+		try {
+			await args.modelRegistry.authStorage?.reload();
+		} catch (error) {
+			logger.warn("Failed to reload auth before startup model profile recovery", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		try {
+			await args.modelRegistry.refreshModelPresetProfilesFromRegistry();
+		} catch (error) {
+			if (!continueOnRefreshError && args.modelRegistry.getError()) throw error;
+			profileCatalogRefreshUnavailable = true;
+			logger.warn("Failed to refresh model profile catalog before startup recovery", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		try {
+			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
+		} catch (error) {
+			if (!continueOnRefreshError) throw error;
+			logger.warn("Failed to refresh model catalog before startup profile recovery", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	};
+	const reportFinalProfileFailures = (markDefaultUnavailable = true): void => {
+		for (const failure of profilePassFailures) {
+			if (failure.error instanceof ModelProfileCredentialError) {
+				onCredentialError?.(failure.error);
+			} else {
+				onUnknownDefault?.(failure.error, profileCatalogRefreshUnavailable);
+			}
+		}
+		if (
+			markDefaultUnavailable &&
+			(onCredentialError || onUnknownDefault) &&
+			args.parsedArgs.mpreset === undefined &&
+			args.parsedArgs.model === undefined
+		) {
+			const defaultFailure = profilePassFailures.find(failure => failure.profileName === defaultProfile);
+			if (defaultFailure) args.session.setUnavailableModelProfile(defaultFailure.profileName);
+		}
+	};
 
+	// Deferred --mpreset startup can overlap selector input; never reapply its
+	// captured profile after the user has selected a newer model.
 	if (preferCachedProfiles) {
 		let applied: boolean;
 		let refreshedOnline = false;
+		const selectionRevision = args.session.getUserModelSelectionRevision();
 		try {
-			applied = await applyConfiguredProfiles(false);
+			applied = await applyConfiguredProfiles(false, undefined, selectionRevision);
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
 			if (error instanceof UnknownModelProfileError) {
-				try {
-					await args.modelRegistry.refreshModelPresetProfilesFromRegistry();
-				} catch (refreshError) {
-					if (args.modelRegistry.getError()) throw refreshError;
-					profileCatalogRefreshUnavailable = true;
-					logger.warn("Failed to refresh model profile catalog before startup recovery", {
-						error: refreshError instanceof Error ? refreshError.message : String(refreshError),
-					});
+				await refreshAuthAndCatalog(onCredentialError !== undefined || onUnknownDefault !== undefined);
+			} else {
+				await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
+			}
+			if (args.session.getUserModelSelectionRevision() !== selectionRevision) return;
+			refreshedOnline = true;
+			const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
+			if (unhandledProfileName) failedProfiles.add(unhandledProfileName);
+			const profilesToRetry = profilesFromFirstFailure(failedProfiles);
+			applied = await applyConfiguredProfiles(
+				true,
+				profilesToRetry.size > 0 ? profilesToRetry : undefined,
+				selectionRevision,
+			);
+			if (args.session.getUserModelSelectionRevision() !== selectionRevision) return;
+		}
+		if (args.session.getUserModelSelectionRevision() !== selectionRevision) {
+			modelSelectionChangedDuringRecovery = true;
+			applied = false;
+		}
+		if (
+			!modelSelectionChangedDuringRecovery &&
+			!applied &&
+			profilePassFailures.length > 0 &&
+			(onCredentialError !== undefined || onUnknownDefault !== undefined)
+		) {
+			if (!refreshedOnline) {
+				const failedProfiles = new Set(profilePassFailures.map(failure => failure.profileName));
+				await refreshAuthAndCatalog(true);
+				refreshedOnline = true;
+				if (args.session.getUserModelSelectionRevision() !== selectionRevision) {
+					modelSelectionChangedDuringRecovery = true;
+					applied = false;
+				} else {
+					applied = await applyFailedProfiles(failedProfiles, selectionRevision);
+					if (args.session.getUserModelSelectionRevision() !== selectionRevision) {
+						modelSelectionChangedDuringRecovery = true;
+						applied = false;
+					}
 				}
 			}
-			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
-			refreshedOnline = true;
-			applied = await applyConfiguredProfiles(true);
+			if (applied) args.session.setUnavailableModelProfile(undefined);
+			else reportFinalProfileFailures(!modelSelectionChangedDuringRecovery);
 		}
 		if (applied && !refreshedOnline)
 			args.modelRegistry.refreshInBackground("online-if-uncached", args.session.credentialSessionId);
@@ -611,7 +745,7 @@ async function applyStartupModelProfilesWithPolicy(
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
-	if (explicitModel) {
+	if (explicitModel && !modelSelectionChangedDuringRecovery) {
 		await args.session.setModelTemporary(explicitModel, args.startupThinkingLevel ?? args.parsedArgs.thinking, {
 			persistAsSessionDefault: true,
 			cause: "startup-override",
@@ -619,7 +753,7 @@ async function applyStartupModelProfilesWithPolicy(
 		const selector = `${explicitModel.provider}/${explicitModel.id}`;
 		args.session.setConfiguredModelChain("default", [selector], "startup-override", undefined, true);
 		args.session.seedDefaultFallbackResolution(0, []);
-	} else if (args.parsedArgs.thinking && args.session.model) {
+	} else if (!modelSelectionChangedDuringRecovery && args.parsedArgs.thinking && args.session.model) {
 		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking, { cause: "startup-override" });
 	}
 }
@@ -988,6 +1122,21 @@ export async function runInteractiveMode(
 		);
 	}
 
+	// Startup input bypasses the editor submit path, so seed the automatic title
+	// here. Only text that `prompt` actually dispatches to a loaded skill is
+	// skipped; unknown `/skill:` text is submitted as an ordinary prompt and is
+	// titled like one. It must run before the prompt (the title gate skips
+	// sessions that already hold a user message), and a title failure must never
+	// drop the prompt.
+	const maybeGenerateStartupTitle = (text: string, images?: readonly unknown[]): void => {
+		try {
+			if (session.resolvePromptSkillInvocation(text, images) || session.isLocallyHandledSlashCommand(text)) return;
+			mode.maybeGenerateSessionTitle(text);
+		} catch (error: unknown) {
+			logger.warn("Startup session title generation failed", { error: String(error) });
+		}
+	};
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
@@ -1001,6 +1150,7 @@ export async function runInteractiveMode(
 
 		if (initialMessage !== undefined) {
 			try {
+				maybeGenerateStartupTitle(initialMessage, initialImages);
 				await session.prompt(initialMessage, { images: initialImages });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -1017,6 +1167,7 @@ export async function runInteractiveMode(
 				});
 				if (slashResult === true) continue;
 				if (typeof slashResult === "string") text = slashResult;
+				maybeGenerateStartupTitle(text);
 				await session.prompt(text);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";

@@ -1058,7 +1058,8 @@ test("the bus deadline path autosaves the dirty worktree before ownership teardo
 					if (key === "sdk.flushWorktreeOnDeadline") return true;
 					return undefined;
 				},
-				has: (key: string) => key === "sdk.flushWorktreeOnDeadline",
+				// Primary checkout: the bus autosave runs only for a user/global true.
+				getGlobal: (key: string) => (key === "sdk.flushWorktreeOnDeadline" ? true : undefined),
 				getAgentDir: () => cwd,
 			}) as unknown as Settings,
 	});

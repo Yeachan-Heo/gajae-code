@@ -26,6 +26,7 @@ import {
 	preparationBudgetMs,
 	startupQueueWaitMs,
 } from "../src/sdk/broker/startup-budget";
+import { DEFAULT_SDK_REQUEST_TIMEOUT_MS } from "../src/sdk/client/client";
 import { normalizeSdkStartupFailure } from "../src/sdk/startup-capability";
 
 function controlledTiming(now: () => number): {
@@ -57,6 +58,16 @@ class TimeoutCapturingSdkClient {
 		this.timeoutMs = options?.timeoutMs;
 		return { ok: true };
 	}
+}
+
+/**
+ * The adapter grants `deadline - Date.now()` when the client reads its timeout, so a
+ * millisecond tick between computing and reading the deadline shortens it by one.
+ * Pinning the clock makes the granted budget exactly comparable.
+ */
+function freezeClock(): Disposable {
+	const now = spyOn(Date, "now").mockReturnValue(Date.now());
+	return { [Symbol.dispose]: () => now.mockRestore() };
 }
 
 test("SDK host startup concurrency scales sublinearly with observable CPU parallelism", () => {
@@ -590,6 +601,7 @@ test("a stop that cannot prove it still owns the root drains the queued startups
 }, 15_000);
 
 test("the ACP caller deadline covers the admission wait even when readiness is defaulted", async () => {
+	using _clock = freezeClock();
 	const defaulted = new TimeoutCapturingSdkClient();
 	await new AcpSdkAdapter({ client: defaulted as never }).global(
 		"session.create",
@@ -806,6 +818,7 @@ test("the production queue-wait sleep ends with its cutoff instead of its durati
 });
 
 test("the ACP caller deadline follows a supplied lifecycle deadline tuple, not the field it overrides", async () => {
+	using _clock = freezeClock();
 	const receivedAt = 1_000_000;
 	const tuple = deriveLifecycleDeadlines(receivedAt, 30_000);
 
@@ -831,16 +844,18 @@ test("the ACP caller deadline follows a supplied lifecycle deadline tuple, not t
 });
 
 test("the ACP caller leaves an unbudgetable lifecycle request on the generic client deadline", async () => {
+	using _clock = freezeClock();
 	// A partial tuple conflicts with the broker's all-or-nothing deadline contract, and an
 	// out-of-range readiness value is out of contract on its own. Both are refused as invalid
-	// input before anything is queued, so neither may claim a startup-sized caller deadline.
+	// input before anything is queued, so neither may claim a startup-sized caller deadline. They stay
+	// bounded by the default client request deadline instead of going unbounded.
 	const partial = new TimeoutCapturingSdkClient();
 	await new AcpSdkAdapter({ client: partial as never }).global(
 		"session.create",
 		{ cwd: "/workspace", receivedAt: 1_000_000, requestedReadinessTimeoutMs: 30_000 },
 		"partial-deadline-tuple",
 	);
-	expect(partial.timeoutMs).toBeUndefined();
+	expect(partial.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 
 	const outOfRange = new TimeoutCapturingSdkClient();
 	await new AcpSdkAdapter({ client: outOfRange as never }).global(
@@ -848,5 +863,5 @@ test("the ACP caller leaves an unbudgetable lifecycle request on the generic cli
 		{ cwd: "/workspace", readinessTimeoutMs: 600_000 },
 		"out-of-range-readiness",
 	);
-	expect(outOfRange.timeoutMs).toBeUndefined();
+	expect(outOfRange.timeoutMs).toBe(DEFAULT_SDK_REQUEST_TIMEOUT_MS);
 });

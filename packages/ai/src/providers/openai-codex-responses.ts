@@ -2779,6 +2779,11 @@ async function handleCodexStreamFailure(
 	error: unknown,
 ): Promise<AssistantMessage> {
 	const { output } = context;
+	// Preserve failed-call identities for diagnostics, but not their unvalidated
+	// arguments: a stalled call can otherwise make the terminal error oversized.
+	for (const block of output.content) {
+		if (block.type === "toolCall" && "partialJson" in block) block.arguments = {};
+	}
 	removeTransientBlockIndices(output);
 	if (context.requestContext.websocketState) {
 		resetCodexWebSocketAppendState(context.requestContext.websocketState);
@@ -2794,6 +2799,7 @@ async function handleCodexStreamFailure(
 		codexError !== undefined && CODEX_TYPED_TRANSPORT_PROVIDER_CODES.has(codexError.code ?? "")
 			? codexError.code
 			: undefined;
+	if (codexError?.code === "request_timeout") output.errorCode = codexError.code;
 	output.transportFailure = typedProviderCode
 		? explicitTerminalVeto
 			? undefined

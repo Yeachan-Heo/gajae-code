@@ -1,6 +1,7 @@
 import { Editor, type KeyId, matchesKey, parseKittySequence } from "@gajae-code/tui";
 import { BracketedPasteHandler } from "@gajae-code/tui/bracketed-paste";
 import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
+import { macosOptionChordForComposedText } from "../utils/macos-option-forwarding";
 
 type ConfigurableEditorAction = Extract<
 	AppKeybinding,
@@ -116,6 +117,12 @@ export class CustomEditor extends Editor {
 	onQueue?: () => void;
 	/** Called when Caps Lock is pressed. */
 	onCapsLock?: () => void;
+	/**
+	 * Called when typed text is what macOS composes for a bound Option chord
+	 * (for example `œ` for a bound `alt+q`), meaning the terminal sent Option as
+	 * text. The text is still inserted; the callback only explains the miss.
+	 */
+	onUnforwardedOptionChord?: (key: KeyId, text: string) => void;
 	/** Called when PageUp/PageDown should scroll the transcript viewport instead of prompt history. */
 	onViewportPageScroll?: (direction: -1 | 1) => void;
 	/** Called before regular composer input should return the transcript viewport to the live bottom. */
@@ -470,6 +477,13 @@ export class CustomEditor extends Editor {
 		for (const [keyId, handler] of this.#customKeyHandlers) {
 			if (matchesKey(data, keyId)) {
 				if (handler() !== false) return;
+			}
+		}
+
+		if (this.onUnforwardedOptionChord) {
+			const optionKey = macosOptionChordForComposedText(data);
+			if (optionKey && (this.hasActionKey(optionKey) || this.#customKeyHandlers.has(optionKey))) {
+				this.onUnforwardedOptionChord(optionKey, data);
 			}
 		}
 

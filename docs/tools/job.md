@@ -73,6 +73,8 @@ Read-only snapshot path:
 12. `#buildResult(...)` deduplicates jobs, snapshots current manager state, then calls `manager.acknowledgeDeliveries(...)` for every terminal job (`completed`, `failed`, `cancelled`) in the result. That suppresses later automatic follow-up delivery for the same completions and removes queued deliveries for those ids; a `paused` job is left unsuppressed and resumable.
 13. The final text partitions jobs by terminal (`## Completed`), still-running (`## Still Running`), and non-terminal non-running (`## Waiting`) state. A timeout is not an error path; it simply returns the current snapshot.
 
+Delivery draining enrolls the original in-flight record and its completion future before notifying change listeners or invoking `onJobComplete`. Drains join that future; bounded disposal returns its existing timeout result while retaining the unsettled future until the callback operation finishes. This is delivery-future enrollment only, not proof of the entire task lifecycle or closure. It does not settle the initial parked artifact save, preserve the original publication capability across ordinary retries, or certify queue acknowledgement, private claims, eviction, or pinning.
+
 ## Modes / Variants
 - Poll all running jobs: call with neither `poll` nor `cancel`.
 - Poll explicit ids: call with `poll` only.

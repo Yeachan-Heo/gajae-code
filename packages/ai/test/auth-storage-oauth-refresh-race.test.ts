@@ -601,6 +601,95 @@ describe("AuthStorage OAuth refresh race", () => {
 		}
 	});
 
+	test("keeps a same-instance automatic refresh lease alive after a forced MCP refresh fails", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const provider = "unit-oauth-same-instance-mcp";
+		oauthUtils.registerOAuthProvider({
+			id: provider,
+			name: "Unit OAuth Same Instance MCP",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+		const firstRequest = Promise.withResolvers<void>();
+		const releaseFirstRequest = Promise.withResolvers<void>();
+		let requestCount = 0;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async () => {
+				requestCount += 1;
+				if (requestCount === 1) {
+					firstRequest.resolve();
+					await releaseFirstRequest.promise;
+					return new Response("aborted", { status: 500 });
+				}
+				return Response.json({ access_token: "fresh-access", refresh_token: "fresh-refresh", expires_in: 3600 });
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+			await authStorage.set(provider, [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "shared-refresh",
+					expires: Date.now() - 60_000,
+					mcpBinding: { resourceOrigin: origin, tokenEndpoint: `${origin}/token` },
+				},
+			]);
+			const credentialId = store.listAuthCredentials(provider)[0]?.id;
+			if (credentialId === undefined) throw new Error("credential missing");
+
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+				const credential = credentials[provider];
+				if (!credential) return null;
+				return { newCredentials: credential, apiKey: credential.access };
+			});
+
+			const originalClaim = store.claimOAuthRefreshLease!.bind(store);
+			const secondClaim = Promise.withResolvers<void>();
+			let claimCalls = 0;
+			vi.spyOn(store, "claimOAuthRefreshLease").mockImplementation((...args) => {
+				const claim = originalClaim(...args);
+				claimCalls += 1;
+				if (claimCalls === 2) secondClaim.resolve();
+				return claim;
+			});
+
+			const controller = new AbortController();
+			const forced = authStorage.forceRefreshCredentialById(credentialId, controller.signal).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await firstRequest.promise;
+
+			const automatic = authStorage.getApiKey(provider, "automatic-peer");
+			await secondClaim.promise;
+			controller.abort();
+			releaseFirstRequest.resolve();
+
+			const forcedOutcome = await forced;
+			expect(forcedOutcome).toBeInstanceOf(Error);
+			await expect(automatic).resolves.toBe("fresh-access");
+
+			const persisted = store.listAuthCredentials(provider);
+			expect(persisted).toHaveLength(1);
+			expect(persisted[0]?.credential).toMatchObject({
+				type: "oauth",
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+			});
+		} finally {
+			releaseFirstRequest.resolve();
+			server.stop(true);
+		}
+	});
+
 	test("an internal probe timeout memoizes the local refresh failure so the next request cannot replay the token", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 

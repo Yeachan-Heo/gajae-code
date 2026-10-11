@@ -3,6 +3,7 @@
  * filesystem-discovered custom skills.
  */
 import { Settings } from "../config/settings";
+import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import {
 	DEFAULT_GJC_DEFINITION_NAMES,
 	type EmbeddedDefaultGjcSkill,
@@ -111,6 +112,10 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 					...settings.getGroup("skills"),
 					disabledExtensions: settings.get("disabledExtensions"),
 				},
+				allowExternalUserSkillSymlinks: resolveGlobalUserSkillLinkTrust({
+					trustUserSkills: settings.getGlobal("skills.trustUserSkills"),
+					enablePiUser: settings.getGlobal("skills.enablePiUser"),
+				}),
 			});
 			if (cmd.flags?.json) {
 				writeJson({

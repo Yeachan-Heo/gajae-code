@@ -210,6 +210,7 @@ const requiredGeneratedBindingSymbols = [
 	"__gjcInstallTokioRuntime",
 	"PowerAssertion",
 	"currentExecutablePath",
+	"windowsOrdinalCaseFold",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {

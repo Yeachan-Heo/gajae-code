@@ -13,6 +13,7 @@ function makeCtx(overrides: Partial<SegmentContext> = {}): SegmentContext {
 				thinkingLevel: ThinkingLevel.High,
 			},
 			isFastModeActive: () => false,
+			getUnavailableModelProfile: () => undefined,
 		} as unknown as SegmentContext["session"],
 		width: 120,
 		options: {},
@@ -97,6 +98,23 @@ describe("model segment inline context percentage", () => {
 		// both the model segment and a standalone context_pct segment.
 		expect(rendered).not.toContain("42.5%");
 		expect(rendered).toContain("sonnet");
+	});
+
+	it("keeps the unavailable default profile visible beside the provisional model", () => {
+		const ctx = makeCtx({
+			session: {
+				state: {
+					model: { id: "gpt-5.5", name: "GPT-5.5", thinking: true, contextWindow: 200_000 },
+					thinkingLevel: ThinkingLevel.XHigh,
+				},
+				isFastModeActive: () => false,
+				getUnavailableModelProfile: () => "claude-codex",
+			} as unknown as SegmentContext["session"],
+		});
+		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
+
+		expect(rendered).toContain("profile unavailable: claude-codex");
+		expect(rendered).toMatch(/profile unavailable: claude-codex.*gpt-5\.5/);
 	});
 
 	it("still shows the percentage when the reasoning effort is off", () => {

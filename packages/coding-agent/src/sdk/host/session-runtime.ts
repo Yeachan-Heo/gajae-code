@@ -35,6 +35,7 @@ import {
 	validateSettingPatch,
 } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { tagSdkLifecycleObserver } from "../../extensibility/extensions/function-hooks-internal";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -72,7 +73,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
-import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
+import { autosaveWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import {
 	PromptDeadlineManager,
 	type PromptDeadlinePublicationResult,
@@ -2109,12 +2110,7 @@ function createQuerySurface(
 	};
 	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
 	const profileSettings = (options.settings ?? ctx.settings) as Pick<Settings, "get"> | undefined;
-	const getProfileAvailableModels = (): Model<Api>[] => {
-		const getAvailableForProfileActivation = ctx.modelRegistry.getAvailableForProfileActivation;
-		return typeof getAvailableForProfileActivation === "function"
-			? getAvailableForProfileActivation.call(ctx.modelRegistry)
-			: ctx.modelRegistry.getAvailable();
-	};
+	const getProfileAvailableModels = (): Model<Api>[] => ctx.modelRegistry.getAvailable();
 	const resolveProfileAvailability = async (
 		profile: ModelProfileDefinition,
 		authenticatedProviders: ReadonlySet<string>,
@@ -2468,6 +2464,9 @@ function createQuerySurface(
 		getExtensions: () => ctx.getExtensions(),
 		getArtifactRange: (artifactId, offset, length) => ctx.getArtifactRange?.(artifactId, offset, length),
 		getJobs: () => ctx.getJobs(),
+		...(typeof (ctx as Partial<ExtensionContext>).getProjectProgress === "function"
+			? { getProjectProgress: () => ctx.getProjectProgress!() }
+			: {}),
 		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			reconciliation.lookup("prompt", selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
@@ -2740,6 +2739,11 @@ export function providerFailureFromAgentEnd(
 			return undefined;
 		}
 		if (errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow") return undefined;
+		if (errorKind === "local_empty_response")
+			return {
+				code: "empty_response",
+				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+			};
 		let errorMessage: unknown;
 		try {
 			errorMessage = assistant.errorMessage;
@@ -6043,40 +6047,43 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			resolveTerminalPublicationWaiters(observed, terminalPublicationByCorrelation);
 		}
 	};
-	api.on("agent_start", (event, ctx) => {
-		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		// The activity checkpoint is already fire-and-forget and does not depend on
-		// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
-		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
-			?.reportActivity("active")
-			.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
-		// Interactive/skill turns must not wait on durable start persist. Keep
-		// trackLifecycle so drain, persist-then-publish, content-hold release, and
-		// shutdown still run; do not return that promise to the extension runner
-		// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
-		void trackLifecycle(
-			async () =>
-				emitLifecycle(
-					"agent_start",
-					ctx,
-					undefined,
-					undefined,
-					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
-					undefined,
-					false,
-					undefined,
-					undefined,
-					typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
-					event.sdkRunTokens,
-					event.lifecycleScope,
-				),
-			owner,
-		).catch(error => {
-			logger.error("SDK agent_start lifecycle task failed", {
-				error: sanitizePromptFailure(error),
+	api.on(
+		"agent_start",
+		tagSdkLifecycleObserver((event, ctx) => {
+			const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
+			// The activity checkpoint is already fire-and-forget and does not depend on
+			// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
+			void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
+				?.reportActivity("active")
+				.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
+			// Interactive/skill turns must not wait on durable start persist. Keep
+			// trackLifecycle so drain, persist-then-publish, content-hold release, and
+			// shutdown still run; do not return that promise to the extension runner
+			// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
+			void trackLifecycle(
+				async () =>
+					emitLifecycle(
+						"agent_start",
+						ctx,
+						undefined,
+						undefined,
+						owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+						undefined,
+						false,
+						undefined,
+						undefined,
+						typeof event.sdkRunToken === "string" ? event.sdkRunToken : undefined,
+						event.sdkRunTokens,
+						event.lifecycleScope,
+					),
+				owner,
+			).catch(error => {
+				logger.error("SDK agent_start lifecycle task failed", {
+					error: sanitizePromptFailure(error),
+				});
 			});
-		});
-	});
+		}),
+	);
 	api.on("agent_end", (event, ctx) => {
 		const tokenBinding =
 			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
@@ -6441,7 +6448,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const seams = options.terminalAbortSeams;
 				const handle = seams?.getActivePromptHandle();
 				const epoch = seams?.getTerminalTurnEpoch();
-				if (!seams || !handle || epoch === undefined || !seams.pendingToolExecutions) return;
+				if (!seams || !handle || epoch === undefined) return;
 				const existing = deadlineTerminalizationObservations.get(key);
 				if (existing) return () => cleanupDeadlineTerminalizationObservation(key, existing);
 
@@ -6623,22 +6630,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// the session down (#5583). Best effort by contract: failures are logged
 			// inside the flush and the deadline outcome is unaffected.
 			onDeadlineExceeded: async (_correlation, signal, isCurrent) => {
-				if (options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === false) return;
-				// `has` is true only for a value the user actually wrote, so this
-				// separates an explicit opt-in from the schema default. The flush only
-				// honours the default inside a linked worktree the session owns.
-				const configured = options.settings?.get("sdk.flushWorktreeOnDeadline" as never);
-				const hasExplicitSetting =
-					typeof options.settings?.has === "function"
-						? options.settings.has("sdk.flushWorktreeOnDeadline" as never)
-						: configured === true;
-				const explicitOptIn = hasExplicitSetting === true && configured === true;
-				await flushWorktreeOnPromptDeadline(ctx.cwd, {
-					agentDir: options.settings?.getAgentDir(),
-					explicitOptIn,
-					isCurrent,
-					signal,
-				});
+				// Project `.gjc` files are not an opt-in. The shared helper reads the
+				// user/global layer and runtime overrides only (#5583).
+				await autosaveWorktreeOnPromptDeadline(ctx.cwd, options.settings, { isCurrent, signal });
 			},
 			onExpired: correlation => {
 				retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation, true);
@@ -7072,7 +7066,33 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => acceptingGateResolutions,
 			trackGateResolution,
 			options.onInvocationCompletionReconciledForTests,
-			frame => runtime.emitEvent(frame),
+			frame => {
+				// Completion can win the durable transaction while a lifecycle end is
+				// still waiting on it. Both publishers must share the same claim.
+				if (typeof frame.commandId !== "string" || typeof frame.turnId !== "string") return;
+				const correlation = { commandId: frame.commandId, turnId: frame.turnId };
+				if (frame.type !== "agent_end") {
+					if (!hasClaimedTerminalBoundary(correlation)) runtime.emitEvent(frame);
+					return;
+				}
+				const key = lifecycleCorrelationKey(correlation);
+				if (!claimTerminalBoundary(correlation)) {
+					const previouslyPublished = terminalBoundaryClaims.publicationResult(key) === true;
+					if (previouslyPublished) return;
+					terminalBoundaryClaims.releaseClaim(key);
+					if (!claimTerminalBoundary(correlation)) return;
+				}
+				const sequenceBefore = runtime.host.events.sequence;
+				try {
+					runtime.emitEvent(frame);
+					terminalBoundaryClaims.setPublicationResult(key, true);
+				} catch (error) {
+					if (runtime.host.events.sequence > sequenceBefore)
+						terminalBoundaryClaims.setPublicationResult(key, true);
+					else terminalBoundaryClaims.releaseClaim(key);
+					throw error;
+				}
+			},
 			acceptedQueueCancellations,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {

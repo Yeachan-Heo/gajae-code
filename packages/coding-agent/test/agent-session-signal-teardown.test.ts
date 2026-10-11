@@ -12,6 +12,8 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import * as tabSupervisor from "@gajae-code/coding-agent/tools/browser/tab-supervisor";
 import { TempDir } from "@gajae-code/utils";
 
+const disposeOwnedPythonKernels = pyExecutor.disposeKernelSessionsByOwner;
+
 describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 	let tempDir: TempDir | undefined;
 	let authStorage: AuthStorage | undefined;
@@ -64,6 +66,58 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 		// Browser and eval kernels share no owner id, but both teardowns must fire.
 		expect(disposeKernels.mock.calls[0]?.[0]).toBe(disposeVms.mock.calls[0]?.[0]);
 	});
+
+	it("aborts and joins a live Python invocation before signal teardown completes", async () => {
+		const pythonStarted = Promise.withResolvers<void>();
+		const kernelCleanupCompleted = Promise.withResolvers<void>();
+		const releaseCompletion = Promise.withResolvers<void>();
+		const executePython = pyExecutor.executePython;
+		vi.spyOn(pyExecutor, "executePython").mockImplementation(async (code, options) => {
+			const result = await executePython(code, options);
+			await releaseCompletion.promise;
+			return result;
+		});
+		disposeKernels.mockImplementation(async (ownerId: string) => {
+			await disposeOwnedPythonKernels(ownerId);
+			kernelCleanupCompleted.resolve();
+		});
+		const execution = session!.executePython(
+			"import time; print('signal-ready', flush=True); time.sleep(60)",
+			chunk => {
+				if (chunk.includes("signal-ready")) pythonStarted.resolve();
+			},
+		);
+		await pythonStarted.promise;
+		let executionSettled = false;
+		void execution.then(
+			() => {
+				executionSettled = true;
+			},
+			() => {
+				executionSettled = true;
+			},
+		);
+
+		let teardownSettled = false;
+		const teardown = session!.disposeChildSubprocesses().then(() => {
+			teardownSettled = true;
+		});
+		try {
+			await kernelCleanupCompleted.promise;
+			await Bun.sleep(0);
+			expect(teardownSettled).toBe(false);
+			expect(executionSettled).toBe(false);
+			expect(session!.isEvalRunning).toBe(true);
+			releaseCompletion.resolve();
+			await teardown;
+			expect(executionSettled).toBe(true);
+			expect(session!.isEvalRunning).toBe(false);
+			expect((await execution).cancelled).toBe(true);
+		} finally {
+			releaseCompletion.resolve();
+			await Promise.allSettled([teardown, execution]);
+		}
+	}, 15000);
 
 	it("is idempotent across repeated calls", async () => {
 		await session!.disposeChildSubprocesses();

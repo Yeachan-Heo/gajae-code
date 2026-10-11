@@ -330,10 +330,19 @@ describe("safe discovery boundaries", () => {
 			expect(result.warnings).toEqual(
 				expect.arrayContaining([
 					expect.stringContaining(
-						` (resolves to ${path.join(realRoot, "outside", "SKILL.md")}; add ${realRoot} to skills.customDirectories to load it)`,
+						` (resolves to ${path.join(realRoot, "outside", "SKILL.md")}; add ${realRoot} to skills.customDirectories to load it, or enable skills.trustUserSkills)`,
 					),
 				]),
 			);
+
+			const projectResult = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: skillsDir, providerId: "test", level: "project", requireDescription: true },
+			);
+			expect(projectResult.warnings).toEqual(
+				expect.arrayContaining([expect.stringContaining("keep project skill targets inside the skills scan root")]),
+			);
+			expect(projectResult.warnings?.some(warning => warning.includes("skills.trustUserSkills"))).toBe(false);
 
 			const directSkill = result.items.find(skill => skill.path === path.join(insideDir, "SKILL.md"));
 			expect(directSkill).toBeDefined();
@@ -811,6 +820,232 @@ describe("safe discovery boundaries", () => {
 			);
 			expect(result.items).toEqual([]);
 			expect(result.warnings?.filter(warning => warning.includes("not a regular file"))).toHaveLength(2);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("follows user-level symlinks resolving outside scan root when trustUserSkills is true (issue #6355)", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-user-skills-"));
+		try {
+			const skillsRepo = path.join(root, "skills-repo");
+			const userSkillsDir = path.join(root, ".gjc", "agent", "skills");
+			const linkedSkillName = "external-skill";
+			const linkedSkillDir = path.join(skillsRepo, linkedSkillName);
+
+			// Create a skills directory outside the scan root
+			await fs.mkdir(linkedSkillDir, { recursive: true });
+			await fs.writeFile(
+				path.join(linkedSkillDir, "SKILL.md"),
+				"---\nname: external-skill\ndescription: Skill in external repo\n---\nExternal skill body",
+			);
+
+			// Create user skills directory and symlink to the external skill
+			await fs.mkdir(userSkillsDir, { recursive: true });
+			await fs.symlink(linkedSkillDir, path.join(userSkillsDir, linkedSkillName), "dir");
+
+			// Without trustUserSkills, the symlink should be rejected
+			const resultWithoutTrust = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: userSkillsDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+					allowExternalUserSkillSymlinks: false,
+				},
+			);
+			expect(resultWithoutTrust.items).toHaveLength(0);
+			expect(resultWithoutTrust.warnings).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining("Refusing skill path outside scan root"),
+					expect.stringContaining("skills.trustUserSkills"),
+				]),
+			);
+
+			// With trustUserSkills, the symlink should be followed and the skill loaded
+			const resultWithTrust = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: userSkillsDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+					allowExternalUserSkillSymlinks: true,
+				},
+			);
+			expect(resultWithTrust.items).toHaveLength(1);
+			expect(resultWithTrust.items[0].name).toBe("external-skill");
+			expect(resultWithTrust.warnings).toEqual([]);
+
+			// Verify the skill body can be loaded
+			const loadContent = resultWithTrust.items[0].loadContent;
+			if (!loadContent) throw new Error("Expected skill body loader");
+			const body = await loadContent();
+			expect(body).toContain("External skill body");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a trusted user skill when its symlink changes after discovery", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-link-identity-"));
+		try {
+			const userSkillsDir = path.join(root, ".gjc", "agent", "skills");
+			const originalTarget = path.join(root, "skills-repo", "external-skill");
+			const replacementTarget = path.join(root, "replacement-repo", "external-skill");
+			const skillLink = path.join(userSkillsDir, "external-skill");
+			const writeSkill = async (dir: string, body: string) => {
+				await fs.mkdir(dir, { recursive: true });
+				await fs.writeFile(
+					path.join(dir, "SKILL.md"),
+					`---\nname: external-skill\ndescription: External skill\n---\n${body}`,
+				);
+			};
+			await writeSkill(originalTarget, "Original body");
+			await writeSkill(replacementTarget, "Replacement body");
+			await fs.mkdir(userSkillsDir, { recursive: true });
+			await fs.symlink(originalTarget, skillLink, "dir");
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: userSkillsDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+					allowExternalUserSkillSymlinks: true,
+				},
+			);
+			const loadContent = result.items[0]?.loadContent;
+			if (!loadContent) throw new Error("Expected trusted external skill");
+
+			await fs.unlink(skillLink);
+			await fs.symlink(replacementTarget, skillLink, "dir");
+			await expect(loadContent()).rejects.toThrow();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a trusted skill resolved through an uncaptured intermediate symlink target", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-intermediate-link-"));
+		try {
+			const userSkillsDir = path.join(root, ".gjc", "agent", "skills");
+			const skillLink = path.join(userSkillsDir, "external-skill");
+			const intermediateLink = path.join(root, "shared", "current");
+			const safeTarget = path.join(root, "shared", "safe");
+			const alternateTarget = path.join(root, "shared", "alternate");
+			const candidatePath = path.join(skillLink, "SKILL.md");
+			const writeSkill = async (dir: string, body: string) => {
+				await fs.mkdir(dir, { recursive: true });
+				await fs.writeFile(
+					path.join(dir, "SKILL.md"),
+					`---\nname: external-skill\ndescription: External skill\n---\n${body}`,
+				);
+			};
+			await writeSkill(safeTarget, "Safe body");
+			await writeSkill(alternateTarget, "Unbound alternate body");
+			await fs.mkdir(userSkillsDir, { recursive: true });
+			await fs.mkdir(path.dirname(intermediateLink), { recursive: true });
+			await fs.symlink(safeTarget, intermediateLink, "dir");
+			await fs.symlink(intermediateLink, skillLink, "dir");
+
+			SkillDiscoveryTestHooks.afterSkillLinksCaptured = async validatedCandidate => {
+				if (validatedCandidate !== candidatePath) return;
+				await fs.unlink(intermediateLink);
+				await fs.symlink(alternateTarget, intermediateLink, "dir");
+			};
+			SkillDiscoveryTestHooks.afterSkillPathResolved = async resolvedCandidate => {
+				if (resolvedCandidate !== candidatePath) return;
+				await fs.unlink(intermediateLink);
+				await fs.symlink(safeTarget, intermediateLink, "dir");
+			};
+			try {
+				const result = await scanSkillsFromDir(
+					{ cwd: root, home: root, repoRoot: root },
+					{
+						dir: userSkillsDir,
+						providerId: "test",
+						level: "user",
+						requireDescription: true,
+						allowExternalUserSkillSymlinks: true,
+					},
+				);
+
+				expect(result.items).toEqual([]);
+				expect(result.warnings).toEqual(
+					expect.arrayContaining([expect.stringContaining("not bound to its captured external link target")]),
+				);
+			} finally {
+				delete SkillDiscoveryTestHooks.afterSkillLinksCaptured;
+				delete SkillDiscoveryTestHooks.afterSkillPathResolved;
+			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("loads an in-root skill after an atomic file replacement", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-in-root-skill-atomic-save-"));
+		try {
+			const skillsDir = path.join(root, "skills");
+			const skillDir = path.join(skillsDir, "edited-skill");
+			const skillPath = path.join(skillDir, "SKILL.md");
+			const replacementPath = path.join(skillDir, "SKILL.md.next");
+			const previousPath = path.join(skillDir, "SKILL.md.previous");
+			await fs.mkdir(skillDir, { recursive: true });
+			await fs.writeFile(skillPath, "---\nname: edited-skill\ndescription: Editable skill\n---\nOriginal body");
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{ dir: skillsDir, providerId: "test", level: "user", requireDescription: true },
+			);
+			const loadContent = result.items[0]?.loadContent;
+			if (!loadContent) throw new Error("Expected the in-root skill body loader");
+
+			await fs.writeFile(replacementPath, "---\nname: edited-skill\ndescription: Editable skill\n---\nUpdated body");
+			await fs.rename(skillPath, previousPath);
+			await fs.rename(replacementPath, skillPath);
+			expect(await loadContent()).toContain("Updated body");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a trusted user skill when its target directory identity changes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skill-target-identity-"));
+		try {
+			const userSkillsDir = path.join(root, ".gjc", "agent", "skills");
+			const target = path.join(root, "skills-repo", "external-skill");
+			const movedTarget = `${target}-moved`;
+			const skillLink = path.join(userSkillsDir, "external-skill");
+			await fs.mkdir(target, { recursive: true });
+			await fs.mkdir(userSkillsDir, { recursive: true });
+			await fs.writeFile(
+				path.join(target, "SKILL.md"),
+				"---\nname: external-skill\ndescription: External skill\n---\nStable body",
+			);
+			await fs.symlink(target, skillLink, "dir");
+
+			const result = await scanSkillsFromDir(
+				{ cwd: root, home: root, repoRoot: root },
+				{
+					dir: userSkillsDir,
+					providerId: "test",
+					level: "user",
+					requireDescription: true,
+					allowExternalUserSkillSymlinks: true,
+				},
+			);
+			const loadContent = result.items[0]?.loadContent;
+			if (!loadContent) throw new Error("Expected trusted external skill");
+
+			await fs.rename(target, movedTarget);
+			await fs.mkdir(target);
+			await fs.rename(path.join(movedTarget, "SKILL.md"), path.join(target, "SKILL.md"));
+			await fs.rmdir(movedTarget);
+			await expect(loadContent()).rejects.toThrow();
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

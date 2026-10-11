@@ -87,6 +87,12 @@ The contract preserves Rust/N-API call style:
 
 Changing sync ↔ async for an existing export is a breaking public API change because consumers call these exports directly.
 
+## Bounded empty-directory proof
+
+`snapshotEmptyDirectory(path)` returns `NativeDirectoryTreeResult`. Success contains exactly one root directory entry, using metadata from the opened native handle. It uses no-follow root/parent binding, checks emptiness twice and revalidates the retained and named objects before returning. Each emptiness pass stops at the first non-dot child: it does not collect child names, descend into directories, open payload files or hash their contents. A nonempty root returns `directory_not_empty` without a snapshot; unsupported platforms fail explicitly.
+
+The exchange-placeholder producer and `cleanupAuthorityMatches` consume this proof instead of a recursive snapshot. Other payload-tree proofs still use `snapshotDirectoryTree`. Returned metadata is evidence for comparison with an already authenticated identity, not an independent filesystem grant, writer-quiescence guarantee or permission to reclaim quarantine. This fixed bounded operation does not provide a whole-GC invocation budget.
+
 ## Object and enum typing patterns
 
 ### Object patterns

@@ -121,6 +121,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 	const flush = vi.fn(async () => {});
 	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
+	const markUserModelSelection = vi.fn();
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
 		setCalls.push({ path: path as string, value });
@@ -132,6 +133,10 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		sessionId: "session-1",
 		scopedModels: [],
 		modelRegistry: createRegistry(options),
+		markUserModelSelection,
+		async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+			return body();
+		},
 		configuredChains: {} as Record<string, readonly string[]>,
 		getConfiguredModelChain(role: string): readonly string[] | undefined {
 			return this.configuredChains[role];
@@ -399,14 +404,11 @@ describe("model selector profiles", () => {
 			modelMapping: { default: "provider-a/default", executor: "provider-a/missing" },
 			source: "registry",
 		};
-		const registry = createRegistry() as unknown as TestModelRegistry & {
-			getAvailableForProfileActivation: () => Model[];
-		};
+		const registry = createRegistry() as unknown as TestModelRegistry;
 		registry.getModelProfiles = () => new Map([[registryProfile.name, registryProfile]]);
 		registry.getModelProfile = (name: string) => (name === registryProfile.name ? registryProfile : undefined);
-		registry.getAvailable = () => [defaultModel, model("provider-a", "missing")];
+		registry.getAvailable = () => [defaultModel];
 		registry.getAll = registry.getAvailable;
-		registry.getAvailableForProfileActivation = () => [defaultModel];
 		const selector = createSelector(() => {}, { registry });
 		await Bun.sleep(10);
 		selector.handleInput("\x1b[C");
@@ -509,13 +511,12 @@ describe("model selector profiles", () => {
 		const refreshGate = Promise.withResolvers<"key">();
 		let delayProviderAuth = false;
 		const registry = createRegistry() as unknown as TestModelRegistry & {
-			getAvailableForProfileActivation: () => Model[];
 			getApiKeyForProvider: (provider: string) => Promise<string>;
 		};
 		registry.getModelProfiles = () => new Map(profiles);
 		registry.getModelProfile = (name: string) => profiles.get(name);
 		registry.getAvailableModelProfileNames = () => [...profiles.keys()];
-		registry.getAvailableForProfileActivation = () =>
+		registry.getAvailable = () =>
 			settings.get("disabledProviders").includes("provider-a") ? [] : [defaultModel, alternateModel];
 		registry.getApiKeyForProvider = async provider => {
 			if (delayProviderAuth && provider === "provider-a") return refreshGate.promise;
@@ -882,6 +883,7 @@ describe("model selector profiles", () => {
 		const controller = new SelectorController(ctx as never);
 		await selectFirstProfile(controller);
 
+		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
 		expect(session.setModelTemporaryCalls).toHaveLength(1);
 		expect(session.model).toBe(defaultModel);
 		expect(session.thinkingLevel).toBe(ThinkingLevel.High);

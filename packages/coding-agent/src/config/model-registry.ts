@@ -13,6 +13,7 @@ import {
 	type Context,
 	codexContextOverrideKey,
 	createModelManager,
+	createTrustedStrippedModelClone,
 	Effort,
 	enrichModelThinking,
 	getBundledModels,
@@ -49,6 +50,8 @@ import {
 	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
+// Internal-only: registerFinalizedModelClone is not part of the public @gajae-code/ai surface
+import { registerFinalizedModelClone } from "@gajae-code/ai/utils/trusted-model-clone";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.
@@ -1771,9 +1774,6 @@ export class ModelRegistry {
 		{
 			fresh: boolean;
 			modelIds: ReadonlySet<string>;
-			profileModelIds?: ReadonlySet<string>;
-			profileFresh?: boolean;
-			profileEndpoint?: string;
 			authGeneration: string;
 			endpoint: string;
 		}
@@ -2746,20 +2746,7 @@ export class ModelRegistry {
 		}));
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
-		return models.map(model => {
-			if (!model.baseUrl) return model;
-			try {
-				const parsed = new URL(model.baseUrl);
-				parsed.username = "";
-				parsed.password = "";
-				parsed.search = "";
-				parsed.hash = "";
-				return { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
-			} catch {
-				const { baseUrl: _baseUrl, ...withoutBaseUrl } = model;
-				return withoutBaseUrl as Model<Api>;
-			}
-		});
+		return models.map(model => createTrustedStrippedModelClone(model));
 	}
 	#stripUrlUserinfo(url: string | undefined): string | undefined {
 		if (!url) return url;
@@ -3288,6 +3275,11 @@ export class ModelRegistry {
 									result.provider,
 									this.#providerEvidenceApiKeys.get(result.provider),
 								) &&
+							result.configurationGeneration ===
+								this.authStorage.getProviderConfigurationGeneration(
+									result.provider,
+									this.#authStorageConfigOwner,
+								) &&
 							result.endpoint ===
 								this.#normalizeDiscoveryEvidenceEndpoint(
 									this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
@@ -3309,7 +3301,10 @@ export class ModelRegistry {
 									this.#providerEvidenceApiKeys.get(result.provider),
 								) ||
 							result.configurationGeneration !==
-								this.authStorage.getProviderConfigurationGeneration(result.provider) ||
+								this.authStorage.getProviderConfigurationGeneration(
+									result.provider,
+									this.#authStorageConfigOwner,
+								) ||
 							result.endpoint !==
 								this.#normalizeDiscoveryEvidenceEndpoint(
 									this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "",
@@ -3334,9 +3329,6 @@ export class ModelRegistry {
 				| {
 						fresh: boolean;
 						modelIds: ReadonlySet<string>;
-						profileModelIds?: ReadonlySet<string>;
-						profileFresh?: boolean;
-						profileEndpoint?: string;
 						authGeneration: string;
 						endpoint: string;
 				  }
@@ -3481,12 +3473,9 @@ export class ModelRegistry {
 				.map(([provider, evidence]) => [
 					provider,
 					evidence.fresh,
-					evidence.profileFresh,
 					evidence.authGeneration,
 					evidence.endpoint,
-					evidence.profileEndpoint,
 					[...evidence.modelIds].sort(),
-					evidence.profileModelIds === undefined ? undefined : [...evidence.profileModelIds].sort(),
 				]),
 			configured: [...this.#configuredDiscoveryEvidence.entries()]
 				.sort(([left], [right]) => left.localeCompare(right))
@@ -3540,7 +3529,10 @@ export class ModelRegistry {
 			? this.authStorage.has(provider) ||
 				this.authStorage.hasAuth(provider, undefined, { owner: this.#authStorageConfigOwner })
 			: !this.#isCredentiallessProvider(provider);
-		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
+		let preflightAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+			provider,
+			this.#authStorageConfigOwner,
+		);
 		let preflightOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
 		if (shouldPreflightAuth) {
 			if (optionalAuth && isCurrentPreflight()) this.#credentiallessAuthFallbackProviders.delete(provider);
@@ -3555,7 +3547,10 @@ export class ModelRegistry {
 						credentialSessionId,
 					}),
 				);
-				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
+				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+					provider,
+					this.#authStorageConfigOwner,
+				);
 				if (preflightAuthConfigurationGeneration !== currentAuthConfigurationGeneration) {
 					const currentOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
 					if (
@@ -3633,6 +3628,9 @@ export class ModelRegistry {
 		const isCurrentEndpoint = () =>
 			endpoint ===
 			this.#normalizeDiscoveryEvidenceEndpoint(this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "");
+		const isCurrentAuthConfiguration = () =>
+			preflightAuthConfigurationGeneration ===
+			this.authStorage.getProviderConfigurationGeneration(provider, this.#authStorageConfigOwner);
 		const isCurrentProviderRefresh = () =>
 			providerRefresh === undefined ||
 			("providerId" in providerRefresh
@@ -3704,7 +3702,7 @@ export class ModelRegistry {
 			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
 			cacheDynamicModelProvenance: cacheLookupProvenance,
-			canPublishCache: () => isCurrentEndpoint() && isCurrentProviderRefresh(),
+			canPublishCache: () => isCurrentAuthConfiguration() && isCurrentEndpoint() && isCurrentProviderRefresh(),
 		});
 		const authGeneration =
 			mergeInput.authGeneration ??
@@ -3712,6 +3710,7 @@ export class ModelRegistry {
 		const current =
 			mergeInput.current &&
 			authGeneration === this.#getProviderEvidenceGeneration(effectiveProviderConfig.provider, preflightApiKey) &&
+			isCurrentAuthConfiguration() &&
 			isCurrentEndpoint();
 		if (!current) {
 			return {
@@ -3899,9 +3898,15 @@ export class ModelRegistry {
 		// The token is only needed if the dynamic fetch fires (cache miss),
 		// and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
-			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(descriptor.providerId);
+			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(
+				descriptor.providerId,
+				this.#authStorageConfigOwner,
+			);
 			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId, { credentialSessionId });
-			if (configurationGeneration !== this.authStorage.getProviderConfigurationGeneration(descriptor.providerId)) {
+			if (
+				configurationGeneration !==
+				this.authStorage.getProviderConfigurationGeneration(descriptor.providerId, this.#authStorageConfigOwner)
+			) {
 				return { apiKey: undefined, authGeneration: undefined };
 			}
 			return {
@@ -4071,13 +4076,6 @@ export class ModelRegistry {
 				this.#descriptorDiscoveryEvidence.set(options.providerId, {
 					fresh: result.fetched,
 					modelIds: new Set(models.map(model => model.id)),
-					...(result.dynamicModelIds === undefined
-						? {}
-						: {
-								profileModelIds: new Set(result.dynamicModelIds),
-								profileFresh: !result.stale,
-								profileEndpoint: endpoint,
-							}),
 					authGeneration,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
 				});
@@ -5005,6 +5003,14 @@ export class ModelRegistry {
 			}
 			const generated = this.#generatedAuthHeaders.get(models[index]!);
 			if (generated) this.#generatedAuthHeaders.set(result[index]!, generated);
+			// Register finalized clone as trusted if the original is trusted
+			// registerFinalizedModelClone builds a fresh trusted object from the original's snapshot
+			if (result[index]) {
+				const registeredClone = registerFinalizedModelClone(models[index]!, result[index]);
+				if (registeredClone) {
+					result[index] = registeredClone;
+				}
+			}
 		}
 		return result;
 	}
@@ -5648,9 +5654,10 @@ export class ModelRegistry {
 
 	/**
 	 * Get selectable models with auth configured.
-	 * This is a fast check that doesn't refresh OAuth tokens. A current,
-	 * authoritative live catalog also limits each provider to its enrolled ids;
-	 * bundled entries remain the fallback until that evidence exists.
+	 * This is a fast check that doesn't refresh OAuth tokens. The bundled catalog
+	 * is authoritative for visibility: live discovery only enriches entries and
+	 * adds unknown ids, and never removes a bundled model. A provider that cannot
+	 * serve a model reports its own error when the model is used.
 	 */
 	getAvailable(): Model<Api>[] {
 		this.#synchronizeEnvironmentCredentials();
@@ -5664,80 +5671,10 @@ export class ModelRegistry {
 		) {
 			return this.#availableModelsCache;
 		}
-		const authoritativeDiscoveryIds = new Map<string, ReadonlySet<string> | undefined>();
-		const bundledIdsByProvider = new Map<string, Set<string>>();
-		this.#availableModelsCache = this.#models.filter(model => {
-			if (!this.#isModelAvailable(model, disabledProviders)) return false;
-
-			let liveIds = authoritativeDiscoveryIds.get(model.provider);
-			if (!authoritativeDiscoveryIds.has(model.provider)) {
-				liveIds = this.#getAuthoritativeDiscoveredModelIds(model.provider);
-				authoritativeDiscoveryIds.set(model.provider, liveIds);
-			}
-			// Undefined means discovery has not run successfully for the current
-			// provider context. Keep the bundled catalog as the explicit fallback.
-			if (liveIds === undefined) return true;
-			if (this.#hasCustomModelOverlay(model.provider, model.id)) return true;
-
-			const activity = this.#providerActivity.get(model.provider);
-			if (!activity?.staticModelIds.has(model.id)) return liveIds.has(model.id);
-
-			let bundledIds = bundledIdsByProvider.get(model.provider);
-			if (!bundledIds) {
-				bundledIds = new Set(
-					(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
-						candidate => candidate.id,
-					),
-				);
-				bundledIdsByProvider.set(model.provider, bundledIds);
-			}
-			return !bundledIds.has(model.id) || liveIds.has(model.id);
-		});
+		this.#availableModelsCache = this.#models.filter(model => this.#isModelAvailable(model, disabledProviders));
 		this.#availableModelsDisabledProviders = disabledProviderKey;
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
-	}
-
-	/**
-	 * Return the current live model ids only when discovery produced an
-	 * authoritative catalog for the provider and endpoint. An unavailable or
-	 * failed discovery returns undefined so callers retain the bundled fallback.
-	 */
-	#getAuthoritativeDiscoveredModelIds(provider: string): ReadonlySet<string> | undefined {
-		const descriptorEvidence = this.#descriptorDiscoveryEvidence.get(provider);
-		if (descriptorEvidence?.profileFresh && descriptorEvidence.profileModelIds !== undefined) {
-			try {
-				if (
-					descriptorEvidence.authGeneration === this.#getProviderEvidenceGeneration(provider) &&
-					descriptorEvidence.profileEndpoint ===
-						this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "")
-				) {
-					return descriptorEvidence.profileModelIds;
-				}
-			} catch {
-				// A provider context that can no longer be verified must use its fallback.
-			}
-		}
-
-		const configuredEvidence = this.#configuredDiscoveryEvidence.get(provider);
-		if (!configuredEvidence) return undefined;
-		const discoveryState = this.#discoveryManager.getState(provider);
-		if (
-			discoveryState?.status !== "ok" &&
-			discoveryState?.status !== "cached" &&
-			discoveryState?.status !== "empty"
-		) {
-			return undefined;
-		}
-		try {
-			return configuredEvidence.authGeneration === this.#getProviderEvidenceGeneration(provider) &&
-				configuredEvidence.endpoint ===
-					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "")
-				? configuredEvidence.modelIds
-				: undefined;
-		} catch {
-			return undefined;
-		}
 	}
 
 	#synchronizeEnvironmentCredentials(): void {
@@ -5751,49 +5688,6 @@ export class ModelRegistry {
 			if (this.#runtimeProviderCredentialInstalled.has(provider)) continue;
 			this.#refreshRotatingConfigApiKey(provider, true);
 		}
-	}
-
-	/**
-	 * Get authenticated models, excluding bundled entries that a fresh provider
-	 * catalog has positively shown to be unavailable. Bundled entries remain
-	 * usable until live catalog evidence exists so offline startup is unchanged.
-	 */
-	getAvailableForProfileActivation(): Model<Api>[] {
-		const bundledIdsByProvider = new Map<string, Set<string>>();
-		// Evidence staleness depends only on the provider, and resolving it scans the
-		// catalog for the provider base URL. Decide it once per provider per call so a
-		// multi-thousand-model catalog is not rescanned for every model.
-		const staleEvidenceByProvider = new Map<string, boolean>();
-		return this.getAvailable().filter(model => {
-			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
-			if (!evidence?.profileFresh || evidence.profileModelIds === undefined) return true;
-			if (this.#hasCustomModelOverlay(model.provider, model.id)) return true;
-			let bundledModelIds = bundledIdsByProvider.get(model.provider);
-			if (!bundledModelIds) {
-				bundledModelIds = new Set(
-					(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
-						candidate => candidate.id,
-					),
-				);
-				bundledIdsByProvider.set(model.provider, bundledModelIds);
-			}
-			if (!bundledModelIds.has(model.id)) return true;
-			let staleEvidence = staleEvidenceByProvider.get(model.provider);
-			if (staleEvidence === undefined) {
-				staleEvidence =
-					evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
-					evidence.profileEndpoint !==
-						this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "");
-				staleEvidenceByProvider.set(model.provider, staleEvidence);
-			}
-			if (staleEvidence) return true;
-			return evidence.profileModelIds.has(model.id);
-		});
-	}
-
-	#hasCustomModelOverlay(provider: string, id: string): boolean {
-		const matches = (overlay: CustomModelOverlay) => overlay.provider === provider && overlay.id === id;
-		return this.#customModelOverlays.some(matches) || this.#runtimeModelOverlays.some(matches);
 	}
 
 	#hasFreshOrStaticModelEvidence(model: Model<Api>): boolean {

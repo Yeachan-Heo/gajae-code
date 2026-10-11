@@ -179,6 +179,44 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(headers["User-Agent"]).toBe("curl/8.7.1");
 	});
 
+	it("sends the Claude Code X-App marker only with OAuth credentials", () => {
+		const oauthHeaders = buildAnthropicHeaders({ apiKey: "sk-ant-oat-test", isOAuth: true, stream: true });
+		expect(oauthHeaders["X-App"]).toBe("cli");
+
+		// API-key requests carrying Claude Code markers are billed as Claude Code usage
+		// and excluded from API credit grants ("credit balance too low").
+		const apiKeyVariants = [
+			{ baseUrl: undefined },
+			{ baseUrl: "https://proxy.example.com" },
+			{ isCloudflareAiGateway: true },
+		];
+		for (const variant of apiKeyVariants) {
+			const apiKeyHeaders = buildAnthropicHeaders({
+				apiKey: "sk-ant-api-test",
+				isOAuth: false,
+				stream: true,
+				modelHeaders: { "X-App": "cli" },
+				...variant,
+			});
+			const headerNames = Object.keys(apiKeyHeaders).map(name => name.toLowerCase());
+			expect(headerNames).not.toContain("x-app");
+		}
+	});
+
+	it("keeps Claude Code markers off api-key custom anthropic-messages client options", () => {
+		const options = buildAnthropicClientOptions({
+			model: { ...ANTHROPIC_MODEL, provider: "anthropic-api" },
+			apiKey: "sk-ant-api03-test",
+			isOAuth: false,
+		});
+		const headers = new Headers(options.defaultHeaders);
+		expect(options.isOAuthToken).toBe(false);
+		expect(options.apiKey).toBe("sk-ant-api03-test");
+		expect(headers.get("anthropic-beta")).not.toContain("claude-code-20250219");
+		expect(headers.get("anthropic-beta")).not.toContain("oauth-2025-04-20");
+		expect(headers.has("x-app")).toBe(false);
+	});
+
 	it("forwards only prefix-matching Claude Code User-Agent values", () => {
 		const forwardedHeaders = buildAnthropicHeaders({
 			apiKey: "sk-ant-oat-test",

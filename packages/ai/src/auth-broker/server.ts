@@ -673,7 +673,12 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						const parsed = await parseBody(req, credentialRefreshRequestSchema, { allowEmpty: true });
 						if (!parsed.ok) return parsed.response;
 						const refreshRequest: CredentialRefreshRequest = parsed.data;
-						const entry = await opts.storage.refreshCredentialById(id, req.signal, refreshRequest);
+						const entry = await opts.storage.refreshCredentialById(
+							id,
+							req.signal,
+							refreshRequest,
+							refreshRequest.expectedRevision,
+						);
 						const body: CredentialRefreshResponse = { entry };
 						logger.info("auth-broker credential refreshed", {
 							id,

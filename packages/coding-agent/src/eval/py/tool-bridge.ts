@@ -72,6 +72,10 @@ async function startServer(): Promise<BridgeServer> {
 			if (!sessionId || !name) {
 				return Response.json({ ok: false, error: "Missing session/name" }, { status: 400 });
 			}
+			const live = registrations.get(capability);
+			if (live !== registration || registration.signal?.aborted) {
+				return new Response("Forbidden", { status: 403 });
+			}
 			if (sessionId !== registration.sessionId) {
 				return new Response("Forbidden", { status: 403 });
 			}

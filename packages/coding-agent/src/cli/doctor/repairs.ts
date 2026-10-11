@@ -954,7 +954,10 @@ export async function executeSelectedDoctorRepair(
 					},
 					afterChecks,
 				};
-			const preEffect = outcome.kind === "owner_unavailable" || outcome.kind === "prepare_refused";
+			const preEffect =
+				outcome.kind === "owner_unavailable" ||
+				outcome.kind === "prepare_refused" ||
+				outcome.kind === "attach_only_refused";
 			return {
 				repair: {
 					...plan,

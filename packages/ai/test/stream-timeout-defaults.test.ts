@@ -46,11 +46,11 @@ afterEach(() => {
 });
 
 describe("getProviderStreamIdleTimeoutFallbackMs(provider)", () => {
-	it("gives Anthropic a 300-second idle window for long reasoning gaps", () => {
-		expect(getProviderStreamIdleTimeoutFallbackMs("anthropic")).toBe(300_000);
+	it("gives Anthropic a 600-second idle window for long reasoning gaps", () => {
+		expect(getProviderStreamIdleTimeoutFallbackMs("anthropic")).toBe(600_000);
 	});
 
-	it("gives xAI Grok and Grok Build the same 300-second idle window as Anthropic", () => {
+	it("gives xAI Grok and Grok Build a 300-second idle window for long reasoning gaps", () => {
 		expect(getProviderStreamIdleTimeoutFallbackMs("xai")).toBe(300_000);
 		expect(getProviderStreamIdleTimeoutFallbackMs("grok-build")).toBe(300_000);
 	});
@@ -189,16 +189,16 @@ describe("resolveOpenAISdkRequestTimeoutMs(provider, override)", () => {
 });
 
 describe("resolveAnthropicSdkRequestTimeoutMs(provider, override, idleOverride)", () => {
-	it("bounds the Anthropic connect/headers phase at the 300s idle-floored first-event window", () => {
+	it("bounds the Anthropic connect/headers phase at the 600s idle-floored first-event window", () => {
 		// The Anthropic first-event watchdog arms only after headers arrive, so
 		// without an SDK timeout a connection that dies before headers hangs for
 		// the SDK's 10-minute default per attempt times its internal retries —
 		// the "stuck after a completed tool call" spinner.
-		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic")).toBe(300_000);
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic")).toBe(600_000);
 	});
 
 	it("floors an explicit short first-event override at the env/default window", () => {
-		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", 5_000)).toBe(300_000);
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", 5_000)).toBe(600_000);
 	});
 
 	it("lets a longer explicit first-event override widen the setup bound", () => {

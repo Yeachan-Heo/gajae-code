@@ -34,7 +34,7 @@ The tool returns a single `text` content block plus optional `details`.
   - `content[0].text`: command output, or `(no output)` when the command produced nothing.
   - `details.timeoutSeconds`: effective timeout after clamping.
   - `details.requestedTimeoutSeconds`: only present when the requested timeout was clamped.
-  - `details.meta.truncation`: present when output was truncated in memory; includes `artifactId` when full output spilled to an artifact.
+  - `details.meta.truncation`: present when output was truncated in memory; includes `artifactId` when stored output was published. A capped artifact reports omitted UTF-8 bytes rather than claiming completeness.
 - Success, background start (`async: true` or auto-background):
   - `content[0].text`: optional preview tail, timeout notice if any, then `Background job <id> started: <label>` with follow-up instructions.
   - `details.async`: `{ state: "running", jobId, type: "bash" }`.
@@ -48,6 +48,9 @@ The tool returns a single `text` content block plus optional `details`.
 Stdout and stderr are merged before the model sees them. Non-zero exit codes are appended to the thrown error text as `Command exited with code <n>`.
 
 ## Flow
+Before asynchronous preparation, Bash and Monitor capture the originating session's private artifact publisher. That same callback follows foreground, background, managed, client-terminal, and PTY output; a committed session transition or closed owner cannot redirect retained output into its successor.
+Direct SDK `AgentSession.executeBash()` also captures its minimized-original publisher before awaited `user_bash` hooks. Its original-output helper consumes that retained callback directly rather than looking up the current manager or artifact path after execution.
+
 1. `BashTool.execute()` in `packages/coding-agent/src/tools/bash.ts` reads `command`, normalizes `env`, and defaults `timeout` to `300`.
 2. If `cwd` is absent, it rewrites a leading `cd <path> && ...` into the structured `cwd` field and strips that prefix from `command`.
 3. If `async: true` is requested while `async.enabled` is off, it throws `ToolError` before any execution.
@@ -61,7 +64,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
    3. Foreground non-PTY, ACP client-terminal, and PTY waits are manager-backed when async support is available, so the fold chord can transfer ownership without restarting the command; otherwise they remain ordinary foreground waits.
 9. Foreground non-PTY calls `executeBash()` from `packages/coding-agent/src/exec/bash-executor.ts`.
 10. Foreground PTY calls `runInteractiveBashPty()` from `packages/coding-agent/src/tools/bash-interactive.ts`.
-11. Both paths allocate an output artifact first when `session.allocateOutputArtifact` is available. The artifact path/id are passed into the sink so large output can spill to disk.
+11. Output sinks publish through the invocation-retained callback and the originating `SessionManager`'s authorized secure writer. They do not fall back to an allocator or a raw artifact pathname.
 12. `executeBash()` loads shell settings, optional shell snapshot, and shell minimizer settings, then runs via a persistent native `Shell` session or one-shot `executeShell()`. `docs/bash-tool-runtime.md` covers that path in detail.
 13. `runInteractiveBashPty()` creates a `PtySession`, overlays an xterm-backed console UI, forwards user key input into the PTY, captures output through `OutputSink`, and keeps the PTY owned by the manager when its observer folds. Escape explicitly kills; disposal alone never kills folded work.
 14. On completion, `#buildCompletedResult()` formats `(no output)` when needed, attaches truncation metadata from the `OutputSink` summary, and re-checks exit status / timeout / cancellation before returning.
@@ -105,7 +108,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
   - Reads session settings for async, auto-background, interceptor, tool availability, and shell configuration.
   - Registers jobs with `session.asyncJobManager` for explicit/auto background runs.
   - Uses `session.getSessionId()` to isolate shell reuse and async session keys.
-  - Uses `session.allocateOutputArtifact()` for spill files.
+  - Uses `session.captureArtifactPublication()` to retain artifact publication authority before asynchronous preparation.
 - User-visible prompts / interactive UI
   - PTY mode opens a TUI overlay titled `Console` and forwards input to the PTY.
   - Background start messages direct the agent to the `job` tool (use `list: true` for a snapshot, or pass `poll: [id]` to wait).
@@ -138,7 +141,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
   - missing exit code -> thrown `ToolError` with `Command failed: missing exit status`.
   - timeout -> thrown `ToolError`; PTY uses `Command timed out after <n> seconds`, non-PTY executor returns cancelled output that `BashTool` converts to an error.
   - user abort -> `ToolAbortError` when the caller signal is aborted.
-- Artifact allocation / artifact save failures are swallowed in `saveBashOriginalArtifact()` and `OutputSink.#createFileSink()`; execution continues without that artifact.
+- Missing artifact publication authority reports storage unavailable; publication refusal reports a bounded failure diagnostic. Execution output remains available, but neither outcome produces a successful artifact reference or falls back to a raw file write.
 
 ## Notes
 - `strict = true` and `concurrency = "exclusive"` are set on `BashTool`; the tool does not run concurrently with another bash tool call in the same session.

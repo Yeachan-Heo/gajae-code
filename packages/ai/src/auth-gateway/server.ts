@@ -39,7 +39,7 @@ import type {
 	SimpleStreamOptions,
 } from "../types";
 import { beginAttempt, classifyFallbackTrigger } from "../utils/fallback-transport";
-import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { assertAuthenticatedOrLoopback, hostHeaderMatchesBind, parseBind } from "../utils/parse-bind";
 import { REPETITION_GUARD_ERROR_CODE } from "../utils/stream-repetition-guard";
 import {
 	captureRequestHeaders,
@@ -1281,6 +1281,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-gateway");
 	const version = opts.version;
 
+	let listenPort = bind.port;
 	const server = Bun.serve({
 		hostname: bind.hostname,
 		port: bind.port,
@@ -1296,6 +1297,19 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					origin: req.headers.get("origin"),
 				});
 				return json(403, { error: "no-auth rejects requests carrying Origin" });
+			}
+			if (
+				tokens.size === 0 &&
+				!(req.method === "GET" && pathname === "/healthz") &&
+				!hostHeaderMatchesBind(req.headers.get("host"), { hostname: bind.hostname, port: listenPort })
+			) {
+				logger.info("auth-gateway no-auth host rejected", {
+					method: req.method,
+					path: pathname,
+					peer,
+					hostPresent: req.headers.has("host"),
+				});
+				return json(403, { error: "no-auth rejects a host that is not the loopback bind" });
 			}
 			// CORS preflight is always answered without auth — browsers send
 			// preflights pre-authentication and a 401 here breaks the actual
@@ -1391,8 +1405,9 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		idleTimeout: 255,
 	});
 
+	listenPort = server.port ?? listenPort;
 	const boundHost = server.hostname ?? bind.hostname;
-	const boundPort = server.port ?? bind.port;
+	const boundPort = server.port ?? listenPort;
 	return {
 		url: `http://${boundHost}:${boundPort}`,
 		port: boundPort,

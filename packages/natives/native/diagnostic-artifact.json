@@ -1,7 +1,8 @@
 {
   "schema": "gjc.diagnostic-artifact",
-  "version": "0.18.7",
+  "version": "0.18.8",
   "artifacts": {
-    "pi_natives.darwin-arm64.node": "f55f09180673cf9944075fda4d8d1189d338507a9ceb579682d52f5d5f3b0c8b"
+    "pi_natives.darwin-arm64.node": "18cbb004b1fbda2d42eb8cb654d517985faa0ab305113ab4447f851c8b64820b",
+    "pi_natives.linux-x64-modern.node": "e4ac4a068d03c82c809fb994ee42bc486ff4c12d9b2730e9b1c4c42f5ec9cf40"
   }
 }
