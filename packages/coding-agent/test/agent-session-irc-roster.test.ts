@@ -10,6 +10,7 @@ import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry"
 import { AgentSession, type EphemeralTurnPurpose } from "@gajae-code/coding-agent/session/agent-session";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 registerMockApi();
 
@@ -57,7 +58,11 @@ function createHarness(
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": options.retryEnabled ?? true }),
-		modelRegistry: { getApiKey: options.getApiKey ?? (async () => "test-key"), getAvailable: () => [model] } as never,
+		modelRegistry: {
+			...testModelRegistryConsumerLease,
+			getApiKey: options.getApiKey ?? (async () => "test-key"),
+			getAvailable: () => [model],
+		} as never,
 		agentId: "0-Main",
 		agentRegistry: registry,
 		convertToLlm: async messages => {

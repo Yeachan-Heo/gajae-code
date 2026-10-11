@@ -10,6 +10,7 @@ import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtim
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 /**
  * A prompt submitted to a session with no selected model must be refused by the
@@ -72,7 +73,11 @@ async function startRuntimeHarness(): Promise<RuntimeHarness> {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "registry-api-key", getAvailable: () => [] } as never,
+		modelRegistry: {
+			...testModelRegistryConsumerLease,
+			getApiKey: async () => "registry-api-key",
+			getAvailable: () => [],
+		} as never,
 	});
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 	const waiters = new Map<string, (frame: ControlResponse) => void>();

@@ -10,6 +10,7 @@ import { EphemeralBlobStore, MemoryBlobStore } from "@gajae-code/coding-agent/se
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 registerMockApi();
 const sessions: AgentSession[] = [];
@@ -28,7 +29,11 @@ function createSession(cwd: string, reply = "ok", tools: AgentTool[] = []) {
 		agent,
 		sessionManager: SessionManager.inMemory(cwd),
 		settings: Settings.isolated({ "compaction.enabled": false, "edit.streamingAbort": true }),
-		modelRegistry: { getApiKey: async () => "test-key", getAvailable: () => [model] } as never,
+		modelRegistry: {
+			...testModelRegistryConsumerLease,
+			getApiKey: async () => "test-key",
+			getAvailable: () => [model],
+		} as never,
 		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 	});
 	sessions.push(session);

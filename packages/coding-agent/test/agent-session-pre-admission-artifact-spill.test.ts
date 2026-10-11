@@ -13,6 +13,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir, withTimeout } from "@gajae-code/utils";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const SPILL_URI = /artifact:\/\/(\d+)/;
 
@@ -162,7 +163,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated(),
-			modelRegistry: {} as never,
+			modelRegistry: { ...testModelRegistryConsumerLease } as never,
 		});
 		const toolResult: ToolResultMessage = {
 			role: "toolResult",
@@ -214,7 +215,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
-			modelRegistry: {} as never,
+			modelRegistry: { ...testModelRegistryConsumerLease } as never,
 		});
 		const fullText = "💥".repeat(30_000);
 		const toolResult: ToolResultMessage = {
@@ -299,7 +300,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
-			modelRegistry: {} as never,
+			modelRegistry: { ...testModelRegistryConsumerLease } as never,
 		});
 
 		// An uncontended message_end (predecessor already released) must not cost

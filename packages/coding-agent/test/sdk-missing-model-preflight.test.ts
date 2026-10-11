@@ -7,6 +7,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { TempDir } from "@gajae-code/utils";
 import { type ControlSurface, dispatchControl } from "../src/sdk/host/control";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 /**
  * A session that reaches SDK prompt admission with no effective model must
@@ -71,7 +72,11 @@ function sessionWithoutModel(): Harness {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "registry-api-key", getAvailable: () => [] } as never,
+		modelRegistry: {
+			...testModelRegistryConsumerLease,
+			getApiKey: async () => "registry-api-key",
+			getAvailable: () => [],
+		} as never,
 	});
 	sessions.push(session);
 	return { session, sessionManager, streamCalls: () => streamCalls };
@@ -94,7 +99,7 @@ function sessionWithModel(getApiKey: () => Promise<string | undefined>): Harness
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey, getAvailable: () => [mock.model] } as never,
+		modelRegistry: { ...testModelRegistryConsumerLease, getApiKey, getAvailable: () => [mock.model] } as never,
 	});
 	sessions.push(session);
 	return { session, sessionManager, streamCalls: () => streamCalls };

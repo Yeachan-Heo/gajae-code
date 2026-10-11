@@ -11,6 +11,7 @@ import { createSdkSessionRuntimeExtension, terminalStoppedOutcome } from "../src
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 /**
  * The SDK-only host publishes the lifecycle boundary that settles an externally
@@ -103,6 +104,7 @@ test("disowned SDK steering cohorts share streams and terminals without adopting
 		sessionManager,
 		settings,
 		modelRegistry: {
+			...testModelRegistryConsumerLease,
 			getApiKey: async () => "test-key",
 			getAuthStorageOwner: () => undefined,
 		} as never,

@@ -13,6 +13,7 @@ import {
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 function eventDelta(event: AgentSessionEvent): string {
 	if (event.type !== "message_update") return "";
@@ -20,7 +21,11 @@ function eventDelta(event: AgentSessionEvent): string {
 	return ame.delta ?? "";
 }
 
-const testModelRegistry = { getApiKey: async () => "test-key", getAuthStorageOwner: () => undefined };
+const testModelRegistry = {
+	...testModelRegistryConsumerLease,
+	getApiKey: async () => "test-key",
+	getAuthStorageOwner: () => undefined,
+};
 
 function createAgent(): Agent {
 	return new Agent({

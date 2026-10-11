@@ -29,6 +29,7 @@ import type {
 	ExtensionContextActions,
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 test("extension API cannot set the private recovery bypass", () => {
 	const api = undefined as ExtensionAPI | undefined;
@@ -6424,7 +6425,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		}),
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { ...testModelRegistryConsumerLease } as never,
 		toolRegistry: new Map([[bashTool.name, bashTool]]),
 	});
 	agentSession.setSdkPermissionMode("prompt");

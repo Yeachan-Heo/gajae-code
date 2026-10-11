@@ -1,6 +1,5 @@
 import { describe, expect, it, test, vi } from "bun:test";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
-
 import type { Model } from "@gajae-code/ai";
 import { hookFetch, TempDir } from "@gajae-code/utils";
 import {
@@ -20,7 +19,6 @@ import {
 	rewriteSelectorForProxy,
 	rollbackPreparedModelProfileActivation,
 } from "../src/config/model-profile-activation";
-
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
@@ -33,6 +31,7 @@ import {
 } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
 	({
@@ -1904,6 +1903,7 @@ describe("model profile activation", () => {
 		try {
 			const previousModel = model("provider-c", "default");
 			const registry = {
+				...testModelRegistryConsumerLease,
 				...fakeRegistry(),
 				getApiKey: async (candidate: Model) => (candidate.provider === "provider-c" ? undefined : kNoAuth),
 			};
@@ -1957,10 +1957,7 @@ describe("model profile activation", () => {
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		try {
 			const previousModel = model("provider-c", "default");
-			const registry = {
-				...fakeRegistry(),
-				getApiKey: async () => undefined,
-			};
+			const registry = { ...testModelRegistryConsumerLease, ...fakeRegistry(), getApiKey: async () => undefined };
 			const session = new AgentSession({
 				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
 				sessionManager: manager,
@@ -2001,6 +1998,7 @@ describe("model profile activation", () => {
 			};
 			const base = fakeRegistry({ profiles: [profile] });
 			const registry = {
+				...testModelRegistryConsumerLease,
 				...base,
 				getAll: () => [...base.getAll(), targetModel],
 				getApiKey: async () => kNoAuth,
@@ -2152,7 +2150,11 @@ describe("model profile activation", () => {
 		try {
 			const previousModel = model("provider-c", "default");
 			const manager = SessionManager.create(tempDir.path(), tempDir.path());
-			const sessionRegistry = { ...fakeRegistry(), getApiKey: async () => kNoAuth };
+			const sessionRegistry = {
+				...testModelRegistryConsumerLease,
+				...fakeRegistry(),
+				getApiKey: async () => kNoAuth,
+			};
 			const session = new AgentSession({
 				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
 				sessionManager: manager,
@@ -2204,6 +2206,7 @@ describe("model profile activation", () => {
 				sessionManager: manager,
 				settings: Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: {
+					...testModelRegistryConsumerLease,
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
@@ -2227,6 +2230,7 @@ describe("model profile activation", () => {
 				sessionManager: reopened,
 				settings: Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: {
+					...testModelRegistryConsumerLease,
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
@@ -3381,6 +3385,7 @@ describe("preset-equivalent profile activation", () => {
 				sessionManager: manager,
 				settings: Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: {
+					...testModelRegistryConsumerLease,
 					...fakeRegistry(),
 					getApiKey: async () => kNoAuth,
 					getCanonicalId,
@@ -3844,6 +3849,7 @@ describe("preset-equivalent profile activation", () => {
 			const clearCanonicalVariant = vi.fn(() => true);
 			const getCanonicalId = vi.fn((selected: Model) => (selected.id === "opus-real" ? "opus" : undefined));
 			const registry = {
+				...testModelRegistryConsumerLease,
 				...fakeRegistry({ profiles: [profile] }),
 				getApiKey: async () => kNoAuth,
 				getAll: () => [model("provider-a", "opus-real"), nextModel],

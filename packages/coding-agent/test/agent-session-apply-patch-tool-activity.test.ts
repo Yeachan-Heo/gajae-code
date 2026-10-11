@@ -7,6 +7,7 @@ import { projectToolSummary } from "../src/sdk/bus/index";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import type { ToolSession } from "../src/tools";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 function model(): Model<"openai-responses"> {
 	return {
@@ -45,7 +46,7 @@ describe("apply_patch tool activity resolution", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: {} as never,
+			modelRegistry: { ...testModelRegistryConsumerLease } as never,
 			toolRegistry: new Map([[editTool.name, editTool as AgentTool]]),
 		});
 

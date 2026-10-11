@@ -19,6 +19,7 @@ import type { BashResult } from "@gajae-code/coding-agent/exec/bash-executor";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const model: Model = {
 	id: "deferred-shell-model",
@@ -85,7 +86,7 @@ function createHarness(sessions: AgentSession[]): Harness {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key" } as never,
+		modelRegistry: { ...testModelRegistryConsumerLease, getApiKey: async () => "test-key" } as never,
 	});
 	sessions.push(session);
 

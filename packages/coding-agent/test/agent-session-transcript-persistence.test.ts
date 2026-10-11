@@ -6,6 +6,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 function assistantMessage(text: string): AssistantMessage {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -61,7 +62,7 @@ describe("AgentSession transcript persistence", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: { ...testModelRegistryConsumerLease, getApiKey: async () => "test-key" } as never,
 		});
 
 		const prompt = session.prompt("persist this turn");

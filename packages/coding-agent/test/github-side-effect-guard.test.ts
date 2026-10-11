@@ -36,6 +36,7 @@ import { GithubTool } from "@gajae-code/coding-agent/tools/gh";
 import * as git from "@gajae-code/coding-agent/utils/git";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const SECRET_BODY = "ghp_SUPERSECRETTOKEN";
 const READ_ONLY_OPS = [
@@ -101,7 +102,7 @@ async function createSession(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry: { ...testModelRegistryConsumerLease } as never,
 		toolRegistry: new Map(tools.map(entry => [entry.name, entry])),
 	});
 	sess.setSdkPermissionMode(permissionMode);
