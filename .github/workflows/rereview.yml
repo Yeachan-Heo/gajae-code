@@ -1,0 +1,183 @@
+name: Re-request Review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  request-review-on-comment:
+    name: Re-request review via comment
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Check if comment is on a PR and starts with /rereview
+        id: check-comment
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const issue = context.issue;
+            const comment = context.payload.comment;
+            
+            // Check if this is a PR (has pull_request field)
+            if (!context.payload.pull_request) {
+              console.log('Not a PR, skipping');
+              return 'not-pr';
+            }
+            
+            // Check if comment starts with /rereview
+            if (!comment.body.trim().startsWith('/rereview')) {
+              console.log('Comment does not start with /rereview');
+              return 'no-match';
+            }
+            
+            return 'matched';
+
+      - name: Check authorization
+        if: steps.check-comment.outputs.result == 'matched'
+        id: check-auth
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const comment = context.payload.comment;
+            const commentAuthor = comment.user.login;
+            const prAuthor = pr.user.login;
+            
+            // Check if comment author is PR author
+            if (commentAuthor === prAuthor) {
+              return 'authorized';
+            }
+            
+            // Check if comment author has write permission
+            try {
+              const collaborator = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: commentAuthor,
+              });
+              
+              const permission = collaborator.data.permission;
+              if (permission === 'admin' || permission === 'write') {
+                return 'authorized';
+              }
+            } catch (error) {
+              console.log('Could not determine permission level:', error.message);
+            }
+            
+            return 'unauthorized';
+
+      - name: Get reviewers to re-request
+        if: steps.check-auth.outputs.result == 'authorized'
+        id: get-reviewers
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            
+            // Get all reviews on the PR
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+            });
+            
+            // Get currently requested reviewers
+            const currentlyRequested = new Set(
+              pr.requested_reviewers.map(r => r.login)
+            );
+            
+            // Find reviewers with CHANGES_REQUESTED or COMMENTED (latest review only)
+            const reviewerMap = new Map();
+            
+            for (const review of reviews.data) {
+              const reviewer = review.user.login;
+              
+              // Skip bots (check if user type is Bot)
+              if (review.user.type === 'Bot') {
+                continue;
+              }
+              
+              // Keep track of the latest review state for each reviewer
+              if (!reviewerMap.has(reviewer)) {
+                reviewerMap.set(reviewer, review);
+              } else {
+                const existing = reviewerMap.get(reviewer);
+                if (new Date(review.submitted_at) > new Date(existing.submitted_at)) {
+                  reviewerMap.set(reviewer, review);
+                }
+              }
+            }
+            
+            // Find reviewers whose latest review is CHANGES_REQUESTED or COMMENTED
+            // and who are not currently requested
+            const reviewersToRequest = [];
+            for (const [reviewer, review] of reviewerMap) {
+              if (
+                (review.state === 'CHANGES_REQUESTED' || review.state === 'COMMENTED') &&
+                !currentlyRequested.has(reviewer)
+              ) {
+                reviewersToRequest.push(reviewer);
+              }
+            }
+            
+            console.log('Reviewers to request:', reviewersToRequest);
+            return JSON.stringify(reviewersToRequest);
+
+      - name: Request reviews
+        if: steps.get-reviewers.outputs.result != '[]'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const reviewersStr = '${{ steps.get-reviewers.outputs.result }}';
+            const reviewers = JSON.parse(reviewersStr);
+            
+            if (reviewers.length === 0) {
+              console.log('No reviewers to request');
+              return 'no-op';
+            }
+            
+            await github.rest.pulls.requestReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              reviewers: reviewers,
+            });
+            
+            console.log('Requested reviews from:', reviewers);
+            return 'success';
+
+      - name: React to comment on success
+        if: steps.get-reviewers.outputs.result != '[]'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const comment = context.payload.comment;
+            
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: comment.id,
+              content: '+1',
+            });
+
+      - name: Reply to comment on no-op
+        if: steps.get-reviewers.outputs.result == '[]'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const comment = context.payload.comment;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: 'No reviewers to re-request (all with pending feedback are already requested).',
+            });
+
+

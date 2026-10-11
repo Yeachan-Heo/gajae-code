@@ -83,6 +83,10 @@ The `CI` workflow publishes a scheduled nightly prerelease from `main` at 04:23 
 - Relevant focused tests or checks are listed in the PR description.
 - User-facing changes include a changelog fragment under `packages/<pkg>/changelog.d/` when appropriate.
 
+## Re-requesting reviews
+
+If you want reviewers to re-examine your PR after addressing feedback, comment with `/rereview` and the workflow will automatically request review from all reviewers whose latest feedback was a request for changes or a comment (and who are not already requested).
+
 ## Approval requirement
 
 Merges to `dev` require one approving GitHub review from a write-access maintainer on the exact current head. This is enforced by the repository's native GitHub ruleset.
