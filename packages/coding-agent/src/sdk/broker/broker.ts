@@ -3138,7 +3138,16 @@ export class Broker {
 			for (const ref of restored.refs) this.#managedAttempts.set(ref.nativeIdentity, ref);
 			for (const root of restored.failedRoots) this.#managedFailedRoots.add(root);
 		} catch {
-			this.#managedEnrollmentFailed = true;
+			// Only mark enrollment as failed if there was enrollment data to begin with.
+			// A fresh environment with no enrollment index is not a failure.
+			try {
+				const enrollment = await loadManagedEnrollmentRecord(this.settings.agentDir);
+				if (enrollment.controlRoots.length > 0) {
+					this.#managedEnrollmentFailed = true;
+				}
+			} catch {
+				// If we can't even check enrollment status, don't fail startup for an empty environment.
+			}
 		}
 	}
 
