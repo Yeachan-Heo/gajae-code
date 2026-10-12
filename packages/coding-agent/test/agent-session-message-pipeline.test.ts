@@ -39,8 +39,13 @@ function createAgent(): Agent {
 
 describe("AgentSession message pipeline", () => {
 	const sessions: AgentSession[] = [];
+	const releaseHeldIntegrations = new Set<() => void>();
 
 	afterEach(async () => {
+		// Restore the clock and release test-owned work even when a test times out.
+		vi.useRealTimers();
+		for (const release of releaseHeldIntegrations) release();
+		releaseHeldIntegrations.clear();
 		vi.restoreAllMocks();
 		__agentSessionPerfCounters.reset();
 		__sessionStateSidecarPerfCounters.reset();
@@ -1029,6 +1034,8 @@ describe("AgentSession message pipeline", () => {
 		const integrationStarted = Promise.withResolvers<void>();
 		const sdkIntegrationStarted = Promise.withResolvers<void>();
 		const releaseIntegration = Promise.withResolvers<void>();
+		releaseHeldIntegrations.add(releaseIntegration.resolve);
+		let freezeNextIntegrationDeadline = false;
 		let integrationRequests = 0;
 		let failIntegration = false;
 		let neverSettle = false;
@@ -1067,13 +1074,21 @@ describe("AgentSession message pipeline", () => {
 				if (failIntegration) throw new Error("worker integration failed");
 				integrationStarted.resolve();
 				if (neverSettle) {
-					sdkIntegrationStarted.resolve();
-					return new Promise<void>(resolve => {
-						signal.addEventListener("abort", () => {
-							integrationAborted = true;
-							resolve();
-						});
+					// Freeze only after prompt admission, before the scheduler arms its
+					// deadline. Unrelated preflight timers must continue to run normally.
+					if (freezeNextIntegrationDeadline) {
+						freezeNextIntegrationDeadline = false;
+						vi.useFakeTimers();
+					}
+					const completion = Promise.withResolvers<void>();
+					releaseHeldIntegrations.add(completion.resolve);
+					signal.addEventListener("abort", () => {
+						integrationAborted = true;
+						completion.resolve();
+						releaseHeldIntegrations.delete(completion.resolve);
 					});
+					sdkIntegrationStarted.resolve();
+					return completion.promise;
 				}
 				return releaseIntegration.promise;
 			},
@@ -1098,31 +1113,36 @@ describe("AgentSession message pipeline", () => {
 		expect(integrationRequests).toBe(1);
 
 		// SDK/ACP settlement must not wait for post-prompt recovery. A recovery
-		// request that ignores its abort signal represents the subagent/tool work
-		// seen in the field: the correlated agent_end is still the terminal
-		// boundary and must reach the client before that work drains.
+		// request that stays pending until its deadline represents subagent/tool
+		// work: the correlated agent_end must reach the client before it drains.
+		// Worker integration starts at turn_end, so observe terminal publication
+		// itself instead of assuming continuation checks finish in one timer tick.
+		freezeNextIntegrationDeadline = true;
 		neverSettle = true;
 		integrationAborted = false;
 		const sdkSubmission = session.sendUserMessage("sdk terminal fast path", {
 			sdkRunCapability: createSdkRunCapability("sdk-terminal-fast-path"),
 		} as never);
 		const secondAgentEnd = Promise.withResolvers<void>();
+		void sdkSubmission.catch(secondAgentEnd.reject);
 		const unsubscribe = session.subscribe(event => {
 			if (event.type === "agent_end" && events.filter(candidate => candidate.type === "agent_end").length >= 2)
 				secondAgentEnd.resolve();
 		});
 		try {
 			await sdkIntegrationStarted.promise;
-			await Bun.sleep(0);
-			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
 			await secondAgentEnd.promise;
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
+			expect(integrationAborted).toBe(false);
+			await sdkSubmission;
+			expect(integrationAborted).toBe(false);
+			vi.advanceTimersByTime(10);
+			expect(integrationAborted).toBe(true);
 		} finally {
+			vi.useRealTimers();
+			freezeNextIntegrationDeadline = false;
 			unsubscribe();
 		}
-		expect(integrationAborted).toBe(false);
-		await sdkSubmission;
-		await Bun.sleep(25);
-		expect(integrationAborted).toBe(true);
 
 		failIntegration = true;
 		await session.prompt("again");
