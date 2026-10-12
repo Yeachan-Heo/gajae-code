@@ -35,6 +35,7 @@ function makeSession(overrides: Record<string, unknown> = {}): any {
 		"astGrep.enabled": true,
 		"astEdit.enabled": true,
 		"renderMermaid.enabled": true,
+		"reportIssue.enabled": true,
 		"web_search.enabled": true,
 		"calc.enabled": true,
 		"skill.enabled": true,
@@ -128,6 +129,7 @@ describe("tool descriptor compatibility gate", () => {
 			"skill",
 			"goal",
 			"move_session",
+			"report_issue",
 		];
 		expect(Object.keys(BUILTIN_TOOLS)).toEqual(expectedBuiltin);
 		expect(Object.keys(BUILTIN_TOOL_DESCRIPTORS)).toEqual(expectedBuiltin);
@@ -291,6 +293,7 @@ describe("tool descriptor compatibility gate", () => {
 			"astGrep.enabled": false,
 			"astEdit.enabled": false,
 			"renderMermaid.enabled": false,
+			"reportIssue.enabled": false,
 			"web_search.enabled": false,
 			"calc.enabled": false,
 			"skill.enabled": false,
@@ -313,6 +316,7 @@ describe("tool descriptor compatibility gate", () => {
 			"ast_grep",
 			"ast_edit",
 			"render_mermaid",
+			"report_issue",
 			"web_search",
 			"calc",
 			"skill",

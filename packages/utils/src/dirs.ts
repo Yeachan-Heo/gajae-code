@@ -859,6 +859,11 @@ export function getNativesDir(): string {
 	return dirs.rootSubdir("natives", "cache");
 }
 
+/** Get the local tool-issue report database path (~/.gjc/tool-issues.db). */
+export function getToolIssuesDbPath(): string {
+	return dirs.rootSubdir("tool-issues.db", "data");
+}
+
 /** Get the stats database path (~/.gjc/stats.db). */
 export function getStatsDbPath(): string {
 	return dirs.rootSubdir("stats.db", "data");

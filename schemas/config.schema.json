@@ -2486,6 +2486,17 @@
 			},
 			"additionalProperties": false
 		},
+		"reportIssue": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable the report_issue tool: the model records tool behavior that contradicts the tool's description into the local ~/.gjc/tool-issues.db. Nothing is sent anywhere.",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"debug": {
 			"type": "object",
 			"properties": {

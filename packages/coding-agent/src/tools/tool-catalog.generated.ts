@@ -2955,6 +2955,34 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 		"concurrency": "exclusive",
 		"intent": "omit"
 	},
+	"report_issue": {
+		"name": "report_issue",
+		"label": "Report Issue",
+		"description": "Records a tool that behaved inconsistently with its own description, for local quality tracking.\n\n<instruction>\n- Call this when a tool's output contradicts what its description or parameters promise: ignored or misapplied parameters, wrong or truncated results, misleading errors, silent no-ops.\n- `tool` is the misbehaving tool's name; `report` states what you called, what you expected, and what actually happened, in one or two sentences.\n- Do not report your own mistakes, user-caused failures, or expected errors (missing files, failing tests, network outages).\n- False positives are acceptable. Report once per distinct problem, then continue the task; this never fixes or retries anything.\n</instruction>\n\n<output>\nConfirms whether the report was recorded. Reports stay on this machine.\n</output>",
+		"parameters": {
+			"type": "object",
+			"properties": {
+				"tool": {
+					"type": "string",
+					"description": "name of the tool that misbehaved"
+				},
+				"report": {
+					"type": "string",
+					"description": "what was called, what was expected, what happened"
+				}
+			},
+			"required": [
+				"tool",
+				"report"
+			],
+			"additionalProperties": false
+		},
+		"strict": true,
+		"deferrable": false,
+		"loadMode": "essential",
+		"summary": "Record a tool that behaved inconsistently with its description",
+		"intent": "omit"
+	},
 	"yield": {
 		"name": "yield",
 		"label": "Submit Result",
