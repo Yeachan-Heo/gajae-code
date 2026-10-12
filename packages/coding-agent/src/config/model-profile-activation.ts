@@ -1710,13 +1710,27 @@ export async function prepareModelProfileActivation(
 		}
 		for (const [role, value] of installedState?.modelRoles ?? []) {
 			if (manualModelRoleOverrides.has(role)) continue;
-			if (value === undefined) delete baseModelRoles[role];
-			else baseModelRoles[role] = value;
+			// Only restore baseline if this role is also in the new profile.
+			// Otherwise, clear it completely since the new profile doesn't define it.
+			if (!modelRoles.hasOwnProperty(role)) {
+				delete baseModelRoles[role];
+			} else if (value === undefined) {
+				delete baseModelRoles[role];
+			} else {
+				baseModelRoles[role] = value;
+			}
 		}
 		for (const [role, value] of installedState?.agentModelOverrides ?? []) {
 			if (manualAgentModelOverrides.has(role)) continue;
-			if (value === undefined) delete baseAgentModelOverrides[role];
-			else baseAgentModelOverrides[role] = value;
+			// Only restore baseline if this role is also in the new profile.
+			// Otherwise, clear it completely since the new profile doesn't define it.
+			if (!agentModelOverrides.hasOwnProperty(role)) {
+				delete baseAgentModelOverrides[role];
+			} else if (value === undefined) {
+				delete baseAgentModelOverrides[role];
+			} else {
+				baseAgentModelOverrides[role] = value;
+			}
 		}
 		const preparedDefaultModelSelection =
 			options.prepareSessionModelSelection && defaultModel

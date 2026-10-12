@@ -1675,13 +1675,23 @@ export class AsyncJobManager {
 		for (const target of lease.targets) {
 			const executions = state.backingExecutions.get(target.subagentId) ?? [];
 			const capture = state.records.get(target.subagentId);
-			if (
-				target.source === "record" &&
-				capture &&
-				this.#subagentRecords.get(target.subagentId) === capture.record &&
-				capture.record.status === "queued"
-			) {
-				this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
+			// Cancel queued subagents for this owner
+			if (target.source === "record" && target.jobId === null) {
+				const rec = this.#subagentRecords.get(target.subagentId);
+				if (rec && rec.status === "queued" && rec.ownerId === lease.ownerId) {
+					const idx = this.#resumeQueue.findIndex(e => e.subagentId === rec.subagentId);
+					const queuedSeq = rec.queued?.seq;
+					if (idx !== -1) this.#resumeQueue.splice(idx, 1);
+					rec.status = "cancelled";
+					if (queuedSeq !== undefined) {
+						this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "cancelled");
+						rec.terminalQueuedSeq = queuedSeq;
+						this.#retireQueuedOwned(rec);
+					}
+					rec.queued = undefined;
+					this.#subagentProgress.delete(rec.subagentId);
+					this.#notifyChange();
+				}
 			}
 			for (const execution of executions) {
 				this.#cancelExactExecution(execution);
@@ -1695,6 +1705,20 @@ export class AsyncJobManager {
 				if (row && row.generation === capture.currentJobGeneration) continue;
 				record.status = "cancelled";
 				this.#liveHandles.delete(record.subagentId);
+				this.#subagentProgress.delete(record.subagentId);
+				this.#notifyChange();
+			}
+			if (record.status === "queued") {
+				const idx = this.#resumeQueue.findIndex(e => e.subagentId === record.subagentId);
+				if (idx !== -1) this.#resumeQueue.splice(idx, 1);
+				const queuedSeq = record.queued?.seq;
+				record.status = "cancelled";
+				if (queuedSeq !== undefined) {
+					this.#publishQueuedTerminal(record.subagentId, `queued:${record.subagentId}:${queuedSeq}`, "cancelled");
+					record.terminalQueuedSeq = queuedSeq;
+					this.#retireQueuedOwned(record);
+				}
+				record.queued = undefined;
 				this.#subagentProgress.delete(record.subagentId);
 				this.#notifyChange();
 			}
@@ -1737,10 +1761,15 @@ export class AsyncJobManager {
 	): boolean {
 		const capture = state.records.get(target.subagentId);
 		const record = capture?.record;
+		if (!record || this.#subagentRecords.get(target.subagentId) !== record || record.ownerId !== ownerId) {
+			return false;
+		}
+		// Queued subagents (target.jobId === null) do not have backing executions.
+		// They are terminal for shutdown purposes — they'll be drained from the queue
+		// when the owner resumes operations or are abandoned on disposal.
+		if (target.jobId === null) return true;
+		// For non-queued records, verify currentJobId/Generation match and status is terminal.
 		if (
-			!record ||
-			this.#subagentRecords.get(target.subagentId) !== record ||
-			record.ownerId !== ownerId ||
 			record.currentJobId !== capture.currentJobId ||
 			record.currentJobGeneration !== capture.currentJobGeneration ||
 			!this.#isTerminalSubagentStatus(record.status)
