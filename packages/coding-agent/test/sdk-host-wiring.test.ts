@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, spyOn, test, vi } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
@@ -18,6 +18,7 @@ import { type AssistantMessage, closeModelCache, getBundledModel } from "@gajae-
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import { $ } from "bun";
 import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
@@ -148,6 +149,9 @@ type SdkPermissionProvider =
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
 afterEach(async () => {
+	// A timed-out test can still be unwinding asynchronous shutdown. Restore
+	// process-wide spies before cleanup or the next test observes its frozen clock.
+	vi.restoreAllMocks();
 	await Promise.all(sockets.splice(0).map(closeSocket));
 	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
 	if (process.platform === "win32") {
@@ -727,6 +731,9 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 test("a blocked Telegram ownership race preserves the canonical endpoint and withholds adapters", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
+	// Own the repository boundary instead of assuming the host's temporary
+	// directory has no Git ancestor. The canonical locator stays exact.
+	await $`git -C ${cwd} init --quiet`;
 	const agentDir = path.join(cwd, "agent");
 	const sessionId = `telegram-sibling-isolation-${Date.now()}`;
 	const base = Settings.isolated({
@@ -784,7 +791,7 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 	expect(sessions).toContainEqual(
 		expect.objectContaining({
 			sessionId,
-			locator: { cwd: path.resolve(cwd), worktreeRoot: null, stateRoot },
+			locator: { cwd: path.resolve(cwd), worktreeRoot: path.resolve(cwd), stateRoot },
 			endpointMtimeMs: fs.statSync(defaultEndpoint).mtimeMs,
 			lifecycleRequestId,
 		}),
@@ -3188,15 +3195,17 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 			result: { status: "failed", error: { code: "prompt_deadline_exceeded" } },
 		});
 	} finally {
-		try {
-			predecessorDispatchReady.resolve();
-			settleSubmissions();
-			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-		} finally {
-			leaseClock.mockRestore();
-		}
+		// Shutdown may await real socket/disk work; it must not keep the process
+		// clock frozen if that work fails or the outer test budget expires.
+		leaseClock.mockRestore();
+		predecessorDispatchReady.resolve();
+		settleSubmissions();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
-});
+	// Three real host generations use the same bounded lifecycle budget as the
+	// neighboring restart tests. The controlled 500 ms/350 ms lease assertions
+	// above remain independent of this socket, disk and teardown allowance.
+}, 60_000);
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
