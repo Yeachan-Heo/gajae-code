@@ -17,6 +17,28 @@ describe("hostHeaderMatchesBind", () => {
 		expect(hostHeaderMatchesBind(null, bind)).toBe(false);
 	});
 
+	test("still allows a Host without a port on a port-80 listener", () => {
+		expect(hostHeaderMatchesBind("127.0.0.1", parseBind("127.0.0.1:80"))).toBe(true);
+		expect(hostHeaderMatchesBind("[::1]", parseBind("[::1]:80"))).toBe(true);
+		expect(hostHeaderMatchesBind("attacker.example", parseBind("127.0.0.1:80"))).toBe(false);
+		expect(hostHeaderMatchesBind("127.0.0.1", parseBind("127.0.0.1:443"))).toBe(false);
+		expect(hostHeaderMatchesBind("127.0.0.1", parseBind("127.0.0.1:4000"))).toBe(false);
+	});
+
+	test("still allows Host :80 on an http port-80 listener", () => {
+		expect(hostHeaderMatchesBind("127.0.0.1:80", parseBind("127.0.0.1:80"))).toBe(true);
+		expect(hostHeaderMatchesBind("[::1]:80", parseBind("[::1]:80"))).toBe(true);
+		expect(hostHeaderMatchesBind("127.0.0.1:80", parseBind("127.0.0.1:443"))).toBe(false);
+		expect(hostHeaderMatchesBind("attacker.example:80", parseBind("127.0.0.1:80"))).toBe(false);
+	});
+
+	test("still allows Host :443 on a port-443 listener", () => {
+		expect(hostHeaderMatchesBind("127.0.0.1:443", parseBind("127.0.0.1:443"))).toBe(true);
+		expect(hostHeaderMatchesBind("[::1]:443", parseBind("[::1]:443"))).toBe(true);
+		expect(hostHeaderMatchesBind("127.0.0.1:443", parseBind("127.0.0.1:80"))).toBe(false);
+		expect(hostHeaderMatchesBind("attacker.example:443", parseBind("127.0.0.1:443"))).toBe(false);
+	});
+
 	test("accepts a bracketed IPv6 loopback bind", () => {
 		const bind = parseBind("[::1]:4000");
 		expect(hostHeaderMatchesBind("[::1]:4000", bind)).toBe(true);

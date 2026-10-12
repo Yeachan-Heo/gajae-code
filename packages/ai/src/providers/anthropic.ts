@@ -1246,7 +1246,9 @@ function parseAnthropicCustomHeaders(rawHeaders: string | undefined): Record<str
 function resolveAnthropicCustomHeaders(model: Model<"anthropic-messages">): Record<string, string> | undefined {
 	if (model.provider !== "anthropic") return undefined;
 	if (!isFoundryEnabled()) return undefined;
-	return parseAnthropicCustomHeaders($env.ANTHROPIC_CUSTOM_HEADERS);
+	return parseAnthropicCustomHeaders(
+		trustedFoundryHeaderValue("ANTHROPIC_CUSTOM_HEADERS", startupProjectEnvSnapshot()),
+	);
 }
 
 function looksLikeFilePath(value: string): boolean {
@@ -1294,6 +1296,23 @@ function trustedFoundryTlsValue(name: string, snapshot: ProjectEnvSnapshot): str
 	) {
 		return undefined;
 	}
+	return raw;
+}
+
+/**
+ * Operator environment only, for Foundry request headers.
+ *
+ * A `$` / backtick declaration, or a value equal to the project declaration,
+ * is ignored. Literal `\n` in that declaration is not decoded: Bun decodes it
+ * only inside double quotes, and decoding every declaration would also drop
+ * an operator value that is a real newline.
+ */
+function trustedFoundryHeaderValue(name: string, snapshot: ProjectEnvSnapshot): string | undefined {
+	const raw = $env[name];
+	if (!raw) return undefined;
+	const key = canonicalEnvKey(name);
+	const declared = snapshot.values[key];
+	if (declared !== undefined && (snapshot.dynamic.has(key) || declared === raw)) return undefined;
 	return raw;
 }
 

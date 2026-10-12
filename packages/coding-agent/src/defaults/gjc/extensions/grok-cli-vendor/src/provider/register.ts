@@ -7,6 +7,7 @@ import { Effort } from '@gajae-code/ai/model-thinking';
 import type { OAuthCredentials, OAuthLoginCallbacks } from '@gajae-code/ai/utils/oauth/types';
 import { loginXai, refreshXaiToken, XAI_OAUTH_SCOPE } from '@gajae-code/ai/utils/oauth/xai';
 import type { ExtensionAPI, ProviderConfig } from '@gajae-code/coding-agent';
+import { tagProviderRequestHandler } from '../../../../../../extensibility/extensions/function-hooks-internal';
 import {
   type GrokCliModelConfig,
   getMaxReasoningEffort,
@@ -102,13 +103,16 @@ export default function registerGrokCli(api: ExtensionAPI) {
     }
   });
 
-  api.on('before_provider_request', (event, ctx) => {
-    if (ctx.model?.provider !== 'grok-build') return;
+  api.on(
+    'before_provider_request',
+    tagProviderRequestHandler('grok-build', (event, ctx) => {
+      if (ctx.model?.provider !== 'grok-build') return;
 
-    const modelId = ctx.model?.id ?? '';
-    const sessionId = ctx.sessionManager?.getSessionId();
-    return sanitizePayload(event.payload as Record<string, unknown>, modelId, sessionId, ctx.cwd);
-  });
+      const modelId = ctx.model?.id ?? '';
+      const sessionId = ctx.sessionManager?.getSessionId();
+      return sanitizePayload(event.payload as Record<string, unknown>, modelId, sessionId, ctx.cwd);
+    }),
+  );
 
   registerUsageCommand(api);
 }

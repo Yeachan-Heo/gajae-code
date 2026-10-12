@@ -1005,8 +1005,7 @@ export async function readContainedFile(
 		rootIdentity = capturedRoot;
 		if (
 			expectedRootIdentity !== undefined &&
-			(rootIdentity.dev !== BigInt(expectedRootIdentity.dev) ||
-				rootIdentity.ino !== BigInt(expectedRootIdentity.ino))
+			(rootIdentity.dev !== expectedRootIdentity.dev || rootIdentity.ino !== expectedRootIdentity.ino)
 		)
 			return null;
 		await SkillDiscoveryTestHooks.afterContainedRootValidated?.(root);

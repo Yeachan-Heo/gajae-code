@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
+import { SessionManager } from "../src/session/session-manager";
 import {
 	assertExecutedScenarios,
+	assertManagedTranscript,
 	assertScenarioReport,
 	EMPTY_STOP_SCENARIOS,
 	handleProviderRequest,
@@ -68,6 +72,31 @@ async function chunks(response: Response): Promise<Array<Record<string, unknown>
 }
 
 describe("managed empty-stop harness local contracts (no connected scenarios)", () => {
+	test("rejects missing accepted messages and leaked provisional attempts on disk", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-stop-transcript-"));
+		const manager = SessionManager.create(root, path.join(root, "sessions"));
+		const accepted = successfulReport().assistantMessages;
+		try {
+			await expect(assertManagedTranscript(manager, accepted)).rejects.toMatchObject({
+				code: "ERR_ASSERTION",
+				actual: [],
+				expected: accepted,
+			});
+			manager.appendMessage(accepted[0]!);
+			await assertManagedTranscript(manager, accepted);
+			const rejected: AssistantMessage = { ...assistant(""), model: "primary", stopReason: "error" };
+			manager.appendMessage(rejected);
+			await expect(assertManagedTranscript(manager, accepted)).rejects.toMatchObject({
+				code: "ERR_ASSERTION",
+				actual: [...accepted, rejected],
+				expected: accepted,
+			});
+		} finally {
+			await manager.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("selects all scenarios by default and rejects unknown names", () => {
 		expect(scenarioNames([])).toEqual([...EMPTY_STOP_SCENARIOS]);
 		expect(scenarioNames(["untyped-fallback"])).toEqual(["untyped-fallback"]);
@@ -78,10 +107,10 @@ describe("managed empty-stop harness local contracts (no connected scenarios)", 
 		expect(() => assertExecutedScenarios(count)).toThrow("Zero scenarios executed");
 	});
 
-	test("fails CLI validation with exit one and explicitly reports zero executions", async () => {
+	test.each(["invalid-scenario", ""])("rejects CLI selection %j with zero executions", async selection => {
 		// Invalid selection never constructs a session or binds a server.
 		const child = Bun.spawn(
-			[process.execPath, path.resolve(import.meta.dir, "../scripts/verify-managed-empty-stop.ts"), "unknown"],
+			[process.execPath, path.resolve(import.meta.dir, "../scripts/verify-managed-empty-stop.ts"), selection],
 			{ stdout: "pipe", stderr: "pipe" },
 		);
 		const [exit, stdout, stderr] = await Promise.all([

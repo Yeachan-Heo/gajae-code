@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { PromptDeadlineManager } from "../src/sdk/prompt-deadline-manager";
+import { failedPromptOutcome } from "../src/sdk/prompt-failure";
 
 /**
  * Issue #4668 exact-head review (P1): when expiry reconciliation fails, the
@@ -859,6 +860,111 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		await Bun.sleep(150);
 		expect(state.uncertainCalls).toBe(1);
 		expect(manager.has(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	const deadlineExceeded = () =>
+		failedPromptOutcome({
+			code: "prompt_deadline_exceeded",
+			provenance: "deadline",
+			evidence: {},
+		});
+
+	test("a drained renewal whose new lease is already due publishes on the follow-up expiry", async () => {
+		// The tool-boundary wait captures one generation, then tool_execution_end
+		// renews the lease. On a slow runner that wait outlives the renewal, so
+		// the new deadline is already due when the wait returns. Time-only
+		// supersession used to keep the stale pass, the publisher refused the
+		// old generation, and uncertainty recovery refused the same mismatch —
+		// the prompt stayed in flight until settledStatus gave up.
+		let now = 0;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let terminalizations = 0;
+		let publications = 0;
+		const currentAtTerminalization: boolean[] = [];
+		const { reconciliation, state } = fakeReconciliation();
+		let manager: PromptDeadlineManager;
+		manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 250,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onDeadlineTerminalization: async (correlation, isCurrent) => {
+				terminalizations += 1;
+				if (terminalizations === 1) {
+					started.resolve();
+					await release.promise;
+				}
+				currentAtTerminalization.push(isCurrent());
+				if (!isCurrent()) return "uncertain";
+				manager.noteTerminalTransition(correlation, undefined, { outcome: deadlineExceeded() }, true);
+				return "settled";
+			},
+			onDeadlinePublishTerminal: async (_correlation, isCurrent) => {
+				if (!isCurrent()) return false;
+				publications += 1;
+				state.status = "failed";
+				return { published: true, outcome: deadlineExceeded() };
+			},
+		});
+		const correlation = { commandId: "cmd-drained-lease", turnId: "turn-drained-lease" };
+		manager.onAccepted(correlation);
+		now = 250;
+		await started.promise;
+		now = 800;
+		manager.onAttributableEvent(correlation, "tool_execution_end", 500);
+		release.resolve();
+		const deadline = Date.now() + 2_000;
+		while (publications === 0 && Date.now() < deadline) await Bun.sleep(10);
+		expect(publications).toBe(1);
+		expect(state.status).toBe("failed");
+		expect(state.uncertainCalls).toBe(0);
+		expect(currentAtTerminalization[0]).toBe(false);
+		expect(terminalizations).toBeGreaterThanOrEqual(2);
+		manager.clearAll();
+	});
+
+	test("progress during the flush whose renewed lease is already due publishes on the follow-up expiry", async () => {
+		let now = 0;
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		let publications = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		let manager: PromptDeadlineManager;
+		manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 250,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onDeadlineTerminalization: async (correlation, isCurrent) => {
+				if (!isCurrent()) return "uncertain";
+				manager.noteTerminalTransition(correlation, undefined, { outcome: deadlineExceeded() }, true);
+				return "settled";
+			},
+			onDeadlineExceeded: async () => {
+				flushStarted.resolve();
+				await releaseFlush.promise;
+			},
+			onDeadlinePublishTerminal: async (_correlation, isCurrent) => {
+				if (!isCurrent()) return false;
+				publications += 1;
+				state.status = "failed";
+				return { published: true, outcome: deadlineExceeded() };
+			},
+		});
+		const correlation = { commandId: "cmd-flush-lease", turnId: "turn-flush-lease" };
+		manager.onAccepted(correlation);
+		now = 250;
+		await flushStarted.promise;
+		now = 800;
+		manager.onAttributableEvent(correlation, "tool_execution_update", 500);
+		releaseFlush.resolve();
+		const deadline = Date.now() + 2_000;
+		while (publications === 0 && Date.now() < deadline) await Bun.sleep(10);
+		expect(publications).toBe(1);
+		expect(state.status).toBe("failed");
+		expect(state.uncertainCalls).toBe(0);
 		manager.clearAll();
 	});
 });

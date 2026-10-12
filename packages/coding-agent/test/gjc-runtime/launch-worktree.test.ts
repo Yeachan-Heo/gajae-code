@@ -458,8 +458,9 @@ describe("default launch worktrees", () => {
 	it("allows a valid directory symlink or Windows junction as the worktree bucket", async () => {
 		const repo = await createRepo("gjc-launch-valid-bucket-symlink-");
 		const bucket = path.join(repo, ".worktrees");
-		const target = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-target-"));
-		cleanupPaths.push(target);
+		// The target stays inside the repo. A symlink that leaves the repo is refused below.
+		const target = path.join(repo, "inside-worktree-bucket");
+		await fs.mkdir(target);
 		await fs.symlink(target, bucket, process.platform === "win32" ? "junction" : "dir");
 
 		const launched = prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
@@ -470,6 +471,36 @@ describe("default launch worktrees", () => {
 		const reused = prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
 		expect(await fs.realpath(reused.cwd)).toBe(await fs.realpath(expectedPath));
 		expect(reused.worktree.enabled && reused.worktree.reused).toBe(true);
+		expect(path.relative(await fs.realpath(repo), await fs.realpath(launched.cwd)).startsWith("..")).toBe(false);
+	});
+
+	it("refuses a gitignored in-repo bucket symlink that resolves to a sibling outside the repository", async () => {
+		const repo = await createRepo("gjc-launch-bucket-symlink-escape-");
+		expect(await Bun.file(path.join(repo, ".gitignore")).text()).toContain(".worktrees");
+		const outside = await fs.mkdtemp(path.join(path.dirname(repo), "gjc-launch-bucket-outside-"));
+		cleanupPaths.push(outside);
+		const bucket = path.join(repo, ".worktrees");
+		await fs.symlink(outside, bucket, process.platform === "win32" ? "junction" : "dir");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+			/worktree_bucket_escapes_repository/,
+		);
+		expect(await fs.readdir(outside)).toEqual([]);
+		expect(fsSync.existsSync(path.join(outside, testSlug("feature/demo")))).toBe(false);
+		expect((await fs.lstat(bucket)).isSymbolicLink()).toBe(true);
+	});
+
+	it("allows an ordinary ignored in-repo directory bucket", async () => {
+		const repo = await createRepo("gjc-launch-bucket-ignored-directory-");
+		const bucket = path.join(repo, ".worktrees");
+		await fs.mkdir(bucket);
+
+		const launched = prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
+		const expectedPath = path.join(bucket, testSlug("feature/demo"));
+
+		expect(await fs.realpath(launched.cwd)).toBe(await fs.realpath(expectedPath));
+		expect(path.relative(await fs.realpath(repo), await fs.realpath(launched.cwd)).startsWith("..")).toBe(false);
+		expect(launched.worktree.enabled && launched.worktree.created).toBe(true);
 	});
 
 	it("reports a symlink to a non-directory target without disclosing or deleting the target", async () => {

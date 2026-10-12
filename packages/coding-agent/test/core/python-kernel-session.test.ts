@@ -13,6 +13,7 @@ class FakeKernel {
 	shutdownCalls = 0;
 	alive = true;
 	readonly id: string;
+	private _exitCode: number | null = null;
 
 	constructor(id: string) {
 		this.id = id;
@@ -36,6 +37,14 @@ class FakeKernel {
 
 	async ping(): Promise<boolean> {
 		return this.alive;
+	}
+
+	getExitCode(): number | null {
+		return this._exitCode;
+	}
+
+	setExitCode(code: number | null): void {
+		this._exitCode = code;
 	}
 }
 

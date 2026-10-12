@@ -49,6 +49,10 @@ const RESIDUAL_PATTERNS: readonly RegExp[] = [
 	/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./,
 	/\bxox[baprs]-[A-Za-z0-9-]{8,}/,
 	/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+	// Same shapes `redactCrashSecrets` rewrites. A survivor means this scanner
+	// is not certain, so the submission is refused rather than sent raw.
+	/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{0,39}[/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/,
+	/(?<![A-Za-z0-9_%])session(?:id|[_-]id)%3[Dd][A-Za-z0-9._~%-]{8,}/i,
 	// Opaque URIs the URL rule cannot parse into an origin, and inline payloads.
 	/\bdata:[^\s]{0,64};base64,/i,
 	/:\/\//,

@@ -163,6 +163,51 @@ describe("TUI bottom-pinned layout", () => {
 	}
 
 	for (const isProcessTerminal of [false, true]) {
+		it(`replays contracted output without spacer rows when clearOnShrink is enabled (${isProcessTerminal ? "process" : "virtual"} terminal)`, async () => {
+			const term = new VirtualTerminal(40, 6, { isProcessTerminal });
+			const tui = new TUI(term);
+			tui.setClearOnShrink(true);
+			const transcript = new MutableLinesComponent(["transcript-0", "transcript-1", "transcript-2"]);
+			const working = new MutableLinesComponent(["working-0", "working-1", "working-2"]);
+			const status = new LinesComponent(["status"]);
+
+			tui.addChild(transcript);
+			tui.addChild(working);
+			tui.addChild(status);
+			tui.setBottomPinnedComponent(status);
+
+			try {
+				tui.start();
+				await term.waitForRender();
+
+				transcript.setLines(Array.from({ length: 14 }, (_value, index) => `transcript-${index}`));
+				tui.requestRender();
+				await term.waitForRender();
+
+				working.setLines([]);
+				tui.requestRender();
+				await term.waitForRender();
+
+				expect(term.getViewport().map(line => line.trimEnd())).toEqual([
+					"transcript-9",
+					"transcript-10",
+					"transcript-11",
+					"transcript-12",
+					"transcript-13",
+					"status",
+				]);
+				const scrollBuffer = term.getScrollBuffer().map(line => line.trimEnd());
+				expect(scrollBuffer.filter(line => line.startsWith("transcript-"))).toEqual(
+					Array.from({ length: 14 }, (_value, index) => `transcript-${index}`),
+				);
+				expect(scrollBuffer.some(line => line.startsWith("working-"))).toBe(false);
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	for (const isProcessTerminal of [false, true]) {
 		describe(`frontier preservation with ${isProcessTerminal ? "process" : "virtual"} terminal`, () => {
 			it("preserves the committed frontier when following live after manual-history output", async () => {
 				const term = new VirtualTerminal(40, 6, { isProcessTerminal });

@@ -213,3 +213,189 @@ describe("SearXNG web search provider", () => {
 		expect(captured.headers?.get("Authorization")).toBe("Bearer bearer-token");
 	});
 });
+
+describe("SearXNG project endpoint credential boundary", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		resetSettingsForTest();
+		delete process.env.SEARXNG_ENDPOINT;
+		delete process.env.SEARXNG_TOKEN;
+		delete process.env.SEARXNG_BASIC_USERNAME;
+		delete process.env.SEARXNG_BASIC_PASSWORD;
+		await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+	});
+
+	async function projectSettings(searxng: Record<string, unknown>): Promise<Settings> {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "searxng-project-endpoint-"));
+		tempDirs.push(root);
+		const projectDir = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await Bun.write(path.join(projectDir, ".gjc", "settings.json"), JSON.stringify({ searxng }));
+		return Settings.loadReadonly({ cwd: projectDir, agentDir });
+	}
+
+	async function captureSearch(query: string, activeSettings?: Settings) {
+		const captured: { url?: URL; headers?: Headers } = {};
+		using _hook = hookFetch((input, init) => {
+			captured.url = new URL(input.toString());
+			captured.headers = new Headers(init?.headers);
+			return new Response(
+				JSON.stringify({
+					results: [{ title: "Result", url: "https://example.com/result", content: "snippet" }],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		const response = await searchSearXNG({ query, settings: activeSettings });
+		return { captured, response };
+	}
+
+	it("does not send an operator env token to a project settings endpoint", async () => {
+		const activeSettings = await projectSettings({ endpoint: "https://attacker.example" });
+		process.env.SEARXNG_TOKEN = "operator-token";
+		process.env.SEARXNG_BASIC_USERNAME = "alice";
+		process.env.SEARXNG_BASIC_PASSWORD = "s3cret";
+
+		const { captured, response } = await captureSearch("project endpoint", activeSettings);
+
+		expect(captured.url?.origin).toBe("https://attacker.example");
+		expect(captured.url?.searchParams.get("q")).toBe("project endpoint");
+		expect(captured.headers?.get("Authorization")).toBeNull();
+		expect(response).toMatchObject({
+			provider: "searxng",
+			sources: [{ title: "Result", url: "https://example.com/result", snippet: "snippet" }],
+		});
+	});
+
+	it("still sends an operator env token to an operator env endpoint", async () => {
+		process.env.SEARXNG_ENDPOINT = "https://searx.example.org";
+		process.env.SEARXNG_TOKEN = "operator-token";
+
+		const { captured, response } = await captureSearch("operator endpoint");
+
+		expect(captured.url?.origin).toBe("https://searx.example.org");
+		expect(captured.headers?.get("Authorization")).toBe("Bearer operator-token");
+		expect(response.provider).toBe("searxng");
+		expect(response.sources.length).toBeGreaterThan(0);
+	});
+
+	it("still sends an operator env token to an operator settings endpoint", async () => {
+		process.env.SEARXNG_TOKEN = "operator-token";
+		const activeSettings = Settings.isolated({ "searxng.endpoint": "https://searx.example.org" });
+
+		const { captured } = await captureSearch("operator settings endpoint", activeSettings);
+
+		expect(captured.url?.origin).toBe("https://searx.example.org");
+		expect(captured.headers?.get("Authorization")).toBe("Bearer operator-token");
+	});
+
+	it("still sends a credential that the project settings set themselves", async () => {
+		const activeSettings = await projectSettings({
+			endpoint: "https://attacker.example",
+			token: "project-token",
+		});
+		process.env.SEARXNG_TOKEN = "operator-token";
+
+		const { captured, response } = await captureSearch("project credential", activeSettings);
+
+		expect(captured.url?.origin).toBe("https://attacker.example");
+		expect(captured.headers?.get("Authorization")).toBe("Bearer project-token");
+		expect(response.sources.length).toBeGreaterThan(0);
+	});
+
+	it("still sends project basic auth and does not attach the operator env token", async () => {
+		const activeSettings = await projectSettings({
+			endpoint: "https://attacker.example",
+			basicUsername: "alice",
+			basicPassword: "project-secret",
+		});
+		process.env.SEARXNG_TOKEN = "operator-token";
+
+		const { captured } = await captureSearch("project basic", activeSettings);
+
+		expect(captured.headers?.get("Authorization")).toBe(
+			`Basic ${Buffer.from("alice:project-secret", "utf-8").toString("base64")}`,
+		);
+	});
+
+	it("runs a query when no credential is configured", async () => {
+		process.env.SEARXNG_ENDPOINT = "https://searx.example.org";
+
+		const { captured, response } = await captureSearch("no credential");
+
+		expect(captured.url?.origin).toBe("https://searx.example.org");
+		expect(captured.headers?.get("Authorization")).toBeNull();
+		expect(response).toMatchObject({ provider: "searxng", sources: [{ url: "https://example.com/result" }] });
+	});
+
+	it("does not send an environment password when the project sets only a basic username", async () => {
+		const activeSettings = await projectSettings({
+			endpoint: "https://attacker.example",
+			basicUsername: "alice",
+		});
+		process.env.SEARXNG_BASIC_PASSWORD = "env-only-password";
+		process.env.SEARXNG_BASIC_USERNAME = "env-user";
+
+		const { captured, response } = await captureSearch("project username only", activeSettings);
+
+		expect(captured.url?.origin).toBe("https://attacker.example");
+		expect(captured.headers?.get("Authorization")).toBeNull();
+		expect(response.sources.length).toBeGreaterThan(0);
+	});
+
+	it("does not send an environment username when the project sets only a basic password", async () => {
+		const activeSettings = await projectSettings({
+			endpoint: "https://attacker.example",
+			basicPassword: "project-secret",
+		});
+		process.env.SEARXNG_BASIC_USERNAME = "env-only-user";
+		process.env.SEARXNG_BASIC_PASSWORD = "env-only-password";
+
+		const { captured } = await captureSearch("project password only", activeSettings);
+
+		expect(captured.headers?.get("Authorization")).toBeNull();
+	});
+
+	it("uses the project bearer token when project basic auth is only half set", async () => {
+		const activeSettings = await projectSettings({
+			endpoint: "https://attacker.example",
+			basicUsername: "alice",
+			token: "project-token",
+		});
+		process.env.SEARXNG_BASIC_PASSWORD = "env-only-password";
+		process.env.SEARXNG_TOKEN = "operator-token";
+
+		const { captured } = await captureSearch("project token over half basic", activeSettings);
+
+		expect(captured.headers?.get("Authorization")).toBe("Bearer project-token");
+	});
+
+	it("still sends a session auth-broker key to a project endpoint", async () => {
+		const activeSettings = await projectSettings({ endpoint: "https://attacker.example" });
+		process.env.SEARXNG_TOKEN = "operator-token";
+		const captured: { headers?: Headers } = {};
+		using _hook = hookFetch((_input, init) => {
+			captured.headers = new Headers(init?.headers);
+			return new Response(JSON.stringify({ results: [] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		await searchSearXNG({
+			query: "stored key",
+			settings: activeSettings,
+			authStorage: {
+				async getApiKey(provider: string) {
+					return provider === "searxng" ? "stored-searxng-key" : undefined;
+				},
+			} as unknown as NonNullable<Parameters<typeof searchSearXNG>[0]["authStorage"]>,
+		});
+
+		expect(captured.headers?.get("Authorization")).toBe("Bearer stored-searxng-key");
+	});
+});

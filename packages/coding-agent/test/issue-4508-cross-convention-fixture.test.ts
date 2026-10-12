@@ -11,6 +11,7 @@ import { loadSkills, resetActiveSkillsForTests } from "../src/extensibility/skil
 import { MCPManager } from "../src/runtime-mcp/manager";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
+import { wrapUntrustedContent } from "../src/tools/fetch";
 
 type ImportedProduct = "claude-code" | "codex";
 
@@ -267,7 +268,7 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 		expect(tool).toBeDefined();
 		const toolResult = await tool?.execute("cross-convention-call", {}, undefined, {} as never, undefined);
 		const text = (toolResult?.content ?? []).map(content => (content.type === "text" ? content.text : "")).join("\n");
-		expect(text).toBe("canonical-mcp-consumed");
+		expect(text).toBe(wrapUntrustedContent("canonical-mcp-consumed"));
 		const readTool = created.session.agent.state.tools.find(candidate => candidate.name === HOOK_TOOL);
 		expect(readTool).toBeDefined();
 		await readTool?.execute(
@@ -378,7 +379,7 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 			const observed = await consumeCanonicalBundle(marker);
 			expect(observed.skill.name).toBe(SKILL_NAME);
 			expect(observed.skill.description).toBe("Cross-convention fixture skill.");
-			expect(observed.mcp.text).toBe("canonical-mcp-consumed");
+			expect(observed.mcp.text).toBe(wrapUntrustedContent("canonical-mcp-consumed"));
 			expect(observed.hook).toBe(HOOK_TOOL);
 			expect(
 				await fs.stat(foreignMarker).then(

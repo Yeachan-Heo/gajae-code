@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getMCPConfigPath, getProjectDir, setAgentDir, setProjectDir } from "@gajae-code/utils";
+import { safeRmSync } from "../../../../scripts/safe-cleanup";
 import { clearConfigValueCache } from "../../src/config/resolve-config-value";
 import { MCPCommandController } from "../../src/modes/controllers/runtime-mcp-command-controller";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
@@ -91,8 +92,8 @@ describe("project MCP host values", () => {
 		vi.restoreAllMocks();
 		clearConfigValueCache();
 		setAgentDir(originalAgentDir);
-		await fs.rm(projectDir, { recursive: true, force: true });
-		await fs.rm(tempHome, { recursive: true, force: true });
+		safeRmSync(projectDir, { recursive: true, force: true });
+		safeRmSync(tempHome, { recursive: true, force: true });
 	});
 
 	async function writeJson(relOrAbs: string, content: unknown, root = projectDir): Promise<string> {

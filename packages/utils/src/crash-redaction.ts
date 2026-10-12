@@ -66,9 +66,19 @@ export function redactCrashSecrets(text: string): string {
 	// does not match `SecretAccessKey` (the canonical field has `Access` in the
 	// middle), and `access_token` does not match `SessionToken`.
 	redacted = redacted.replace(/\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
+	// `AWS_` sits on the underscore lookbehind, so `secret_access_key` never
+	// matched `AWS_SECRET_ACCESS_KEY=`. `sessionid=` is the literal cookie;
+	// `sessionid%3D` is the same cookie with `=` percent-encoded, which the
+	// `=` rule cannot see. A bare AWS secret is 40 base64 characters with no
+	// prefix; requiring `/` or `+` leaves a 40-character alphanumeric token.
 	redacted = redacted.replace(
-		/(?<![A-Za-z0-9_])(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
+		/(?<![A-Za-z0-9_])(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|session[_-]?token|client[_-]?secret|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
 		"$1«redacted»",
+	);
+	redacted = redacted.replace(/(?<![A-Za-z0-9_%])(session(?:id|[_-]id)%3[Dd])[A-Za-z0-9._~%-]{8,}/gi, "$1«redacted»");
+	redacted = redacted.replace(
+		/(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+]{0,39}[/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g,
+		"«redacted-aws-key»",
 	);
 	return redacted;
 }

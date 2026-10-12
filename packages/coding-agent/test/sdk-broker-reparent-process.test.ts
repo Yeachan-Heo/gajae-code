@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { brokerProcessIncarnation, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { observeProcessIncarnation } from "../src/sdk/broker/process-incarnation";
+import { SdkClient } from "../src/sdk/client/client";
 
 const ensureModule = path.resolve(import.meta.dir, "../src/sdk/broker/ensure.ts");
 
@@ -73,6 +75,8 @@ test.serial(
 			{ stdout: "ignore", stderr: "pipe" },
 		);
 		let brokerPid: number | undefined;
+		let brokerIncarnation: string | undefined;
+		let cleanupError: Error | undefined;
 		try {
 			try {
 				await waitForFile(ready, parent);
@@ -85,8 +89,9 @@ test.serial(
 			}
 			const initial = JSON.parse(await fs.readFile(ready, "utf8")) as { pid: number };
 			brokerPid = initial.pid;
-			const brokerIncarnation = brokerProcessIncarnation(brokerPid);
+			brokerIncarnation = brokerProcessIncarnation(brokerPid);
 			expect(brokerIncarnation).toBeString();
+			if (brokerIncarnation === undefined) throw new Error("Broker process identity could not be observed.");
 			const parentPid = parent.pid;
 			expect(parentPid).toBeGreaterThan(0);
 			const brokerPpid = processTable().get(brokerPid);
@@ -100,17 +105,48 @@ test.serial(
 			expect(after?.pid).toBe(brokerPid);
 			expect(after?.heartbeatAt).toBeGreaterThan(firstHeartbeat!);
 		} finally {
-			if (brokerPid !== undefined) {
-				try {
-					process.kill(brokerPid, "SIGTERM");
-				} catch {
-					// already gone
+			try {
+				if (brokerPid !== undefined && brokerIncarnation !== undefined) {
+					const discovery = await readBrokerDiscovery(agentDir);
+					if (discovery?.pid === brokerPid && discovery.incarnation === brokerIncarnation) {
+						const client = await SdkClient.connect(discovery.url, discovery.token, { timeoutMs: 2_000 });
+						try {
+							await client.global("broker.shutdown", {});
+						} finally {
+							await client.close().catch(() => undefined);
+						}
+						const deadline = Date.now() + 5_000;
+						while (Date.now() < deadline) {
+							const observation = observeProcessIncarnation(brokerPid);
+							if (
+								observation.status === "absent" ||
+								(observation.status === "present" && observation.incarnation !== brokerIncarnation)
+							)
+								break;
+							await Bun.sleep(20);
+						}
+						const observation = observeProcessIncarnation(brokerPid);
+						if (
+							observation.status !== "absent" &&
+							!(observation.status === "present" && observation.incarnation !== brokerIncarnation)
+						)
+							cleanupError = new Error(`Broker ${brokerPid} did not exit after authenticated cleanup.`);
+					} else {
+						const observation = observeProcessIncarnation(brokerPid);
+						if (observation.status === "present" && observation.incarnation === brokerIncarnation)
+							cleanupError = new Error(
+								`Broker ${brokerPid} is alive without its authenticated cleanup endpoint.`,
+							);
+					}
 				}
+			} catch (error) {
+				cleanupError = error instanceof Error ? error : new Error(String(error));
 			}
 			if (parent.exitCode === null) parent.kill("SIGKILL");
 			await parent.exited;
 			await fs.rm(root, { recursive: true, force: true });
 		}
+		if (cleanupError) throw cleanupError;
 	},
 	60_000,
 );

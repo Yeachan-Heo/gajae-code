@@ -73,7 +73,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
-import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
+import { autosaveWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import {
 	PromptDeadlineManager,
 	type PromptDeadlinePublicationResult,
@@ -6630,22 +6630,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// the session down (#5583). Best effort by contract: failures are logged
 			// inside the flush and the deadline outcome is unaffected.
 			onDeadlineExceeded: async (_correlation, signal, isCurrent) => {
-				if (options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === false) return;
-				// `has` is true only for a value the user actually wrote, so this
-				// separates an explicit opt-in from the schema default. The flush only
-				// honours the default inside a linked worktree the session owns.
-				const configured = options.settings?.get("sdk.flushWorktreeOnDeadline" as never);
-				const hasExplicitSetting =
-					typeof options.settings?.has === "function"
-						? options.settings.has("sdk.flushWorktreeOnDeadline" as never)
-						: configured === true;
-				const explicitOptIn = hasExplicitSetting === true && configured === true;
-				await flushWorktreeOnPromptDeadline(ctx.cwd, {
-					agentDir: options.settings?.getAgentDir(),
-					explicitOptIn,
-					isCurrent,
-					signal,
-				});
+				// Project `.gjc` files are not an opt-in. The shared helper reads the
+				// user/global layer and runtime overrides only (#5583).
+				await autosaveWorktreeOnPromptDeadline(ctx.cwd, options.settings, { isCurrent, signal });
 			},
 			onExpired: correlation => {
 				retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation, true);

@@ -1603,10 +1603,35 @@ export class ManagedSessionDescendantStore {
 		if (access === "read-only" && !expectedSubtreeRoot)
 			throw new Error("managed_read_store_requires_existing_identity");
 		assertManagedDirectoryRoot(root);
-		const canonicalBaseDir = canonicalizeManagedPathWithinRoot(root.canonicalPath, baseDir);
-		const canonicalAuthorityBaseDir = retained
-			? canonicalizeManagedPathWithinRoot(root.canonicalPath, retained.authorityBaseDir)
-			: canonicalBaseDir;
+		let canonicalBaseDir: string;
+		try {
+			canonicalBaseDir = canonicalizeManagedPathWithinRoot(root.canonicalPath, baseDir);
+		} catch (error) {
+			// If canonicalization fails with a symlink error on a retained path,
+			// the binding has changed: the path no longer resolves to the original inode.
+			if (retained && error instanceof Error && error.message.startsWith("Managed path contains symlink:")) {
+				throw new Error("Managed descendant root binding changed");
+			}
+			throw error;
+		}
+		let canonicalAuthorityBaseDir: string;
+		if (retained) {
+			try {
+				canonicalAuthorityBaseDir = canonicalizeManagedPathWithinRoot(
+					root.canonicalPath,
+					retained.authorityBaseDir,
+				);
+			} catch (error) {
+				// If canonicalization fails with a symlink error on a retained path,
+				// the binding has changed: the path no longer resolves to the original inode.
+				if (error instanceof Error && error.message.startsWith("Managed path contains symlink:")) {
+					throw new Error("Managed descendant root binding changed");
+				}
+				throw error;
+			}
+		} else {
+			canonicalAuthorityBaseDir = canonicalBaseDir;
+		}
 		managedRelativePath(root, canonicalBaseDir);
 
 		this.#root = root;

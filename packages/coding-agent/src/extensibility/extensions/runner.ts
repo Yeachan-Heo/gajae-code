@@ -51,6 +51,7 @@ import {
 import {
 	getExtensionHandlerRegistrationOrder,
 	getFunctionHookRegistration,
+	getProviderRequestHandlerProvider,
 	isSdkLifecycleObserver,
 	readConstrainedFunctionHookFile,
 } from "./function-hooks-internal";
@@ -919,6 +920,13 @@ export class ExtensionRunner {
 		const wildcard = this.#handlersByEvent.get("*") ?? [];
 		const matches: IndexedHandler[] = [];
 		for (const indexed of [...exact, ...wildcard]) {
+			const provider = getProviderRequestHandlerProvider(indexed.handler);
+			if (
+				event.type === "before_provider_request" &&
+				provider !== undefined &&
+				this.createContext().model?.provider !== provider
+			)
+				continue;
 			const registration = getFunctionHookRegistration(indexed.handler);
 			if (!registration) {
 				if (includeLegacyToolHandlers && indexed.registrationOrder >= 0 && exact.includes(indexed))

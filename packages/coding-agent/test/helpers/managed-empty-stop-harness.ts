@@ -13,7 +13,7 @@ import { SdkClient } from "../../src/sdk/client";
 import type { TurnResultPage } from "../../src/sdk/turn-result";
 import type { AgentSession, AgentSessionEvent } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
-import { SessionManager } from "../../src/session/session-manager";
+import { type SessionEntry, SessionManager } from "../../src/session/session-manager";
 import { createFixtureBrokerEnvironment, withFixtureBrokerEnvironment } from "./fixture-broker-cleanup";
 
 export const EMPTY_STOP_SCENARIOS = [
@@ -115,6 +115,23 @@ export function responseResult(value: unknown): Record<string, unknown> {
 	const response = record(value);
 	assert.equal(response.ok, true, "SDK request failed");
 	return record(response.result);
+}
+
+export async function assertManagedTranscript(
+	manager: SessionManager,
+	assistants: readonly AssistantMessage[],
+): Promise<void> {
+	await manager.ensureOnDisk();
+	await manager.flush();
+	const transcript = manager.getSessionFile();
+	assert.ok(transcript, "Missing managed transcript path");
+	const entries = Bun.JSONL.parse(await Bun.file(transcript).text()) as SessionEntry[];
+	const persisted = entries.flatMap(entry =>
+		entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : [],
+	);
+	// JSONL omits optional undefined fields (for example, errorMessage on a stop).
+	const expected: unknown = JSON.parse(JSON.stringify(assistants));
+	assert.deepEqual(persisted, expected, "Managed transcript must contain only accepted assistant messages");
 }
 
 export function assertScenarioReport(report: ScenarioReport): void {
@@ -318,7 +335,10 @@ export async function runManagedEmptyStopScenario(
 			await waitUntil(() => correlatedFrames().length > 0, "correlated terminal lifecycle");
 			assert.deepEqual(runtimeErrors, [], "Provider/SDK runtime errors");
 			const replay = responseResult(await client.query("turn.result", input)) as unknown as TurnResultPage;
-			await session.sessionManager.ensureOnDisk();
+			const assistantMessages = session.messages.filter(
+				(message): message is AssistantMessage => message.role === "assistant",
+			);
+			await assertManagedTranscript(session.sessionManager, assistantMessages);
 			const transcript = session.sessionManager.getSessionFile();
 			const report: ScenarioReport = {
 				scenario,
@@ -327,9 +347,7 @@ export async function runManagedEmptyStopScenario(
 				replay,
 				terminalFrames: correlatedFrames(),
 				selectedModel: `${session.model?.provider}/${session.model?.id}`,
-				assistantMessages: session.messages.filter(
-					(message): message is AssistantMessage => message.role === "assistant",
-				),
+				assistantMessages,
 				lifecycle: events
 					.filter(
 						event =>
@@ -363,12 +381,12 @@ export async function runManagedEmptyStopScenario(
 			}
 		};
 		await clean(async () => await client?.close());
-		await clean(async () => await session?.extensionRunner?.emit({ type: "session_shutdown" }));
 		await clean(async () => await session?.dispose());
 		await clean(() => auth?.close());
 		await clean(async () => await lease?.close());
 		await clean(async () => await server?.stop(true));
-		await clean(async () => await fs.rm(root, { recursive: true, force: true }));
+		// Keep failure evidence and never remove storage beneath an unclosed owner.
+		if (errors.length === 0) await clean(async () => await fs.rm(root, { recursive: true, force: true }));
 	}
 	if (errors.length > 0)
 		throw new AggregateError(

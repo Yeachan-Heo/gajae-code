@@ -18,6 +18,7 @@ import type {
 	MCPTransport,
 } from "../../src/runtime-mcp/types";
 import { MCPExpectedFailure, MCPHttpRequestError } from "../../src/runtime-mcp/types";
+import { wrapUntrustedContent } from "../../src/tools/fetch";
 import { legacyMcpMethodNotFound } from "../mcp-test-utils";
 
 async function mkdtempExact(prefix: string): Promise<string> {
@@ -1632,7 +1633,7 @@ setInterval(() => {}, 1000);
 			expect(result.connectedServers).toEqual(["exact"]);
 			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__exact_tool"]);
 			const toolResult = await result.tools[0]!.execute("exact-call", {}, undefined, {} as never);
-			expect(toolResult.content).toEqual([{ type: "text", text: "exact-ok" }]);
+			expect(toolResult.content).toEqual([{ type: "text", text: wrapUntrustedContent("exact-ok") }]);
 			expect(toolCallCount).toBe(1);
 			expect(initializeCapabilities).toEqual({});
 			// auto preference probes server/discover first; this stub answers like a real legacy server.

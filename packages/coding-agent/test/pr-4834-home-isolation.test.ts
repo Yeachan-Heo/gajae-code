@@ -959,7 +959,7 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		await seedProfile(outsideAgentDir, "outside");
 		await fs.mkdir(path.dirname(homeAgentDir), { recursive: true });
 
-		const homeStats = await fs.stat(home);
+		const homeStats = await fs.stat(home, { bigint: true });
 		const result = await readFile(path.join(homeAgentDir, "SYSTEM.md"), {
 			isolatedHome: true,
 			home,

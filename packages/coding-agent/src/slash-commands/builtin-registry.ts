@@ -1151,6 +1151,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					if (!materializedProfile) {
 						for (const [targetId, selector] of assignments) {
 							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
+							runtime.session.markProfileRoleOverrideManual?.(target.settingsPath, targetId);
 							if (target.settingsPath === "modelRoles") {
 								runtime.settings.setModelRole(targetId, selector);
 							} else {

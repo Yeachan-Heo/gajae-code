@@ -538,7 +538,9 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 			read.kind === "value"
 				? options.product === "claude-code"
 					? normalizeClaudeMcpJson(read.content, sourcePath, options.sourceScope)
-					: normalizeCodexMcpToml(read.content, sourcePath, options.sourceScope)
+					: normalizeCodexMcpToml(read.content, sourcePath, options.sourceScope, {
+							omitEnvReferences: options.destinationScope === "project",
+						})
 				: { items: [], warnings: [] as string[] };
 		for (const warning of normalized.warnings) warnings.push(`${sourceLabel} MCPs: ${warning}`);
 		const unsupportedNestedAuth =

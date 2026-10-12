@@ -11,6 +11,7 @@ import { createAgentSession } from "../../src/sdk/session";
 import { SessionManager } from "../../src/session/session-manager";
 import type { AskAnswerSource, AskRemoteReceipt, AskSettlement } from "../../src/tools";
 import { registerAskAnswerSource } from "../../src/tools/ask-answer-registry";
+import { wrapUntrustedContent } from "../../src/tools/fetch";
 
 const context = { serverName: "fixture", originMethod: "tools/call", correlationId: "exchange-1" };
 function request(property: Record<string, unknown> = { type: "string" }) {
@@ -336,7 +337,7 @@ it("registers a real input handler on an owned explicit-config session and resum
 		const tool = session.getToolByName("mcp__fixture_confirm");
 		expect(tool).toBeDefined();
 		const result = await tool!.execute("call-1", {});
-		expect(result.content).toEqual([{ type: "text", text: "confirmed" }]);
+		expect(result.content).toEqual([{ type: "text", text: wrapUntrustedContent("confirmed") }]);
 		expect(received).toHaveLength(2);
 		expect(received[1]?.requestState).toBe("same-exchange");
 		expect(received[1]?.inputResponses).toEqual({ confirmation: { action: "accept", content: { value: true } } });

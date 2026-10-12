@@ -912,7 +912,17 @@ async function replaceSessionKernel(
 	const old = session.kernel;
 	const remaining = getRemainingTimeoutMs(options.deadlineMs);
 	const ownerIds = new Set(session.ownerIds);
-	await shutdownOrRetainKernel(old, ownerIds, remaining === undefined ? undefined : Math.max(0, remaining));
+	try {
+		await shutdownOrRetainKernel(old, ownerIds, remaining === undefined ? undefined : Math.max(0, remaining));
+	} catch (error) {
+		// Suppress unconfirmed shutdown error ONLY when we have positive evidence the
+		// process actually exited (exitCode is set). Without that evidence, propagate the error
+		// so we don't start a replacement while the old subprocess is still running.
+		// See https://github.com/yeachan-heo/gajae-code/issues/6569
+		const hasConfirmedExit = old.getExitCode() !== null;
+		if (!hasConfirmedExit || !(error instanceof Error) || error.name !== "PythonKernelShutdownUnconfirmedError")
+			throw error;
+	}
 	throwIfExecutionCancelled(options);
 	if (sessions.get(session.sessionId) !== session) {
 		throw new PythonExecutionCancelledError(false);

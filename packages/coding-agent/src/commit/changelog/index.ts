@@ -168,9 +168,47 @@ function applyChangelogEntries(
 	if (deletions) {
 		base = applyDeletions(base, deletions);
 	}
-	const merged = mergeEntries(base, entries);
+	const merged = mergeEntries(base, redactPersistedEntries(entries));
 	const sectionLines = renderUnreleasedSections(merged);
 	return [...before, ...sectionLines, ...after].join("\n");
+}
+
+function redactPersistedEntries(entries: Record<string, string[]>): Record<string, string[]> {
+	const redacted: Record<string, string[]> = {};
+	for (const [section, items] of Object.entries(entries)) {
+		redacted[section] = items.map(item => redactChangelogEntry(item));
+	}
+	return redacted;
+}
+
+const AWS_LABELED_KEY =
+	"(?:(?:aws[_-]?)?secret[_-]?access[_-]?key|(?:aws[_-]?)?session[_-]?token|x[_-]?amz[_-]?security[_-]?token)";
+
+export function redactChangelogEntry(text: string): string {
+	let redacted = text.replace(/(^|[^0-9A-Za-z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])/g, "$1[REDACTED_AWS_KEY_ID]");
+	redacted = redacted.replace(
+		new RegExp(
+			`(^|[^A-Za-z0-9_-])(["']?${AWS_LABELED_KEY}["']?\\s*[=:]\\s*)(\\$?)(["'\`])([^"'\`\\r\\n]{8,})\\4`,
+			"gi",
+		),
+		"$1$2$3$4[REDACTED_SECRET]$4",
+	);
+	redacted = redacted.replace(
+		new RegExp(`(^|[^A-Za-z0-9_-])(["']?${AWS_LABELED_KEY}["']?\\s*[=:]\\s*)[^\\s"'\`,;{}[\\]()&<>#]{8,}`, "gi"),
+		"$1$2[REDACTED_SECRET]",
+	);
+	redacted = redacted.replace(/\b(?:sk|pk|rk|xox[baprs])-[-_A-Za-z0-9]{12,}\b/g, "[REDACTED_TOKEN]");
+	redacted = redacted.replace(/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g, "[REDACTED_TOKEN]");
+	redacted = redacted.replace(/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[REDACTED_TOKEN]");
+	redacted = redacted.replace(
+		/\b((?:ANTHROPIC|OPENAI|GITHUB|GOOGLE|GEMINI|KAGI|TAVILY|EXA|PERPLEXITY|ZAI|KIMI|BRAVE|SEARXNG|AWS)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET|COOKIE|PASSWORD))\s*=\s*[^\s\n]+/gi,
+		"$1=[REDACTED_SECRET]",
+	);
+	redacted = redacted.replace(
+		/\b(Authorization|Proxy-Authorization)\s*:\s*(?:Bearer|Basic|Token)\s+[^\s\n]+/gi,
+		"$1: [REDACTED_AUTH_HEADER]",
+	);
+	return redacted.replace(/\b(Cookie|Set-Cookie)\s*:\s*[^\n]+/gi, "$1: [REDACTED_COOKIE]");
 }
 
 function applyDeletions(

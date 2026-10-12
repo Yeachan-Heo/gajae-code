@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { flushWorktreeOnPromptDeadline } from "../src/sdk/prompt-deadline-flush";
+import { Settings } from "../src/config/settings";
+import { autosaveWorktreeOnPromptDeadline, flushWorktreeOnPromptDeadline } from "../src/sdk/prompt-deadline-flush";
 import { PromptDeadlineManager } from "../src/sdk/prompt-deadline-manager";
 
 /**
@@ -547,4 +548,216 @@ describe("deadline autosave index rollback (#5623)", () => {
 		expect(await run(root, ["show", "HEAD:user-staged.ts"])).toBe("export const staged = 1;\n");
 		expect(await run(root, ["show", "HEAD:README.md"])).toBe("edited by the user\n");
 	});
+});
+
+const PROJECT_OPTIN_CANARY = "GJC-CANARY-deadline-project-optin";
+
+async function tempAgentDir(): Promise<string> {
+	const agentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-deadline-agent-"));
+	tempRoots.push(agentDir);
+	return agentDir;
+}
+
+async function dirtyCheckout(root: string): Promise<void> {
+	await fsp.writeFile(path.join(root, "README.md"), "tracked v2\n");
+	await fsp.writeFile(path.join(root, "agent-work.ts"), `export const canary = "${PROJECT_OPTIN_CANARY}";\n`);
+	await fsp.writeFile(path.join(root, ".env"), `SECRET=${PROJECT_OPTIN_CANARY}\n`);
+}
+
+async function writeProjectFlush(root: string, kind: "json" | "yml", value: boolean): Promise<void> {
+	const dir = path.join(root, ".gjc");
+	await fsp.mkdir(dir, { recursive: true });
+	if (kind === "json") {
+		await fsp.writeFile(
+			path.join(dir, "settings.json"),
+			`${JSON.stringify({ sdk: { flushWorktreeOnDeadline: value } }, null, 2)}\n`,
+		);
+		return;
+	}
+	await fsp.writeFile(path.join(dir, "config.yml"), `sdk:\n  flushWorktreeOnDeadline: ${value}\n`);
+}
+
+async function writeGlobalFlush(agentDir: string, value: boolean): Promise<void> {
+	await fsp.mkdir(agentDir, { recursive: true });
+	await fsp.writeFile(path.join(agentDir, "config.yml"), `sdk:\n  flushWorktreeOnDeadline: ${value}\n`);
+}
+
+async function closeSettings(settings: Settings): Promise<void> {
+	await settings.flush();
+	settings.getStorage()?.close();
+}
+
+async function commitCount(root: string): Promise<string> {
+	return (await run(root, ["rev-list", "--count", "HEAD"])).trim();
+}
+
+async function refuseAutosave(root: string, settings: Settings): Promise<void> {
+	const before = (await run(root, ["rev-parse", "HEAD"])).trim();
+	expect(await autosaveWorktreeOnPromptDeadline(root, settings, { isCurrent: () => true })).toBeUndefined();
+	expect((await run(root, ["rev-parse", "HEAD"])).trim()).toBe(before);
+	expect(await commitCount(root)).toBe("1");
+	const status = await run(root, ["status", "--porcelain", "--", "README.md", "agent-work.ts", ".env"]);
+	expect(status).toContain("README.md");
+	expect(status).toContain("agent-work.ts");
+	expect(status).toContain(".env");
+}
+
+async function expectAutosave(root: string, settings: Settings, branch: string): Promise<void> {
+	const result = await autosaveWorktreeOnPromptDeadline(root, settings, { isCurrent: () => true });
+	expect(result?.branch).toBe(branch);
+	expect(await run(root, ["log", "-1", "--pretty=%s"])).toBe(`wip(${branch}): autosave on prompt deadline\n`);
+	expect(await run(root, ["show", "HEAD:agent-work.ts"])).toBe(`export const canary = "${PROJECT_OPTIN_CANARY}";\n`);
+	expect(await run(root, ["show", "HEAD:.env"])).toBe(`SECRET=${PROJECT_OPTIN_CANARY}\n`);
+	expect(await run(root, ["show", "HEAD:README.md"])).toBe("tracked v2\n");
+}
+
+async function addLinkedWorktree(): Promise<string> {
+	const main = await initRepo("gjc-deadline-linked-main-");
+	const linked = path.join(
+		os.tmpdir(),
+		`gjc-deadline-linked-wt-${process.pid}-${Math.random().toString(16).slice(2)}`,
+	);
+	tempRoots.push(linked);
+	await run(main, ["worktree", "add", "-b", "wtbranch", linked]);
+	return linked;
+}
+
+describe("deadline autosave ignores project .gjc opt-in on a primary checkout", () => {
+	test("a repo settings.json does not commit a dirty primary checkout", async () => {
+		const root = await initRepo("gjc-deadline-project-json-");
+		const agentDir = await tempAgentDir();
+		await dirtyCheckout(root);
+		await writeProjectFlush(root, "json", true);
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			// The merged view still reports the project value. That is the gate the
+			// deadline hosts used to trust via Settings.has().
+			expect(settings.get("sdk.flushWorktreeOnDeadline")).toBe(true);
+			expect(settings.has("sdk.flushWorktreeOnDeadline")).toBe(true);
+			expect(settings.getGlobal("sdk.flushWorktreeOnDeadline")).toBeUndefined();
+			expect(settings.getOverride("sdk.flushWorktreeOnDeadline")).toBeUndefined();
+			await refuseAutosave(root, settings);
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a repo config.yml does not commit a dirty primary checkout", async () => {
+		const root = await initRepo("gjc-deadline-project-yml-");
+		const agentDir = await tempAgentDir();
+		await dirtyCheckout(root);
+		await writeProjectFlush(root, "yml", true);
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(settings.get("sdk.flushWorktreeOnDeadline")).toBe(true);
+			expect(settings.has("sdk.flushWorktreeOnDeadline")).toBe(true);
+			expect(settings.getGlobal("sdk.flushWorktreeOnDeadline")).toBeUndefined();
+			await refuseAutosave(root, settings);
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a primary checkout with no flush setting stays dirty", async () => {
+		const root = await initRepo("gjc-deadline-project-none-");
+		const agentDir = await tempAgentDir();
+		await dirtyCheckout(root);
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(settings.get("sdk.flushWorktreeOnDeadline")).toBe(true);
+			expect(settings.has("sdk.flushWorktreeOnDeadline")).toBe(false);
+			await refuseAutosave(root, settings);
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a user global true still commits the primary checkout, untracked files included", async () => {
+		const root = await initRepo("gjc-deadline-global-true-");
+		const agentDir = await tempAgentDir();
+		await writeGlobalFlush(agentDir, true);
+		await dirtyCheckout(root);
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(settings.getGlobal("sdk.flushWorktreeOnDeadline")).toBe(true);
+			await expectAutosave(root, settings, "work");
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a runtime override true still commits when the only file opt-in is the project", async () => {
+		const root = await initRepo("gjc-deadline-override-true-");
+		const agentDir = await tempAgentDir();
+		await dirtyCheckout(root);
+		await writeProjectFlush(root, "json", true);
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			settings.override("sdk.flushWorktreeOnDeadline", true);
+			expect(settings.getOverride("sdk.flushWorktreeOnDeadline")).toBe(true);
+			await expectAutosave(root, settings, "work");
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a user global false stays off when the project file says true", async () => {
+		const root = await initRepo("gjc-deadline-global-false-");
+		const agentDir = await tempAgentDir();
+		await writeGlobalFlush(agentDir, false);
+		await dirtyCheckout(root);
+		await writeProjectFlush(root, "json", true);
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(settings.get("sdk.flushWorktreeOnDeadline")).toBe(true);
+			expect(settings.getGlobal("sdk.flushWorktreeOnDeadline")).toBe(false);
+			await refuseAutosave(root, settings);
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a linked worktree still autosaves on the default without a user opt-in", async () => {
+		const linked = await addLinkedWorktree();
+		const agentDir = await tempAgentDir();
+		await dirtyCheckout(linked);
+		const settings = await Settings.loadForScope({ cwd: linked, agentDir });
+		try {
+			expect(settings.has("sdk.flushWorktreeOnDeadline")).toBe(false);
+			expect(settings.getGlobal("sdk.flushWorktreeOnDeadline")).toBeUndefined();
+			await expectAutosave(linked, settings, "wtbranch");
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a user global true still commits when the project file says false", async () => {
+		const root = await initRepo("gjc-deadline-project-false-");
+		const agentDir = await tempAgentDir();
+		await writeGlobalFlush(agentDir, true);
+		await dirtyCheckout(root);
+		await writeProjectFlush(root, "json", false);
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(settings.getGlobal("sdk.flushWorktreeOnDeadline")).toBe(true);
+			expect(settings.get("sdk.flushWorktreeOnDeadline")).toBe(false);
+			await expectAutosave(root, settings, "work");
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
+
+	test("a project false still skips the linked-worktree default", async () => {
+		const linked = await addLinkedWorktree();
+		const agentDir = await tempAgentDir();
+		await dirtyCheckout(linked);
+		await writeProjectFlush(linked, "yml", false);
+		const settings = await Settings.loadForScope({ cwd: linked, agentDir });
+		try {
+			expect(settings.get("sdk.flushWorktreeOnDeadline")).toBe(false);
+			await refuseAutosave(linked, settings);
+		} finally {
+			await closeSettings(settings);
+		}
+	}, 30_000);
 });
