@@ -1489,10 +1489,22 @@ test("lifecycle startup settles failure when native callback registration throws
 		throw new Error("token=prestart-secret");
 	});
 	try {
-		start(context(cwd, sessionId), undefined, () => {}, false, new Map(), {
-			startupCapability: capability,
-			lifecycleRequired: true,
-		});
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			undefined,
+			() => {},
+			false,
+			new Map(),
+			{
+				startupCapability: capability,
+				lifecycleRequired: true,
+			},
+			false,
+		);
+		// The capability settles before abandoned-startup cleanup. Join the
+		// lifecycle handler so this test does not leave owner release in flight.
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 		const result = await capability.promise;
 		expect(result.status).toBe("failed");
 		if (result.status !== "failed") throw new Error("Expected lifecycle startup failure.");
@@ -1507,18 +1519,23 @@ test("session_start swallows startup plus owner-release failure without surfacin
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
 	dirs.push(cwd);
 	const sessionId = `startup-cleanup-double-failure-${Date.now()}`;
-	// `mockRejectedValueOnce` on a shared prototype is a one-shot global: a peer
-	// test scheduled concurrently in the same shard can consume the single
-	// rejection, after which this test's own `start`/`stop` resolve, startup
-	// never sets `suppressExtensionError`, and the error surfaces. Scope the
-	// rejection to this test's first call instead so shard composition cannot
-	// steal it.
+	const peerCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-peer-"));
+	dirs.push(peerCwd);
+	const peer = await startProductionSdkHost(peerCwd, { acceptPromptPreflightWithoutExecution: true });
+	// A predecessor can still be releasing its host after its startup capability
+	// settles. Scope fault injection and exact call counts to this lifecycle;
+	// a first-call flag alone is still a process-global one-shot rejection.
+	const startupScope = new AsyncLocalStorage<boolean>();
+	let ownedServerStartCalls = 0;
+	let ownedHostStopCalls = 0;
 	let serverStartRejected = false;
 	const serverStartImpl = NotificationServer.prototype.start;
 	const serverStart = spyOn(NotificationServer.prototype, "start").mockImplementation(async function (
 		this: NotificationServer,
 		...args: Parameters<NotificationServer["start"]>
 	) {
+		if (!startupScope.getStore()) return await serverStartImpl.apply(this, args);
+		ownedServerStartCalls++;
 		if (!serverStartRejected) {
 			serverStartRejected = true;
 			throw new Error("server start failed");
@@ -1531,6 +1548,8 @@ test("session_start swallows startup plus owner-release failure without surfacin
 		this: SessionSdkHost,
 		...args: Parameters<SessionSdkHost["stop"]>
 	) {
+		if (!startupScope.getStore()) return await hostStopImpl.apply(this, args);
+		ownedHostStopCalls++;
 		if (!hostStopRejected) {
 			hostStopRejected = true;
 			throw new Error("host stop failed");
@@ -1540,6 +1559,9 @@ test("session_start swallows startup plus owner-release failure without surfacin
 	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 	let restored = false;
 	try {
+		// Exercise unrelated owner release while fault injection is installed.
+		// It must neither consume the target's failure nor enter its call counts.
+		await peer.stop();
 		const sessionContext = context(cwd, sessionId);
 		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
 		const startupExt = {
@@ -1560,10 +1582,10 @@ test("session_start swallows startup plus owner-release failure without surfacin
 		const surfaced: Array<{ event: string }> = [];
 		runner.onError(error => surfaced.push(error));
 
-		await expect(runner.emit({ type: "session_start" })).resolves.toBeUndefined();
+		await expect(startupScope.run(true, () => runner.emit({ type: "session_start" }))).resolves.toBeUndefined();
 		expect(surfaced).toEqual([]);
-		expect(serverStart).toHaveBeenCalledTimes(1);
-		expect(hostStop).toHaveBeenCalledTimes(2);
+		expect(ownedServerStartCalls).toBe(1);
+		expect(ownedHostStopCalls).toBe(2);
 		const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
 		expect(
 			breadcrumbs.some(
@@ -1585,6 +1607,7 @@ test("session_start swallows startup plus owner-release failure without surfacin
 			serverStart.mockRestore();
 			hostStop.mockRestore();
 		}
+		await peer.stop();
 	}
 }, 60_000);
 
