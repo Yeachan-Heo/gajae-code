@@ -4,6 +4,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+
+// Tests in this file spawn brokers, so they need SDK_BROKER_AUTOSTART to be unset
+// even if inherited from the parent environment
+delete process.env.GJC_SDK_BROKER_AUTOSTART;
 import packageJson from "../package.json" with { type: "json" };
 import Sdk from "../src/commands/sdk";
 import { readBrokerExitRecord, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
