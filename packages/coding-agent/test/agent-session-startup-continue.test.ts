@@ -86,13 +86,17 @@ describe("AgentSession startup continuation", () => {
 		];
 		for (const messages of resumableTails) {
 			const session = await createSession(messages);
+			const completion = Promise.withResolvers<void>();
 			try {
-				const completion = Promise.withResolvers<void>();
-				const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(() => completion.promise);
+				const continueStarted = Promise.withResolvers<void>();
+				const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(() => {
+					continueStarted.resolve();
+					return completion.promise;
+				});
 				const continuation = session.continuePersistedHistory();
+				void continuation.catch(continueStarted.reject);
 
-				for (let attempt = 0; attempt < 100 && continueSpy.mock.calls.length === 0; attempt += 1)
-					await Bun.sleep(1);
+				await continueStarted.promise;
 				expect(continueSpy).toHaveBeenCalledTimes(1);
 				let settled = false;
 				void continuation.then(() => {
@@ -103,6 +107,7 @@ describe("AgentSession startup continuation", () => {
 				completion.resolve();
 				await continuation;
 			} finally {
+				completion.resolve();
 				await session.dispose();
 			}
 		}
@@ -267,11 +272,18 @@ describe("AgentSession startup continuation lifecycle", () => {
 
 	it("emits one cancelled agent_end when startup continuation is aborted", async () => {
 		const pending = new AssistantMessageEventStream();
-		await createManagedSession(() => pending);
+		const providerStarted = Promise.withResolvers<void>();
+		await createManagedSession(() => {
+			providerStarted.resolve();
+			return pending;
+		});
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));
 		const continuation = session!.continuePersistedHistory();
-		for (let index = 0; index < 20 && session!.agent.activeRunId === undefined; index += 1) await Bun.sleep(1);
+		void continuation.catch(providerStarted.reject);
+		// Abort a live provider turn, after asynchronous startup preparation has
+		// actually admitted it, rather than assuming admission finishes in 20 ms.
+		await providerStarted.promise;
 
 		await session!.abort();
 		await continuation;
