@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { computeCrashFingerprint, computeHandledErrorFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	computeCrashFingerprint,
+	computeHandledErrorFingerprint,
+	formatCrashRecordMarker,
+	postmortem,
+} from "@gajae-code/utils";
 import { findLatestRecord, parseCrashRecords, parseRecoverableCrashRecords } from "../src/crash/record-loader";
 
 const FP_A = "a".repeat(32);
@@ -137,6 +145,45 @@ describe("parseCrashRecords", () => {
 			"Error: first line\nsecond line\n    at frame (packages/coding-agent/src/x.ts:1:1)",
 		);
 		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
+	it("rebinds a name-only empty-message stack with its frame", () => {
+		const root = path.resolve(import.meta.dir, "..", "..");
+		const frame = `    at emptySite (${path.join(root, "packages/coding-agent/src/empty-message.ts")}:3:1)`;
+		const err = new Error("");
+		err.stack = `Error\n${frame}`;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crash-empty-"));
+		const target = path.join(dir, "gjc-crash.log");
+		expect(postmortem.recordFatalCrash("Uncaught Exception", err, { path: target })).toBe(target);
+
+		const text = fs.readFileSync(target, "utf8");
+		const preserved = computeCrashFingerprint({
+			name: "Error",
+			message: "(no message)",
+			stack: `Error\n${frame}`,
+		});
+		const records = parseRecoverableCrashRecords(text);
+		expect(text.split("\n")).toContain(frame);
+		expect(preserved.frames[0]).not.toBe("<no-app-frame>");
+		expect(records.map(record => record.fingerprint)).toEqual([preserved.fingerprint]);
+	});
+
+	it("rebinds a flattened control and a boundary-spanning credential", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "crash-rebind-"));
+		const target = path.join(dir, "gjc-crash.log");
+		const nul = new Error(`boom${"\u0000"}here`);
+		nul.stack = `Error: ${nul.message}\n    at frame (packages/coding-agent/src/x.ts:1:1)`;
+		expect(postmortem.recordFatalCrash("Uncaught Exception", nul, { path: target })).toBe(target);
+
+		const token = "z".repeat(24);
+		const crossed = new Error("Bearer");
+		crossed.stack = `Error: Bearer\n${token}\n    at frame (packages/coding-agent/src/x.ts:2:1)`;
+		expect(postmortem.recordFatalCrash("Uncaught Exception", crossed, { path: target })).toBe(target);
+
+		const text = fs.readFileSync(target, "utf8");
+		expect(text).not.toContain(token);
+		expect(text).not.toContain("\u0000");
+		expect(parseRecoverableCrashRecords(text)).toHaveLength(2);
 	});
 
 	it("rejects arbitrary-text identity decoys and mismatched markers", () => {

@@ -864,6 +864,7 @@ describe("resolveCliModel", () => {
 			modelRegistry: {
 				...canonicalRegistry,
 				getAll: () => canonicalVariantModels,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"],
 		});
 

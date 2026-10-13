@@ -3222,6 +3222,21 @@ async function assertSanctionedExecutionApprovalAudit(
 	)
 		throw new StateCommandError(2, "deep-interview execution approval lacks sanctioned transition provenance");
 
+	// The approval index is written only after the append-only ledger entry.
+	// A pending journal means that append did not finish, so the index must
+	// not authorize execution handoff.
+	let approvalJournal: WorkflowTransactionJournal | undefined;
+	try {
+		approvalJournal = await readWorkflowTransactionJournal(cwd, sessionId, mutationId);
+	} catch (error) {
+		throw new StateCommandError(
+			2,
+			`failed to read execution approval journal: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (approvalJournal?.status === "pending")
+		throw new StateCommandError(2, "deep-interview execution approval journal is incomplete");
+
 	const indexedApprovalPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-approval-audit.json");
 	let indexedRaw = "";
 	try {
@@ -5067,8 +5082,6 @@ async function appendExecutionApprovalAudit(
 	} = {},
 ): Promise<void> {
 	const entry = buildExecutionApprovalAuditEntry(options);
-	await writeExecutionApprovalIndex(options, entry);
-	await hooks.afterIndex?.();
 	const filePath = auditPath(options.cwd, options.sessionId);
 	await withWorkflowStateLock(
 		filePath,
@@ -5089,6 +5102,8 @@ async function appendExecutionApprovalAudit(
 		},
 		{ cwd: options.cwd },
 	);
+	await writeExecutionApprovalIndex(options, entry);
+	await hooks.afterIndex?.();
 	await hooks.afterAudit?.();
 }
 
@@ -5296,8 +5311,6 @@ async function handleApproveExecutionRecordLocked(
 				indexedMatches = isPlainObject(parsed) && JSON.stringify(parsed) === JSON.stringify(expectedApprovalEntry);
 			} catch {}
 		}
-		if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
-		recoverySteps.add("approval-index");
 		let approvalAuditOffset = pendingJournal.approval_audit_offset;
 		if (!recoverySteps.has("approval-audit")) {
 			approvalAuditOffset = await appendExecutionApprovalAuditIdempotent(
@@ -5312,6 +5325,8 @@ async function handleApproveExecutionRecordLocked(
 			);
 			recoverySteps.add("approval-audit");
 		}
+		if (!indexedMatches) await writeExecutionApprovalIndex(approvalOptions, expectedApprovalEntry);
+		recoverySteps.add("approval-index");
 		await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id, {
 			steps: [...recoverySteps],
 			approval_audit_offset: approvalAuditOffset,

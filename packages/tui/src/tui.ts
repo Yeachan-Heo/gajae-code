@@ -4,7 +4,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { $flag, $pickflag, getDebugLogPath, logger, onDefaultTabWidthChange } from "@gajae-code/utils";
+import {
+	$flag,
+	$pickflag,
+	getDebugLogPath,
+	logger,
+	onDefaultTabWidthChange,
+	redactCrashSecrets,
+} from "@gajae-code/utils";
 import { getKeybindings } from "./keybindings";
 import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
@@ -999,6 +1006,23 @@ function createPreparationCancellation(entry: RenderPreparation): () => void {
 
 function cancelNoPreparation(): void {}
 
+function filesystemErrorCode(error: unknown): string | undefined {
+	if (error === null || typeof error !== "object" || !("code" in error)) return undefined;
+	return typeof error.code === "string" ? error.code : undefined;
+}
+
+// JSON.stringify writes ESC as "\\u001b", and a CSI final is a letter, so a
+// following "Bearer" has no word boundary. Split that join, scrub, then restore.
+function redactTuiRenderDump(debugData: string): string {
+	const separateCsiFinal = (match: string) => `${match}\u0000`;
+	const separated = debugData
+		.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, separateCsiFinal)
+		.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]/g, separateCsiFinal);
+	return redactCrashSecrets(separated)
+		.replace(/\u001b\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1))
+		.replace(/\\u001[bB]\[[0-9;?]*[A-Za-z]\u0000/g, match => match.slice(0, -1));
+}
+
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
@@ -1152,6 +1176,7 @@ export class TUI extends Container {
 	#fullRedrawCount = 0;
 	#stopped = false;
 	#terminalUnavailable = false;
+	#restartNeedsClear = false; // Set when stop() resets viewport state
 	#bottomPinnedComponent: Component | null = null;
 	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
 	#mouseSelectionStart: MouseSelectionPoint | null = null;
@@ -1271,6 +1296,38 @@ export class TUI extends Container {
 	#appendDebugRedrawLog(message: string): void {
 		TUI.#renderCounters.debugRedrawAppendWrites += 1;
 		fs.appendFileSync(getDebugLogPath(), message);
+	}
+
+	// Sibling of the debug log. Create the parent only when it is missing.
+	// The dump file is opened exclusive and no-follow, then written through that fd.
+	#writeRenderDebugDump(debugData: string): void {
+		const debugDir = path.dirname(getDebugLogPath());
+		if (!fs.existsSync(debugDir)) {
+			fs.mkdirSync(debugDir, { recursive: true, mode: 0o700 });
+			fs.chmodSync(debugDir, 0o700);
+		}
+		// stat follows a symlink to the real agent directory; a directory we do
+		// not own is not a place for a session frame.
+		const dirStat = fs.statSync(debugDir);
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		if (!dirStat.isDirectory() || (uid !== undefined && dirStat.uid !== uid)) return;
+
+		const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+		const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+		let fd: number;
+		try {
+			fd = fs.openSync(debugPath, flags, 0o600);
+		} catch (error) {
+			const code = filesystemErrorCode(error);
+			if (code === "EEXIST" || code === "ELOOP") return;
+			throw error;
+		}
+		try {
+			fs.writeFileSync(fd, redactTuiRenderDump(debugData));
+			fs.fchmodSync(fd, 0o600);
+		} finally {
+			fs.closeSync(fd);
+		}
 	}
 
 	#visibleWidthForDifferentialGuard(line: string): number {
@@ -1430,6 +1487,11 @@ export class TUI extends Container {
 
 	setClearOnShrink(enabled: boolean): void {
 		this.#clearOnShrink = enabled;
+	}
+
+	/** Overlays rely on padded rows, so contraction replays only without them. */
+	#clearOnShrinkReplays(): boolean {
+		return this.#clearOnShrink && this.overlayStack.length === 0;
 	}
 
 	setFocus(component: Component | null): void {
@@ -2981,6 +3043,12 @@ export class TUI extends Container {
 		this.#lineEmitWidthCache.clear();
 		this.#previousWidth = 0;
 		this.#previousHeight = 0;
+		this.#cursorRow = 0;
+		this.#hardwareCursorRow = 0;
+		this.#viewportTopRow = 0;
+		this.#maxLinesRendered = 0;
+		// Mark that the next initial render needs to clear the screen after terminal reset
+		this.#restartNeedsClear = true;
 		this.#forcedRenderPreviousWidth = 0;
 		this.#forcedRenderPreviousHeight = 0;
 		this.#transcriptRebuildPending = false;
@@ -5228,6 +5296,7 @@ export class TUI extends Container {
 		let usedWindowNormalize = false;
 		let stitched = false;
 		let frontierSpacerLineCount = 0;
+		let strandedContractionReplay = false;
 		if (reusedAnchor !== null && layoutPrefixEligible && !layoutPrefixBlocked) {
 			const reused = this.#reuseCachedLayoutPrefix(
 				width,
@@ -5268,12 +5337,32 @@ export class TUI extends Container {
 			if (hasStickySuffix && height > 0 && this.#manualViewportTop === undefined) {
 				// Rebuilds start at their new transcript frontier. Forced redraws use the
 				// captured rendered dimensions rather than their -1 invalidation sentinels.
+				// clearOnShrink replays the whole frame on contraction instead; spacer rows
+				// would otherwise stay on screen as a blank gap above the pinned component.
 				const preserveLiveFrontier =
+					!this.#clearOnShrinkReplays() &&
 					!transcriptIdentityReplaced &&
 					!transcriptRebuildPending &&
 					frontierPreviousWidth === width &&
 					(frontierPreviousHeight === height || this.#viewportRepaintHost());
-				const minimumLineCount = preserveLiveFrontier ? prevViewportTop + height : height;
+				// Padding to the committed frontier keeps scrollback rows from being
+				// repainted, but when the contraction ends the transcript at or above that
+				// frontier the padded viewport holds nothing but spacer rows. Replay the
+				// frame instead of leaving a blank screen above the pinned component. A
+				// pinned suffix that already fills the viewport hides the spacers, so it
+				// keeps the frontier and its scrollback.
+				strandedContractionReplay =
+					preserveLiveFrontier &&
+					!heightChanged &&
+					frontierPreviousHeight === height &&
+					this.overlayStack.length === 0 &&
+					prevViewportTop > 0 &&
+					sourceTranscriptLineCount > 0 &&
+					sourceTranscriptLineCount <= prevViewportTop &&
+					newLines.length < prevViewportTop + height &&
+					newLines.length - sourceTranscriptLineCount < height;
+				const minimumLineCount =
+					preserveLiveFrontier && !strandedContractionReplay ? prevViewportTop + height : height;
 				const padded = this.#padBeforeBottomPinnedComponent(
 					newLines,
 					minimumLineCount,
@@ -5788,9 +5877,12 @@ export class TUI extends Container {
 			return;
 		}
 		// First render - just output everything without clearing (assumes clean screen)
+		// unless we're restarting after a stop() which leaves stale content
 		if (initialRender) {
 			logRedraw("first render");
-			fullRender(false, "first render");
+			const shouldClear = this.#restartNeedsClear;
+			this.#restartNeedsClear = false;
+			fullRender(shouldClear, "first render");
 			return;
 		}
 
@@ -5848,13 +5940,19 @@ export class TUI extends Container {
 		// Content shrunk below the previous render and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
 		// Configurable via setClearOnShrink() or GJC_CLEAR_ON_SHRINK=0 env var
-		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
+		// Erase native scrollback too: scrolled-off rows cannot be pulled back into the
+		// viewport, and repainting them on screen would duplicate them in history.
+		if (this.#clearOnShrinkReplays() && newLines.length < this.#previousLines.length) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			if (useViewportRepaintPath) {
-				viewportRepaint(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			} else {
-				fullRender(true, "clearOnShrink");
-			}
+			fullRender(true, "clearOnShrink", true);
+			return;
+		}
+		// Default (clearOnShrink off) still replays when frontier padding would leave the
+		// viewport with no transcript row, e.g. a tall live block collapsing back into
+		// history. Same scrollback erase as above, for the same duplication reason.
+		if (strandedContractionReplay) {
+			logRedraw(`stranded contraction (prev=${this.#previousLines.length}, new=${newLines.length})`);
+			fullRender(true, "stranded contraction", true);
 			return;
 		}
 
@@ -6318,9 +6416,6 @@ export class TUI extends Container {
 		buffer = this.#frameSynchronizedOutput(buffer);
 
 		if ($pickflag("GJC_TUI_DEBUG", "PI_TUI_DEBUG")) {
-			const debugDir = "/tmp/tui";
-			fs.mkdirSync(debugDir, { recursive: true });
-			const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
 			const debugData = [
 				`firstChanged: ${firstChanged}`,
 				`viewportTop: ${viewportTop}`,
@@ -6344,7 +6439,7 @@ export class TUI extends Container {
 				"=== buffer ===",
 				JSON.stringify(buffer),
 			].join("\n");
-			fs.writeFileSync(debugPath, debugData);
+			this.#writeRenderDebugDump(debugData);
 		}
 
 		// Write entire buffer at once. Once those bytes are accepted, the painted

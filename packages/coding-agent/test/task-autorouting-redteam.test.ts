@@ -64,7 +64,10 @@ function session(settingsOverrides: Record<string, unknown> = {}, overrides: Par
 		settings: Settings.isolated(settingsOverrides),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		modelRegistry: { getAvailable: () => snapshot } as never,
+		modelRegistry: {
+			getAvailable: () => snapshot,
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 		...overrides,
 	} as unknown as ToolSession;
 }

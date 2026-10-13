@@ -3004,6 +3004,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"reportIssue.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Tool issue reporting",
+			description:
+				"Enable the report_issue tool: the model records tool behavior that contradicts the tool's description into the local ~/.gjc/tool-issues.db. Nothing is sent anywhere.",
+		},
+	},
+
 	"debug.enabled": {
 		type: "boolean",
 		default: true,

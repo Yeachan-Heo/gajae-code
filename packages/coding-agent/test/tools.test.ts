@@ -346,6 +346,7 @@ function createTestToolContext(toolNames: string[]): AgentToolContext {
 			find: () => undefined,
 			getAll: () => [],
 			getApiKey: async () => undefined,
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as unknown as AgentToolContext["modelRegistry"],
 		model: undefined,
 		isIdle: () => true,

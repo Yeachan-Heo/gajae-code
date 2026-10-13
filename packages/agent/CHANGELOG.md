@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Added
+
+- Add `AgentPromptOptions.contextOverflowManaged` so session owners can classify and recover context overflow at their session boundary while keeping successful empty stops terminal in the agent loop.
+
 ## [0.18.8] - 2026-10-08
 
 ### Fixed

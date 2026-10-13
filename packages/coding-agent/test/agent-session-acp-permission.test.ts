@@ -27,7 +27,6 @@ import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { callSessionTool } from "../src/eval/js/tool-bridge";
 import { EventBus } from "../src/utils/event-bus";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -112,7 +111,7 @@ async function createSession(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { ...testModelRegistryConsumerLease } as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 		extensionRunner,
 	});
@@ -147,7 +146,10 @@ async function createSessionWithMockModel(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { ...testModelRegistryConsumerLease, getApiKey: () => "test-key" } as never,
+		modelRegistry: {
+			getApiKey: () => "test-key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+		} as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 	sess.setSdkPermissionMode("prompt");

@@ -37,6 +37,7 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@gajae-code/ai";
+import { $credentialEnv } from "@gajae-code/utils";
 import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { recordHandledError } from "@gajae-code/utils/postmortem";
 import {
@@ -345,9 +346,11 @@ export interface AgentTelemetryConfig {
 	 * truncated to bounded snippets, not removed. `"full"` emits both summaries
 	 * and full OTEL message payloads.
 	 *
-	 * Defaults to the value of the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
-	 * env var (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
-	 * `"full"` => `"full"`). Env-driven `"full"` capture emits a
+	 * Defaults to the trusted value of
+	 * `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
+	 * (`true`/`1`/`yes` => `"summary"`, `"summary"` => `"summary"`,
+	 * `"full"` => `"full"`). A project `.env` cannot select this default.
+	 * Env-driven `"full"` capture emits a
 	 * `full_content_capture_env_active` telemetry warning once per process.
 	 */
 	readonly captureMessageContent?: TelemetryContentCapture;
@@ -457,9 +460,28 @@ export function resolveTelemetry(
 
 let contentCaptureEnvCache: ResolvedTelemetryContentCapture | undefined;
 let hasWarnedFullContentCaptureEnv = false;
+
+/** `full` > `summary` > anything else. Matches the parser below. */
+function contentCaptureRank(raw: string | undefined): 0 | 1 | 2 {
+	if (!raw) return 0;
+	const normalized = raw.trim().toLowerCase();
+	if (normalized === "full") return 2;
+	if (normalized === "summary" || normalized === "true" || normalized === "1" || normalized === "yes") return 1;
+	return 0;
+}
+
 function readContentCaptureEnv(): ResolvedTelemetryContentCapture {
 	if (contentCaptureEnvCache !== undefined) return contentCaptureEnvCache;
-	const raw = process.env[CONTENT_CAPTURE_ENV];
+	// `$credentialEnv` ignores a project `.env`, pins an inherited value, and
+	// falls back to trusted files. A missing current key is off, so that
+	// fallback cannot restore a deleted value. A lower live rank is a downgrade.
+	// A present higher rank cannot raise the pin.
+	const trusted = $credentialEnv(CONTENT_CAPTURE_ENV);
+	const live = Bun.env[CONTENT_CAPTURE_ENV];
+	let raw: string | undefined;
+	if (live === undefined) raw = undefined;
+	else if (contentCaptureRank(live) < contentCaptureRank(trusted)) raw = live;
+	else raw = trusted;
 	if (!raw) {
 		contentCaptureEnvCache = "none";
 		return "none";

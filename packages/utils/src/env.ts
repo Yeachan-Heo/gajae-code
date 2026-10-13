@@ -6,7 +6,7 @@ import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
-import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file";
+import { parseEnvFile, parseEnvFileContent, parseShellEnvFile, projectEnvSnapshot } from "./env-file";
 
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
@@ -37,6 +37,12 @@ function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string
 			else dynamic.delete(key);
 		}
 	}
+	// Quoted escapes are not `$` or backticks, but Bun autoload decodes `\n`
+	// and `\r` inside double quotes. `projectEnvSnapshot` already refuses that
+	// shape. Union those keys. Do not copy its values: an unparsed declaration
+	// is stored there as "" and must not overlay this layer. File selection
+	// stays above, so a higher static layer still clears a lower dynamic one.
+	for (const key of projectEnvSnapshot(cwd).dynamic) dynamic.add(key);
 	return { values, dynamic };
 }
 
@@ -189,21 +195,30 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 }
 
 /**
- * Process-wide transport-security switches a repository must not be able to flip.
+ * Names a repository `.env` must not install into the process environment.
  * `NODE_TLS_REJECT_UNAUTHORIZED=0` disables certificate verification for every
  * fetch in the process, so a project `.env` pairing it with a proxy would expose
  * provider credentials to whoever answers the proxy.
+ * `GJC_HARNESS_SOCKET_DIR` and `GJC_HARNESS_ROOT_REGISTRY_DIR` select the harness
+ * control socket directory and the session-root registry. The harness reads both
+ * from the process environment after this module loads, so a project `.env` must
+ * not point either at a path the repository controls.
  */
-const PROJECT_DENIED_ENV_NAMES = ["NODE_TLS_REJECT_UNAUTHORIZED"] as const;
+const PROJECT_DENIED_ENV_NAMES = [
+	"NODE_TLS_REJECT_UNAUTHORIZED",
+	"GJC_HARNESS_SOCKET_DIR",
+	"GJC_HARNESS_ROOT_REGISTRY_DIR",
+] as const;
 
 // Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
 // (same provenance rule as the credential snapshot) and never copy it below.
-// Bun reads this switch per TLS connection, so removing it here restores
-// verification for every connection the process opens afterwards.
+// Removing `NODE_TLS_REJECT_UNAUTHORIZED` restores verification: Bun reads that
+// switch per TLS connection. The same drop covers the harness directory names.
+// A quoted escape is dynamic even when the line parser did not store a value.
 for (const name of PROJECT_DENIED_ENV_NAMES) {
 	const key = canonicalEnvKey(name);
 	const declared = projectEnv[key];
-	if (declared === undefined) continue;
+	if (declared === undefined && !projectSnapshot.dynamic.has(key)) continue;
 	const runtime = Bun.env[name];
 	if (
 		runtime !== undefined &&

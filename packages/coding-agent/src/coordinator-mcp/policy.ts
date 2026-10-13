@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { coordinatorMcpStateRoot, gjcRoot } from "../gjc-runtime/session-layout";
 import {
 	DEFAULT_SESSION_IDLE_TTL_MS,
@@ -121,6 +122,30 @@ function parseRootList(value: string | undefined): string[] {
 		.filter(Boolean);
 }
 
+const MANAGED_WORKTREE_DIR_ENV = "GJC_WORKTREE_DIR";
+/** Captured at load so a later chdir or dotenv delete cannot hide the declaration. */
+const startupManagedWorktreeSnapshot = projectEnvSnapshot();
+
+/**
+ * Operator value only. A project dotenv declaration, including a dynamic one,
+ * must not widen managed worktree roots. An operator value the project does
+ * not declare is kept.
+ */
+function trustedManagedWorktreeDir(env: NodeJS.ProcessEnv): string | undefined {
+	const raw = env[MANAGED_WORKTREE_DIR_ENV];
+	if (!raw) return undefined;
+	const key = canonicalEnvKey(MANAGED_WORKTREE_DIR_ENV);
+	const declared = startupManagedWorktreeSnapshot.values[key];
+	const trimmed = raw.trim();
+	if (
+		declared !== undefined &&
+		(startupManagedWorktreeSnapshot.dynamic.has(key) || declared === raw || declared === trimmed)
+	) {
+		return undefined;
+	}
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function resolveManagedWorktreeRoot(root: string, configured: string | undefined): string {
 	// Function replacers so a `$` in the home or repository path is kept verbatim.
 	const template = (configured?.trim() || "{repo}/.worktrees").replace(/^~(?=\/|$)/, () => os.homedir());
@@ -168,7 +193,7 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 	return {
 		allowedRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
 		managedWorktreeRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root =>
-			resolveManagedWorktreeRoot(path.resolve(root), env.GJC_WORKTREE_DIR),
+			resolveManagedWorktreeRoot(path.resolve(root), trustedManagedWorktreeDir(env)),
 		),
 		mutationClasses: parseMutationClasses(
 			env.GJC_COORDINATOR_MCP_MUTATIONS ?? env.GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES,

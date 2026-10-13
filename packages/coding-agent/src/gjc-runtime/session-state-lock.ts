@@ -300,9 +300,12 @@ async function repairPendingOwnerRecord(pending: PendingOwnerRepair): Promise<bo
 	const handle = pending.repairHandle;
 	if (!handle || pending.repairBytes === undefined) return true;
 	try {
-		await writeOwnerBytes(handle, Buffer.from(pending.repairBytes, "utf8"));
+		const written = await writeOwnerBytes(handle, Buffer.from(pending.repairBytes, "utf8"), undefined);
 		const stat = await handle.stat({ bigint: true });
-		pending.repairSnapshot = ownerSnapshotFrom(stat, Buffer.from(pending.repairBytes, "utf8"));
+		// The rewritten record may have been padded back to its previous length, so the
+		// identity that authorizes later cleanup is the bytes that landed, not the bytes
+		// requested.
+		pending.repairSnapshot = ownerSnapshotFrom(stat, written);
 		await handle.close();
 		pending.repairHandle = undefined;
 		return true;
@@ -533,6 +536,8 @@ export const SessionStateLockTestHooks: {
 	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before a held owner record rewrite mutates bytes. */
 	beforeOwnerRecordRewrite?: (file: string) => void | Promise<void>;
+	/** @internal Fault seam immediately before the pre-rewrite fstat on the owner record handle. */
+	beforeOwnerRecordPrewriteStat?: (file: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before final transition-generation validation. */
 	beforeTransitionReleaseLstat?: (transitionDir: string) => void | Promise<void>;
 	/** @internal Fault seam immediately before setup generation capture. */
@@ -1491,13 +1496,21 @@ async function createOwnerLock(
 	// pair names the record this call brought into existence and nothing else.
 	let created: OpenOwnerIdentity | null = null;
 	try {
-		await handle.chmod(0o600);
 		created = await openOwnerIdentity(handle);
 		await SessionStateLockTestHooks.ownerRecordWriteFault?.(file);
+		// The record's bytes land before anything else is asked of this descriptor. A
+		// freshly created record is empty until they do, and an empty record carries no
+		// `owner_host_id`, so every syscall placed in front of this write is a window in
+		// which a kill leaves debris no later contender may reclaim. `chmod` is the one
+		// that can actually stall — it is a metadata round-trip that a File Provider,
+		// NFS, or CIFS mount may hold for seconds — so it moves behind the write. The
+		// unrestricted mode it corrected for is already excluded by the create's own
+		// mode argument, so the descriptor is never more permissive than 0o600 here.
 		await handle.writeFile(bytes);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile() || stat.size !== BigInt(bytes.byteLength))
 			throw new SessionStateLockUnavailableError(new Error("Owner record did not land as a regular file."));
+		await handle.chmod(0o600);
 		return ownerSnapshotFrom(stat, bytes);
 	} catch (error) {
 		// Deliberately BEFORE any close: releasing the descriptor first would free the
@@ -1520,16 +1533,48 @@ const POSIX_OWNER_REWRITE_FLAGS = POSIX_NOFOLLOW_AVAILABLE
 	? fsSync.constants.O_RDWR | fsSync.constants.O_NONBLOCK | fsSync.constants.O_NOFOLLOW
 	: undefined;
 
-async function writeOwnerBytes(handle: fs.FileHandle, bytes: Buffer): Promise<void> {
-	await handle.truncate(0);
+/**
+ * The one writer of an owner record's bytes: overwrite in place, never shorter.
+ *
+ * `truncate(0)` followed by a write looks atomic and is not. The bytes a truncate
+ * publishes are EMPTY, and an empty record carries no `owner_host_id` at all, so a
+ * process that dies inside that window (a repeated Ctrl-C reaches `postmortem.quit`,
+ * which deliberately performs no lock release) leaves a record with no attributable
+ * owner. `malformedOwnerProvenance` classifies it `unprovenanced`, the reclaim refuses
+ * it, and every later contender fails closed forever: `transition_claim_timeout` with
+ * `claim_or_owner_unreadable`, and coordinator state persistence for that session is
+ * lost for good — the failure class #5159 and #5216 both land on.
+ *
+ * So the replacement is written over the HEAD of the record and the previous byte
+ * length is kept instead of discarded. A JSON document ignores trailing whitespace, so
+ * a padded record is the same record to every reader — `JSON.parse`, `validLockOwner`,
+ * `malformedOwnerProvenance`, and the identity-bound unlink all see exactly the
+ * replacement — while the bytes on disk always carry the full ownership preamble. That
+ * leaves a torn single write (which needs the kernel to short-write a ~200 byte payload)
+ * as the only state the record cannot be attributed from, instead of the guaranteed
+ * empty window between two syscalls.
+ *
+ * @returns the exact bytes now on disk. A padded record's size and SHA-256 are the
+ * padded bytes', so this — not the requested payload — is what identifies the record
+ * for every later capture, comparison, and replay.
+ */
+async function writeOwnerBytes(handle: fs.FileHandle, bytes: Buffer, file?: string): Promise<Buffer> {
+	if (file) await SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat?.(file);
+	const previous = await handle.stat({ bigint: true });
+	const previousSize = previous.isFile() === true ? Number(previous.size) : 0;
+	const padding = Math.max(0, previousSize - bytes.byteLength);
+	const payload = padding === 0 ? bytes : Buffer.concat([bytes, Buffer.alloc(padding, 0x20)]);
 	let offset = 0;
-	while (offset < bytes.byteLength) {
-		const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
+	while (offset < payload.byteLength) {
+		const { bytesWritten } = await handle.write(payload, offset, payload.byteLength - offset, offset);
 		if (bytesWritten <= 0) throw new Error("Owner record rewrite made no progress.");
 		offset += bytesWritten;
 	}
-	await handle.truncate(bytes.byteLength);
+	// `payload` is never shorter than the record already was, so this can only remove a
+	// tail that outgrew the bytes just written; it can never cut the record itself.
+	await handle.truncate(payload.byteLength);
 	await handle.sync();
+	return payload;
 }
 
 async function rewriteHeldOwnerRecord(
@@ -1581,15 +1626,15 @@ async function rewriteHeldOwnerRecord(
 		mutationStarted = true;
 		await SessionStateLockTestHooks.beforeOwnerRecordRewrite?.(file);
 		rewriteHookPassed = true;
-		await writeOwnerBytes(handle, replacementBytes);
+		const writtenBytes = await writeOwnerBytes(handle, replacementBytes, file);
 		const canonical = await captureRegularLockOwner(file);
-		// On Windows, an in-place truncate/write can expose refreshed descriptor
+		// On Windows, an in-place rewrite can expose refreshed descriptor
 		// metadata even though the file object is unchanged. The descriptor opened
 		// before mutation is the stable identity bracket; the path capture still
 		// proves that the pathname resolves to that same object after the rewrite.
 		if (!canonical || canonical.dev !== opened.dev || canonical.ino !== opened.ino)
 			throw new SessionStateLockUnavailableError(new Error("Owner pathname changed after rewrite."));
-		if (canonical.bytes !== replacementBytes.toString("utf8")) {
+		if (canonical.bytes !== writtenBytes.toString("utf8")) {
 			let successor: unknown;
 			try {
 				successor = JSON.parse(canonical.bytes);
@@ -1602,7 +1647,7 @@ async function rewriteHeldOwnerRecord(
 		return canonical;
 	} catch (error) {
 		// Keep the descriptor as the repair authority until the held bytes have
-		// been restored. A truncate/write/fsync fault may leave a malformed or
+		// been restored. A write/fsync fault may leave a malformed or
 		// partially committed record; closing first would force recovery to trust
 		// an unproven pathname and can wedge a successor behind the transition.
 		let repairNeeded = mutationStarted;
@@ -1616,9 +1661,9 @@ async function rewriteHeldOwnerRecord(
 		if (repairNeeded) {
 			let repaired: LockOwnerSnapshot;
 			try {
-				await writeOwnerBytes(handle, Buffer.from(held.bytes, "utf8"));
+				const restored = await writeOwnerBytes(handle, Buffer.from(held.bytes, "utf8"), file);
 				const repairedStat = await handle.stat({ bigint: true });
-				repaired = ownerSnapshotFrom(repairedStat, Buffer.from(held.bytes, "utf8"));
+				repaired = ownerSnapshotFrom(repairedStat, restored);
 			} catch (repairError) {
 				const aggregate = new AggregateError(
 					[error, repairError],

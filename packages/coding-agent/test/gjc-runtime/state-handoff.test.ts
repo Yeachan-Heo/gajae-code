@@ -2561,6 +2561,48 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("refuses ultragoal handoff while the approval audit journal is incomplete", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
+			const priorFailpoint = process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT;
+			process.env.GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT = "1";
+			let approval: StateCommandResult;
+			try {
+				approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			} finally {
+				restoreEnvironmentValue("GJC_STATE_APPROVAL_FAIL_BEFORE_AUDIT", priorFailpoint);
+			}
+			expect(approval.status).not.toBe(0);
+			expect(approval.stderr).toContain("injected approval audit failure");
+			const indexPath = path.join(sessionStateDir(cwd, TEST_SESSION_ID), "deep-interview-approval-audit.json");
+			await expect(fs.access(indexPath)).rejects.toThrow();
+			const handoff = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(handoff.status).toBe(2);
+			expect(handoff.stderr).toContain("deep-interview execution approval journal is incomplete");
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
+		});
+	});
+
+	it("still hands off a committed execution approval when the ledger tail omits the audit line", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			await recordExecutionApproval(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const ledgerPath = auditPath(cwd, TEST_SESSION_ID);
+			await fs.appendFile(ledgerPath, `${"x".repeat(2 * 1024 * 1024)}\n`);
+			const handoff = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(handoff.status, handoff.stderr).toBe(0);
+			expect(await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).not.toBeNull();
+		});
+	});
+
 	it("repairs a missing specialized approval audit on exact retry", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);

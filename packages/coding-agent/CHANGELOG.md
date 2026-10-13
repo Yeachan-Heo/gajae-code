@@ -2,6 +2,108 @@
 
 ## [Unreleased]
 
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Added
+
+- Added attach-only SDK client mode: with `GJC_SDK_BROKER_AUTOSTART=0` or `--attach-only` (on `gjc sdk session`, `gjc sdk search`, `gjc sdk spawn` and `gjc mcp-serve`), every SDK client entry point (session CLI, search, spawn, SDK and coordinator MCP servers, ACP, session hosts) attaches only to a live, reusable broker and fails with `broker_unavailable` instead of spawning, retiring, or restarting one, so a supervisor-owned broker has a single owner. `gjc doctor` broker restart refuses with `attach_only_refused`, and the SDK broker restart script refuses before closing hosts or stopping the broker.
+
+- Added `gjc sdk broker run [--agent-dir <dir>]`, a stable foreground broker command for supervisors (systemd, launchd). It never detaches, stops gracefully on SIGTERM or SIGINT and exits with the signal status, exits 1 instead of serving when another live broker already owns the agent directory (never retiring it), and exits 1 if it loses its discovery root while serving.
+
+### Fixed
+
+- Prevented deferred startup profile recovery from replacing newer model or role selections during credential refresh or settings flush; rejected model selections no longer cancel recovery, and canceled recovery restores session-owned alias and fallback state (#6380).
+
+- Match Windows session paths by filesystem identity without rewriting canonical paths or conflating distinct case-sensitive files. Managed-root containment canonicalizes aliases above the root and rejects symlink components below it.
+- Reject managed descendant symlinks before canonicalizing paths, preventing a replaced scope directory from redirecting access to a sibling session.
+- Keep native-backed endpoint key derivation out of the broadly imported async barrel so idle startup does not load path identity bindings.
+
+- The Bash tool now counts characters instead of UTF-8 bytes for `${#var}`, so negative substring offsets such as `${var: -2}` select the right characters in non-ASCII values (#6544).
+- A negative substring length now marks where the slice ends, as in bash (`${v:2:-2}` on `abcdefgh` is `cdef`), and an end before the offset or a negative length on an array fails with `substring expression < 0` instead of slicing the wrong range.
+
+- `ast_edit` apply refuses auto-generated files when that edit guard is on, the same as write and vim.
+
+- `ast_edit` apply checks the real write path and the original preview path, so a directory symlink such as `src` → `.gjc` cannot bypass the `.gjc/**` block, and a `.gjc` directory that points at another in-workspace directory stays blocked.
+
+- Enroll async-job delivery and loop completion futures before callbacks and change notifications so drains and bounded disposal cannot mistake in-flight work for settled delivery.
+
+- Contain rejections from `async` agent-session event subscribers, so a failed subscriber write (for example the `managed_append_identity_mismatch` fence after another process resumed the same session) is logged instead of terminating the interactive process with an unhandled rejection.
+
+- `app.cdp_url` is refused unless its host is loopback.
+
+- Debug adapter lookup uses the same trusted `$PATH` rule as LSP auto-detection, so a repository `bin/`, `node_modules/.bin`, or virtualenv binary is no longer spawned as a debugger.
+
+- Managed-session descriptor preflight and bounded range reads now preserve their original metadata, pathname, or range error when descriptor close also fails; close-only errors after a successful read still propagate.
+
+- Reusing a detached launch worktree now refuses to check out a new source HEAD when the worktree commit is not an ancestor of that HEAD, so committed work is not silently dropped.
+
+- Explicit session directories create fork and branch transcripts and unsent drafts with the same native owner-only security as the primary transcript.
+
+- A project `.env` declaration of `VISUAL` or `EDITOR` no longer selects the external editor that GJC executes on your draft; values inherited from the launching shell or GJC/user-owned env files are still honored.
+
+- Temp directory cleanup on Windows: sessions now properly release managed sidecar cache file handles during `closeStrict()`, preventing "directory in use" errors when deleting temporary session directories in tests. The root cause was unconditional resource retention when close succeeded; the fix ensures file handles are released even when resident blob cleanup is skipped (#6566).
+
+- Side-effect `github` operations (`pr_create`, `pr_checkout`, `pr_push`) now go through the session approval gate and the planning-phase mutation guard, while read-only operations stay available.
+
+- HTML session export creates and replaces its output file as owner-only (`0600`).
+
+- Keep bundled Grok Build request hooks scoped to their provider so unrelated SDK sessions retain replay-safe empty-response fallback. Cover the production SDK observer, accepted-only lifecycle, managed transcript persistence, and billed empty stops without changing deadline reconciliation or admitting rejected attempts.
+
+- Preserve clean managed-session fallback admission when the SDK observes the run start, while keeping user extension execution replay-unsafe. Successful empty stops with nonzero usage no longer trigger legacy proxy-overflow retries in session-owned turns.
+
+- Plugin MCP policy denies the shared CGNAT range 100.64.0.0/10, matching the public URL address check.
+
+- Remote MCP HTTP no longer follows a redirect onto another origin, so custom credential headers, the MCP session id, and the JSON-RPC body stay on the configured server.
+
+- A modern MCP `roots/list` input request uses the connection's request handler, so a tools-only session does not answer with the project URI.
+
+- Project MCP config no longer runs shell substitutions or copies secret-named environment variables into server environment and headers.
+
+- Local memory consolidation (phase 2) no longer runs out of room under a fixed 8192-token response cap that, on adaptive-thinking and reasoning-effort models, also had to hold the reasoning; on large memories the rewritten `MEMORY.md`, summary and skills were cut off, failed as `phase2 JSON parse failure`, and `MEMORY.md` / `memory_summary.md` silently stopped updating. The response budget is now the model's output limit capped at 64k, clamped so input, response and any provider-added thinking budget fit the context window (inputs are shrunk on small-context models rather than dropping below the old 8192 budget), and phase 2 requests low reasoning effort like phase 1. A length-truncated response is recorded as `phase2 output truncated …` and a response with no text as `phase2 returned no text (stopReason=…, … output tokens, … thinking blocks)` instead of a JSON parse failure. A job that already exhausted its retries runs again once new sessions advance its input.
+
+- The workflow mutation guard no longer treats an out-of-band mode-state phase as permission to edit product code while the active planning skill is still sealed.
+
+- `monitor` commands are checked by the same planning-phase mutation guard as `bash` before a background job starts.
+
+- The MCP OAuth client_id probe does not GET a non-public authorization URL: the request is pinned to the validated address and the flow abort signal reaches that DNS lookup. The shared address check rejects 192.88.99.0/24, including the non-global 6a44 relay 192.88.99.2.
+
+- OAuth dynamic registration metadata is fetched only from a public URL, and that fetch does not follow redirects.
+
+- Plugin MCP launchers no longer trust startup `node` executables located under temporary roots, even when the GJC checkout is also under `/tmp`; transient first-use digest failures can be retried against the original startup identity.
+
+- The Python tool bridge checks that its registration is still current and not aborted after the request body arrives.
+
+- Register spawned Python kernels before startup callbacks and retain failed or unconfirmed cleanup resources for an explicit retry instead of losing or replacing them.
+- Separate cancelled requests from shared kernel initialization while preserving captured cleanup joins and removing failed provisional acquisitions.
+- Preserve direct-start recovery handles and execution/cleanup error precedence, revalidate cancelled retry acquisitions, and keep active fallback owners through failed explicit preflight.
+
+- Enroll the original Python tool invocation before external execution tracking, so reentrant clear and registered cleanup join its transcript and result finalization without clearing an independent generation.
+
+- Remove temporary deadline-recovery stderr diagnostics so SDK prompt bookkeeping stays within centralized logging and does not expose correlation identifiers through debug prints.
+
+- A retained managed session directory replaced by a symlink is now refused as a changed root binding, and the newly retained child store is closed.
+
+- Bound shared GC count/collect inventories across each read-only receipt read, discovery call and protocol inspection, including unrelated entries and repeated passes. Preserve genuine leased publication quotas, authority fences and descriptor admission; report capacity refusal rather than omitting targets. This does not establish full GC traversal/read/hash admission or writer quiescence.
+
+- The coordinator sidecar ignores a signing-key URL or key that the project dotenv declares, so a repository `.env` cannot supply the signing key.
+
+- Task isolation directories are unique per attempt, so one session can no longer delete another session's live worktree when both reuse the same task id.
+
+- A project `.env` declaration of `GJC_TMUX_COMMAND`, including a dynamic one, no longer selects the tmux binary; the default `tmux` path is used instead, while an operator value the project does not declare is kept.
+
+- Preserve trusted user-skill symlink provenance in isolated-home discovery, honor the effective scope trust policy, and reuse scanner-validated import metadata in customization inventory.
+
+- Fixed Windows CI task cache key test cleanup failures (EBUSY/EPERM) by adding exponential backoff retry logic to temporary directory removal. File handles on Windows may remain open during deletion, causing removal to fail; retrying with increasing delays resolves the locking issue.
+
+- A project `.env` declaration of `GJC_WORKTREE_DIR`, including a dynamic one, no longer selects the launch worktree bucket; the default `{repo}/.worktrees` path is used instead, while an operator value the project does not declare is kept.
+
+- Zero-usage empty stops from context-overflow proxies trigger context promotion and overflow recovery again; only successful empty stops with nonzero usage stay terminal in session-owned turns.
+- Total-token-only empty stops (from OpenAI-compatible endpoints returning only `usage.total_tokens`) are now correctly classified as nonzero usage and remain terminal, preventing unnecessary promotion or retry.
+
 ## [0.18.8] - 2026-10-08
 
 ### Added

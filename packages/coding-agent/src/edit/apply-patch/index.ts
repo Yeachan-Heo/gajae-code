@@ -12,7 +12,13 @@
  */
 
 import { ApplyPatchError } from "../diff";
-import { type ApplyPatchOptions, type ApplyPatchResult, applyPatch, type PatchInput } from "../modes/patch";
+import {
+	type ApplyPatchOptions,
+	type ApplyPatchResult,
+	applyPatch,
+	type PatchInput,
+	preflightPatchMkdir,
+} from "../modes/patch";
 import { parseApplyPatch } from "./parser";
 
 export * from "./parser";
@@ -48,6 +54,11 @@ export async function applyCodexPatch(patchText: string, options: ApplyPatchOpti
 		deleted: [] as string[],
 	};
 
+	// Containment is checked for every hunk before the first write. A later
+	// I/O failure still leaves earlier hunks applied, per spec §6.1.
+	for (const hunk of hunks) {
+		await preflightPatchMkdir(hunk, options);
+	}
 	for (const hunk of hunks) {
 		const result = await applyPatch(hunk, options);
 		results.push(result);

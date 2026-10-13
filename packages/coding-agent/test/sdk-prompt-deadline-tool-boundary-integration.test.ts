@@ -9,7 +9,6 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { waitForToolCallBoundary } from "../src/sdk/prompt-tool-boundary";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 /**
  * #5637 review thread P2: the bus-level cases drive the deadline handlers
@@ -118,9 +117,9 @@ describe("prompt deadline tool boundary on a live AgentSession", () => {
 			// pressure, so a stub without it passes alone and throws inside
 			// `prompt()` under a full-suite run — taking every assertion below with it.
 			modelRegistry: {
-				...testModelRegistryConsumerLease,
 				getApiKey: async () => "test-key",
 				getAvailable: () => [mock.model],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as never,
 		});
 		session = live;

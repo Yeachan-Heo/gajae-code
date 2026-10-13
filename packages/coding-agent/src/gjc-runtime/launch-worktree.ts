@@ -244,9 +244,34 @@ function resolveWorktreeBucket(repoRoot: string): string {
 	return resolveWorktreeBucketForPath(repoRoot, trustedWorktreeBucketEnv(process.env), os.homedir(), path);
 }
 
+function throwIfBucketRealpathEscapesRepository(repoRoot: string, bucketPath: string): void {
+	let realBucket: string;
+	try {
+		realBucket = fs.realpathSync(bucketPath);
+	} catch (error) {
+		// A missing bucket is created later. A dangling link is classified by inspectBucketDir.
+		if (fileSystemErrorCode(error) === "ENOENT") return;
+		throw error;
+	}
+	const relativeReal = path.relative(fs.realpathSync(repoRoot), realBucket);
+	if (relativeReal.startsWith(`..${path.sep}`) || relativeReal === ".." || path.isAbsolute(relativeReal)) {
+		throw new Error(
+			[
+				"worktree_bucket_escapes_repository",
+				"The GJC launch worktree bucket resolves outside the repository.",
+				`Path: ${formatBucketPath(bucketPath)}`,
+				"Safe remediation: replace the path with a real directory inside the repository, or set GJC_WORKTREE_DIR to a directory outside the repository. GJC did not create a worktree.",
+			].join("\n"),
+		);
+	}
+}
+
 function ensureRepositoryBucketIgnored(repoRoot: string, bucketPath: string): void {
 	const relativeBucket = path.relative(repoRoot, bucketPath);
+	// Lexical paths outside the repo are the operator override and stay allowed.
 	if (relativeBucket.startsWith(`..${path.sep}`) || relativeBucket === ".." || path.isAbsolute(relativeBucket)) return;
+	// git check-ignore accepts a gitignored symlink without looking at its target.
+	throwIfBucketRealpathEscapesRepository(repoRoot, bucketPath);
 	const ignoreProbe = path.join(relativeBucket, ".gjc-worktree-probe");
 	for (const candidate of [relativeBucket, ignoreProbe]) {
 		const result = Bun.spawnSync(["git", "check-ignore", "--quiet", "--", candidate], {
@@ -702,17 +727,87 @@ function tryRestore(restore: () => void): void {
 	}
 }
 
-/** Best-effort removal of a worktree GJC just created, used when a later step must roll it back. */
-function rollbackCreatedWorktree(plan: GjcLaunchWorktreePlan): void {
+function lexicalPathInsideRepository(repoRoot: string, targetPath: string): boolean {
+	const relative = path.relative(path.resolve(repoRoot), path.resolve(targetPath));
+	return !(relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative));
+}
+
+function realpathEscapesRepository(repoRoot: string, targetPath: string): boolean {
+	let realTarget: string;
 	try {
-		runGit(plan.repoRoot, ["worktree", "remove", "--force", plan.worktreePath]);
+		realTarget = fs.realpathSync(targetPath);
+	} catch (error) {
+		// A missing path is not an escape. Anything else is not safe to hand to remove --force.
+		if (fileSystemErrorCode(error) === "ENOENT") return false;
+		return true;
+	}
+	const relativeReal = path.relative(fs.realpathSync(repoRoot), realTarget);
+	return relativeReal.startsWith(`..${path.sep}`) || relativeReal === ".." || path.isAbsolute(relativeReal);
+}
+
+function pruneWorktreeRegistration(repoRoot: string): void {
+	try {
+		runGit(repoRoot, ["worktree", "prune"]);
 	} catch {
-		try {
-			runGit(plan.repoRoot, ["worktree", "prune"]);
-		} catch {
-			// Best-effort rollback; the restore failure below is the actionable error.
+		// Best-effort. Callers report their own failure.
+	}
+}
+
+/**
+ * Remove a launch worktree this process just created.
+ *
+ * `git worktree remove --force` follows a symlink and deletes the referent when a
+ * copied `.git` gitdir file passes validation. Unlink that link only when its
+ * parent stays inside the repository, or when the path is an explicit external
+ * worktree. An in-repo path whose parent resolves outside the repository is
+ * left untouched. A real directory is still removed with `--force`.
+ */
+function removeCreatedWorktree(repoRoot: string, worktreePath: string): void {
+	let stat: fs.Stats | undefined;
+	try {
+		stat = fs.lstatSync(worktreePath);
+	} catch (error) {
+		if (fileSystemErrorCode(error) !== "ENOENT") {
+			pruneWorktreeRegistration(repoRoot);
+			return;
 		}
 	}
+	// A retargeted in-repo bucket can place this path's parent outside the repository.
+	// Do not unlink that outside entry. An explicit external worktree is not this case.
+	if (
+		lexicalPathInsideRepository(repoRoot, worktreePath) &&
+		realpathEscapesRepository(repoRoot, path.dirname(worktreePath))
+	) {
+		pruneWorktreeRegistration(repoRoot);
+		return;
+	}
+	if (stat?.isSymbolicLink()) {
+		try {
+			fs.unlinkSync(worktreePath);
+		} catch {
+			// The link may already be gone.
+		}
+		pruneWorktreeRegistration(repoRoot);
+		return;
+	}
+	if (
+		stat?.isDirectory() &&
+		lexicalPathInsideRepository(repoRoot, worktreePath) &&
+		realpathEscapesRepository(repoRoot, worktreePath)
+	) {
+		pruneWorktreeRegistration(repoRoot);
+		return;
+	}
+	try {
+		runGit(repoRoot, ["worktree", "remove", "--force", worktreePath]);
+	} catch {
+		pruneWorktreeRegistration(repoRoot);
+	}
+}
+
+/** Best-effort removal of a worktree GJC just created, used when a later step must roll it back. */
+function rollbackCreatedWorktree(plan: GjcLaunchWorktreePlan): void {
+	removeCreatedWorktree(plan.repoRoot, plan.worktreePath);
 }
 
 /**
@@ -1205,15 +1300,7 @@ export function removeOwnedLaunchWorktree(
 	receipt: { created: boolean; reused: boolean; createdBranch: boolean },
 ): void {
 	if (!receipt.created || receipt.reused) return;
-	try {
-		runGit(plan.repoRoot, ["worktree", "remove", "--force", plan.worktreePath]);
-	} catch {
-		try {
-			runGit(plan.repoRoot, ["worktree", "prune"]);
-		} catch {
-			// Proof stays on the ledger; leftover classify is best-effort after abort.
-		}
-	}
+	removeCreatedWorktree(plan.repoRoot, plan.worktreePath);
 	if (receipt.createdBranch && plan.branchName) {
 		try {
 			runGit(plan.repoRoot, ["branch", "-D", plan.branchName]);

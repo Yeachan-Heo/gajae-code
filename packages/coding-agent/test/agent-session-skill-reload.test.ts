@@ -5,7 +5,6 @@ import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { Settings } from "../src/config/settings";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 function createModel(): Model<"openai-responses"> {
 	return {
@@ -58,7 +57,9 @@ describe("AgentSession skill reload", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(cwd),
 			settings,
-			modelRegistry: { ...testModelRegistryConsumerLease } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			skills: [oldSkill],
 			skillWarnings: [{ skillPath: oldSkill.filePath, message: "old warning" }],
 			reloadSkills: async () => ({

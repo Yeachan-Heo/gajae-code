@@ -5,7 +5,6 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const model = { provider: "test", id: "model", api: "openai-responses", name: "model" } as Model;
 
@@ -16,9 +15,9 @@ function createSession(streamFn?: AgentOptions["streamFn"], models: readonly Mod
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated(),
 		modelRegistry: {
-			...testModelRegistryConsumerLease,
 			getAvailable: () => models,
 			getApiKey: async () => "key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 	});
 }

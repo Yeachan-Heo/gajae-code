@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## [0.18.11] - 2026-10-12
+
+### Fixed
+
+- Fixed the viewport going blank above the status line and input box when a tall live block (task output, streaming tool output) collapsed with `clearOnShrink` off: the TUI now replays the frame when padding to the committed frontier would leave no transcript row on screen.
+
+## [0.18.10] - 2026-10-12
+
+### Fixed
+
+- TUI no longer goes blank after stop/restart cycles: `#hardwareCursorRow` is now properly reset during `stop()` to prevent stale cursor position state from corrupting viewport calculations on the next `start()`.
+
+- With `clearOnShrink` enabled, a live block that shrinks after the transcript has scrolled into history no longer leaves blank spacer rows above the pinned composer until the next resize. The contraction now clears the screen and history and replays the frame, so the viewport is filled again and no row appears twice in history.
+
+## [0.18.9] - 2026-10-11
+
+### Added
+
+- With mouse support on, dragging over Markdown copies the original Markdown instead of the painted glyphs: prose is joined across soft wraps, fully selected blocks copy their original Markdown (code with its original tabs, quotes with `>`), a selection inside a single code block drops the fences and presentation indent, and a partial table selection copies tab-separated cells without box drawing.
+- A held drag keeps extending while the wheel scrolls the transcript, and auto-scrolls while the pointer rests on the top or bottom transcript edge. A drag that leaves the window or crosses editor chrome keeps its selection instead of clearing it.
+
+### Fixed
+
+- Preserve the committed viewport frontier through bottom-pinned frame contractions and temporary manual-history handoffs, preventing scrolled-off transcript rows from being added to scrollback twice.
+
 ## [0.18.8] - 2026-10-08
 
 ## [0.18.7] - 2026-10-04

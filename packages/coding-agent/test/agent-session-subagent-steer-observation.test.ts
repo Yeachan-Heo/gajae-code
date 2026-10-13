@@ -8,7 +8,6 @@ import {
 	type AgentSessionEvent,
 } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 type SteerDetails = {
 	observationId?: string;
@@ -35,7 +34,7 @@ function createSession(
 		agent: createAgent(),
 		sessionManager: options.sessionManager ?? SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { ...testModelRegistryConsumerLease } as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		agentId: options.agentId,
 		agentRegistry: options.agentRegistry,
 	} satisfies AgentSessionConfig);

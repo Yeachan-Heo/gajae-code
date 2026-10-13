@@ -18,7 +18,6 @@ import {
 } from "../src/setup/model-onboarding-guidance";
 import { BUILTIN_SLASH_COMMANDS_INTERNAL } from "../src/slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "../src/slash-commands/types";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const tempDirs: string[] = [];
 
@@ -192,7 +191,10 @@ describe("model onboarding guidance", () => {
 			agent: noCredentialAgent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { ...testModelRegistryConsumerLease, getApiKey: async () => undefined } as never,
+			modelRegistry: {
+				getApiKey: async () => undefined,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 		});
 		try {
 			let noCredentialMessage: string | undefined;

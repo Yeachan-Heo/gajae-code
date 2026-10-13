@@ -381,8 +381,8 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 
 | Variable | Default / behavior |
 | -------- | ------------------ |
-| `GJC_GROK_CLI_BASE_URL` | Base URL override for the bundled Grok Build provider (default `https://cli-chat-proxy.grok.com/v1`; trailing slashes are trimmed). `GROK_CLI_BASE_URL` is read when it is unset. To keep OAuth credentials on the Grok host, an override is honored only for `https://cli-chat-proxy.grok.com`; any other URL is ignored with a session warning and the default is used. |
-| `GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL` | Exactly `1` honors a base URL override on any other host. For trusted local testing only: the OAuth bearer token is sent to that host. |
+| `GJC_GROK_CLI_BASE_URL` | Base URL override for the bundled Grok Build provider (default `https://cli-chat-proxy.grok.com/v1`; trailing slashes are trimmed). `GROK_CLI_BASE_URL` is read when it is unset. A value declared in the project dotenv (`.env`, `.env.local`, `.env.$NODE_ENV`, `.env.$NODE_ENV.local`) is ignored. An operator override is honored only for `https://cli-chat-proxy.grok.com`; any other URL is ignored with a session warning and the default is used. |
+| `GJC_GROK_CLI_ALLOW_UNSAFE_BASE_URL` | Exactly `1` in the operator environment honors a base URL override on any other host. A project dotenv declaration of this flag is ignored, so a repository cannot approve its own redirect. For trusted local testing only: the OAuth bearer token is sent to that host. |
 | `GJC_GROK_CLI_MODELS` | Comma-separated model ids that replace the built-in model list, in that order. Known ids keep their built-in metadata; unknown ids are added as text-only reasoning models with a 1,000,000-token context window. |
 | `GROK_CLI_OAUTH_TOKEN` | Bearer token bypass for local use. No refresh and no model discovery; a session warning recommends `/login grok-build` instead. |
 

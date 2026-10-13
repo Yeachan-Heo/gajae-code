@@ -23,7 +23,6 @@ import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtim
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const SETTING_PATH = "sdk.promptDeadlineMs";
 
@@ -423,9 +422,9 @@ describe("sdk prompt deadline arming — SDK-only host route (#5583)", () => {
 				sessionManager,
 				settings,
 				modelRegistry: {
-					...testModelRegistryConsumerLease,
 					getApiKey: async () => "test-key",
 					getAuthStorageOwner: () => undefined,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as never,
 				extensionRunner: {
 					hasHandlers: () => true,

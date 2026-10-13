@@ -12,7 +12,6 @@ import { addSSHHost, removeSSHHost, updateSSHHost } from "../src/ssh/config-writ
 import * as connectionManager from "../src/ssh/connection-manager";
 import type { ToolSession } from "../src/tools";
 import { loadSshTool } from "../src/tools/implementations";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 function createModel(): Model<"openai-responses"> {
 	return {
@@ -71,7 +70,9 @@ describe("AgentSession SSH tool refresh", () => {
 			agent,
 			sessionManager,
 			settings,
-			modelRegistry: { ...testModelRegistryConsumerLease } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			toolRegistry,
 			reloadSshTool:
 				options?.reloadSshTool ?? (async () => (await loadSshTool(toolSession)) as unknown as AgentTool | null),

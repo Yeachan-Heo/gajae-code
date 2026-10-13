@@ -445,7 +445,7 @@ describe("TUI manual viewport paging", () => {
 		const tui = new TUI(term);
 		const transcript = new AnchoredTranscript();
 		for (let index = 0; index < 3; index++) transcript.addRow(`transcript-${index}`, `transcript-${index}`);
-		const working = new Lines(Array.from({ length: 5 }, (_value, index) => `working-${index}`));
+		const working = new Lines(Array.from({ length: 3 }, (_value, index) => `working-${index}`));
 		const status = new Lines(["status"]);
 		tui.addChild(transcript);
 		tui.addChild(working);
@@ -479,7 +479,7 @@ describe("TUI manual viewport paging", () => {
 
 			expect(tui.followLiveViewport()).toBe(true);
 			await term.flush();
-			expect(visible(term)).toEqual(["later-0", "", "", "", "", "status"]);
+			expect(visible(term)).toEqual(["transcript-12", "transcript-13", "later-0", "", "", "status"]);
 
 			working.replace(["later-0", "later-1"]);
 			tui.requestRender();
@@ -490,7 +490,7 @@ describe("TUI manual viewport paging", () => {
 					.map(line => line.trimEnd())
 					.filter(line => line.startsWith("transcript-")),
 			).toEqual(committedRows);
-			expect(visible(term)).toEqual(["later-0", "later-1", "", "", "", "status"]);
+			expect(visible(term)).toEqual(["transcript-12", "transcript-13", "later-0", "later-1", "", "status"]);
 		} finally {
 			tui.stop();
 		}

@@ -9,6 +9,7 @@ import {
 	ensureLaunchWorktree,
 	evacuatePreWorktreeTarget,
 	isReplaceableWorktreeTarget,
+	removeOwnedLaunchWorktree,
 	restorePreWorktreeGjc,
 } from "./launch-worktree";
 
@@ -244,5 +245,152 @@ describe("acquireTargetLock", () => {
 		const result = ensureLaunchWorktree(plan);
 		expect(result.enabled).toBe(true);
 		expect(fs.existsSync(path.join(worktreePath, ".git"))).toBe(true);
+	});
+});
+
+function ownedReceipt(): { created: true; reused: false; createdBranch: false } {
+	return { created: true, reused: false, createdBranch: false };
+}
+
+function detachedPlan(repoRoot: string, worktreePath: string): GjcLaunchWorktreePlan {
+	return {
+		enabled: true,
+		repoRoot,
+		worktreePath,
+		detached: true,
+		baseRef: "HEAD",
+		branchName: null,
+	};
+}
+
+/** Replace a real worktree directory with a symlink to a directory that copies its `.git` file. */
+function swapWorktreeForForgedGitdir(worktreePath: string, forgeDir: string): void {
+	const gitFile = fs.readFileSync(path.join(worktreePath, ".git"), "utf8");
+	fs.mkdirSync(forgeDir, { recursive: true });
+	fs.writeFileSync(path.join(forgeDir, ".git"), gitFile.endsWith("\n") ? gitFile : `${gitFile}\n`);
+	fs.writeFileSync(path.join(forgeDir, "needle.txt"), "KEEP-NEEDLE\n");
+	fs.rmSync(worktreePath, { recursive: true, force: true });
+	fs.symlinkSync(forgeDir, worktreePath, "dir");
+}
+
+describe("removeOwnedLaunchWorktree", () => {
+	test("still removes a real directory worktree", () => {
+		const repo = initRepo("gjc-rm-real-repo-");
+		const bucket = makeTempDir("gjc-rm-real-bucket-");
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		fs.writeFileSync(path.join(worktreePath, "needle.txt"), "inside\n");
+
+		removeOwnedLaunchWorktree(detachedPlan(repo, worktreePath), ownedReceipt());
+
+		expect(fs.existsSync(worktreePath)).toBe(false);
+		expect(countRegisteredWorktrees(repo)).toBe(1);
+	});
+
+	test("still removes a worktree reached through an in-repo directory symlink", () => {
+		const repo = initRepo("gjc-rm-inside-link-repo-");
+		const inside = path.join(repo, "inside");
+		fs.mkdirSync(inside);
+		fs.symlinkSync(inside, path.join(repo, ".worktrees"), "dir");
+		const worktreePath = path.join(repo, ".worktrees", "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+
+		removeOwnedLaunchWorktree(detachedPlan(repo, worktreePath), ownedReceipt());
+
+		expect(fs.existsSync(path.join(inside, "wt"))).toBe(false);
+		expect(fs.lstatSync(path.join(repo, ".worktrees")).isSymbolicLink()).toBe(true);
+		expect(countRegisteredWorktrees(repo)).toBe(1);
+	});
+
+	test("does not delete the referent when the worktree path is a symlink to a forged gitdir", () => {
+		const repo = initRepo("gjc-rm-forge-repo-");
+		const bucket = makeTempDir("gjc-rm-forge-bucket-");
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		const forge = makeTempDir("gjc-rm-forge-target-");
+		swapWorktreeForForgedGitdir(worktreePath, forge);
+
+		removeOwnedLaunchWorktree(detachedPlan(repo, worktreePath), ownedReceipt());
+
+		expect(fs.readFileSync(path.join(forge, "needle.txt"), "utf8")).toBe("KEEP-NEEDLE\n");
+		expect(fs.lstatSync(path.join(forge, ".git")).isFile()).toBe(true);
+		expect(fs.existsSync(worktreePath)).toBe(false);
+	});
+
+	test("still leaves an outside symlink when an in-repo bucket is retargeted", () => {
+		const repo = initRepo("gjc-rm-outlink-repo-");
+		const bucket = path.join(repo, ".worktrees");
+		fs.mkdirSync(bucket);
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		fs.rmSync(bucket, { recursive: true, force: true });
+		const outside = makeTempDir("gjc-rm-outlink-outside-");
+		const vault = makeTempDir("gjc-rm-outlink-vault-");
+		fs.writeFileSync(path.join(vault, "needle.txt"), "KEEP-NEEDLE\n");
+		const outsideLink = path.join(outside, "wt");
+		fs.symlinkSync(vault, outsideLink, "dir");
+		fs.symlinkSync(outside, bucket, "dir");
+
+		removeOwnedLaunchWorktree(detachedPlan(repo, worktreePath), ownedReceipt());
+
+		expect(fs.lstatSync(outsideLink).isSymbolicLink()).toBe(true);
+		expect(fs.readlinkSync(outsideLink)).toBe(vault);
+		expect(fs.readFileSync(path.join(vault, "needle.txt"), "utf8")).toBe("KEEP-NEEDLE\n");
+		expect(fs.lstatSync(bucket).isSymbolicLink()).toBe(true);
+	});
+
+	test("does not delete a directory outside the repo when an in-repo bucket symlink is retargeted", () => {
+		const repo = initRepo("gjc-rm-retarget-repo-");
+		const bucket = path.join(repo, ".worktrees");
+		fs.mkdirSync(bucket);
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		const gitFile = fs.readFileSync(path.join(worktreePath, ".git"), "utf8");
+		fs.rmSync(bucket, { recursive: true, force: true });
+		const outside = makeTempDir("gjc-rm-retarget-outside-");
+		const outsideWt = path.join(outside, "wt");
+		fs.mkdirSync(outsideWt);
+		fs.writeFileSync(path.join(outsideWt, ".git"), gitFile.endsWith("\n") ? gitFile : `${gitFile}\n`);
+		fs.writeFileSync(path.join(outsideWt, "needle.txt"), "KEEP-NEEDLE\n");
+		fs.symlinkSync(outside, bucket, "dir");
+
+		removeOwnedLaunchWorktree(detachedPlan(repo, worktreePath), ownedReceipt());
+
+		expect(fs.readFileSync(path.join(outsideWt, "needle.txt"), "utf8")).toBe("KEEP-NEEDLE\n");
+		expect(fs.lstatSync(bucket).isSymbolicLink()).toBe(true);
+	});
+});
+
+describe("commitPreWorktreeRestore symlink rollback", () => {
+	test("rolls back a symlinked worktree without deleting the forged referent", () => {
+		const repo = initRepo("gjc-rb-forge-repo-");
+		const bucket = makeTempDir("gjc-rb-forge-bucket-");
+		const worktreePath = path.join(bucket, "wt");
+		git(repo, ["worktree", "add", "-q", "--detach", worktreePath, "HEAD"]);
+		const forge = makeTempDir("gjc-rb-forge-target-");
+		swapWorktreeForForgedGitdir(worktreePath, forge);
+		const stashPath = path.join(bucket, ".gjc-pre-wt-wt");
+		fs.mkdirSync(stashPath, { recursive: true });
+		fs.writeFileSync(path.join(stashPath, "launcher.txt"), "config");
+
+		let message = "";
+		try {
+			commitPreWorktreeRestore(
+				{
+					restore: () => {
+						throw new Error("overlay exploded");
+					},
+					stashPath,
+				},
+				detachedPlan(repo, worktreePath),
+			);
+			throw new Error("expected commitPreWorktreeRestore to throw");
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+
+		expect(message).toMatch(/worktree_gjc_restore_failed/);
+		expect(fs.readFileSync(path.join(forge, "needle.txt"), "utf8")).toBe("KEEP-NEEDLE\n");
+		expect(fs.existsSync(path.join(stashPath, "launcher.txt"))).toBe(true);
 	});
 });

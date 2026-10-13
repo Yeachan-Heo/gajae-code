@@ -4,7 +4,7 @@
  * Handles `gjc stats` subcommand for viewing AI usage statistics.
  */
 
-import { APP_NAME, formatDuration, formatNumber, formatPercent } from "@gajae-code/utils";
+import { APP_NAME, formatDuration, formatNumber, formatPercent, sanitizeDisplayLine } from "@gajae-code/utils";
 import chalk from "chalk";
 import { openPath } from "../utils/open";
 
@@ -168,7 +168,7 @@ async function printStatsSummary(): Promise<void> {
 		console.log(chalk.bold("\nBy Model:"));
 		for (const m of byModel.slice(0, 10)) {
 			console.log(
-				`  ${m.model}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+				`  ${sanitizeDisplayLine(m.model)}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
 			);
 		}
 	}
@@ -177,7 +177,7 @@ async function printStatsSummary(): Promise<void> {
 		console.log(chalk.bold("\nBy Agent Role:"));
 		for (const agent of byAgent) {
 			console.log(
-				`  ${agent.agent}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
+				`  ${sanitizeDisplayLine(agent.agent)}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
 			);
 		}
 	}
@@ -185,7 +185,9 @@ async function printStatsSummary(): Promise<void> {
 	if (byFolder.length > 0) {
 		console.log(chalk.bold("\nBy Folder:"));
 		for (const f of byFolder.slice(0, 10)) {
-			console.log(`  ${f.folder}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`);
+			console.log(
+				`  ${sanitizeDisplayLine(f.folder)}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`,
+			);
 		}
 	}
 
@@ -201,7 +203,9 @@ async function printStatsSummary(): Promise<void> {
 		console.log(`  Provider-side (prefix intact): ${formatNumber(misses.providerSideMisses)}`);
 		console.log(`  Model switch: ${formatNumber(misses.modelSwitchMisses)}`);
 		for (const cause of misses.byCause) {
-			const label = cause.divergedRole ? `${cause.change} (${cause.divergedRole})` : cause.change;
+			const label = sanitizeDisplayLine(
+				cause.divergedRole ? `${cause.change} (${cause.divergedRole})` : cause.change,
+			);
 			console.log(`    ${label}: ${formatNumber(cause.misses)}`);
 		}
 	}

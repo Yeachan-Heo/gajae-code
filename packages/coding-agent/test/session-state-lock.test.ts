@@ -63,6 +63,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.afterLocalTransitionQueued = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	SessionStateLockTestHooks.beforeOwnerRecordRewrite = undefined;
+	SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = undefined;
 	SessionStateLockTestHooks.beforeTransitionReleaseLstat = undefined;
 	SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
 	SessionStateLockTestHooks.afterAcquireContention = undefined;
@@ -727,6 +728,94 @@ describe("coordinator session state lock", () => {
 		await expectReleasedOwner(lockFile);
 		expectReleasedTransition(lockFile);
 	});
+	it("rewrites an owner record without ever shortening it past its own preamble", async () => {
+		// The in-place rewrite used to `truncate(0)` before writing, so EVERY rewrite passed
+		// through a zero-length record. An empty record carries no `owner_host_id`, so a
+		// process killed inside that window left a transition claim that
+		// `malformedOwnerProvenance` refuses as `unprovenanced` forever:
+		// `transition_claim_timeout` with `claim_or_owner_unreadable`, and coordinator state
+		// persistence for the session was lost for good (#5159, #5216).
+		//
+		// The released tombstone is the shortening half of the cycle — the released form is
+		// shorter than the held form it replaces — so it is where the record used to shrink.
+		// It must now keep the previous length and stay parseable with its host id intact.
+		const { root, stateFile } = await seededRunningSession("lock-rewrite-attributable");
+		const lockFile = `${stateFile}.lock`;
+		let heldBytes = "";
+		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+			// Runs with the held record still on disk, immediately before the rewrite.
+			if (file === lockFile) heldBytes = await Bun.file(file).text();
+		};
+		try {
+			await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+		} finally {
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+		}
+
+		expect(heldBytes).not.toBe("");
+		expect((JSON.parse(heldBytes) as { released?: boolean }).released).toBeUndefined();
+
+		const releasedBytes = await Bun.file(lockFile).text();
+		expect(releasedBytes.length).toBeGreaterThanOrEqual(heldBytes.length);
+		// Padding is trailing whitespace and nothing else, so every reader — `JSON.parse`,
+		// `validLockOwner`, `malformedOwnerProvenance` — still sees exactly the released
+		// record, which is what keeps the tombstone reclaimable.
+		const releasedRecord = releasedBytes.trimEnd();
+		expect(releasedRecord).toBe(JSON.stringify(JSON.parse(releasedRecord)));
+		expect(releasedBytes.slice(releasedRecord.length)).toMatch(/^ *$/u);
+		expect(JSON.parse(releasedRecord)).toMatchObject({
+			pid: 1,
+			owner_host_id: expect.any(String),
+			released: true,
+		});
+
+		// The claim's own sidecar is written by the same primitive and is what a contender
+		// reads first when the claim survives a crash.
+		const sidecar = await Bun.file(`${lockFile}.transition.owner`).text();
+		expect(sidecar.length).toBeGreaterThan(0);
+		expect(JSON.parse(sidecar)).toMatchObject({ owner_host_id: expect.any(String), released: true });
+	}, 15_000);
+
+	it("propagates pre-rewrite fstat failure and leaves the held record untouched", async () => {
+		// The pre-rewrite stat must fail before any write attempt, so a descriptor
+		// fault does not silently become a zero-length record assumption (#6621).
+		// If the fstat fails, the rewrite should throw and leave the original held
+		// record on disk unchanged.
+		const { root, stateFile } = await seededRunningSession("lock-prewrite-stat-failure");
+		const lockFile = `${stateFile}.lock`;
+		let heldBytes = "";
+		SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+			// Capture the held record before rewrite attempt
+			if (file === lockFile) heldBytes = await Bun.file(file).text();
+		};
+		let faulted = false;
+		SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = async file => {
+			if (!faulted && file === lockFile) {
+				faulted = true;
+				throw Object.assign(new Error("pre-rewrite fstat failure"), { code: "EIO" });
+			}
+		};
+		try {
+			// writeToolActivity triggers a rewrite by calling withSessionStateFileLock,
+			// which acquires the lock, transitions it, and tries to release it (rewrite).
+			await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toBeInstanceOf(
+				SessionStateLockUnavailableError,
+			);
+		} finally {
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+			SessionStateLockTestHooks.beforeOwnerRecordPrewriteStat = undefined;
+		}
+		expect(faulted).toBe(true);
+		// The held record must still be on disk unchanged
+		const finalBytes = await Bun.file(lockFile).text();
+		expect(finalBytes).toBe(heldBytes);
+		// And it must still be valid JSON
+		const parsed = JSON.parse(finalBytes);
+		expect(parsed).toMatchObject({
+			pid: expect.any(Number),
+			owner_host_id: expect.any(String),
+		});
+	}, 15_000);
 
 	it("leaves a successor owner that claimed the path after the stale verdict", async () => {
 		const { stateFile } = await seededRunningSession("lock-successor");

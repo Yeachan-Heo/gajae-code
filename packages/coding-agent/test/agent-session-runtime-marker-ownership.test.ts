@@ -17,7 +17,6 @@ import {
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 // The coordinator pins ONE runtime-state marker per launched session through
 // GJC_COORDINATOR_SESSION_STATE_FILE. That pin is process-wide environment, so every
@@ -85,7 +84,7 @@ async function nestedSession(cwd: string, scope: string): Promise<AgentSession> 
 		agent,
 		sessionManager: SessionManager.inMemory(cwd),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { ...testModelRegistryConsumerLease } as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map([[tool.name, tool]]),
 		builtinToolIdentities: new Set<object>([tool]),
 		providerSessionId: scope,

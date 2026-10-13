@@ -8,7 +8,6 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const sessions: AgentSession[] = [];
 const storages: AuthStorage[] = [];
@@ -52,12 +51,12 @@ describe("AgentSession auth metadata owner boundary", () => {
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {
-				...testModelRegistryConsumerLease,
 				authStorage,
 				// The facade delegates a registry-scoped API key, but intentionally
 				// omits getAuthStorageOwner from its compatibility surface.
 				getApiKey: async () => "registry-api-key",
 				getAvailable: () => [mock.model],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as never,
 		});
 		sessions.push(session);
@@ -104,11 +103,11 @@ describe("AgentSession auth metadata owner boundary", () => {
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {
-				...testModelRegistryConsumerLease,
 				authStorage,
 				getApiKey: async () => "stored-oauth-access",
 				getAvailable: () => [mock.model],
 				getAuthStorageOwner: () => owner,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as never,
 		});
 		sessions.push(session);

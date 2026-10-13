@@ -13,6 +13,7 @@ import {
 	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
 	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
 	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+	trustedManagedOwnerLaunchSessionFile,
 } from "./managed-owner-admission";
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
@@ -1249,8 +1250,12 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 							[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: replacement.generation,
 							[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: replacement.runId,
 							[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: replacement.incarnation,
-							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]:
-								context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "",
+							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]: trustedManagedOwnerLaunchSessionFile(
+								{
+									GJC_SESSION_FILE: context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE,
+								},
+								plan.cwd,
+							),
 						}
 					: {}),
 			},

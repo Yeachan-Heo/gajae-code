@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Fixed
+
+- A project dotenv declaration whose quotes this line parser does not decode, such as `GJC_CODING_AGENT_DIR`, is refused instead of being treated as an operator override.
+
+- A project `.env` can no longer redirect `GJC_GITHUB_CACHE_DB` outside the config root.
+
+- Build stable Windows path keys with ordinal filesystem casing and proven volume-level case-insensitive semantics so distinct Unicode filename spellings do not collide.
+- When a parent lacks a usable file ID, canonicalize its path when possible and fold only the final entry name, preserving ancestor casing.
+- Keep stable path identity in a dedicated subpath so importing the utils root barrel does not load native bindings.
+- Normalize ordinary Win32 trailing-dot and trailing-space aliases when deriving keys for missing path entries.
+
+- When the launching shell does not export `SHELL`, a project `.env` declaration of `SHELL` no longer selects the shell that runs bash tool commands with the agent's environment and credentials; the inherited value or the standard bash/sh fallback is used instead.
+
+- A project `.env` declaration of `NODE_TLS_REJECT_UNAUTHORIZED` no longer disables TLS certificate verification for the process; combined with a project `HTTPS_PROXY`, it previously let the proxy read provider API keys. A value exported by the launching shell is still honored.
+
 ## [0.18.8] - 2026-10-08
 
 ## [0.18.7] - 2026-10-04

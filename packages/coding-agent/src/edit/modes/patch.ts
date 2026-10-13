@@ -6,6 +6,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { isEnoent } from "@gajae-code/utils";
@@ -80,6 +81,9 @@ export interface ApplyPatchOptions {
 	 * object identity is not a durable-lock capability probe.
 	 */
 	crossProcessLock?: boolean;
+	/** Explicit artifacts `local` root for this call. The caller session owns it. */
+	localRoot?: string;
+	signal?: AbortSignal;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -115,6 +119,117 @@ let nativePatchBindingsPromise: Promise<NativePatchBindings> | undefined;
 function loadNativePatchBindings(): Promise<NativePatchBindings> {
 	nativePatchBindingsPromise ??= import("@gajae-code/natives");
 	return nativePatchBindingsPromise;
+}
+
+function explicitLocalRootForSession(session: ToolSession): string | undefined {
+	const artifactsDir = session.getArtifactsDir?.();
+	if (!artifactsDir || session.isManagedSessionDestination?.()) return undefined;
+	return path.resolve(artifactsDir, "local");
+}
+
+function pathIsWithin(target: string, root: string): boolean {
+	const relative = path.relative(root, target);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+/**
+ * Trust root for a delete. `localRoot` is the caller session's explicit
+ * artifacts root. `gjc-local/<id>` is recognized from the path. Else `cwd`.
+ */
+function boundaryForPatchDelete(cwd: string, absolutePath: string, localRoot?: string): string {
+	const resolved = path.resolve(absolutePath);
+	if (localRoot) {
+		const explicit = path.resolve(localRoot);
+		if (pathIsWithin(resolved, explicit)) return explicit;
+	}
+	const managedParent = path.join(os.tmpdir(), "gjc-local");
+	if (pathIsWithin(resolved, managedParent)) {
+		const rest = resolved.slice(managedParent.length + path.sep.length);
+		const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
+		if (sessionSegment.length > 0) return path.join(managedParent, sessionSegment);
+	}
+	return path.resolve(cwd);
+}
+
+/**
+ * `unlink` follows a directory symlink. Resolve the parent only, then delete
+ * that real parent plus the final name so a file symlink is removed as a link.
+ */
+async function resolvePatchDeletePath(
+	root: string,
+	absolutePath: string,
+	displayPath: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	signal?.throwIfAborted();
+	let realRoot: string;
+	try {
+		realRoot = await fs.promises.realpath(root);
+	} catch (error) {
+		if (isEnoent(error)) throw new ApplyPatchError(`File not found: ${displayPath}`);
+		throw error;
+	}
+	signal?.throwIfAborted();
+	let realParent: string;
+	try {
+		realParent = await fs.promises.realpath(path.dirname(absolutePath));
+	} catch (error) {
+		if (isEnoent(error)) throw new ApplyPatchError(`File not found: ${displayPath}`);
+		throw error;
+	}
+	signal?.throwIfAborted();
+	if (!pathIsWithin(realParent, realRoot)) {
+		throw new ApplyPatchError(`Delete target resolves outside its root: ${displayPath}`);
+	}
+	return path.join(realParent, path.basename(absolutePath));
+}
+
+/**
+ * `mkdir` follows a directory symlink. Walk to the nearest existing ancestor
+ * and return its real path plus the missing suffix. A parent that is already
+ * lexically outside the workspace or session local root is unchanged.
+ */
+async function resolvePatchMkdirPath(
+	cwd: string,
+	absolutePath: string,
+	localRoot: string | undefined,
+	parentDir: string,
+	displayPath: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	signal?.throwIfAborted();
+	const boundary = path.resolve(boundaryForPatchDelete(cwd, absolutePath, localRoot));
+	const lexicalParent = path.resolve(parentDir);
+	if (!pathIsWithin(lexicalParent, boundary)) return parentDir;
+	// A root that does not exist yet is not an escape. Keep the missing suffix
+	// under its real ancestor, which is what mkdir did before this check.
+	const realRoot = await realpathThroughExistingAncestor(boundary, signal);
+	signal?.throwIfAborted();
+	const realParent = await realpathThroughExistingAncestor(lexicalParent, signal);
+	signal?.throwIfAborted();
+	if (!pathIsWithin(realParent, realRoot)) {
+		throw new ApplyPatchError(`Parent directory resolves outside its root: ${displayPath}`);
+	}
+	return realParent;
+}
+
+async function realpathThroughExistingAncestor(target: string, signal?: AbortSignal): Promise<string> {
+	const resolved = path.resolve(target);
+	const missing: string[] = [];
+	let cursor = resolved;
+	for (;;) {
+		signal?.throwIfAborted();
+		try {
+			const real = await fs.promises.realpath(cursor);
+			return missing.length === 0 ? real : path.join(real, ...missing.reverse());
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			const parent = path.dirname(cursor);
+			if (parent === cursor) return resolved;
+			missing.push(path.basename(cursor));
+			cursor = parent;
+		}
+	}
 }
 
 async function readExistingPatchFile(fileSystem: FileSystem, absolutePath: string, path: string): Promise<string> {
@@ -160,11 +275,44 @@ export async function applyPatch(input: PatchInput, options: ApplyPatchOptions):
 		const destPath = resolvePath(input.rename);
 		if (destPath !== absolutePath) mutationPaths.push(destPath);
 	}
+	// The cross-process lock creates missing parent directories for `<path>.lock`.
+	// Check every locked create/move path, including a rename on create, first.
+	await preflightPatchMkdir(input, options);
 	const usingDefaultFs = options.fs === undefined || options.fs === defaultFileSystem;
 	// dryRun/preview must stay read-only: never create durable `<path>.lock` dirs
 	// (would fail on read-only parents and mutate the FS during preview) (#2900 review).
 	const crossProcess = options.dryRun === true ? false : (options.crossProcessLock ?? usingDefaultFs);
 	return withEditPathMutation(mutationPaths, () => applyNormalizedPatch(input, options), { crossProcess });
+}
+
+/** Read-only mkdir check for one patch hunk. Does not create directories. */
+export async function preflightPatchMkdir(input: PatchInput, options: ApplyPatchOptions): Promise<void> {
+	const resolvePath = (p: string): string => resolveToCwd(p, options.cwd);
+	const absolutePath = resolvePath(input.path);
+	const op = input.op ?? "update";
+	if (op === "create") {
+		await rejectPatchMkdirEscape(options.cwd, absolutePath, options.localRoot, input.path, options.signal);
+	}
+	if (input.rename) {
+		const destPath = resolvePath(input.rename);
+		if (destPath !== absolutePath) {
+			// The source is locked too. Check it before that lock can mkdir through a symlink.
+			await rejectPatchMkdirEscape(options.cwd, absolutePath, options.localRoot, input.path, options.signal);
+			await rejectPatchMkdirEscape(options.cwd, destPath, options.localRoot, input.rename, options.signal);
+		}
+	}
+}
+
+async function rejectPatchMkdirEscape(
+	cwd: string,
+	absolutePath: string,
+	localRoot: string | undefined,
+	displayPath: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	const parentDir = path.dirname(absolutePath);
+	if (!parentDir || parentDir === ".") return;
+	await resolvePatchMkdirPath(cwd, absolutePath, localRoot, parentDir, displayPath, signal);
 }
 
 /**
@@ -179,6 +327,8 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		fs = defaultFileSystem,
 		fuzzyThreshold = DEFAULT_FUZZY_THRESHOLD,
 		allowFuzzy = true,
+		localRoot,
+		signal,
 	} = options;
 
 	const resolvePath = (p: string): string => resolveToCwd(p, cwd);
@@ -201,11 +351,17 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		const normalizedContent = normalizeCreateContent(input.diff);
 		const content = normalizedContent.endsWith("\n") ? normalizedContent : `${normalizedContent}\n`;
 
+		const parentDir = path.dirname(absolutePath);
+		const mkdirPath =
+			parentDir && parentDir !== "."
+				? await resolvePatchMkdirPath(cwd, absolutePath, localRoot, parentDir, input.path, signal)
+				: undefined;
 		if (!dryRun) {
-			const parentDir = path.dirname(absolutePath);
-			if (parentDir && parentDir !== ".") {
-				await fs.mkdir(parentDir);
+			if (mkdirPath) {
+				signal?.throwIfAborted();
+				await fs.mkdir(mkdirPath);
 			}
+			signal?.throwIfAborted();
 			await fs.write(absolutePath, content);
 		}
 
@@ -220,9 +376,14 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 
 	// Handle DELETE operation
 	if (op === "delete") {
-		const oldContent = await readExistingPatchFile(fs, absolutePath, input.path);
+		signal?.throwIfAborted();
+		const boundary = boundaryForPatchDelete(cwd, absolutePath, localRoot);
+		const deletePath = await resolvePatchDeletePath(boundary, absolutePath, input.path, signal);
+		signal?.throwIfAborted();
+		const oldContent = await readExistingPatchFile(fs, deletePath, input.path);
+		signal?.throwIfAborted();
 		if (!dryRun) {
-			await fs.delete(absolutePath);
+			await fs.delete(deletePath);
 		}
 
 		return {
@@ -260,6 +421,20 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 	const finalContent = bom + restoreLineEndings(newContent, lineEnding);
 	const destPath = input.rename ? resolvePath(input.rename) : absolutePath;
 	const isMove = Boolean(input.rename) && destPath !== absolutePath;
+	let moveParent: string | undefined;
+	if (isMove) {
+		const parentDir = path.dirname(destPath);
+		if (parentDir && parentDir !== ".") {
+			moveParent = await resolvePatchMkdirPath(
+				cwd,
+				destPath,
+				localRoot,
+				parentDir,
+				input.rename ?? input.path,
+				signal,
+			);
+		}
+	}
 
 	if (!dryRun) {
 		// Commit-time CAS: reject if another writer mutated the file after our
@@ -269,10 +444,11 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 			throw new ApplyPatchError(`concurrent edit conflict: file changed since read: ${input.path}`);
 		}
 		if (isMove) {
-			const parentDir = path.dirname(destPath);
-			if (parentDir && parentDir !== ".") {
-				await fs.mkdir(parentDir);
+			if (moveParent) {
+				signal?.throwIfAborted();
+				await fs.mkdir(moveParent);
 			}
+			signal?.throwIfAborted();
 			await fs.write(destPath, finalContent);
 			await fs.delete(absolutePath);
 		} else {
@@ -493,12 +669,15 @@ export async function executePatchSingle(
 	// not `defaultFileSystem` by object identity. Force durable cross-process
 	// locking so multi-process agents cannot silently race past the path mutex
 	// (#2900 review: do not infer lock capability from FileSystem identity).
+	const localRoot = explicitLocalRootForSession(session);
 	const result = await applyPatch(input, {
 		cwd: session.cwd,
 		fs: patchFileSystem,
 		fuzzyThreshold,
 		allowFuzzy,
 		crossProcessLock: true,
+		localRoot,
+		signal,
 	});
 
 	// Post-write verification: only meaningful for in-place updates where the

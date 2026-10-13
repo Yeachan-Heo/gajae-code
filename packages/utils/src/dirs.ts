@@ -564,6 +564,15 @@ const trustedAgentOverride =
 	trustedValue("PI_CODING_AGENT_DIR", INITIAL_PROJECT_SNAPSHOT);
 let dirs = new DirResolver(trustedAgentOverride, INITIAL_PROJECT_SNAPSHOT);
 
+/**
+ * Project dotenv as captured when this module loaded.
+ * A later edit or delete of those files does not change the returned provenance.
+ */
+export function loadedProjectEnvSnapshot(): ProjectEnvSnapshot {
+	const snapshot = dirs.trustSnapshot;
+	return { values: { ...snapshot.values }, dynamic: new Set(snapshot.dynamic) };
+}
+
 // =============================================================================
 // Root directories
 // =============================================================================
@@ -857,6 +866,11 @@ export function getClaudeCodeVersionCachePath(): string {
 /** Get the natives directory (~/.gjc/natives). */
 export function getNativesDir(): string {
 	return dirs.rootSubdir("natives", "cache");
+}
+
+/** Get the local tool-issue report database path (~/.gjc/tool-issues.db). */
+export function getToolIssuesDbPath(): string {
+	return dirs.rootSubdir("tool-issues.db", "data");
 }
 
 /** Get the stats database path (~/.gjc/stats.db). */

@@ -270,6 +270,7 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "ast_grep") return Boolean(session.settings.get("astGrep.enabled"));
 	if (name === "ast_edit") return Boolean(session.settings.get("astEdit.enabled"));
 	if (name === "render_mermaid") return Boolean(session.settings.get("renderMermaid.enabled"));
+	if (name === "report_issue") return Boolean(session.settings.get("reportIssue.enabled"));
 	if (name === "web_search") return Boolean(session.settings.get("web_search.enabled"));
 	if (name === "search_tool_bm25") return context.discoveryActive ?? resolveDiscoveryActive(session);
 	if (name === "calc") return Boolean(session.settings.get("calc.enabled"));
@@ -389,6 +390,8 @@ const loaders: Record<string, Loader> = {
 		cached("goal", () => import("../goals/tools/goal-tool")).then(module => new module.GoalTool(session)),
 	move_session: session =>
 		cached("move_session", () => import("./move-session")).then(module => new module.MoveSessionTool(session)),
+	report_issue: session =>
+		cached("report_issue", () => import("./report-issue")).then(module => new module.ReportIssueTool(session)),
 	yield: session => cached("yield", () => import("./yield")).then(module => new module.YieldTool(session)),
 	report_finding: _session => cached("review", () => import("./review")).then(module => module.reportFindingTool),
 	resolve: session => cached("resolve", () => import("./resolve")).then(module => new module.ResolveTool(session)),
@@ -481,6 +484,7 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 		["skill", "Skill", "Chain into another available skill", "essential"],
 		["goal", "Goal", undefined, "essential"],
 		["move_session", "Move Session", undefined, "essential"],
+		["report_issue", "Report Issue", "Record a tool that behaved inconsistently with its description", "essential"],
 	];
 
 const sessionDescriptions: Readonly<Record<string, ToolDescriptorMetadata["descriptionForSession"]>> = {

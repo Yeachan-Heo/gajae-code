@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { parseArgs } from "node:util";
-import { formatDuration, formatNumber, formatPercent } from "@gajae-code/utils";
+import { formatDuration, formatNumber, formatPercent, sanitizeDisplayLine } from "@gajae-code/utils";
 import { getDashboardStats, getTotalMessageCount, syncAllSessions } from "./aggregator";
 import { closeDb } from "./db";
 import { startServer } from "./server";
@@ -81,7 +81,7 @@ async function printStats(): Promise<void> {
 		console.log("\nBy Model:");
 		for (const m of byModel.slice(0, 10)) {
 			console.log(
-				`  ${m.model}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+				`  ${sanitizeDisplayLine(m.model)}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
 			);
 		}
 	}
@@ -90,7 +90,7 @@ async function printStats(): Promise<void> {
 		console.log("\nBy Agent Role:");
 		for (const agent of byAgent) {
 			console.log(
-				`  ${agent.agent}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
+				`  ${sanitizeDisplayLine(agent.agent)}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
 			);
 		}
 	}
@@ -98,7 +98,9 @@ async function printStats(): Promise<void> {
 	if (byFolder.length > 0) {
 		console.log("\nBy Folder:");
 		for (const f of byFolder.slice(0, 10)) {
-			console.log(`  ${f.folder}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`);
+			console.log(
+				`  ${sanitizeDisplayLine(f.folder)}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`,
+			);
 		}
 	}
 

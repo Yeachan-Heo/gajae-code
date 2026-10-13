@@ -29,6 +29,14 @@ import {
 /** Window within which two activity timestamps are treated as an ambiguous tie. */
 export const LATEST_SESSION_TIE_WINDOW_MS = 1000;
 
+/**
+ * Local writers stamp `Date.now()`. A parsed `updated_at` further ahead than this
+ * is planted marker content, not activity, and is not a candidate. Marker mtime
+ * is not used in that case: a checkout or touch refreshes mtime without rewriting
+ * a future timestamp.
+ */
+const ACTIVITY_FUTURE_SKEW_MS = 2 * 60 * 1000;
+
 export interface SessionIdSources {
 	/** Raw `--session-id` value: `undefined` = flag absent; `""` = present-but-blank (invalid). */
 	flagValue?: string | undefined;
@@ -191,7 +199,10 @@ async function readActivityMs(markerPath: string): Promise<number | undefined> {
 		const parsed = JSON.parse(raw) as { updated_at?: unknown };
 		if (typeof parsed.updated_at === "string") {
 			const ms = Date.parse(parsed.updated_at);
-			if (!Number.isNaN(ms)) return ms;
+			if (!Number.isNaN(ms)) {
+				if (ms > Date.now() + ACTIVITY_FUTURE_SKEW_MS) return undefined;
+				return ms;
+			}
 		}
 	} catch {
 		// fall through to mtime

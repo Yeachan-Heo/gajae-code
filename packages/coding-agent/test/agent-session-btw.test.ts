@@ -17,7 +17,6 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { BTW_STREAM_IDLE_TIMEOUT_MS } from "@gajae-code/coding-agent/session/btw-contract";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 registerMockApi();
 const CONTROLLED_BTW_API = "controlled-btw-test";
@@ -170,11 +169,11 @@ function createHarness(options: HarnessOptions = {}): {
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": true }),
 		modelRegistry: {
-			...testModelRegistryConsumerLease,
 			authStorage: undefined,
 			getApiKey,
 			getAvailable: () => [model],
 			getAuthStorageOwner: () => ({}),
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 		convertToLlm: options.convert ?? (async messages => convertToLlm(messages)),
 		onPayload: options.onPayload,

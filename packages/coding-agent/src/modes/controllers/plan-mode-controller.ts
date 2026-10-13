@@ -5,7 +5,7 @@ import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { Container, type KeyId, Markdown, Spacer, Text } from "@gajae-code/tui";
 import { isEnoent, prompt } from "@gajae-code/utils";
-import { resolveLocalUrlToPath } from "../../internal-urls";
+import { resolveLocalRoot, resolveLocalUrlToPath } from "../../internal-urls";
 import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../../plan-mode/approved-plan";
 import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
@@ -13,6 +13,7 @@ import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-co
 };
 import type { AgentSession, TemporaryProviderSessionScope } from "../../session/agent-session";
 import type { SessionContext, SessionManager } from "../../session/session-manager";
+import { writeFileAtomically } from "../../tools/atomic-file-write";
 import { normalizeLocalScheme } from "../../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../../tools/resolve";
 import { ToolError } from "../../tools/tool-errors";
@@ -338,13 +339,16 @@ export class PlanModeController {
 			throw error;
 		}
 	}
+	#localProtocolOptions() {
+		return {
+			getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
+			isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
+			getSessionId: () => this.ctx.sessionManager.getSessionId(),
+		};
+	}
 	#resolvePath(planFilePath: string): string {
 		return planFilePath.startsWith("local:")
-			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), {
-					getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
-					isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
-					getSessionId: () => this.ctx.sessionManager.getSessionId(),
-				})
+			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), this.#localProtocolOptions())
 			: path.resolve(this.ctx.sessionManager.getCwd(), planFilePath);
 	}
 	async #finalizeApprovedPlan(planContent: string, planFilePath: string, finalPlanFilePath: string): Promise<void> {
@@ -420,7 +424,13 @@ export class PlanModeController {
 				trimTrailingNewline: false,
 			});
 			if (result !== null) {
-				await Bun.write(resolved, result);
+				// Lexical local:// checks do not see a symlink. Bind this save to the
+				// same local root so a link inside it cannot publish outside.
+				if (planFilePath.startsWith("local:")) {
+					await writeFileAtomically(resolved, result, {
+						trustBoundary: path.resolve(resolveLocalRoot(this.#localProtocolOptions())),
+					});
+				} else await Bun.write(resolved, result);
 				this.ctx.showStatus("Plan updated in external editor.");
 			}
 			return result;

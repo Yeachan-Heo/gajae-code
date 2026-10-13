@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## [0.18.11] - 2026-10-12
+
+## [0.18.10] - 2026-10-12
+
+## [0.18.9] - 2026-10-11
+
+### Fixed
+
+- Exclude Claude Code and OAuth beta headers from API-key requests so subscription-provided API credits can be used, while preserving OAuth headers and feature betas.
+
+- Anthropic API-key requests no longer send the Claude Code `X-App: cli` marker, and Anthropic API-key model discovery (`/v1/models`) no longer sends the Claude Code beta list (`claude-code-20250219`, `oauth-2025-04-20`, …). Anthropic classified requests carrying these markers as Claude Code usage, which excluded them from API credit grants such as the Max plan's monthly API credit. OAuth requests are unchanged.
+
+- Finalize all outstanding SQLite auth statements on close, including usage-fetch leases, so Windows releases database file handles immediately.
+
+- Auth broker credential requests do not follow redirects, so a 307 or 308 cannot replay the JSON body to another host.
+
+- Preserve bounded terminal errors when Codex Responses times out mid-tool-call by dropping unvalidated partial arguments, retaining the call identity, and reporting `request_timeout`.
+
+- A project `.env` can no longer add Foundry request headers through `ANTHROPIC_CUSTOM_HEADERS`.
+
+- A project `.env` can no longer choose the Foundry CA or mTLS client certificate, including when the declaration uses `$` or backticks, and later deleting that file or changing directory does not turn the loaded value into an operator setting.
+
+- A tokenless auth gateway rejects data requests whose Host header is not the loopback bind.
+
+- HTTP 400 request dumps redact `x-goog-api-key` and `cf-aig-authorization` before the dump JSON is written, and the dump file is created owner-readable only.
+
+- Finalize cached SQLite statements when closing the shared model cache so Windows releases its database file handle before temporary roots are removed.
+
 ## [0.18.8] - 2026-10-08
 
 ### Added

@@ -14,7 +14,6 @@ import {
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 // The agent loop emits the raw model-supplied `toolCall.name`, including for a
 // call it is about to reject as unknown. Only a label proven against the ACTIVE
@@ -118,7 +117,7 @@ async function newSession(
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { ...testModelRegistryConsumerLease } as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: registry,
 		builtinToolIdentities,
 		...(options.reloadSshTool ? { reloadSshTool: options.reloadSshTool } : {}),
@@ -240,7 +239,7 @@ async function newDispatchSession(options: {
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { ...testModelRegistryConsumerLease } as never,
+		modelRegistry: { withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body() } as never,
 		toolRegistry: new Map(options.activeTools.map(tool => [tool.name, tool])),
 		builtinToolIdentities: new Set<object>(options.builtins),
 	});
@@ -376,7 +375,9 @@ describe("AgentSession coordinator activity labels", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { ...testModelRegistryConsumerLease } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			toolRegistry: new Map([[bashTool.name, bashTool]]),
 		});
 		sessions.push(session);

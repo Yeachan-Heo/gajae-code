@@ -6,7 +6,6 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { InteractiveMode } from "../src/modes/interactive-mode";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const defaultModel = { provider: "test", id: "default", api: "openai-responses", name: "default" } as Model;
 const planModel = { provider: "test", id: "plan", api: "openai-responses", name: "plan" } as Model;
@@ -21,9 +20,9 @@ function createHarness() {
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated({ modelRoles: { plan: "test/plan" } }),
 		modelRegistry: {
-			...testModelRegistryConsumerLease,
 			getAvailable: () => [defaultModel, planModel],
 			getApiKey: async () => "key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 	});
 	return { session, mode: new InteractiveMode(session, "test") };

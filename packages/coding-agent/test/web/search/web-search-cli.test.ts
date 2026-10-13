@@ -128,9 +128,20 @@ describe("web search CLI settings", () => {
 			overrides: { "web_search.provider": "insane" },
 		});
 
-		vi.spyOn(globalThis, "fetch").mockImplementation((async input => {
+		// Mock fetch to handle wire requests: IP-based URLs with Host header.
+		// guardedPublicFetch resolves www.reddit.com to an IP, sets Host header to www.reddit.com,
+		// then calls fetch(wireUrl, {headers: {Host: "www.reddit.com", ...}}).
+		// The test isolates DNS by mocking fetch to match wire URL + Host header pattern.
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input, init) => {
 			const url = input.toString();
-			if (url === "https://www.reddit.com/r/test/.rss") {
+			const headers =
+				init?.headers instanceof Headers
+					? Object.fromEntries(init.headers)
+					: (init?.headers as Record<string, string>) || {};
+			const hostHeader = (headers as Record<string, string>).Host || (headers as Record<string, string>).host || "";
+
+			// Match wire request: www.reddit.com Host header + /r/test path
+			if (hostHeader === "www.reddit.com" && url.includes("/r/test")) {
 				return new Response(
 					`<?xml version="1.0"?><feed><entry><title>Alias Provider</title><link href="https://www.reddit.com/r/test/comments/1"/><content>via alias</content></entry></feed>`,
 					{ status: 200 },
@@ -138,6 +149,7 @@ describe("web search CLI settings", () => {
 			}
 			return new Response("", { status: 404 });
 		}) as typeof fetch);
+
 		let output = "";
 		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 			output += String(chunk);

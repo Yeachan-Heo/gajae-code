@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
+import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { isAutoresearchAuthorizedResearchPath } from "../autoresearch/git";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
@@ -1787,15 +1788,96 @@ function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets): boolean 
 	);
 }
 
-function neutralTempRoots(): string[] {
+/** POSIX directories that are temp roots even when `TMPDIR` is unset or poisoned. */
+const POSIX_SYSTEM_TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
+
+/**
+ * `os.tmpdir()` follows `TMPDIR`, and Bun copies `cwd/.env` into the environment
+ * when that variable was unset. A repository can therefore name an arbitrary
+ * directory. Declarations below are not neutral scratch roots.
+ */
+function tempEnvNames(): readonly string[] {
+	return process.platform === "win32" ? ["TEMP", "TMP", "TMPDIR"] : ["TMPDIR"];
+}
+
+// The snapshot is the cwd at module import, not a directory created later or a chdir before this module is imported.
+const startupTempSnapshot = projectEnvSnapshot();
+
+function projectTempSnapshots(_cwd: string): ProjectEnvSnapshot[] {
+	return [startupTempSnapshot];
+}
+
+/** macOS account temp directory. `getconf` does not read `TMPDIR`. */
+let darwinUserTempDirCache: string | undefined | null = null;
+function darwinUserTempDir(): string | undefined {
+	if (process.platform !== "darwin") return undefined;
+	if (darwinUserTempDirCache !== null) return darwinUserTempDirCache;
+	darwinUserTempDirCache = undefined;
+	try {
+		const result = Bun.spawnSync({
+			cmd: ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"],
+			env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" },
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		if (result.exitCode !== 0) return undefined;
+		const value = new TextDecoder().decode(result.stdout).trim();
+		if (value) darwinUserTempDirCache = value;
+	} catch {
+		// Fixed `/tmp` roots still cover the POSIX default.
+	}
+	return darwinUserTempDirCache ?? undefined;
+}
+
+function addResolvedTempRoot(roots: Set<string>, value: string | undefined): void {
+	const trimmed = value?.trim();
+	if (trimmed) roots.add(path.resolve(trimmed));
+}
+
+function isPlatformTempPath(resolved: string): boolean {
+	for (const root of POSIX_SYSTEM_TEMP_ROOTS) {
+		const resolvedRoot = path.resolve(root);
+		if (resolved === resolvedRoot || isPathWithin(resolvedRoot, resolved)) return true;
+	}
+	const darwin = darwinUserTempDir();
+	if (!darwin) return false;
+	const resolvedDarwin = path.resolve(darwin);
+	return resolved === resolvedDarwin || isPathWithin(resolvedDarwin, resolved);
+}
+
+/** True when `live` is the temp directory a project dotenv file declares. */
+function projectDeclaresTempPath(cwd: string, live: string): boolean {
+	const trimmedLive = live.trim();
+	if (!trimmedLive) return false;
+	const resolvedLive = path.resolve(trimmedLive);
+	for (const snapshot of projectTempSnapshots(cwd)) {
+		for (const name of tempEnvNames()) {
+			const key = canonicalEnvKey(name);
+			const declared = snapshot.values[key];
+			if (declared === undefined) continue;
+			if (snapshot.dynamic.has(key)) {
+				// Expansion is not comparable. A dynamic value that landed on a
+				// real system temp dir is already allowed through those roots.
+				if (!isPlatformTempPath(resolvedLive)) return true;
+				continue;
+			}
+			const trimmedDeclared = declared.trim();
+			if (trimmedDeclared && path.resolve(trimmedDeclared) === resolvedLive) return true;
+		}
+	}
+	return false;
+}
+
+function neutralTempRoots(cwd: string): string[] {
 	const roots = new Set<string>();
-	const add = (value: string | undefined): void => {
-		const trimmed = value?.trim();
-		if (trimmed) roots.add(path.resolve(trimmed));
-	};
-	add(os.tmpdir());
-	add(process.env.TMPDIR);
-	for (const fixed of ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"]) add(fixed);
+	for (const fixed of POSIX_SYSTEM_TEMP_ROOTS) addResolvedTempRoot(roots, fixed);
+	addResolvedTempRoot(roots, darwinUserTempDir());
+	const candidates = [os.tmpdir(), process.env.TMPDIR];
+	if (process.platform === "win32") candidates.push(process.env.TEMP, process.env.TMP);
+	for (const candidate of candidates) {
+		if (!candidate || projectDeclaresTempPath(cwd, candidate)) continue;
+		addResolvedTempRoot(roots, candidate);
+	}
 	return [...roots];
 }
 
@@ -1849,10 +1931,15 @@ async function isNeutralTempPath(cwd: string, rawPath: string): Promise<boolean>
 	if (unknown || !absolutePath) return false;
 	const resolvedCwd = path.resolve(cwd);
 	if (isPathWithin(resolvedCwd, absolutePath)) return false;
-	if (!neutralTempRoots().some(root => isPathWithin(root, absolutePath))) return false;
+	const roots = neutralTempRoots(cwd);
+	const realRoots = await Promise.all(roots.map(realpathOrSelf));
+	// Accept both spellings (`/var/folders` and `/private/var/folders`) before the
+	// canonical re-check. The re-check still rejects a temp path whose real
+	// target is inside the project.
+	const lexicalRoots = new Set([...roots, ...realRoots]);
+	if (![...lexicalRoots].some(root => isPathWithin(root, absolutePath))) return false;
 	const realTarget = await canonicalizeForContainment(absolutePath);
 	if (isPathWithin(await realpathOrSelf(resolvedCwd), realTarget)) return false;
-	const realRoots = await Promise.all(neutralTempRoots().map(realpathOrSelf));
 	return realRoots.some(root => isPathWithin(root, realTarget));
 }
 

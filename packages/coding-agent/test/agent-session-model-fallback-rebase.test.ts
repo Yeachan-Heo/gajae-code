@@ -4,7 +4,6 @@ import type { Model } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const alpha = {
 	provider: "test",
@@ -22,9 +21,9 @@ function createSession(): AgentSession {
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated(),
 		modelRegistry: {
-			...testModelRegistryConsumerLease,
 			getAvailable: () => [alpha, beta, gamma],
 			getApiKey: async () => "key",
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 	});
 }

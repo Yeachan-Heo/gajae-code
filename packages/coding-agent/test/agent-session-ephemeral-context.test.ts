@@ -8,7 +8,6 @@ import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry"
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 registerMockApi();
 
@@ -95,9 +94,9 @@ function createHarness(
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
 		modelRegistry: {
-			...testModelRegistryConsumerLease,
 			getApiKey: async () => "test-key",
 			getAvailable: () => [model],
+			withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 		} as never,
 		agentId: "0-Main",
 		agentRegistry: registry,

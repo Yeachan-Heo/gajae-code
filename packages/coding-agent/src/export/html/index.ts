@@ -2,7 +2,7 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
-import { APP_NAME, isEnoent } from "@gajae-code/utils";
+import { APP_NAME, isEnoent, redactCrashSecrets } from "@gajae-code/utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import { SessionManager } from "../../session/session-manager";
 // Pre-generated template (created by scripts/generate-template.ts at publish time)
@@ -226,18 +226,18 @@ async function writeSessionHtml(
 	};
 	try {
 		sink.write(themedTemplate.slice(0, markerOffset));
-		writeEncoded(`{"header":${JSON.stringify(sm.getHeader())},"entries":[`);
+		writeEncoded(`{"header":${sessionEmbedJson(sm.getHeader())},"entries":[`);
 		let first = true;
 		sm.visitEntriesForExport(entry => {
-			writeEncoded(`${first ? "" : ","}${JSON.stringify(entry)}`);
+			writeEncoded(`${first ? "" : ","}${sessionEmbedJson(entry)}`);
 			first = false;
 		});
-		writeEncoded(`],"leafId":${JSON.stringify(sm.getLeafId())}`);
+		writeEncoded(`],"leafId":${sessionEmbedJson(sm.getLeafId())}`);
 		if (state?.systemPrompt !== undefined)
-			writeEncoded(`,"systemPrompt":${JSON.stringify(state.systemPrompt.join("\n\n"))}`);
+			writeEncoded(`,"systemPrompt":${sessionEmbedJson(state.systemPrompt.join("\n\n"))}`);
 		if (state?.tools !== undefined)
 			writeEncoded(
-				`,"tools":${JSON.stringify(state.tools.map(tool => ({ name: tool.name, description: tool.description })))}`,
+				`,"tools":${sessionEmbedJson(state.tools.map(tool => ({ name: tool.name, description: tool.description })))}`,
 			);
 		writeEncoded("}");
 		const final = encoder.finish();
@@ -251,6 +251,46 @@ async function writeSessionHtml(
 		if (descriptors.source !== undefined) syncFs.closeSync(descriptors.source);
 		syncFs.closeSync(descriptors.destination);
 	}
+}
+
+/**
+ * Own `__proto__` stays a data property; a normal object would turn that assignment into the prototype.
+ * Each field is redacted together with its key. A detached leaf such as `abcdefgh1234` under `password`
+ * would otherwise miss the key-aware rule. If that serialized field does not parse, the value is
+ * redacted on its own so a quotation mark inside a labeled secret cannot break the export.
+ */
+function redactJsonValue(value: unknown): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (Array.isArray(value)) return value.map(item => redactJsonValue(item));
+	if (value === null || typeof value !== "object") return value;
+	const source = value as Record<string, unknown>;
+	const redacted = Object.create(null) as Record<string, unknown>;
+	for (const key of Object.keys(source)) redacted[key] = redactKeyedValue(key, source[key]);
+	return redacted;
+}
+
+const CREDENTIAL_JSON_KEY =
+	/^(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|session[_-]?token|client[_-]?secret|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)$/i;
+
+function redactKeyedValue(key: string, value: unknown): unknown {
+	// A recognized key is authoritative for every JSON type, including a short
+	// string, a number, an array, or a nested object.
+	if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
+	if (typeof value !== "string") return redactJsonValue(value);
+	const encoded = JSON.stringify({ [key]: value });
+	try {
+		const parsed = JSON.parse(redactCrashSecrets(encoded)) as Record<string, unknown>;
+		if (parsed !== null && typeof parsed === "object" && Object.hasOwn(parsed, key)) return parsed[key];
+	} catch {
+		// A quote inside a credential field can make the redacted JSON invalid.
+		// Mask that field instead of exporting the raw value without its key.
+		if (CREDENTIAL_JSON_KEY.test(key)) return "«redacted»";
+	}
+	return redactCrashSecrets(value);
+}
+
+function sessionEmbedJson(value: unknown): string {
+	return JSON.stringify(redactJsonValue(JSON.parse(JSON.stringify(value))));
 }
 
 /** Export session to HTML using SessionManager and AgentState. */

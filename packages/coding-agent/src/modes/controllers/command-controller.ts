@@ -6,6 +6,7 @@ import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
+import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
@@ -105,6 +106,40 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 		"- Type `#` to browse prompt actions like starting a session, pasting an image, or moving the cursor.",
 		"- Type `!` for shell commands and `$` for Python snippets.",
 	].join("\n");
+}
+
+const GH_SHARE_DESTINATION_KEYS = ["GH_HOST", "GH_CONFIG_DIR"] as const;
+
+/**
+ * Project dotenv at import, before `/move` changes cwd. Those declarations are
+ * already in the process environment, and a later `setProjectDir` does not
+ * remove them.
+ */
+const ghShareProjectSnapshot = projectEnvSnapshot();
+
+/**
+ * Environment for the default `/share` `gh` children. A `GH_HOST` or
+ * `GH_CONFIG_DIR` that matches the project dotenv is omitted so the repository
+ * cannot retarget gist upload or point `gh` at a config directory it shipped.
+ * An operator value the project does not declare is kept.
+ */
+function ghShareChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const child: NodeJS.ProcessEnv = { ...env };
+	for (const name of GH_SHARE_DESTINATION_KEYS) {
+		const raw = child[name];
+		if (typeof raw !== "string") continue;
+		const key = canonicalEnvKey(name);
+		const declared = ghShareProjectSnapshot.values[key];
+		if (declared === undefined) continue;
+		if (!(ghShareProjectSnapshot.dynamic.has(key) || declared === raw || declared === raw.trim())) continue;
+		delete child[name];
+		if (process.platform === "win32") {
+			for (const present of Object.keys(child)) {
+				if (canonicalEnvKey(present) === key) delete child[present];
+			}
+		}
+	}
+	return child;
 }
 
 export class CommandController {
@@ -242,9 +277,10 @@ export class CommandController {
 			return;
 		}
 
+		const ghEnv = ghShareChildEnv();
 		try {
 			const authProcess = Bun.spawn(["gh", "auth", "status"], {
-				env: process.env,
+				env: ghEnv,
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
@@ -278,7 +314,7 @@ export class CommandController {
 		let cancellationRequested = false;
 		try {
 			const gistProcess = Bun.spawn(["gh", "gist", "create", "--public=false", tmpFile], {
-				env: process.env,
+				env: ghEnv,
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",

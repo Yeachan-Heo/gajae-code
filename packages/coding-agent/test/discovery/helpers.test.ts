@@ -508,7 +508,7 @@ describe("safe discovery boundaries", () => {
 			await fs.mkdir(replacement, { recursive: true });
 			await fs.writeFile(path.join(agentDir, "SYSTEM.md"), "authorized");
 			await fs.writeFile(path.join(replacement, "SYSTEM.md"), "replacement");
-			const identity = await fs.stat(agentDir);
+			const identity = await fs.stat(agentDir, { bigint: true });
 			await fs.rm(agentDir, { recursive: true });
 			await fs.symlink(replacement, agentDir, "dir");
 

@@ -9,8 +9,8 @@ const dirCache = new Map<string, fs.Dirent[]>();
 export type ReadScope = "project" | "user" | "native";
 
 export interface FileIdentity {
-	readonly dev: number;
-	readonly ino: number;
+	readonly dev: bigint;
+	readonly ino: bigint;
 }
 
 export interface ReadFileOptions {
@@ -45,7 +45,7 @@ function isWithinOrEqual(root: string, candidate: string): boolean {
 async function isHomeIdentityStable(options?: ReadFileOptions): Promise<boolean> {
 	if (!options?.isolatedHome || !options.home || !options.homeIdentity) return true;
 	try {
-		const current = await fs.promises.stat(options.home);
+		const current = await fs.promises.stat(options.home, { bigint: true });
 		return current.dev === options.homeIdentity.dev && current.ino === options.homeIdentity.ino;
 	} catch {
 		return false;
@@ -69,7 +69,7 @@ async function isUserAgentIdentityStable(options?: ReadFileOptions): Promise<boo
 		}
 	}
 	try {
-		const current = await fs.promises.stat(options.userAgentDir);
+		const current = await fs.promises.stat(options.userAgentDir, { bigint: true });
 		return current.dev === options.userAgentIdentity.dev && current.ino === options.userAgentIdentity.ino;
 	} catch {
 		return false;
@@ -79,7 +79,7 @@ async function isUserAgentIdentityStable(options?: ReadFileOptions): Promise<boo
 async function isContainmentRootIdentityStable(options?: ReadFileOptions): Promise<boolean> {
 	if (!options?.isolatedHome || !options.containmentRoot || !options.containmentRootIdentity) return true;
 	try {
-		const current = await fs.promises.stat(options.containmentRoot);
+		const current = await fs.promises.stat(options.containmentRoot, { bigint: true });
 		return sameFileIdentity(current, options.containmentRootIdentity);
 	} catch {
 		return false;
@@ -152,8 +152,8 @@ async function isCurrentIsolatedPath(abs: string, options?: ReadFileOptions): Pr
 	}
 }
 
-function isSingleLinkRegularFile(stat: fs.Stats): boolean {
-	return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1;
+function isSingleLinkRegularFile(stat: fs.Stats | fs.BigIntStats): boolean {
+	return stat.isFile() && !stat.isSymbolicLink() && (stat.nlink === 1n || stat.nlink === 1);
 }
 
 /** Reject hard-linked executable or configuration files in isolated discovery. */
@@ -165,8 +165,16 @@ export async function isSingleLinkRegularFileAt(filePath: string): Promise<boole
 	}
 }
 
-function sameFileIdentity(left: Pick<fs.Stats, "dev" | "ino">, right: Pick<fs.Stats, "dev" | "ino">): boolean {
-	return left.dev === right.dev && left.ino === right.ino;
+function sameFileIdentity(
+	left: Pick<fs.Stats, "dev" | "ino"> | Pick<fs.BigIntStats, "dev" | "ino">,
+	right: Pick<fs.Stats, "dev" | "ino"> | Pick<fs.BigIntStats, "dev" | "ino"> | FileIdentity,
+): boolean {
+	// Convert to bigint if needed for comparison
+	const leftDev = typeof left.dev === "bigint" ? left.dev : BigInt(left.dev);
+	const leftIno = typeof left.ino === "bigint" ? left.ino : BigInt(left.ino);
+	const rightDev = typeof right.dev === "bigint" ? right.dev : BigInt(right.dev);
+	const rightIno = typeof right.ino === "bigint" ? right.ino : BigInt(right.ino);
+	return leftDev === rightDev && leftIno === rightIno;
 }
 
 /**
@@ -174,13 +182,13 @@ function sameFileIdentity(left: Pick<fs.Stats, "dev" | "ino">, right: Pick<fs.St
  * Stat first and canonicalize second so a parent replacement in either seam
  * is detected by the descriptor identity check below.
  */
-async function statAuthorizedPath(abs: string, options?: ReadFileOptions): Promise<fs.Stats | null> {
+async function statAuthorizedPath(abs: string, options?: ReadFileOptions): Promise<fs.Stats | fs.BigIntStats | null> {
 	if (!options?.isolatedHome) return null;
 	if (!(await isHomeIdentityStable(options))) return null;
 	if (!(await isUserAgentIdentityStable(options))) return null;
-	let authorized: fs.Stats;
+	let authorized: fs.Stats | fs.BigIntStats;
 	try {
-		authorized = await fs.promises.stat(abs);
+		authorized = await fs.promises.stat(abs, { bigint: true });
 	} catch {
 		return null;
 	}
@@ -191,18 +199,18 @@ async function validateOpenedPath(
 	handle: fsPromises.FileHandle,
 	abs: string,
 	options: ReadFileOptions | undefined,
-	authorized: fs.Stats | null,
+	authorized: fs.Stats | fs.BigIntStats | null,
 	kind: "file" | "directory",
 ): Promise<boolean> {
 	if (!options?.isolatedHome) return true;
 	if (!(await isHomeIdentityStable(options))) return false;
 	if (!(await isUserAgentIdentityStable(options))) return false;
 	try {
-		const opened = await handle.stat();
+		const opened = await handle.stat({ bigint: true });
 		const validKind =
 			kind === "file" ? isSingleLinkRegularFile(opened) : opened.isDirectory() && !opened.isSymbolicLink();
 		if (!validKind || authorized === null || !sameFileIdentity(opened, authorized)) return false;
-		const current = await fs.promises.stat(abs);
+		const current = await fs.promises.stat(abs, { bigint: true });
 		if (!sameFileIdentity(opened, current)) return false;
 		return await isCurrentIsolatedPath(abs, options);
 	} catch {
@@ -212,7 +220,7 @@ async function validateOpenedPath(
 
 interface OpenedPath {
 	handle: fsPromises.FileHandle;
-	authorized: fs.Stats | null;
+	authorized: fs.Stats | fs.BigIntStats | null;
 }
 
 async function openIsolatedFile(abs: string, options?: ReadFileOptions): Promise<OpenedPath | null> {
@@ -279,7 +287,7 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 /** Capture a stable physical identity for an authorized containment root. */
 export async function capturePathIdentity(filePath: string): Promise<FileIdentity | null> {
 	try {
-		const stat = await fs.promises.stat(path.resolve(filePath));
+		const stat = await fs.promises.stat(path.resolve(filePath), { bigint: true });
 		return { dev: stat.dev, ino: stat.ino };
 	} catch {
 		return null;
@@ -342,14 +350,14 @@ export async function readFileSize(filePath: string, options?: ReadFileOptions):
 async function validateDirectoryPath(
 	abs: string,
 	options: ReadFileOptions | undefined,
-	authorized: fs.Stats | null,
+	authorized: fs.Stats | fs.BigIntStats | null,
 ): Promise<boolean> {
 	if (!options?.isolatedHome) return true;
 	if (authorized === null) return false;
 	if (!(await isHomeIdentityStable(options))) return false;
 	if (!(await isUserAgentIdentityStable(options))) return false;
 	try {
-		const current = await fs.promises.stat(abs);
+		const current = await fs.promises.stat(abs, { bigint: true });
 		return (
 			current.isDirectory() && sameFileIdentity(current, authorized) && (await isCurrentIsolatedPath(abs, options))
 		);

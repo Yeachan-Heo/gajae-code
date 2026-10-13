@@ -9,7 +9,6 @@ import { InputController } from "@gajae-code/coding-agent/modes/controllers/inpu
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 const model = {
 	provider: "test-provider",
@@ -344,7 +343,9 @@ describe("AgentSession locally handled slash command classification", () => {
 			agent: new Agent({ initialState: { model, systemPrompt: [], tools: [], messages: [] } }),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: { ...testModelRegistryConsumerLease } as never,
+			modelRegistry: {
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			extensionRunner: {
 				getCommand: (name: string) => (name === "ext" ? {} : undefined),
 			} as unknown as ExtensionRunner,

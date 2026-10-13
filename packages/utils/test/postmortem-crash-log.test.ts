@@ -2,7 +2,8 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash } from "../src/postmortem";
+import { computeHandledErrorFingerprint, NO_APP_FRAME } from "../src/crash-fingerprint";
+import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash, recordHandledError } from "../src/postmortem";
 
 function tempCrashLog(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-log-"));
@@ -42,6 +43,142 @@ describe("recordFatalCrash", () => {
 		expect(contents).toContain("Error: boom while streaming");
 		// The full stack must be present so the crash is actually diagnosable.
 		expect(contents).toContain(err.stack ?? "MISSING_STACK");
+		expect(contents.split("\n").some(line => line.includes("at "))).toBe(true);
+	});
+
+	it("flattens a forged newline in a header that redaction rewrites", () => {
+		const target = tempCrashLog();
+		// Assembled at runtime so this file does not commit a literal token.
+		const token = ["sk", "a".repeat(24)].join("-");
+		const injected = "INJECTED";
+		const header = `safe ${token}\n${injected}`;
+		const err = new Error(header);
+		const kept = "    at keptFrame (app.ts:1:1)";
+		const alsoKept = "    at alsoKept (app.ts:2:1)";
+		// The raw `name: message` prefix is not a prefix of the redacted stack.
+		err.stack = [`Error: ${header}`, kept, alsoKept].join("\n");
+
+		const written = recordFatalCrash("Uncaught Exception", err, { path: target });
+
+		expect(written).toBe(target);
+		const frameless = new Error(header);
+		frameless.stack = `Error: ${header}`;
+		expect(recordFatalCrash("Uncaught Exception", frameless, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).not.toContain(token);
+		expect(contents).toContain("«redacted-api-key»");
+		const lines = contents.split("\n");
+		expect(lines.every(line => line !== injected)).toBe(true);
+		expect(lines).toContain(kept);
+		expect(lines).toContain(alsoKept);
+	});
+
+	it("flattens a forged at-line inside the message and keeps the real frame", () => {
+		const target = tempCrashLog();
+		const token = ["sk", "b".repeat(24)].join("-");
+		const message = `safe ${token}\n    at forged\nINJECTED`;
+		const err = new Error(message);
+		const realFrame = "    at realFrame (app.ts:1:1)";
+		err.stack = `Error: ${message}\n${realFrame}`;
+
+		expect(recordFatalCrash("Uncaught Exception", err, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		const lines = contents.split("\n");
+		expect(contents).not.toContain(token);
+		expect(contents).toContain("«redacted-api-key»");
+		expect(lines.every(line => line !== "INJECTED" && line !== "    at forged")).toBe(true);
+		expect(lines).toContain(realFrame);
+
+		const handled = new Error(`${message} handled`);
+		handled.stack = `Error: ${handled.message}\n${realFrame}`;
+		const handledLog = tempCrashLog();
+		expect(recordHandledError("tool", handled, { path: handledLog })).toBe(handledLog);
+		const handledLines = fs.readFileSync(handledLog, "utf8").split("\n");
+		expect(handledLines.every(line => line !== "INJECTED" && line !== "    at forged")).toBe(true);
+		expect(handledLines).toContain(realFrame);
+	});
+
+	it("still redacts a bearer token that continues on the line after the message", () => {
+		const target = tempCrashLog();
+		const token = "z".repeat(24);
+		const err = new Error("Bearer");
+		err.stack = `Error: Bearer\n${token}\n    at realFrame (app.ts:1:1)`;
+
+		expect(recordFatalCrash("Uncaught Exception", err, { path: target })).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).not.toContain(token);
+		expect(contents).toContain("«redacted-auth»");
+	});
+
+	it("keeps frame lines when the header ends in a labeled credential", () => {
+		const target = tempCrashLog();
+		const token = "q".repeat(24);
+		const message = `password=${token}`;
+		const err = new Error(message);
+		const first = "    at first (app.ts:1:1)";
+		const second = "    at second (app.ts:2:1)";
+		err.stack = `Error: ${message}\n${first}\n${second}`;
+
+		expect(recordFatalCrash("Uncaught Exception", err, { path: target })).toBe(target);
+		const lines = fs.readFileSync(target, "utf8").split("\n");
+		expect(lines.join("\n")).not.toContain(token);
+		expect(lines).toContain(first);
+		expect(lines).toContain(second);
+	});
+
+	it("keeps frames for a name-only empty-message stack", () => {
+		const root = path.resolve(import.meta.dir, "..", "..", "..");
+		const frameA = `    at firstSite (${path.join(root, "packages/utils/src/empty-a.ts")}:1:1)`;
+		const frameB = `    at secondSite (${path.join(root, "packages/utils/src/empty-b.ts")}:2:1)`;
+		const err = new Error("");
+		err.stack = `Error\n${frameA}`;
+		const target = tempCrashLog();
+
+		expect(recordFatalCrash("Uncaught Exception", err, { path: target })).toBe(target);
+		const lines = fs.readFileSync(target, "utf8").split("\n");
+		expect(lines.some(line => line.includes("Error: (no message)"))).toBe(true);
+		expect(lines).toContain(frameA);
+		expect(lines.some(line => line.includes(`Error ${frameA.trim()}`))).toBe(false);
+
+		const identity = (frame: string) =>
+			computeHandledErrorFingerprint({
+				name: "Error",
+				message: "(no message)",
+				stack: `Error\n${frame}`,
+			});
+		const first = identity(frameA);
+		const second = identity(frameB);
+		expect(first.frames[0]).not.toBe(NO_APP_FRAME);
+		expect(second.frames[0]).not.toBe(NO_APP_FRAME);
+		expect(first.fingerprint).not.toBe(second.fingerprint);
+
+		const handledLog = tempCrashLog();
+		const siteA = new Error("");
+		siteA.stack = `Error\n${frameA}`;
+		const siteB = new Error("");
+		siteB.stack = `Error\n${frameB}`;
+		expect(recordHandledError("tool", siteA, { path: handledLog })).toBe(handledLog);
+		expect(recordHandledError("tool", siteB, { path: handledLog })).toBe(handledLog);
+		expect(recordHandledError("tool", siteA, { path: handledLog })).toBeUndefined();
+		const handled = fs.readFileSync(handledLog, "utf8").split("\n");
+		expect(handled).toContain(frameA);
+		expect(handled).toContain(frameB);
+	});
+
+	it("keeps at frame lines of a normal multi-line stack", () => {
+		const target = tempCrashLog();
+		const err = new Error("boom while streaming");
+		const kept = "    at keptFrame (app.ts:4:2)";
+		const alsoKept = "    at alsoKept (app.ts:5:1)";
+		err.stack = ["Error: boom while streaming", kept, alsoKept].join("\n");
+
+		const written = recordFatalCrash("Uncaught Exception", err, { path: target });
+
+		expect(written).toBe(target);
+		const lines = fs.readFileSync(target, "utf8").split("\n");
+		expect(lines).toContain("Error: boom while streaming");
+		expect(lines).toContain(kept);
+		expect(lines).toContain(alsoKept);
 	});
 
 	it("stringifies non-Error rejection reasons", () => {

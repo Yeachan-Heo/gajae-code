@@ -200,7 +200,10 @@ describe("startup credential auto-import marker matrix", () => {
 		const refreshCalls: string[] = [];
 		const notice = await runStartupCredentialAutoImportIfNeeded({
 			authStorage: a.authStorage as never,
-			modelRegistry: { refresh: async (mode?: string) => refreshCalls.push(mode ?? "") } as never,
+			modelRegistry: {
+				refresh: async (mode?: string) => refreshCalls.push(mode ?? ""),
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
+			} as never,
 			discover: args.discover,
 			stateStore: marker.stateStore,
 		});

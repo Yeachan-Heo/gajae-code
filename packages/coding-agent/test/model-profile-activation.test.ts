@@ -1,5 +1,6 @@
 import { describe, expect, it, test, vi } from "bun:test";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+
 import type { Model } from "@gajae-code/ai";
 import { hookFetch, TempDir } from "@gajae-code/utils";
 import {
@@ -19,6 +20,7 @@ import {
 	rewriteSelectorForProxy,
 	rollbackPreparedModelProfileActivation,
 } from "../src/config/model-profile-activation";
+
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
@@ -613,6 +615,7 @@ describe("model profile activation", () => {
 			modelRegistry: {
 				...baseRegistry,
 				getAvailable: () => available,
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated(),
 			profileName: "claude-opus",
@@ -1957,7 +1960,11 @@ describe("model profile activation", () => {
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		try {
 			const previousModel = model("provider-c", "default");
-			const registry = { ...testModelRegistryConsumerLease, ...fakeRegistry(), getApiKey: async () => undefined };
+			const registry = {
+				...testModelRegistryConsumerLease,
+				...fakeRegistry(),
+				getApiKey: async () => undefined,
+			};
 			const session = new AgentSession({
 				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
 				sessionManager: manager,
@@ -2206,10 +2213,10 @@ describe("model profile activation", () => {
 				sessionManager: manager,
 				settings: Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: {
-					...testModelRegistryConsumerLease,
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			configuringSession.setConfiguredModelChain(
@@ -2230,10 +2237,10 @@ describe("model profile activation", () => {
 				sessionManager: reopened,
 				settings: Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: {
-					...testModelRegistryConsumerLease,
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
 					isSelectorCircuitOpen: () => false,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			try {
@@ -3385,12 +3392,12 @@ describe("preset-equivalent profile activation", () => {
 				sessionManager: manager,
 				settings: Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: {
-					...testModelRegistryConsumerLease,
 					...fakeRegistry(),
 					getApiKey: async () => kNoAuth,
 					getCanonicalId,
 					seedCanonicalVariant,
 					clearCanonicalVariant,
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 			});
 			try {
@@ -4079,6 +4086,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("grok-4.3")],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
 			profileName: profile.name,
@@ -4126,6 +4134,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 						proxyModel("meta/muse-spark-1.2"),
 						proxyModel("other/muse-spark-1.2"),
 					],
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 				settings: Settings.isolated({
 					"modelProfile.proxyProvider": "litellm",
@@ -4315,6 +4324,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			modelRegistry: {
 				...registry,
 				getAll: () => [...registry.getAll(), proxyModel("other/grok-4.3")],
+				withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 			profileName: profile.name,
@@ -4334,6 +4344,7 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 				modelRegistry: {
 					...registry,
 					getAll: () => [...registry.getAll(), proxyModel("foo/grok-4.4"), proxyModel("bar/grok-4.4")],
+					withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 				} as unknown as ModelRegistry,
 				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
 				profileName: profile.name,
