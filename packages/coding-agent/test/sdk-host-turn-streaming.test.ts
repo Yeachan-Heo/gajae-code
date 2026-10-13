@@ -24,6 +24,7 @@ import { AgentSession, type AgentSessionEvent } from "../src/session/agent-sessi
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
+import { testBrokerDiscovery } from "./sdk-test-broker-discovery";
 
 /**
  * The SDK-only host streams turn content to the connections that submitted the
@@ -179,6 +180,7 @@ async function createHostHarness(
 					},
 				}
 			: {}),
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
 			stateRoot,

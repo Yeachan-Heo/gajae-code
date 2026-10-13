@@ -221,6 +221,7 @@ import {
 	type SubagentLifecycle,
 } from "../async";
 import { asyncJobEndpointId as deriveAsyncJobEndpointId } from "../async/endpoint-id";
+import { formatAsyncResultForFollowUp } from "../async/result-formatting";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -580,31 +581,6 @@ import {
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
-
-const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
-const ASYNC_PREVIEW_MAX_CHARS = 4_000;
-
-async function formatParkedAsyncResult(
-	sessionManager: SessionManager,
-	result: string,
-	allowArtifact = true,
-): Promise<string> {
-	if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
-	const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
-	try {
-		if (!allowArtifact) return preview;
-		const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
-		if (artifactPath && artifactId) {
-			await Bun.write(artifactPath, result);
-			return `${preview}\nFull output: artifact://${artifactId}`;
-		}
-	} catch (error) {
-		logger.warn("Failed to persist parked async follow-up artifact", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-	}
-	return preview;
-}
 
 /**
  * #4560: structured workflow recovery projection from canonical durable
@@ -3797,7 +3773,7 @@ export class AgentSession {
 					}
 				: undefined;
 			const allowArtifact = ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(ownedCompletion);
-			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact)
+			void formatAsyncResultForFollowUp(this.sessionManager, disposition.text, allowArtifact)
 				.then(formattedResult => {
 					const manager = this.#ownedAsyncJobManager;
 					if (manager?.isDeliverySuppressed(job.id, job.generation)) {

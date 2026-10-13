@@ -80,6 +80,7 @@ test.each([
 		const sdkObserver: ExtensionFactory = api => {
 			// Register on the runner that actually drives each session. Without
 			// session_start, production lifecycle observation needs no transport.
+			// broker-seam-opt-out: session_start is never emitted; transport creation throws if reached.
 			createSdkSessionRuntimeExtension(api, {
 				agentDir: root,
 				createTransport: () => {

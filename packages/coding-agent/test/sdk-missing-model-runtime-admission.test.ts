@@ -10,6 +10,7 @@ import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtim
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { testBrokerDiscovery } from "./sdk-test-broker-discovery";
 
 /**
  * A prompt submitted to a session with no selected model must be refused by the
@@ -96,6 +97,7 @@ async function startRuntimeHarness(): Promise<RuntimeHarness> {
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: path.join(cwd, ".gjc", "agent"),
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
 			stateRoot,

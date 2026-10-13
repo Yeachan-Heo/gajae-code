@@ -1166,7 +1166,8 @@ function listDirectoryCandidates(
 	try {
 		directoryStat = fs.lstatSync(directory);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || (provenance === "legacy" && code === "ENAMETOOLONG")) return [];
 		throw error;
 	}
 	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw new Error("unsafe directory");

@@ -143,7 +143,11 @@ test("thinking.set uses the control setter and reports the applied session level
 	const transport = memoryTransport(frame => {
 		if (frame.type === "control_response" && frame.id === "thinking-set") response.resolve(frame);
 	});
-	createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
+		createTransport: async () => transport,
+	});
 	const ctx = extensionContext(transport.sessionId, cwd);
 	try {
 		await handlers.get("session_start")?.({}, ctx);
@@ -4443,7 +4447,10 @@ describe("SessionSdkSessionRuntime", () => {
 function createTestRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	createSdkSessionRuntimeExtension(api, {
 		...options,
-		ensureBrokerImpl: options.ensureBrokerImpl ?? (async () => testBrokerDiscovery),
+		ensureBrokerImpl: async input => {
+			if (options.ensureBrokerImpl) return await options.ensureBrokerImpl(input);
+			return testBrokerDiscovery;
+		},
 	});
 }
 
@@ -11494,6 +11501,7 @@ test.each([
 	let transportCreations = 0;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		createTransport: async () => {
 			transportCreations++;
 			return transport;
@@ -11670,6 +11678,7 @@ test.each([
 			get: (key: string) =>
 				key === "sdk.promptDeadlineMs" ? 1_500 : key === "sdk.promptMaxRuntimeMs" ? 15_000 : undefined,
 		} as unknown as Settings,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		createTransport: async () => {
 			creations++;
 			transport = memoryTransport();

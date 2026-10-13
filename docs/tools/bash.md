@@ -95,6 +95,7 @@ Direct SDK `AgentSession.executeBash()` also captures its minimized-original pub
    - The background-start result carries `details.foldReason`; a steer fold appends `Folded into background job <id> because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.`
    - Chord, timer, and SDK-control folds stop the foreground turn cleanly after the result boundary; completion wakes a later turn with a receipt containing output, original intent, and a `job` retrieval handle. A steer fold does NOT end the turn: the same run consumes the steer at the tool boundary right after the fold result (subagent-await parity), remaining parallel tools in that batch are skipped, and the job's completion wakes a later turn.
    - Folded jobs retain their original deadline and live `job tail` output. PTY observer disposal is non-owning; `job cancel` kills the live PTY through the manager lifecycle. Esc still aborts and kills the foreground command; a steer never kills it.
+   - Large ordinary and parked completion results use secured session artifact storage. A storage refusal still delivers the bounded completion preview with an explicit unavailable notice, not a fabricated artifact link or a dropped completion. Saved notices identify completion output rather than full command stdout; capped artifacts report omitted UTF-8 bytes. Existing cancelled/suppressed delivery rules are unchanged.
 
 ## Side Effects
 - Filesystem

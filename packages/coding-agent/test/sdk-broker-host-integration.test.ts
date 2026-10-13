@@ -466,6 +466,7 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 			handlers.set(event, handler);
 		},
 	} as unknown as ExtensionAPI;
+	// broker-seam-opt-out: uses the fixture broker started above and stopped in finally.
 	createSdkSessionRuntimeExtension(api, {
 		agentDir,
 		brokerRegistrationRequired: true,
@@ -604,6 +605,7 @@ test("SDK-only runtime rejects an endpoint substituted before broker registratio
 			handlers.set(event, handler);
 		},
 	} as unknown as ExtensionAPI;
+	// broker-seam-opt-out: uses the fixture broker started above and stopped in finally.
 	createSdkSessionRuntimeExtension(api, {
 		agentDir,
 		brokerRegistrationRequired: true,

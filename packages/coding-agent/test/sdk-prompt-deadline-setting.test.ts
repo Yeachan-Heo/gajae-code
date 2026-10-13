@@ -23,6 +23,7 @@ import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtim
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { testBrokerDiscovery } from "./sdk-test-broker-discovery";
 
 const SETTING_PATH = "sdk.promptDeadlineMs";
 
@@ -445,6 +446,7 @@ describe("sdk prompt deadline arming — SDK-only host route (#5583)", () => {
 				// `Settings.instance`, so an omitted `settings` is a valid falsifier
 				// here on its own.
 				...(shape.omitSettings ? {} : { settings: settingsWithMissingDeadlines }),
+				ensureBrokerImpl: async () => testBrokerDiscovery,
 				createTransport: async ({ sessionId, stateRoot, token }) => ({
 					sessionId,
 					stateRoot,
