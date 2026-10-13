@@ -2852,7 +2852,7 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
-	it("ignores unrelated terminal legacy rows but keeps reused and live create keys fenced", async () => {
+	it("ignores unrelated final legacy rows but keeps reused keys and live creates fenced", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-"));
 		const agentDir = path.join(root, "agent");
 		const legacyLedger = await new LifecycleLedger(agentDir).open();
@@ -2923,8 +2923,19 @@ describe("SDK broker identity and discovery", () => {
 			await broker.start();
 			expect(broker.ledger.get(liveIdentity)?.state).toBe("terminal_uncertain");
 			expect(broker.ledger.get(liveIdentity)?.operationKey).toBeUndefined();
-			await assertLegacyIdentityFenced("fresh-with-recovered-uncertain-legacy");
-			expect(launchAttempts).toBe(1);
+			const recoveredWorkspace = path.join(root, "recovered-workspace");
+			await fs.mkdir(recoveredWorkspace);
+			await expect(
+				broker.handleRequest(
+					"session.create",
+					{ cwd: recoveredWorkspace },
+					"fresh-after-recovered-uncertain-legacy",
+				),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(2);
 		} finally {
 			setLifecycleCommandResolverForTest(broker, undefined);
 			await broker.stop();

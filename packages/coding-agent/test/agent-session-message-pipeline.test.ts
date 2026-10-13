@@ -13,7 +13,6 @@ import {
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
-import { testModelRegistryConsumerLease } from "./helpers/model-registry";
 
 function eventDelta(event: AgentSessionEvent): string {
 	if (event.type !== "message_update") return "";
@@ -22,9 +21,9 @@ function eventDelta(event: AgentSessionEvent): string {
 }
 
 const testModelRegistry = {
-	...testModelRegistryConsumerLease,
 	getApiKey: async () => "test-key",
 	getAuthStorageOwner: () => undefined,
+	withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 };
 
 function createAgent(): Agent {
@@ -1144,6 +1143,7 @@ describe("AgentSession message pipeline", () => {
 			unsubscribe();
 		}
 
+		neverSettle = false;
 		failIntegration = true;
 		await session.prompt("again");
 		await session.waitForIdle();
@@ -1167,7 +1167,7 @@ describe("AgentSession message pipeline", () => {
 		await session.waitForIdle();
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(6);
 	});
-	it("starts SDK worker reconciliation before a slow extension delivery", async () => {
+	it("starts SDK worker reconciliation before slow extension delivery and rejects on dispose", async () => {
 		const extensionStarted = Promise.withResolvers<void>();
 		const releaseExtension = Promise.withResolvers<void>();
 		let workerStarted = false;
@@ -1223,8 +1223,19 @@ describe("AgentSession message pipeline", () => {
 		await extensionStarted.promise;
 		expect(workerStarted).toBe(true);
 		expect(events.some(event => event.type === "agent_end")).toBe(true);
-		releaseExtension.resolve();
-		await prompt;
+		const promptOutcome = prompt.then(
+			() => ({ kind: "resolved" as const }),
+			error => ({ kind: "rejected" as const, error }),
+		);
+		const disposed = session.dispose();
+		try {
+			const outcome = await Promise.race([promptOutcome, Bun.sleep(0).then(() => ({ kind: "pending" as const }))]);
+			expect(outcome).toMatchObject({ kind: "rejected", error: { code: "cancelled" } });
+		} finally {
+			releaseExtension.resolve();
+		}
+		await disposed;
+		expect(await promptOutcome).toMatchObject({ kind: "rejected", error: { code: "cancelled" } });
 	});
 
 	it("drains deferred agent_end extension delivery before session shutdown", async () => {
@@ -1290,5 +1301,80 @@ describe("AgentSession message pipeline", () => {
 		await disposed;
 		await idle;
 		expect(extensionEvents.at(-1)).toBe("session_shutdown");
+	});
+
+	it("does not publish SDK terminal before continuation decision settles", async () => {
+		// Regression test for PR #6668 P1: ensure SDK terminals are not published
+		// before the async handler has recorded its continuation decision.
+		// This test verifies the continuation-decision guard prevents premature publication
+		// when the handler is still awaiting async work like goal/retry/compaction processing.
+
+		const handlerStarted = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+
+		const model: Model = {
+			id: "continuation-decision-guard-model",
+			name: "continuation-decision-guard-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["system prompt"], messages: [], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("test") });
+				});
+				return stream;
+			},
+		});
+
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+		});
+		sessions.push(session);
+		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(async () => {
+			handlerStarted.resolve();
+			await releaseHandler.promise;
+		});
+
+		const events: AgentSessionEvent[] = [];
+		const sdkAgentEnds: Array<AgentSessionEvent & { type: "agent_end" }> = [];
+		session.subscribe(event => {
+			events.push(event);
+			if (event.type === "agent_end") sdkAgentEnds.push(event as never);
+		});
+
+		// Send an SDK message to trigger the agent on the SDK path.
+		// This ensures the agent_end enters #pendingSdkAgentEnds and exercises the decision guard.
+		const sdkPromise = session.sendUserMessage("test", {
+			sdkRunCapability: createSdkRunCapability("continuation-decision-guard"),
+		} as never);
+
+		try {
+			await handlerStarted.promise;
+			await session.agent.waitForIdle();
+			while (session.isStreaming) await Bun.sleep(0);
+			// The prompt has ended while the real terminal handler is still blocked,
+			// so its continuation decision has not yet been recorded.
+			expect(sdkAgentEnds).toHaveLength(0);
+		} finally {
+			releaseHandler.resolve();
+		}
+
+		await sdkPromise;
+		expect(sdkAgentEnds).toHaveLength(1);
 	});
 });
