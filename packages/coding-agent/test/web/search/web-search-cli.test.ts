@@ -101,7 +101,7 @@ describe("web search CLI settings", () => {
 		});
 
 		const fetchMock = (async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-			expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer sk-test-xai");
+			expect((init?.headers as Record<string, string>)?.Authorization).toBe("Bearer sk-test-xai");
 			return Response.json({
 				output_text: "answer",
 				citations: ["https://docs.x.ai/developers/tools/web-search"],

@@ -226,7 +226,7 @@ describe("GLM ZCode OAuth login provider", () => {
 		);
 		expect(credentials.access).toBe(MINTED_KEY);
 		const brokerCall = fetchMock.mock.calls.find(c => String(c[0]) === GLM_ZCODE_OAUTH_BROKER_TOKEN_URL);
-		expect(JSON.parse(String((brokerCall?.[1] as RequestInit).body)).code).toBe("pasted");
+		expect(JSON.parse(String((brokerCall?.[1] as RequestInit)?.body)).code).toBe("pasted");
 	});
 
 	it("refresh re-provisions the API key from the stored upstream token", async () => {

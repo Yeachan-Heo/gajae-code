@@ -104,17 +104,14 @@ describe("cli parse — CliParseError for invalid input", () => {
 		await expect(cmd.parse(Demo)).rejects.toThrow(/Expected --scope to be one of: user, project/);
 	});
 
-	it.each([
-		"12oops",
-		"1.5",
-		"1e3",
-		" 12 ",
-		"9007199254740992",
-	])("throws CliParseError for a non-exact integer flag value %j", async value => {
-		const cmd = new Demo(["build", "--count", value], CFG);
-		await expect(cmd.parse(Demo)).rejects.toBeInstanceOf(CliParseError);
-		await expect(cmd.parse(Demo)).rejects.toThrow(`Expected integer for --count, got "${value}"`);
-	});
+	it.each(["12oops", "1.5", "1e3", " 12 ", "9007199254740992"])(
+		"throws CliParseError for a non-exact integer flag value %j",
+		async value => {
+			const cmd = new Demo(["build", "--count", value], CFG);
+			await expect(cmd.parse(Demo)).rejects.toBeInstanceOf(CliParseError);
+			await expect(cmd.parse(Demo)).rejects.toThrow(`Expected integer for --count, got "${value}"`);
+		},
+	);
 
 	it.each([
 		["--count=0", 0],

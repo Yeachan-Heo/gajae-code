@@ -87,7 +87,7 @@ describe("OpenAI completions tool choice capability", () => {
 
 		expect(payload?.tool_choice).toBeUndefined();
 		expect(payload?.tools).toEqual(expect.any(Array));
-		expect((payload?.tools as unknown[]).length).toBeGreaterThan(0);
+		expect((payload?.tools as unknown[])?.length).toBeGreaterThan(0);
 	});
 
 	it("retries once without forced tool_choice on semantic 400 and records runtime incapability", async () => {

@@ -664,23 +664,22 @@ describe("hashline — hash-less line references", () => {
 		});
 	});
 
-	it.each([
-		"a..b",
-		"a..b..c",
-		"../relative/path",
-	])("preserves the one-line retry hint when copied text contains dots (%s)", async copiedText => {
-		await withTempDir(async tempDir => {
-			const filePath = path.join(tempDir, "a.ts");
-			const original = Array.from({ length: 25 }, (_, index) => `line ${index + 1}`).join("\n");
-			await Bun.write(filePath, original);
-			const message = await rejectionMessage(
-				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔22|${copiedText}\n${pl("X")}`)),
-			);
-			expect(message).toContain(`Use ≔${tag(22, "line 22")}`);
-			expect(message).not.toContain("Re-read the target");
-			await expectFileBytesUnchanged(filePath, original);
-		});
-	});
+	it.each(["a..b", "a..b..c", "../relative/path"])(
+		"preserves the one-line retry hint when copied text contains dots (%s)",
+		async copiedText => {
+			await withTempDir(async tempDir => {
+				const filePath = path.join(tempDir, "a.ts");
+				const original = Array.from({ length: 25 }, (_, index) => `line ${index + 1}`).join("\n");
+				await Bun.write(filePath, original);
+				const message = await rejectionMessage(
+					executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔22|${copiedText}\n${pl("X")}`)),
+				);
+				expect(message).toContain(`Use ≔${tag(22, "line 22")}`);
+				expect(message).not.toContain("Re-read the target");
+				await expectFileBytesUnchanged(filePath, original);
+			});
+		},
+	);
 
 	it("accepts a copied-text suffix on a hash-only anchor", async () => {
 		await withTempDir(async tempDir => {
@@ -715,24 +714,24 @@ describe("hashline — hash-less line references", () => {
 		});
 	});
 
-	it.each([
-		"22|foo..23|bar",
-		"22|foo..23cd",
-	])("keeps the full span when a copied suffix precedes the range separator (≔%s)", async anchor => {
-		await withTempDir(async tempDir => {
-			const filePath = path.join(tempDir, "a.ts");
-			const original = "line 1\nline 2\nline 3\n";
-			await Bun.write(filePath, original);
+	it.each(["22|foo..23|bar", "22|foo..23cd"])(
+		"keeps the full span when a copied suffix precedes the range separator (≔%s)",
+		async anchor => {
+			await withTempDir(async tempDir => {
+				const filePath = path.join(tempDir, "a.ts");
+				const original = "line 1\nline 2\nline 3\n";
+				await Bun.write(filePath, original);
 
-			const message = await rejectionMessage(
-				executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔${anchor}\n${pl("X")}\n`)),
-			);
-			// A one-line `Use ≔22xx` suggestion would make a resent range payload replace line 22 only.
-			expect(message).not.toMatch(/Use ≔\d+/);
-			expect(message).toContain("Re-read the target");
-			await expectFileBytesUnchanged(filePath, original);
-		});
-	});
+				const message = await rejectionMessage(
+					executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔${anchor}\n${pl("X")}\n`)),
+				);
+				// A one-line `Use ≔22xx` suggestion would make a resent range payload replace line 22 only.
+				expect(message).not.toMatch(/Use ≔\d+/);
+				expect(message).toContain("Re-read the target");
+				await expectFileBytesUnchanged(filePath, original);
+			});
+		},
+	);
 
 	it("rejects mixed range with hash on second endpoint only (≔ab..10cd)", async () => {
 		await withTempDir(async tempDir => {

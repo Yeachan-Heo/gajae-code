@@ -73,7 +73,7 @@ describe("fold wake merge window", () => {
 
 		expect(h.idleInjections).toHaveLength(1);
 		expect(h.idleInjections[0]).toHaveLength(1);
-		expect(String((h.idleInjections[0]?.[0] as { content: string }).content)).toBe("first|second");
+		expect(String((h.idleInjections[0]?.[0] as { content: string })?.content)).toBe("first|second");
 	});
 
 	// The scheduled flush returns early when it fires mid-stream and clears its
@@ -96,7 +96,7 @@ describe("fold wake merge window", () => {
 		await h.runScheduled();
 
 		expect(h.idleInjections).toHaveLength(1);
-		expect(String((h.idleInjections[0]?.[0] as { content: string }).content)).toBe("stranded");
+		expect(String((h.idleInjections[0]?.[0] as { content: string })?.content)).toBe("stranded");
 	});
 
 	test("rearmIdle is a no-op when nothing is queued or while streaming", async () => {

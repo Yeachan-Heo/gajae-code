@@ -893,7 +893,9 @@ describe("GJC native skill-state hooks", () => {
 			);
 			expect(allowed.outputJson).toMatchObject({ hookSpecificOutput: { hookEventName: "UserPromptSubmit" } });
 			expect(
-				String((allowed.outputJson?.hookSpecificOutput as { additionalContext?: unknown }).additionalContext ?? ""),
+				String(
+					(allowed.outputJson?.hookSpecificOutput as { additionalContext?: unknown })?.additionalContext ?? "",
+				),
 			).toContain("GJC state recovery");
 			expect(warn).toHaveBeenCalledTimes(2);
 			expect(String(warn.mock.calls[0]?.[0] ?? "")).toContain("gjc skill-state: invalid mode-state at");

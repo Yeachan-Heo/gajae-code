@@ -155,7 +155,7 @@ describe("ACP newSession phase timing", () => {
 			expect(entries).toHaveLength(1);
 			expect(entries[0]?.[1]).toMatchObject({ outcome: "ok", sessionId: response.sessionId });
 			for (const phase of ["launchMs", "attachMs", "startupOptionsMs", "sessionStateMs", "totalMs"]) {
-				expect(typeof (entries[0]?.[1] as Record<string, unknown>)[phase]).toBe("number");
+				expect(typeof (entries[0]?.[1] as Record<string, unknown>)?.[phase]).toBe("number");
 			}
 		} finally {
 			debug.mockRestore();

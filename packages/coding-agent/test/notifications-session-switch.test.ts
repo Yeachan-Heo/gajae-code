@@ -315,9 +315,9 @@ test("turn.prompt preflight rejection returns a correlated failure without an ac
 		"preflight lifecycle replay",
 	);
 	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "preflight-events");
-	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_start")).toBe(false);
-	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_end")).toBe(false);
-	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_failed")).toBe(false);
+	expect((replay?.events as Array<Record<string, unknown>>)?.some(event => event.kind === "agent_start")).toBe(false);
+	expect((replay?.events as Array<Record<string, unknown>>)?.some(event => event.kind === "agent_end")).toBe(false);
+	expect((replay?.events as Array<Record<string, unknown>>)?.some(event => event.kind === "agent_failed")).toBe(false);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
 });
 

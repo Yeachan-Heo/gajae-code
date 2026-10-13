@@ -178,31 +178,31 @@ describe("Kiro API-key content filter #6150", () => {
 		);
 	});
 
-	test.each([
-		undefined,
-		"Request included ksk_test-secret",
-	])("redacts secrets in structured refusal category and explanation (%s)", async explanation => {
-		let finalError: AssistantMessage | undefined;
-		globalThis.fetch = (async () =>
-			new Response(
-				JSON.stringify({
-					stopReason: "CONTENT_FILTERED",
-					stopDetails: { refusal: { category: "ksk_test-secret", explanation } },
-				}),
-				{ status: 200 },
-			)) as unknown as typeof fetch;
+	test.each([undefined, "Request included ksk_test-secret"])(
+		"redacts secrets in structured refusal category and explanation (%s)",
+		async explanation => {
+			let finalError: AssistantMessage | undefined;
+			globalThis.fetch = (async () =>
+				new Response(
+					JSON.stringify({
+						stopReason: "CONTENT_FILTERED",
+						stopDetails: { refusal: { category: "ksk_test-secret", explanation } },
+					}),
+					{ status: 200 },
+				)) as unknown as typeof fetch;
 
-		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
-		for await (const event of stream) {
-			if (event.type === "error") finalError = event.error;
-		}
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				if (event.type === "error") finalError = event.error;
+			}
 
-		expect(finalError?.errorMessage).toBe(
-			explanation
-				? "Kiro refused the request ([redacted]): Request included [redacted]"
-				: "Kiro refused the request ([redacted])",
-		);
-	});
+			expect(finalError?.errorMessage).toBe(
+				explanation
+					? "Kiro refused the request ([redacted]): Request included [redacted]"
+					: "Kiro refused the request ([redacted])",
+			);
+		},
+	);
 
 	test("ksk_ transport emits text_delta incrementally before stream ends", async () => {
 		const emittedEvents: Array<{ type: string }> = [];

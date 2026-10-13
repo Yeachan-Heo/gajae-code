@@ -100,25 +100,23 @@ describe("auth-broker no-auth browser origin guard", () => {
 		);
 	});
 
-	test.each([
-		"https://attacker.example",
-		"null",
-		"not an origin",
-		"",
-	])("rejects tokenless Origin %p before credential mutation", async origin => {
-		const fixture = await startFixture([]);
+	test.each(["https://attacker.example", "null", "not an origin", ""])(
+		"rejects tokenless Origin %p before credential mutation",
+		async origin => {
+			const fixture = await startFixture([]);
 
-		const response = await fetch(`${fixture.handle.url}/v1/credential/${fixture.credentialId}/disable`, {
-			method: "POST",
-			headers: { Origin: origin, "Content-Type": "text/plain" },
-			body: "{}",
-		});
+			const response = await fetch(`${fixture.handle.url}/v1/credential/${fixture.credentialId}/disable`, {
+				method: "POST",
+				headers: { Origin: origin, "Content-Type": "text/plain" },
+				body: "{}",
+			});
 
-		expect(response.status).toBe(403);
-		expect(response.headers.get("access-control-allow-origin")).toBeNull();
-		expect(await response.json()).toEqual({ error: "no-auth rejects requests carrying Origin" });
-		expect(fixture.storage.listCredentialInventory()[0]?.disabledCause).toBeNull();
-	});
+			expect(response.status).toBe(403);
+			expect(response.headers.get("access-control-allow-origin")).toBeNull();
+			expect(await response.json()).toEqual({ error: "no-auth rejects requests carrying Origin" });
+			expect(fixture.storage.listCredentialInventory()[0]?.disabledCause).toBeNull();
+		},
+	);
 
 	test("rejects tokenless browser preflight before route handling", async () => {
 		const fixture = await startFixture([]);

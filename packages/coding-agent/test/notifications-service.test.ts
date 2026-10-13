@@ -1189,34 +1189,32 @@ describe("notification-service endpoint liveness (owner-proof)", () => {
 		expect(report.endpointsKept).toBe(1);
 		expect(unlinked).toEqual([]);
 	});
-	test.each([
-		0,
-		-1,
-		1.5,
-		Number.MAX_SAFE_INTEGER + 1,
-	])("recovery keeps invalid pid %p without probing liveness", async pid => {
-		const endpoint = path.join(epDir, `invalid-${pid}.json`);
-		const { fs, unlinked } = mockFs({
-			[endpoint]: JSON.stringify({ url: "ws://x", token: "t", pid }),
-		});
-		let pidAliveCalls = 0;
-		const report = await recoverNotifications({
-			settings,
-			stateRoot,
-			deps: {
-				fs,
-				pidAlive: () => {
-					pidAliveCalls += 1;
-					return false;
+	test.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+		"recovery keeps invalid pid %p without probing liveness",
+		async pid => {
+			const endpoint = path.join(epDir, `invalid-${pid}.json`);
+			const { fs, unlinked } = mockFs({
+				[endpoint]: JSON.stringify({ url: "ws://x", token: "t", pid }),
+			});
+			let pidAliveCalls = 0;
+			const report = await recoverNotifications({
+				settings,
+				stateRoot,
+				deps: {
+					fs,
+					pidAlive: () => {
+						pidAliveCalls += 1;
+						return false;
+					},
 				},
-			},
-		});
+			});
 
-		expect(report.endpointsRemoved).toEqual([]);
-		expect(report.endpointsKept).toBe(1);
-		expect(unlinked).toEqual([]);
-		expect(pidAliveCalls).toBe(0);
-	});
+			expect(report.endpointsRemoved).toEqual([]);
+			expect(report.endpointsKept).toBe(1);
+			expect(unlinked).toEqual([]);
+			expect(pidAliveCalls).toBe(0);
+		},
+	);
 });
 
 describe("notification-service recovery lock TOCTOU (owner-bound)", () => {

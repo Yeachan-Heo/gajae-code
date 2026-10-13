@@ -280,29 +280,27 @@ describe("deliverRichWithFallback", () => {
 		expect(fallbacks).toBe(0);
 		expect(warns).toHaveLength(1);
 	});
-	test.each([
-		0,
-		-1,
-		1.5,
-		Number.MAX_SAFE_INTEGER + 1,
-	])("invalid numeric message_id %p remains ambiguous without HTML fallback", async messageId => {
-		const { bot } = makeBot(() => ({ ok: true, result: { message_id: messageId } }));
-		let fallbacks = 0;
-		const warns: string[] = [];
-		const result = await deliverRichWithFallback(
-			bot,
-			{ chat_id: 1 },
-			makeSend(),
-			AbortSignal.timeout(30_000),
-			async () => {
-				fallbacks++;
-			},
-			{ warn: message => warns.push(message) },
-		);
-		expect(result).toBeUndefined();
-		expect(fallbacks).toBe(0);
-		expect(warns).toHaveLength(1);
-	});
+	test.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+		"invalid numeric message_id %p remains ambiguous without HTML fallback",
+		async messageId => {
+			const { bot } = makeBot(() => ({ ok: true, result: { message_id: messageId } }));
+			let fallbacks = 0;
+			const warns: string[] = [];
+			const result = await deliverRichWithFallback(
+				bot,
+				{ chat_id: 1 },
+				makeSend(),
+				AbortSignal.timeout(30_000),
+				async () => {
+					fallbacks++;
+				},
+				{ warn: message => warns.push(message) },
+			);
+			expect(result).toBeUndefined();
+			expect(fallbacks).toBe(0);
+			expect(warns).toHaveLength(1);
+		},
+	);
 
 	test("no log provided: ambiguous failure never falls back or crashes", async () => {
 		const bot: BotApi = {
@@ -394,30 +392,28 @@ describe("deliverRichActionWithFallback", () => {
 		expect(fallbacks).toBe(0);
 		expect(warns).toHaveLength(1);
 	});
-	test.each([
-		0,
-		-1,
-		1.5,
-		Number.MAX_SAFE_INTEGER + 1,
-	])("invalid numeric action message_id %p remains ambiguous without HTML fallback", async messageId => {
-		const { bot } = makeBot(() => ({ ok: true, result: { message_id: messageId } }));
-		let fallbacks = 0;
-		const warns: string[] = [];
-		const result = await deliverRichActionWithFallback(
-			bot,
-			{ chat_id: 1 },
-			{ markdown: "ask?" },
-			AbortSignal.timeout(30_000),
-			async () => {
-				fallbacks++;
-				return 888;
-			},
-			{ warn: message => warns.push(message) },
-		);
-		expect(result).toEqual({ messageId: undefined, usedRich: true, usedFallback: false });
-		expect(fallbacks).toBe(0);
-		expect(warns).toHaveLength(1);
-	});
+	test.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+		"invalid numeric action message_id %p remains ambiguous without HTML fallback",
+		async messageId => {
+			const { bot } = makeBot(() => ({ ok: true, result: { message_id: messageId } }));
+			let fallbacks = 0;
+			const warns: string[] = [];
+			const result = await deliverRichActionWithFallback(
+				bot,
+				{ chat_id: 1 },
+				{ markdown: "ask?" },
+				AbortSignal.timeout(30_000),
+				async () => {
+					fallbacks++;
+					return 888;
+				},
+				{ warn: message => warns.push(message) },
+			);
+			expect(result).toEqual({ messageId: undefined, usedRich: true, usedFallback: false });
+			expect(fallbacks).toBe(0);
+			expect(warns).toHaveLength(1);
+		},
+	);
 
 	test("ok:false: warns exactly once, runs htmlFallback, returns its id, usedFallback", async () => {
 		const { bot, calls } = makeBot(() => ({ ok: false, description: "no rich" }));

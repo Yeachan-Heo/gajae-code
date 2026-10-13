@@ -168,7 +168,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 			expect(records.map(record => record.cursor)).toEqual(["000000000001", "000000000002"]);
 			expect(records.map(record => record.envelope.family)).toEqual(["validation", "completion"]);
 			expect(records.every(record => validateReceipt(record.envelope).valid)).toBe(true);
-			expect((records.at(-1)?.envelope.evidence as CompletionEvidence).finalLifecycle).toBe("completed");
+			expect((records.at(-1)?.envelope.evidence as CompletionEvidence)?.finalLifecycle).toBe("completed");
 		} finally {
 			await rm(spoolDir, { recursive: true, force: true });
 		}
@@ -204,8 +204,8 @@ describe("gjc harness CLI -> live owner routing", () => {
 		expect(res.json).toHaveProperty("state");
 		expect(res.json).toHaveProperty("evidence");
 		expect(res.json).toHaveProperty("nextAllowedActions");
-		expect((res.json?.state as Record<string, unknown>).ownerLive).toBe(false);
-		expect((res.json?.evidence as Record<string, unknown>).ownerRouted).toBeUndefined();
+		expect((res.json?.state as Record<string, unknown>)?.ownerLive).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>)?.ownerRouted).toBeUndefined();
 	}, 10_000);
 
 	it("does not accept or advertise submit when the owner endpoint degrades", async () => {
@@ -235,10 +235,10 @@ describe("gjc harness CLI -> live owner routing", () => {
 
 		expect(res.code).toBe(1);
 		expect(res.json?.ok).toBe(false);
-		expect((res.json?.state as Record<string, unknown>).ownerLive).toBe(false);
-		expect((res.json?.evidence as Record<string, unknown>).accepted).toBe(false);
-		expect((res.json?.evidence as Record<string, unknown>).submitted).toBe(false);
-		expect((res.json?.evidence as Record<string, unknown>).reason).toBe("owner-not-live");
+		expect((res.json?.state as Record<string, unknown>)?.ownerLive).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>)?.accepted).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>)?.submitted).toBe(false);
+		expect((res.json?.evidence as Record<string, unknown>)?.reason).toBe("owner-not-live");
 		expect(res.json?.nextAllowedActions).toContainEqual({
 			verb: "submit",
 			available: false,

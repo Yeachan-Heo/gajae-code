@@ -197,7 +197,7 @@ async function retireLiveFixtureOwner(): Promise<void> {
 	let owner = await resolveOwner(root, SID);
 	if (!owner.live) return;
 	const retired = await runHarness(["retire", "--session", SID]);
-	if (retired.code !== 0 || (retired.json?.evidence as Record<string, unknown>).retired !== true)
+	if (retired.code !== 0 || (retired.json?.evidence as Record<string, unknown>)?.retired !== true)
 		throw new Error("Fixture owner retirement failed; preserving fixture roots for retry.");
 	for (let i = 0; i < 80 && owner.live; i++) {
 		await sleep(50);
@@ -246,7 +246,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect(started.code).toBe(0);
 		const evidence = started.json?.evidence as Record<string, unknown>;
 		expect(evidence.ownerRuntime).toBe("tmux");
-		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(true);
+		expect((started.json?.state as Record<string, unknown>)?.ownerLive).toBe(true);
 		const handle = evidence.handle as { viewportHandle?: { tmuxSessionName?: string | null } };
 		expect(handle.viewportHandle?.tmuxSessionName).toBe(`gajae_code_harness_${SID}`);
 		expect(evidence.tmuxOwnerSocketKey).toBeUndefined();
@@ -268,8 +268,8 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		const promptPath = path.join(workspace, "prompt.txt");
 		await writeFile(promptPath, "go", "utf8");
 		const sub = await runHarness(["submit", "--session", SID, "--prompt-file", promptPath]);
-		expect((sub.json?.evidence as Record<string, unknown>).accepted).toBe(true);
-		expect((sub.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect((sub.json?.evidence as Record<string, unknown>)?.accepted).toBe(true);
+		expect((sub.json?.state as Record<string, unknown>)?.lifecycle).toBe("observing");
 		await assertOnlyOwnerSocket();
 
 		// AC-9: the detached owner maps the real RPC frame stream -> observe surfaces tool-call -> completed.
@@ -303,7 +303,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 
 		// Retire stops the owner and releases the lease.
 		const ret = await runHarness(["retire", "--session", SID]);
-		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+		expect((ret.json?.evidence as Record<string, unknown>)?.retired).toBe(true);
 		await assertOnlyOwnerSocket();
 
 		let after = await resolveOwner(root, SID);
@@ -328,8 +328,8 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 			"tmux new-session owner endpoint not routable; exact cleanup or reconciliation uncertain",
 		);
 		expect(evidence.reason).toBe("tmux-owner-endpoint-cleanup-uncertain");
-		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
-		expect((started.json?.state as Record<string, unknown>).blockers).toContain(
+		expect((started.json?.state as Record<string, unknown>)?.ownerLive).toBe(false);
+		expect((started.json?.state as Record<string, unknown>)?.blockers).toContain(
 			"tmux-owner-endpoint-cleanup-uncertain",
 		);
 		const lifecycle = path.join(root, SID, "owner-lifecycle");
@@ -359,9 +359,9 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		const submit = await runHarness(["submit", "--session", SID, "--input", JSON.stringify({ prompt: "go" })]);
 		expect(submit.code).toBe(1);
 		expect(submit.json?.ok).toBe(false);
-		expect((submit.json?.state as Record<string, unknown>).ownerLive).toBe(false);
-		expect((submit.json?.evidence as Record<string, unknown>).accepted).toBe(false);
-		expect((submit.json?.evidence as Record<string, unknown>).reason).toBe("owner-not-live");
+		expect((submit.json?.state as Record<string, unknown>)?.ownerLive).toBe(false);
+		expect((submit.json?.evidence as Record<string, unknown>)?.accepted).toBe(false);
+		expect((submit.json?.evidence as Record<string, unknown>)?.reason).toBe("owner-not-live");
 		expect(submit.json?.nextAllowedActions).toContainEqual({
 			verb: "submit",
 			available: false,
@@ -391,7 +391,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 			expect(evidence.ownerRuntime).toBe("manual");
 			expect(evidence.ownerFallbackReason).toBe("tmux-owner-scope_bootstrap_failed:tmux-owner-cleanup_uncertain");
 			expect(evidence.reason).toBe("tmux-owner-isolation-failed");
-			expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+			expect((started.json?.state as Record<string, unknown>)?.ownerLive).toBe(false);
 		},
 		60_000,
 	);
@@ -404,9 +404,9 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
 		]);
 		expect(started.code).toBe(0);
-		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
-		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
-		expect((started.json?.evidence as Record<string, unknown>).ownerRuntime).toBe("manual");
+		expect((started.json?.state as Record<string, unknown>)?.lifecycle).toBe("started");
+		expect((started.json?.state as Record<string, unknown>)?.ownerLive).toBe(false);
+		expect((started.json?.evidence as Record<string, unknown>)?.ownerRuntime).toBe("manual");
 
 		// recover must bootstrap a fresh owner instead of deadlocking on the missing prior endpoint.
 		const recovered = await runHarness(["recover", "--session", SID]);
@@ -415,11 +415,11 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		expect(evidence.bootstrappedOwner).toBe(true);
 		expect(evidence.restoredOwner).toBeUndefined();
 		expect(evidence.vanishReceiptId).toBeUndefined();
-		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
-		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect((recovered.json?.state as Record<string, unknown>)?.ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>)?.lifecycle).toBe("observing");
 
 		const ret = await runHarness(["retire", "--session", SID]);
-		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+		expect((ret.json?.evidence as Record<string, unknown>)?.retired).toBe(true);
 	}, 60_000);
 	it("recover bootstraps a never-started owner even when the workspace is not a git repo (#421)", async () => {
 		// No gitInit: a bare workspace reports git delta `unknown`, so the vanish classifier
@@ -430,19 +430,19 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
 		]);
 		expect(started.code).toBe(0);
-		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+		expect((started.json?.state as Record<string, unknown>)?.lifecycle).toBe("started");
 
 		const recovered = await runHarness(["recover", "--session", SID]);
 		expect(recovered.code).toBe(0);
 		const evidence = recovered.json?.evidence as Record<string, unknown>;
 		expect(evidence.bootstrappedOwner).toBe(true);
 		expect(evidence.vanishReceiptId).toBeUndefined();
-		expect((evidence.decision as Record<string, unknown>).ownerRequired).toBe(false);
-		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
-		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect((evidence.decision as Record<string, unknown>)?.ownerRequired).toBe(false);
+		expect((recovered.json?.state as Record<string, unknown>)?.ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>)?.lifecycle).toBe("observing");
 
 		const ret = await runHarness(["retire", "--session", SID]);
-		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+		expect((ret.json?.evidence as Record<string, unknown>)?.retired).toBe(true);
 	}, 60_000);
 	it("recover bootstraps a never-started owner in a dirty worktree without a vanish receipt and preserves the delta (#421)", async () => {
 		gitInit(workspace);
@@ -458,7 +458,7 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 			JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID }),
 		]);
 		expect(started.code).toBe(0);
-		expect((started.json?.state as Record<string, unknown>).lifecycle).toBe("started");
+		expect((started.json?.state as Record<string, unknown>)?.lifecycle).toBe("started");
 
 		const recovered = await runHarness(["recover", "--session", SID]);
 		expect(recovered.code).toBe(0);
@@ -470,15 +470,15 @@ describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 		const decision = evidence.decision as Record<string, unknown>;
 		expect(decision.classification).toBe("restart-preserve-delta");
 		expect(decision.ownerRequired).toBe(true);
-		expect((evidence.observation as Record<string, unknown>).gitDelta).toBe("dirty");
-		expect((recovered.json?.state as Record<string, unknown>).ownerLive).toBe(true);
-		expect((recovered.json?.state as Record<string, unknown>).lifecycle).toBe("observing");
+		expect((evidence.observation as Record<string, unknown>)?.gitDelta).toBe("dirty");
+		expect((recovered.json?.state as Record<string, unknown>)?.ownerLive).toBe(true);
+		expect((recovered.json?.state as Record<string, unknown>)?.lifecycle).toBe("observing");
 		// The pre-existing uncommitted work is left untouched (never stashed or reset).
 		expect(await readFile(dirtyFile, "utf8")).toBe("user-work");
 
 		const ret = await runHarness(["retire", "--session", SID]);
 		// retire routes to the live owner, which stops cleanly without mutating the worktree.
-		expect((ret.json?.evidence as Record<string, unknown>).retired).toBe(true);
+		expect((ret.json?.evidence as Record<string, unknown>)?.retired).toBe(true);
 		expect(await readFile(dirtyFile, "utf8")).toBe("user-work");
 	}, 60_000);
 });

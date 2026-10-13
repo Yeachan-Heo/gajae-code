@@ -94,7 +94,7 @@ describe("Cursor usage-context tool identity", () => {
 		} as unknown as Tool;
 
 		const [identity] = buildCursorWireToolIdentitiesForTest([tool]);
-		const advertisedProperties = (identity?.inputSchema as { properties?: Record<string, unknown> }).properties;
+		const advertisedProperties = (identity?.inputSchema as { properties?: Record<string, unknown> })?.properties;
 		expect(Object.keys(advertisedProperties ?? {})).toHaveLength(Object.keys(properties).length);
 		expect(advertisedProperties?.field10049).toEqual({ type: "string" });
 	});

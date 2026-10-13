@@ -24,24 +24,19 @@ describe("loadHindsightConfig numeric env overrides", () => {
 		expect(config.recallMaxQueryChars).toBe(0);
 	});
 
-	it.each([
-		"5turns",
-		"1e3",
-		"1.5",
-		"-3",
-		"",
-		"0x10",
-		"99999999999999999999",
-	])("ignores %p and keeps the settings value", raw => {
-		const config = loadHindsightConfig(settings(), {
-			HINDSIGHT_RETAIN_EVERY_N_TURNS: raw,
-			HINDSIGHT_RECALL_MAX_TOKENS: raw,
-			HINDSIGHT_RECALL_CONTEXT_TURNS: raw,
-			HINDSIGHT_RECALL_MAX_QUERY_CHARS: raw,
-		});
-		expect(config.retainEveryNTurns).toBe(3);
-		expect(config.recallMaxTokens).toBe(1024);
-		expect(config.recallContextTurns).toBe(1);
-		expect(config.recallMaxQueryChars).toBe(800);
-	});
+	it.each(["5turns", "1e3", "1.5", "-3", "", "0x10", "99999999999999999999"])(
+		"ignores %p and keeps the settings value",
+		raw => {
+			const config = loadHindsightConfig(settings(), {
+				HINDSIGHT_RETAIN_EVERY_N_TURNS: raw,
+				HINDSIGHT_RECALL_MAX_TOKENS: raw,
+				HINDSIGHT_RECALL_CONTEXT_TURNS: raw,
+				HINDSIGHT_RECALL_MAX_QUERY_CHARS: raw,
+			});
+			expect(config.retainEveryNTurns).toBe(3);
+			expect(config.recallMaxTokens).toBe(1024);
+			expect(config.recallContextTurns).toBe(1);
+			expect(config.recallMaxQueryChars).toBe(800);
+		},
+	);
 });

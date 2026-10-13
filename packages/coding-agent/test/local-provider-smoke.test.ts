@@ -54,7 +54,7 @@ describe("local provider streaming smoke", () => {
 				throw new Error(`Unexpected URL: ${url}`);
 			}
 			expect(init?.method ?? "GET").toBe("GET");
-			expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer local-key");
+			expect((init?.headers as Record<string, string>)?.Authorization).toBe("Bearer local-key");
 			return new Response(JSON.stringify({ data: [{ id: "z-local" }, { id: "a-local" }, { id: "a-local" }] }), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
@@ -323,7 +323,7 @@ describe("local provider streaming smoke", () => {
 				throw new Error(`Unexpected URL: ${url}`);
 			}
 			expect(init?.method).toBe("POST");
-			expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer local-key");
+			expect((init?.headers as Record<string, string>)?.Authorization).toBe("Bearer local-key");
 			const body = JSON.parse(String(init?.body)) as { model: string; stream: boolean };
 			expect(body.model).toBe("local-model");
 			expect(body.stream).toBe(true);

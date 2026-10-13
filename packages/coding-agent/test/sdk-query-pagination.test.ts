@@ -566,8 +566,8 @@ it("aligns Q23 arbitrary byte offsets past UTF-8 continuation bytes", async () =
 	});
 	expect(insideTwoByte.page?.items[0]).toMatchObject({ byteOffset: 3, body: "🙂z", complete: true });
 	expect(insideFourByte.page?.items[0]).toMatchObject({ byteOffset: 7, body: "z", complete: true });
-	expect((insideTwoByte.page?.items[0] as { body: string }).body).not.toContain("�");
-	expect((insideFourByte.page?.items[0] as { body: string }).body).not.toContain("�");
+	expect((insideTwoByte.page?.items[0] as { body: string })?.body).not.toContain("�");
+	expect((insideFourByte.page?.items[0] as { body: string })?.body).not.toContain("�");
 	await store.close();
 });
 
@@ -675,7 +675,7 @@ it("streams an oversized root object as monotonic bounded canonical JSON ranges"
 	}
 	expect(offsets.length).toBeGreaterThan(1);
 	expect(offsets.every((offset, index) => index === 0 || offset > offsets[index - 1]!)).toBe(true);
-	expect((response.page?.items[0] as { complete: boolean }).complete).toBe(true);
+	expect((response.page?.items[0] as { complete: boolean })?.complete).toBe(true);
 	await store.close();
 });
 

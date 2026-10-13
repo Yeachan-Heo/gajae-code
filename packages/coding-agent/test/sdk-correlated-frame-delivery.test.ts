@@ -230,7 +230,7 @@ isolatedSdkHostTest("oversized correlated snapshots still reach a prompt termina
 	expect(Buffer.byteLength(JSON.stringify(messageEnd))).toBeLessThanOrEqual(RESPONSE_CEILING_BYTES);
 	expect(JSON.stringify(messageEnd)).not.toContain("[truncated]");
 	expect(
-		(messageEnd?.payload as { event?: { message?: { textTruncated?: boolean } } }).event?.message?.textTruncated,
+		(messageEnd?.payload as { event?: { message?: { textTruncated?: boolean } } })?.event?.message?.textTruncated,
 	).toBe(true);
 });
 
@@ -277,7 +277,7 @@ isolatedSdkHostTest("oversized non-text message_end does not fabricate assistant
 	expect(Buffer.byteLength(JSON.stringify(messageEnd))).toBeLessThanOrEqual(RESPONSE_CEILING_BYTES);
 	const content = (
 		messageEnd?.payload as { event?: { message?: { content?: Array<{ type?: string; text?: string }> } } }
-	).event?.message?.content;
+	)?.event?.message?.content;
 	expect(content).toEqual([]);
 	expect(JSON.stringify(messageEnd)).not.toContain("[truncated]");
 });
@@ -318,7 +318,7 @@ isolatedSdkHostTest("oversized message_end preserves aggregate text across multi
 	expect(Buffer.byteLength(JSON.stringify(messageEnd))).toBeLessThanOrEqual(RESPONSE_CEILING_BYTES);
 	const content = (
 		messageEnd?.payload as { event?: { message?: { content?: Array<{ type?: string; text?: string }> } } }
-	).event?.message?.content;
+	)?.event?.message?.content;
 	expect(content?.every(block => block.type === "text")).toBe(true);
 	const joinedText = content?.map(block => block.text ?? "").join("") ?? "";
 	expect(joinedText.length).toBeGreaterThan(8 * 120_000);
@@ -326,7 +326,7 @@ isolatedSdkHostTest("oversized message_end preserves aggregate text across multi
 	expect(content?.length).toBeGreaterThan(1);
 	const boundedMessage = (
 		messageEnd?.payload as { event?: { message?: { textTruncated?: boolean; omittedTextBlocks?: number } } }
-	).event?.message;
+	)?.event?.message;
 	expect(boundedMessage?.textTruncated).toBe(true);
 	expect(boundedMessage?.omittedTextBlocks ?? 0).toBe(textBlocks.length - (content?.length ?? 0));
 	expect(JSON.stringify(messageEnd)).not.toContain("[truncated]");
@@ -378,7 +378,7 @@ isolatedSdkHostTest("oversized message_end keeps every text block when text fits
 				};
 			};
 		}
-	).event?.message;
+	)?.event?.message;
 	expect(boundedMessage?.content).toEqual(textBlocks.map(text => ({ type: "text", text })));
 	expect(boundedMessage?.textTruncated).toBeUndefined();
 	expect(boundedMessage?.omittedTextBlocks).toBeUndefined();

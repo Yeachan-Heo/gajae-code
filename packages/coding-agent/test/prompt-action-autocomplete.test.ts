@@ -187,14 +187,14 @@ describe("prompt action autocomplete", () => {
 		);
 	});
 
-	it.each([
-		"please /he",
-		"please/hel",
-	])("does not offer slash-command suggestions after prompt text: %s", async line => {
-		const provider = createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]);
+	it.each(["please /he", "please/hel"])(
+		"does not offer slash-command suggestions after prompt text: %s",
+		async line => {
+			const provider = createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]);
 
-		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
-	});
+			expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+		},
+	);
 
 	it("keeps the composer autocomplete closed for an inline slash", async () => {
 		const editor = new Editor(defaultEditorTheme);

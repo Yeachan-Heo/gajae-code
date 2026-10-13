@@ -432,7 +432,9 @@ test("attributable tool progress renews the accepted prompt deadline on the bus 
 		expect(Date.now() - session.acceptedAt).toBeGreaterThan(LEASE_MS + 300);
 		await Bun.sleep(200);
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string })?.message).toBe(
+			"Prompt deadline exceeded.",
+		);
 	} finally {
 		await shutdown(session);
 	}
@@ -460,7 +462,9 @@ test("tool_execution_update renews the accepted prompt deadline on the bus route
 		expect(Date.now() - session.acceptedAt).toBeGreaterThan(LEASE_MS + 300);
 		await Bun.sleep(200);
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string })?.message).toBe(
+			"Prompt deadline exceeded.",
+		);
 	} finally {
 		await shutdown(session);
 	}
@@ -817,7 +821,9 @@ test("a deadline expiry attempt in flight is superseded by real progress during 
 		// terminalizes exactly once, proving backoff rather than a dropped timer.
 		await waitFor(() => session.deadlineTerminals().length > 0, "rescheduled deadline terminal");
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string })?.message).toBe(
+			"Prompt deadline exceeded.",
+		);
 	} finally {
 		releaseClaim.resolve();
 		renameSpy.mockRestore();
@@ -967,7 +973,9 @@ test("a deadline that aborts a genuinely dispatched tool still publishes its ter
 		expect(abortProgress).toBeGreaterThan(0);
 		// AC-1: the terminal frame reached the wire, carrying the deadline code.
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string })?.message).toBe(
+			"Prompt deadline exceeded.",
+		);
 		// The first attempt settled it: no back-off/re-arm churn.
 		expect(aborts).toBe(1);
 
@@ -1036,8 +1044,10 @@ test("the deadline abort lands after the running tool call reaches its boundary"
 		// Classification is untouched: still the same terminal deadline failure.
 		await waitFor(() => session.deadlineTerminals().length > 0, "boundary deadline terminal");
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
-		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		expect((session.deadlineTerminals()[0]?.error as { code?: string })?.code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string })?.message).toBe(
+			"Prompt deadline exceeded.",
+		);
 	} finally {
 		await shutdown(session);
 	}
@@ -1075,7 +1085,9 @@ test("the bus deadline path autosaves the dirty worktree before ownership teardo
 		expect(await git(session.cwd, ["status", "--porcelain", "--", "agent-work.ts"])).toBe("");
 		// The terminal itself is untouched by the autosave.
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string })?.message).toBe(
+			"Prompt deadline exceeded.",
+		);
 	} finally {
 		await shutdown(session);
 	}
@@ -1124,8 +1136,10 @@ test("a tool still executing when the boundary grace expires is force-terminated
 		expect(session.deadlineTerminals()).toHaveLength(1);
 		// Classification is byte-identical to a clean expiry — downstream retry
 		// classifiers branch on these and must not move.
-		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
-		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		expect((session.deadlineTerminals()[0]?.error as { code?: string })?.code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { message?: string })?.message).toBe(
+			"Prompt deadline exceeded.",
+		);
 
 		// The structured record of the forced mid-tool kill: ids only.
 		expect(forcedWarnings).toHaveLength(1);
@@ -1168,7 +1182,7 @@ test("a tool that ends before expiry leaves the deadline path unchanged", async 
 		await waitFor(() => session.deadlineTerminals().length > 0, "idle-path deadline terminal");
 		expect(Date.now() - session.acceptedAt).toBeLessThan(maxRuntimeMs + 900);
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { code?: string })?.code).toBe("prompt_deadline_exceeded");
 		expect(String(diagnostics.at(-1)?.reason ?? "")).toBe("Prompt deadline exceeded.");
 	} finally {
 		errorSpy.mockRestore();
@@ -1260,7 +1274,7 @@ test("a tool the ledger reports running is not killed while its start event is s
 		await waitFor(() => session.deadlineTerminals().length > 0, "ledger-authority deadline terminal");
 		await Bun.sleep(200);
 		expect(session.deadlineTerminals()).toHaveLength(1);
-		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { code?: string })?.code).toBe("prompt_deadline_exceeded");
 	} finally {
 		forced.restore();
 		await shutdown(session);
@@ -1326,7 +1340,7 @@ test("a tool_execution_end delivered before its own start never forces a spuriou
 		expect(session.deadlineTerminals()).toHaveLength(1);
 		expect(forced.records).toEqual([]);
 		// Classification and diagnostic stay the clean-expiry ones.
-		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { code?: string })?.code).toBe("prompt_deadline_exceeded");
 		expect(String(diagnostics.at(-1)?.reason ?? "")).toBe("Prompt deadline exceeded.");
 	} finally {
 		forced.restore();
@@ -1375,7 +1389,7 @@ test("an empty ledger reading ends the wait even when a stale start event is sti
 		expect(reason).toBe("Prompt deadline exceeded.");
 		expect(reason).not.toContain("Forced after");
 		expect(forced.records).toEqual([]);
-		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
+		expect((session.deadlineTerminals()[0]?.error as { code?: string })?.code).toBe("prompt_deadline_exceeded");
 		// SECONDARY bound: the terminal lands at the cap, not at cap + grace. Split
 		// halfway so a loaded runner has ~2.5 s of slack on either side of the
 		// discriminator.

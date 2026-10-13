@@ -1568,120 +1568,125 @@ describe.serial("AgentSession resilient retry", () => {
 		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 	});
-	it.each([
-		"server_error",
-		"internal_error",
-	])("keeps real Codex SSE %s transport retries unbounded with streamMaxRetries=0", async code => {
-		const bundled = getBundledModel("openai-codex", "gpt-5.5");
-		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
-		const model: Model<"openai-codex-responses"> = {
-			...bundled,
-			api: "openai-codex-responses",
-			preferWebsockets: false,
-		};
-		authStorage.setRuntimeApiKey(model.provider, "fake-key");
-		const settings = Settings.isolated({
-			"compaction.enabled": false,
-			"retry.maxRetries": 1,
-		});
-		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		const streamOptions: Array<{ streamMaxRetries?: number }> = [];
-		const agent = new Agent({
-			streamMaxRetries: 0,
-			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-			streamFn: (requestedModel, context, options) => {
-				streamOptions.push(options ?? {});
-				return streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {});
-			},
-		});
-		session = configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
-		);
-		let requests = 0;
-		const failure = `data: ${JSON.stringify({ type: "error", code, message: "persistent upstream failure" })}\n\n`;
-		const success = [
-			{ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", content: [] } },
-			{ type: "response.output_text.delta", delta: "recovered" },
-			{
-				type: "response.output_item.done",
-				item: {
-					type: "message",
-					id: "msg_1",
-					role: "assistant",
-					content: [{ type: "output_text", text: "recovered" }],
+	it.each(["server_error", "internal_error"])(
+		"keeps real Codex SSE %s transport retries unbounded with streamMaxRetries=0",
+		async code => {
+			const bundled = getBundledModel("openai-codex", "gpt-5.5");
+			if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+			const model: Model<"openai-codex-responses"> = {
+				...bundled,
+				api: "openai-codex-responses",
+				preferWebsockets: false,
+			};
+			authStorage.setRuntimeApiKey(model.provider, "fake-key");
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.maxRetries": 1,
+			});
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			const streamOptions: Array<{ streamMaxRetries?: number }> = [];
+			const agent = new Agent({
+				streamMaxRetries: 0,
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (requestedModel, context, options) => {
+					streamOptions.push(options ?? {});
+					return streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {});
 				},
-			},
-			{ type: "response.completed", response: { status: "completed", output: [] } },
-		]
-			.map(event => `data: ${JSON.stringify(event)}\n\n`)
-			.join("");
-		mockCodexFetch(async () => {
-			requests++;
-			return new Response(requests <= 3 ? failure : success, { headers: { "content-type": "text/event-stream" } });
-		});
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const { retryStartEvents, retryEndEvents } = track(session);
+			});
+			session = configureRetryTestSession(
+				new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
+			);
+			let requests = 0;
+			const failure = `data: ${JSON.stringify({ type: "error", code, message: "persistent upstream failure" })}\n\n`;
+			const success = [
+				{
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_1", role: "assistant", content: [] },
+				},
+				{ type: "response.output_text.delta", delta: "recovered" },
+				{
+					type: "response.output_item.done",
+					item: {
+						type: "message",
+						id: "msg_1",
+						role: "assistant",
+						content: [{ type: "output_text", text: "recovered" }],
+					},
+				},
+				{ type: "response.completed", response: { status: "completed", output: [] } },
+			]
+				.map(event => `data: ${JSON.stringify(event)}\n\n`)
+				.join("");
+			mockCodexFetch(async () => {
+				requests++;
+				return new Response(requests <= 3 ? failure : success, {
+					headers: { "content-type": "text/event-stream" },
+				});
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents, retryEndEvents } = track(session);
 
-		await session.prompt(`recover persistent real Codex ${code}`);
-		await session.waitForIdle();
+			await session.prompt(`recover persistent real Codex ${code}`);
+			await session.waitForIdle();
 
-		expect(streamOptions.every(options => options.streamMaxRetries === 0)).toBe(true);
-		expect(retryStartEvents).toHaveLength(3);
-		expect(retryStartEvents.every(event => event.unbounded === true)).toBe(true);
-		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
-		expect(requests).toBe(4);
-		expect(lastAssistant(session)).toMatchObject({
-			stopReason: "stop",
-			content: [{ type: "text", text: "recovered" }],
-		});
-		await disposeAfterCoordinatorPersistence(session);
-		session = undefined;
-	});
-	it.each([
-		"server_error",
-		"internal_error",
-	])("bounds real Codex SSE %s retries at the bare-default exhaustion boundary", async code => {
-		const bundled = getBundledModel("openai-codex", "gpt-5.5");
-		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
-		const model: Model<"openai-codex-responses"> = {
-			...bundled,
-			api: "openai-codex-responses",
-			preferWebsockets: false,
-		};
-		authStorage.setRuntimeApiKey(model.provider, "fake-key");
-		const settings = Settings.isolated({ "compaction.enabled": false });
-		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		const agent = new Agent({
-			streamMaxRetries: 0,
-			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-			streamFn: (requestedModel, context, options) =>
-				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
-		});
-		session = configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
-		);
-		let requests = 0;
-		const failure = `data: ${JSON.stringify({ type: "error", code, message: "persistent upstream failure" })}\n\n`;
-		mockCodexFetch(async () => {
-			requests++;
-			return new Response(failure, { headers: { "content-type": "text/event-stream" } });
-		});
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const { retryStartEvents, retryEndEvents } = track(session);
+			expect(streamOptions.every(options => options.streamMaxRetries === 0)).toBe(true);
+			expect(retryStartEvents).toHaveLength(3);
+			expect(retryStartEvents.every(event => event.unbounded === true)).toBe(true);
+			expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+			expect(requests).toBe(4);
+			expect(lastAssistant(session)).toMatchObject({
+				stopReason: "stop",
+				content: [{ type: "text", text: "recovered" }],
+			});
+			await disposeAfterCoordinatorPersistence(session);
+			session = undefined;
+		},
+	);
+	it.each(["server_error", "internal_error"])(
+		"bounds real Codex SSE %s retries at the bare-default exhaustion boundary",
+		async code => {
+			const bundled = getBundledModel("openai-codex", "gpt-5.5");
+			if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+			const model: Model<"openai-codex-responses"> = {
+				...bundled,
+				api: "openai-codex-responses",
+				preferWebsockets: false,
+			};
+			authStorage.setRuntimeApiKey(model.provider, "fake-key");
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			const agent = new Agent({
+				streamMaxRetries: 0,
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (requestedModel, context, options) =>
+					streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+			});
+			session = configureRetryTestSession(
+				new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
+			);
+			let requests = 0;
+			const failure = `data: ${JSON.stringify({ type: "error", code, message: "persistent upstream failure" })}\n\n`;
+			mockCodexFetch(async () => {
+				requests++;
+				return new Response(failure, { headers: { "content-type": "text/event-stream" } });
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents, retryEndEvents } = track(session);
 
-		await session.prompt(`exhaust real Codex ${code}`);
-		await session.waitForIdle();
+			await session.prompt(`exhaust real Codex ${code}`);
+			await session.waitForIdle();
 
-		expect(retryStartEvents).toHaveLength(3);
-		expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
-		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 3 })]);
-		expect(requests).toBe(4);
-		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
-		await disposeAfterCoordinatorPersistence(session);
-		session = undefined;
-	});
+			expect(retryStartEvents).toHaveLength(3);
+			expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
+			expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 3 })]);
+			expect(requests).toBe(4);
+			expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
+			await disposeAfterCoordinatorPersistence(session);
+			session = undefined;
+		},
+	);
 	it.each([
 		["server_error", "bare default", "invalid_request_error: Invalid request: unsupported parameter"],
 		["server_error", "configured", "invalid_request_error: Invalid request: unsupported parameter"],
@@ -1907,158 +1912,158 @@ describe.serial("AgentSession resilient retry", () => {
 		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 	});
-	it.each([
-		"server_error",
-		"internal_error",
-	])("does not advance managed Codex fallback after a schema veto (%s)", async code => {
-		const primaryBundled = getBundledModel("openai-codex", "gpt-5.5");
-		const fallbackBundled = getBundledModel("openai-codex", "gpt-5.4-mini");
-		if (!primaryBundled || !fallbackBundled) throw new Error("Expected bundled Codex test models to exist");
-		const primary: Model<"openai-codex-responses"> = { ...primaryBundled, api: "openai-codex-responses" };
-		const fallback: Model<"openai-codex-responses"> = { ...fallbackBundled, api: "openai-codex-responses" };
-		authStorage.setRuntimeApiKey(primary.provider, "fake-key");
-		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 2 });
-		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
-		const streamCalls = new Map<string, number>();
-		const agent = new Agent({
-			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
-			streamFn: (requestedModel, context, options) => {
-				streamCalls.set(requestedModel.id, (streamCalls.get(requestedModel.id) ?? 0) + 1);
-				return streamOpenAICodexResponses(
-					{ ...requestedModel, api: "openai-codex-responses", preferWebsockets: false },
-					context,
-					{ ...(options ?? {}), preferWebsockets: false },
-				);
-			},
-		});
-		session = configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
-		);
-		session.setConfiguredModelChain(
-			"default",
-			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
-			"test",
-		);
-		const errorSse = `data: ${JSON.stringify({
-			type: "error",
-			code,
-			message:
-				"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
-		})}\n\n`;
-		mockCodexFetch(
-			async () =>
-				new Response(errorSse, {
-					headers: { "content-type": "text/event-stream" },
-				}),
-		);
-
-		await session.prompt(`surface managed Codex ${code} schema veto`);
-		await session.waitForIdle();
-
-		expect(streamCalls.get(primary.id)).toBe(1);
-		expect(streamCalls.get(fallback.id)).toBeUndefined();
-		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
-		expect(lastAssistant(session).errorMessage).toContain("invalid_function_parameters");
-		await disposeAfterCoordinatorPersistence(session);
-		session = undefined;
-	});
-	it.each([
-		"server_error",
-		"internal_error",
-	])("surfaces Codex schema validation veto without a session replay (%s)", async code => {
-		const bundled = getBundledModel("openai-codex", "gpt-5.5");
-		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
-		const model: Model<"openai-codex-responses"> = {
-			...bundled,
-			api: "openai-codex-responses",
-			baseUrl: "http://127.0.0.1:20339/backend-api",
-			preferWebsockets: false,
-		};
-		authStorage.setRuntimeApiKey(model.provider, "fake-key");
-		const settings = Settings.isolated({ "compaction.enabled": false });
-		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		const agent = new Agent({
-			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-			streamFn: (requestedModel, context, options) =>
-				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
-		});
-		session = configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
-		);
-		let requests = 0;
-		const events = [
-			{ type: "response.created", response: { id: "r1", status: "in_progress", output: [] } },
-			{
+	it.each(["server_error", "internal_error"])(
+		"does not advance managed Codex fallback after a schema veto (%s)",
+		async code => {
+			const primaryBundled = getBundledModel("openai-codex", "gpt-5.5");
+			const fallbackBundled = getBundledModel("openai-codex", "gpt-5.4-mini");
+			if (!primaryBundled || !fallbackBundled) throw new Error("Expected bundled Codex test models to exist");
+			const primary: Model<"openai-codex-responses"> = { ...primaryBundled, api: "openai-codex-responses" };
+			const fallback: Model<"openai-codex-responses"> = { ...fallbackBundled, api: "openai-codex-responses" };
+			authStorage.setRuntimeApiKey(primary.provider, "fake-key");
+			const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 2 });
+			settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+			const streamCalls = new Map<string, number>();
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (requestedModel, context, options) => {
+					streamCalls.set(requestedModel.id, (streamCalls.get(requestedModel.id) ?? 0) + 1);
+					return streamOpenAICodexResponses(
+						{ ...requestedModel, api: "openai-codex-responses", preferWebsockets: false },
+						context,
+						{ ...(options ?? {}), preferWebsockets: false },
+					);
+				},
+			});
+			session = configureRetryTestSession(
+				new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
+			);
+			session.setConfiguredModelChain(
+				"default",
+				[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+				"test",
+			);
+			const errorSse = `data: ${JSON.stringify({
 				type: "error",
 				code,
 				message:
 					"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
-			},
-		];
-		mockCodexFetch(async () => {
-			requests++;
-			return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
-				headers: { "content-type": "text/event-stream" },
+			})}\n\n`;
+			mockCodexFetch(
+				async () =>
+					new Response(errorSse, {
+						headers: { "content-type": "text/event-stream" },
+					}),
+			);
+
+			await session.prompt(`surface managed Codex ${code} schema veto`);
+			await session.waitForIdle();
+
+			expect(streamCalls.get(primary.id)).toBe(1);
+			expect(streamCalls.get(fallback.id)).toBeUndefined();
+			expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
+			expect(lastAssistant(session).errorMessage).toContain("invalid_function_parameters");
+			await disposeAfterCoordinatorPersistence(session);
+			session = undefined;
+		},
+	);
+	it.each(["server_error", "internal_error"])(
+		"surfaces Codex schema validation veto without a session replay (%s)",
+		async code => {
+			const bundled = getBundledModel("openai-codex", "gpt-5.5");
+			if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+			const model: Model<"openai-codex-responses"> = {
+				...bundled,
+				api: "openai-codex-responses",
+				baseUrl: "http://127.0.0.1:20339/backend-api",
+				preferWebsockets: false,
+			};
+			authStorage.setRuntimeApiKey(model.provider, "fake-key");
+			const settings = Settings.isolated({ "compaction.enabled": false });
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (requestedModel, context, options) =>
+					streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
 			});
-		});
-		const { retryStartEvents } = track(session);
+			session = configureRetryTestSession(
+				new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
+			);
+			let requests = 0;
+			const events = [
+				{ type: "response.created", response: { id: "r1", status: "in_progress", output: [] } },
+				{
+					type: "error",
+					code,
+					message:
+						"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
+				},
+			];
+			mockCodexFetch(async () => {
+				requests++;
+				return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+					headers: { "content-type": "text/event-stream" },
+				});
+			});
+			const { retryStartEvents } = track(session);
 
-		await session.prompt(`surface Codex ${code} schema validation`);
-		await session.waitForIdle();
+			await session.prompt(`surface Codex ${code} schema validation`);
+			await session.waitForIdle();
 
-		expect(retryStartEvents).toHaveLength(0);
-		expect(requests).toBe(1);
-		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
-		expect(lastAssistant(session).errorMessage).toContain("invalid_function_parameters");
-		await disposeAfterCoordinatorPersistence(session);
-		session = undefined;
-	});
-	it.each([
-		"server_error",
-		"internal_error",
-	])("does not retry Codex schema veto with configured retry settings (%s)", async code => {
-		const bundled = getBundledModel("openai-codex", "gpt-5.5");
-		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
-		const model: Model<"openai-codex-responses"> = { ...bundled, api: "openai-codex-responses" };
-		authStorage.setRuntimeApiKey(model.provider, "fake-key");
-		const settings = Settings.isolated({
-			"compaction.enabled": false,
-			"retry.maxRetries": 1,
-			"retry.streamMaxRetries": 0,
-		});
-		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		const agent = new Agent({
-			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-			streamFn: (requestedModel, context, options) =>
-				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
-		});
-		session = configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
-		);
-		let requests = 0;
-		const veto = `data: ${JSON.stringify({
-			type: "error",
-			code,
-			message:
-				"Invalid schema for function 'computer': schema must have type 'object'. (code=invalid_function_parameters)",
-		})}\n\n`;
-		mockCodexFetch(async () => {
-			requests++;
-			return new Response(veto, { headers: { "content-type": "text/event-stream" } });
-		});
-		const { retryStartEvents } = track(session);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requests).toBe(1);
+			expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
+			expect(lastAssistant(session).errorMessage).toContain("invalid_function_parameters");
+			await disposeAfterCoordinatorPersistence(session);
+			session = undefined;
+		},
+	);
+	it.each(["server_error", "internal_error"])(
+		"does not retry Codex schema veto with configured retry settings (%s)",
+		async code => {
+			const bundled = getBundledModel("openai-codex", "gpt-5.5");
+			if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+			const model: Model<"openai-codex-responses"> = { ...bundled, api: "openai-codex-responses" };
+			authStorage.setRuntimeApiKey(model.provider, "fake-key");
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.maxRetries": 1,
+				"retry.streamMaxRetries": 0,
+			});
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (requestedModel, context, options) =>
+					streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+			});
+			session = configureRetryTestSession(
+				new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
+			);
+			let requests = 0;
+			const veto = `data: ${JSON.stringify({
+				type: "error",
+				code,
+				message:
+					"Invalid schema for function 'computer': schema must have type 'object'. (code=invalid_function_parameters)",
+			})}\n\n`;
+			mockCodexFetch(async () => {
+				requests++;
+				return new Response(veto, { headers: { "content-type": "text/event-stream" } });
+			});
+			const { retryStartEvents } = track(session);
 
-		await session.prompt(`surface configured Codex ${code} schema veto`);
-		await session.waitForIdle();
+			await session.prompt(`surface configured Codex ${code} schema veto`);
+			await session.waitForIdle();
 
-		expect(retryStartEvents).toHaveLength(0);
-		expect(requests).toBe(1);
-		await disposeAfterCoordinatorPersistence(session);
-		session = undefined;
-	});
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requests).toBe(1);
+			await disposeAfterCoordinatorPersistence(session);
+			session = undefined;
+		},
+	);
 	it.each([
 		[undefined, "invalid_prompt"],
 		[undefined, "invalid_function_parameters"],
@@ -3618,248 +3623,243 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(streamCalls).toBe(2);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
-	it.each([
-		"server_is_overloaded",
-		"server_error",
-		"internal_error",
-	])("does not replay Codex %s after auto_retry_start handlers participate", async code => {
-		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
-		if (!model) throw new Error("Expected bundled Codex test model to exist");
-		let hookCalls = 0;
-		let streamCalls = 0;
-		session = buildBareStreamingSession({
-			model,
-			streamFn: () => {
-				streamCalls++;
-				const stream = new AssistantMessageEventStream();
-				queueMicrotask(() => {
-					const failure = assistantMessage(
-						model,
-						[],
-						"error",
-						`Codex error event: fake upstream failure (code=${code})`,
-					);
-					failure.transportFailure = { kind: "transport", providerCode: code };
-					stream.push({ type: "start", partial: failure });
-					stream.push({ type: "error", reason: "error", error: failure });
-				});
-				return stream;
-			},
-			extensionRunner: createExtensionRunner(
-				new Map([
-					[
-						"auto_retry_start",
+	it.each(["server_is_overloaded", "server_error", "internal_error"])(
+		"does not replay Codex %s after auto_retry_start handlers participate",
+		async code => {
+			const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+			if (!model) throw new Error("Expected bundled Codex test model to exist");
+			let hookCalls = 0;
+			let streamCalls = 0;
+			session = buildBareStreamingSession({
+				model,
+				streamFn: () => {
+					streamCalls++;
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const failure = assistantMessage(
+							model,
+							[],
+							"error",
+							`Codex error event: fake upstream failure (code=${code})`,
+						);
+						failure.transportFailure = { kind: "transport", providerCode: code };
+						stream.push({ type: "start", partial: failure });
+						stream.push({ type: "error", reason: "error", error: failure });
+					});
+					return stream;
+				},
+				extensionRunner: createExtensionRunner(
+					new Map([
 						[
-							async () => {
-								hookCalls++;
-							},
+							"auto_retry_start",
+							[
+								async () => {
+									hookCalls++;
+								},
+							],
 						],
-					],
-				]),
-			),
-		});
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const { retryStartEvents } = track(session);
-
-		await session.prompt(`bare-config auto-retry lifecycle Codex ${code}`);
-		await session.waitForIdle();
-
-		expect(hookCalls).toBe(1);
-		expect(retryStartEvents).toHaveLength(1);
-		expect(streamCalls).toBe(2);
-		expect(lastAssistant(session).stopReason).toBe("error");
-	});
-	it.each([
-		"server_is_overloaded",
-		"server_error",
-		"internal_error",
-	])("surfaces Codex %s when auto_retry_start throws", async code => {
-		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
-		if (!model) throw new Error("Expected bundled Codex test model to exist");
-		let streamCalls = 0;
-		const handlerError = `retry hook rejected Codex ${code}`;
-		session = buildBareStreamingSession({
-			model,
-			streamFn: () => {
-				streamCalls++;
-				const stream = new AssistantMessageEventStream();
-				queueMicrotask(() => {
-					const failure = assistantMessage(
-						model,
-						[],
-						"error",
-						`Codex error event: fake upstream failure (code=${code})`,
-					);
-					failure.transportFailure = { kind: "transport", providerCode: code };
-					stream.push({ type: "start", partial: failure });
-					stream.push({ type: "error", reason: "error", error: failure });
-				});
-				return stream;
-			},
-			extensionRunner: createExtensionRunner(
-				new Map([
-					[
-						"auto_retry_start",
-						[
-							async () => {
-								throw new Error(handlerError);
-							},
-						],
-					],
-				]),
-			),
-		});
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const { retryStartEvents } = track(session);
-
-		await session.prompt(`throwing retry hook for Codex ${code}`);
-		await session.waitForIdle();
-
-		expect(retryStartEvents).toHaveLength(1);
-		expect(streamCalls).toBe(2);
-		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
-	});
-	it.each([
-		"server_is_overloaded",
-		"server_error",
-		"internal_error",
-	])("abortRetry cancels a pending Codex %s retry", async code => {
-		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
-		if (!model) throw new Error("Expected bundled Codex test model to exist");
-		let streamCalls = 0;
-		const retryStarted = Promise.withResolvers<void>();
-		const retryEnded = Promise.withResolvers<void>();
-		session = buildBareStreamingSession({
-			model,
-			streamFn: () => {
-				streamCalls++;
-				const stream = new AssistantMessageEventStream();
-				queueMicrotask(() => {
-					const failure = assistantMessage(
-						model,
-						[],
-						"error",
-						`Codex error event: fake upstream failure (code=${code})`,
-					);
-					failure.transportFailure = { kind: "transport", providerCode: code };
-					stream.push({ type: "start", partial: failure });
-					stream.push({ type: "error", reason: "error", error: failure });
-				});
-				return stream;
-			},
-		});
-		vi.spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
-			const signal = options?.signal;
-			await new Promise<void>(resolve => {
-				if (signal?.aborted) resolve();
-				else signal?.addEventListener("abort", () => resolve(), { once: true });
+					]),
+				),
 			});
-		});
-		const { retryStartEvents, retryEndEvents } = track(session);
-		session.subscribe(event => {
-			if (event.type === "auto_retry_start") {
-				retryStarted.resolve();
-				session?.abortRetry();
-			}
-			if (event.type === "auto_retry_end") retryEnded.resolve();
-		});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
 
-		const prompt = session.prompt(`cancel Codex ${code} retry`).catch(() => {});
-		await retryStarted.promise;
-		await retryEnded.promise;
-		await prompt;
-		await session.waitForIdle();
+			await session.prompt(`bare-config auto-retry lifecycle Codex ${code}`);
+			await session.waitForIdle();
 
-		expect(streamCalls).toBe(1);
-		expect(retryStartEvents).toHaveLength(1);
-		expect(retryEndEvents).toEqual([
-			expect.objectContaining({ success: false, finalError: expect.stringContaining("cancelled") }),
-		]);
-	});
-	it.each([
-		"server_is_overloaded",
-		"server_error",
-		"internal_error",
-	])("disposal cancels a pending Codex %s retry", async code => {
-		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
-		if (!model) throw new Error("Expected bundled Codex test model to exist");
-		let streamCalls = 0;
-		const retryStarted = Promise.withResolvers<void>();
-		session = buildBareStreamingSession({
-			model,
-			streamFn: () => {
-				streamCalls++;
-				const stream = new AssistantMessageEventStream();
-				queueMicrotask(() => {
-					const failure = assistantMessage(
-						model,
-						[],
-						"error",
-						`Codex error event: fake upstream failure (code=${code})`,
-					);
-					failure.transportFailure = { kind: "transport", providerCode: code };
-					stream.push({ type: "start", partial: failure });
-					stream.push({ type: "error", reason: "error", error: failure });
+			expect(hookCalls).toBe(1);
+			expect(retryStartEvents).toHaveLength(1);
+			expect(streamCalls).toBe(2);
+			expect(lastAssistant(session).stopReason).toBe("error");
+		},
+	);
+	it.each(["server_is_overloaded", "server_error", "internal_error"])(
+		"surfaces Codex %s when auto_retry_start throws",
+		async code => {
+			const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+			if (!model) throw new Error("Expected bundled Codex test model to exist");
+			let streamCalls = 0;
+			const handlerError = `retry hook rejected Codex ${code}`;
+			session = buildBareStreamingSession({
+				model,
+				streamFn: () => {
+					streamCalls++;
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const failure = assistantMessage(
+							model,
+							[],
+							"error",
+							`Codex error event: fake upstream failure (code=${code})`,
+						);
+						failure.transportFailure = { kind: "transport", providerCode: code };
+						stream.push({ type: "start", partial: failure });
+						stream.push({ type: "error", reason: "error", error: failure });
+					});
+					return stream;
+				},
+				extensionRunner: createExtensionRunner(
+					new Map([
+						[
+							"auto_retry_start",
+							[
+								async () => {
+									throw new Error(handlerError);
+								},
+							],
+						],
+					]),
+				),
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt(`throwing retry hook for Codex ${code}`);
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(1);
+			expect(streamCalls).toBe(2);
+			expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
+		},
+	);
+	it.each(["server_is_overloaded", "server_error", "internal_error"])(
+		"abortRetry cancels a pending Codex %s retry",
+		async code => {
+			const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+			if (!model) throw new Error("Expected bundled Codex test model to exist");
+			let streamCalls = 0;
+			const retryStarted = Promise.withResolvers<void>();
+			const retryEnded = Promise.withResolvers<void>();
+			session = buildBareStreamingSession({
+				model,
+				streamFn: () => {
+					streamCalls++;
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const failure = assistantMessage(
+							model,
+							[],
+							"error",
+							`Codex error event: fake upstream failure (code=${code})`,
+						);
+						failure.transportFailure = { kind: "transport", providerCode: code };
+						stream.push({ type: "start", partial: failure });
+						stream.push({ type: "error", reason: "error", error: failure });
+					});
+					return stream;
+				},
+			});
+			vi.spyOn(scheduler, "wait").mockImplementation(async (_delayMs, options) => {
+				const signal = options?.signal;
+				await new Promise<void>(resolve => {
+					if (signal?.aborted) resolve();
+					else signal?.addEventListener("abort", () => resolve(), { once: true });
 				});
-				return stream;
-			},
-		});
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const { retryStartEvents, retryEndEvents } = track(session);
-		session.subscribe(event => {
-			if (event.type === "auto_retry_start") retryStarted.resolve();
-		});
+			});
+			const { retryStartEvents, retryEndEvents } = track(session);
+			session.subscribe(event => {
+				if (event.type === "auto_retry_start") {
+					retryStarted.resolve();
+					session?.abortRetry();
+				}
+				if (event.type === "auto_retry_end") retryEnded.resolve();
+			});
 
-		const prompt = session.prompt(`dispose during Codex ${code} retry`);
-		await retryStarted.promise;
-		await expect(session.dispose()).resolves.toBeUndefined();
-		await prompt;
+			const prompt = session.prompt(`cancel Codex ${code} retry`).catch(() => {});
+			await retryStarted.promise;
+			await retryEnded.promise;
+			await prompt;
+			await session.waitForIdle();
 
-		expect(streamCalls).toBe(1);
-		expect(retryStartEvents).toHaveLength(1);
-		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 1 })]);
-		expect(session.isRetrying).toBe(false);
-		expect(session.isStreaming).toBe(false);
-		session = undefined;
-	});
-	it.each([
-		"server_is_overloaded",
-		"server_error",
-		"internal_error",
-	])("bounds repeated content-free Codex %s failures", async code => {
-		const model = getBundledModel("openai-codex", "gpt-5.4-mini");
-		if (!model) throw new Error("Expected bundled Codex test model to exist");
-		let streamCalls = 0;
-		const errorMessage = `Codex error event: fake upstream failure (code=${code})`;
-		session = buildBareStreamingSession({
-			model,
-			streamFn: () => {
-				streamCalls++;
-				const stream = new AssistantMessageEventStream();
-				queueMicrotask(() => {
-					const failure = assistantMessage(model, [], "error", errorMessage);
-					failure.transportFailure = { kind: "transport", providerCode: code };
-					stream.push({ type: "start", partial: failure });
-					stream.push({ type: "error", reason: "error", error: failure });
-				});
-				return stream;
-			},
-		});
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const { retryStartEvents, retryEndEvents } = track(session);
+			expect(streamCalls).toBe(1);
+			expect(retryStartEvents).toHaveLength(1);
+			expect(retryEndEvents).toEqual([
+				expect.objectContaining({ success: false, finalError: expect.stringContaining("cancelled") }),
+			]);
+		},
+	);
+	it.each(["server_is_overloaded", "server_error", "internal_error"])(
+		"disposal cancels a pending Codex %s retry",
+		async code => {
+			const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+			if (!model) throw new Error("Expected bundled Codex test model to exist");
+			let streamCalls = 0;
+			const retryStarted = Promise.withResolvers<void>();
+			session = buildBareStreamingSession({
+				model,
+				streamFn: () => {
+					streamCalls++;
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const failure = assistantMessage(
+							model,
+							[],
+							"error",
+							`Codex error event: fake upstream failure (code=${code})`,
+						);
+						failure.transportFailure = { kind: "transport", providerCode: code };
+						stream.push({ type: "start", partial: failure });
+						stream.push({ type: "error", reason: "error", error: failure });
+					});
+					return stream;
+				},
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents, retryEndEvents } = track(session);
+			session.subscribe(event => {
+				if (event.type === "auto_retry_start") retryStarted.resolve();
+			});
 
-		await session.prompt(`exhaust Codex ${code} retry budget`);
-		await session.waitForIdle();
+			const prompt = session.prompt(`dispose during Codex ${code} retry`);
+			await retryStarted.promise;
+			await expect(session.dispose()).resolves.toBeUndefined();
+			await prompt;
 
-		expect(streamCalls).toBe(4);
-		expect(retryStartEvents).toHaveLength(3);
-		expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
-		expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 3 })]);
-		expect(lastAssistant(session)).toMatchObject({
-			stopReason: "error",
-			errorMessage: expect.stringContaining(errorMessage),
-		});
-	});
+			expect(streamCalls).toBe(1);
+			expect(retryStartEvents).toHaveLength(1);
+			expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 1 })]);
+			expect(session.isRetrying).toBe(false);
+			expect(session.isStreaming).toBe(false);
+			session = undefined;
+		},
+	);
+	it.each(["server_is_overloaded", "server_error", "internal_error"])(
+		"bounds repeated content-free Codex %s failures",
+		async code => {
+			const model = getBundledModel("openai-codex", "gpt-5.4-mini");
+			if (!model) throw new Error("Expected bundled Codex test model to exist");
+			let streamCalls = 0;
+			const errorMessage = `Codex error event: fake upstream failure (code=${code})`;
+			session = buildBareStreamingSession({
+				model,
+				streamFn: () => {
+					streamCalls++;
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const failure = assistantMessage(model, [], "error", errorMessage);
+						failure.transportFailure = { kind: "transport", providerCode: code };
+						stream.push({ type: "start", partial: failure });
+						stream.push({ type: "error", reason: "error", error: failure });
+					});
+					return stream;
+				},
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents, retryEndEvents } = track(session);
+
+			await session.prompt(`exhaust Codex ${code} retry budget`);
+			await session.waitForIdle();
+
+			expect(streamCalls).toBe(4);
+			expect(retryStartEvents).toHaveLength(3);
+			expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
+			expect(retryEndEvents).toEqual([expect.objectContaining({ success: false, attempt: 3 })]);
+			expect(lastAssistant(session)).toMatchObject({
+				stopReason: "error",
+				errorMessage: expect.stringContaining(errorMessage),
+			});
+		},
+	);
 
 	it("retries provider stream idle stalls under a bare default config (single model)", async () => {
 		const requestedModels: string[] = [];

@@ -534,7 +534,7 @@ describe("session title source persistence", () => {
 					}
 					expect(failure?.message).toBe("managed_append_committed_outcome_uncertain");
 					expect(failure?.cause).toBeInstanceOf(Error);
-					expect((failure?.cause as Error).message).toBe(failureCode);
+					expect((failure?.cause as Error)?.message).toBe(failureCode);
 					injection.assertHit();
 					expect(injection.hits()).toBe(1);
 					expect(injection.realAppendCalls()).toBe(1);

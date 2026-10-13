@@ -211,7 +211,7 @@ describe("native-over-proxy provider red-team", () => {
 		using _hook = hookFetch(async (input, init) => {
 			urls.push(String(input));
 			if (String(input).includes("/v1beta/models/")) {
-				expect((init?.headers as Record<string, string>)["x-goog-api-key"]).toBe("sk-active");
+				expect((init?.headers as Record<string, string>)?.["x-goog-api-key"]).toBe("sk-active");
 				return Response.json({
 					modelVersion: "gemini-2.5-pro",
 					candidates: [{ content: { parts: [{ text: "Ungrounded answer." }] } }],

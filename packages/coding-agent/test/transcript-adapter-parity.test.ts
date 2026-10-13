@@ -74,7 +74,7 @@ test("tool adapters preserve canonical bytes and use sanitized frozen display de
 	expect(main.renderDescriptor?.detailsData).toEqual(observer.renderDescriptor?.detailsData);
 	expect(JSON.stringify(main.renderDescriptor?.detailsData)).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
 	expect(Object.isFrozen(main.renderDescriptor?.detailsData as object)).toBe(true);
-	expect(Object.isFrozen((main.renderDescriptor?.detailsData as { perFileResults: unknown[] }).perFileResults)).toBe(
+	expect(Object.isFrozen((main.renderDescriptor?.detailsData as { perFileResults: unknown[] })?.perFileResults)).toBe(
 		true,
 	);
 });

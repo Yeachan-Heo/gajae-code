@@ -1145,7 +1145,7 @@ describe("OpenAI-compatible web search provider", () => {
 	it("keeps concurrent request context isolated", async () => {
 		const seen: string[] = [];
 		using _hook = hookFetch(async (input, init) => {
-			seen.push(`${input}:${(init?.headers as Record<string, string>).Authorization}`);
+			seen.push(`${input}:${(init?.headers as Record<string, string>)?.Authorization}`);
 			return Response.json({
 				output_text: "answer",
 				output: [{ content: [{ annotations: [{ type: "url_citation", url: "https://d.example", title: "D" }] }] }],

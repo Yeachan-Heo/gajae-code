@@ -1010,7 +1010,7 @@ describe("gjc state handoff", () => {
 				}),
 			).rejects.toThrow("immutable through runtime reconciliation");
 			const after = await readJson(statePath);
-			expect((after?.state as Record<string, unknown>).execution_approval).toBeUndefined();
+			expect((after?.state as Record<string, unknown>)?.execution_approval).toBeUndefined();
 			await expect(
 				reconcileWorkflowSkillState({
 					cwd,
@@ -1646,7 +1646,7 @@ describe("gjc state handoff", () => {
 			);
 			expect(retried.status).toBe(2);
 			expect(retried.stderr).toContain("requires checksummed canonical caller state");
-			expect(((await readJson(callerPath))?.state as Record<string, unknown>).rounds).toEqual([{ round: 99 }]);
+			expect(((await readJson(callerPath))?.state as Record<string, unknown>)?.rounds).toEqual([{ round: 99 }]);
 		});
 	});
 

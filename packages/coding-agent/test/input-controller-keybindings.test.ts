@@ -545,7 +545,7 @@ describe("InputController keybinding setup", () => {
 		);
 		expect(registration).toBeDefined();
 		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("alt+i", expect.any(Function));
-		expect((registration?.[1] as () => boolean)()).toBe(true);
+		expect((registration?.[1] as () => boolean)?.()).toBe(true);
 		expect(spies.toggleIrcSidebar).toHaveBeenCalledTimes(1);
 	});
 

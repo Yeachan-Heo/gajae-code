@@ -783,7 +783,7 @@ describe("xAI web search provider", () => {
 	it("does not resolve OAuth again when an API key credential wins", async () => {
 		let authorization = "";
 		using _hook = hookFetch(async (_input, init) => {
-			authorization = (init?.headers as Record<string, string>).Authorization;
+			authorization = (init?.headers as Record<string, string>)?.Authorization ?? "";
 			return Response.json({
 				output_text: "answer",
 				citations: ["https://docs.x.ai/developers/tools/web-search"],
@@ -803,7 +803,7 @@ describe("xAI web search provider", () => {
 	it("reports OAuth auth mode without a caller session id", async () => {
 		let authorization = "";
 		using _hook = hookFetch(async (_input, init) => {
-			authorization = (init?.headers as Record<string, string>).Authorization;
+			authorization = (init?.headers as Record<string, string>)?.Authorization ?? "";
 			return Response.json({
 				output_text: "answer",
 				citations: ["https://docs.x.ai/developers/tools/web-search"],

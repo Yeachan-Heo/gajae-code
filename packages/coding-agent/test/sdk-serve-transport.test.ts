@@ -1794,7 +1794,7 @@ describe("SDK serve CLI and discovery", () => {
 			]);
 			const recoveryRequest = brokerRequests.find(request => request.operation === "session.resume");
 			expect(recoveryRequest?.idempotencyKey).toEqual(expect.any(String));
-			expect((recoveryRequest?.idempotencyKey as string).length).toBeLessThanOrEqual(128);
+			expect((recoveryRequest?.idempotencyKey as string)?.length).toBeLessThanOrEqual(128);
 		} finally {
 			stop?.();
 			if (client) client.destroy();

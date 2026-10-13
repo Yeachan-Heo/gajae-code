@@ -2999,7 +2999,7 @@ test("ACP rejects malformed acknowledgement and drops a stale pre-ack terminal",
 			code: "invalid_prompt_acknowledgement",
 		});
 		await waitFor(() => fixture.updates.length === updatesBefore + 1, "malformed acknowledgement idle update");
-		expect((fixture.updates.at(-1)?.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase).toBe("idle");
+		expect((fixture.updates.at(-1)?.update as { _meta?: { gjcPhase?: string } })?._meta?.gjcPhase).toBe("idle");
 		expect(fixture.queryCalls).toHaveLength(queriesBefore);
 	} finally {
 		fixture.dispose();
@@ -3501,7 +3501,7 @@ test("ACP keeps correlationless session updates publishable after terminal settl
 			"post-terminal correlationless assistant update",
 		);
 		const lastChunk = fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").at(-1);
-		expect((lastChunk?.update as { content?: { text?: string } }).content?.text).toBe("after terminal");
+		expect((lastChunk?.update as { content?: { text?: string } })?.content?.text).toBe("after terminal");
 	} finally {
 		fixture.dispose();
 	}

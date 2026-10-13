@@ -433,53 +433,53 @@ describe("pi-native encodeStream", () => {
 		expect((frames[1]!.error as AssistantMessage).content).toEqual([]);
 	});
 
-	it.each([
-		"raw",
-		"mixed",
-	] as const)("withholds unclassified thinking until a terminal $provenance partial classifies it", async provenance => {
-		const earlyPartial = baseAssistant({ content: [{ type: "thinking", thinking: RAW_SENTINEL }] });
-		const final = reasoningMessage(provenance, `${SUMMARY_SENTINEL} terminal`, `rs-terminal-${provenance}`);
-		const events: AssistantMessageEvent[] = [
-			{ type: "start", partial: baseAssistant() },
-			{ type: "thinking_start", contentIndex: 0, partial: earlyPartial },
-			{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial: earlyPartial },
-			{ type: "reasoning_summary_start", contentIndex: 0, partial: earlyPartial },
-			{
-				type: "reasoning_summary_delta",
-				contentIndex: 0,
-				delta: SUMMARY_SENTINEL,
-				partial: earlyPartial,
-			},
-			{ type: "reasoning_summary_end", contentIndex: 0, content: SUMMARY_SENTINEL, partial: earlyPartial },
-			{ type: "thinking_end", contentIndex: 0, content: RAW_SENTINEL, partial: final },
-			{ type: "done", reason: "stop", message: final },
-		];
-		const source = JSON.stringify(events);
-		const lines = await collectSse(encodeStream(makeEventStream(events, final)));
-		const frames = lines.slice(0, -1).map(parseSseLine) as Array<Record<string, unknown>>;
+	it.each(["raw", "mixed"] as const)(
+		"withholds unclassified thinking until a terminal $provenance partial classifies it",
+		async provenance => {
+			const earlyPartial = baseAssistant({ content: [{ type: "thinking", thinking: RAW_SENTINEL }] });
+			const final = reasoningMessage(provenance, `${SUMMARY_SENTINEL} terminal`, `rs-terminal-${provenance}`);
+			const events: AssistantMessageEvent[] = [
+				{ type: "start", partial: baseAssistant() },
+				{ type: "thinking_start", contentIndex: 0, partial: earlyPartial },
+				{ type: "thinking_delta", contentIndex: 0, delta: RAW_SENTINEL, partial: earlyPartial },
+				{ type: "reasoning_summary_start", contentIndex: 0, partial: earlyPartial },
+				{
+					type: "reasoning_summary_delta",
+					contentIndex: 0,
+					delta: SUMMARY_SENTINEL,
+					partial: earlyPartial,
+				},
+				{ type: "reasoning_summary_end", contentIndex: 0, content: SUMMARY_SENTINEL, partial: earlyPartial },
+				{ type: "thinking_end", contentIndex: 0, content: RAW_SENTINEL, partial: final },
+				{ type: "done", reason: "stop", message: final },
+			];
+			const source = JSON.stringify(events);
+			const lines = await collectSse(encodeStream(makeEventStream(events, final)));
+			const frames = lines.slice(0, -1).map(parseSseLine) as Array<Record<string, unknown>>;
 
-		expect(lines.join("\n")).not.toContain(RAW_SENTINEL);
-		expect(lines.join("\n")).toContain(SUMMARY_SENTINEL);
-		expect(frames.map(frame => frame.type)).toEqual([
-			"start",
-			"reasoning_summary_start",
-			"reasoning_summary_delta",
-			"reasoning_summary_end",
-			"done",
-		]);
-		const summaryFrames = frames.slice(1, 4) as Array<{ partial: AssistantMessage }>;
-		for (const frame of summaryFrames) {
-			expect(frame.partial.content[0]).toMatchObject({
-				type: "thinking",
-				provenance: "summary",
-			});
-			expect(frame.partial.content).toHaveLength(1);
-		}
-		expect(summaryFrames[1]!.partial.content[0]).toMatchObject({ summaryText: SUMMARY_SENTINEL });
-		expect(summaryFrames[2]!.partial.content[0]).toMatchObject({ summaryText: SUMMARY_SENTINEL });
-		expect(lines.at(-1)).toBe("data: [DONE]");
-		expect(JSON.stringify(events)).toBe(source);
-	});
+			expect(lines.join("\n")).not.toContain(RAW_SENTINEL);
+			expect(lines.join("\n")).toContain(SUMMARY_SENTINEL);
+			expect(frames.map(frame => frame.type)).toEqual([
+				"start",
+				"reasoning_summary_start",
+				"reasoning_summary_delta",
+				"reasoning_summary_end",
+				"done",
+			]);
+			const summaryFrames = frames.slice(1, 4) as Array<{ partial: AssistantMessage }>;
+			for (const frame of summaryFrames) {
+				expect(frame.partial.content[0]).toMatchObject({
+					type: "thinking",
+					provenance: "summary",
+				});
+				expect(frame.partial.content).toHaveLength(1);
+			}
+			expect(summaryFrames[1]!.partial.content[0]).toMatchObject({ summaryText: SUMMARY_SENTINEL });
+			expect(summaryFrames[2]!.partial.content[0]).toMatchObject({ summaryText: SUMMARY_SENTINEL });
+			expect(lines.at(-1)).toBe("data: [DONE]");
+			expect(JSON.stringify(events)).toBe(source);
+		},
+	);
 
 	it("flushes an opaque provider-native thinking block only after its safe final partial", async () => {
 		const opaqueThinking = {
@@ -542,84 +542,84 @@ describe("pi-native managed gateway credential failure marking", () => {
 	it.each([
 		{ status: 401, message: "invalid API key", classification: "auth" },
 		{ status: 429, message: "rate limit exceeded", classification: "rate limit" },
-	])("marks a streamed $classification failure once and rotates credentials for an explicitly managed pi-native request", async ({
-		status,
-		message,
-	}) => {
-		let upstreamRequests = 0;
-		const credentials: string[] = [];
-		const upstream = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch: req => {
-				upstreamRequests += 1;
-				credentials.push(req.headers.get("authorization") ?? "");
-				return new Response(JSON.stringify({ error: { message } }), {
-					status,
-					headers: { "Content-Type": "application/json" },
-				});
-			},
-		});
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-gateway-managed-"));
-		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "auth.db"));
-		const storage = new AuthStorage(store);
-		const provider = "gateway-managed-test";
-		const model: Model<Api> = {
-			id: "gateway-managed-model",
-			name: "Gateway managed test model",
-			api: "openai-completions",
-			provider,
-			baseUrl: upstream.url.toString(),
-			reasoning: false,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128_000,
-			maxTokens: 4_096,
-		};
-		await storage.set(provider, [
-			{ type: "api_key", key: "gateway-key-one" },
-			{ type: "api_key", key: "gateway-key-two" },
-		]);
-		const gateway = startAuthGateway({
-			bind: "127.0.0.1:0",
-			providerScope: { provider },
-			bearerTokens: ["gateway-test-token"],
-			version: "test",
-			storage,
-			...testAuthority(storage, provider),
-			resolveModel: id => (id === model.id ? model : undefined),
-			listModels: () => [model],
-		});
-		const request = () =>
-			fetch(`${gateway.url}/v1/pi/stream`, {
-				method: "POST",
-				headers: { Authorization: "Bearer gateway-test-token", "Content-Type": "application/json" },
-				body: JSON.stringify({
-					modelId: model.id,
-					context: baseContext,
-					stream: true,
-					options: { fallbackManaged: true },
-				}),
+	])(
+		"marks a streamed $classification failure once and rotates credentials for an explicitly managed pi-native request",
+		async ({ status, message }) => {
+			let upstreamRequests = 0;
+			const credentials: string[] = [];
+			const upstream = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch: req => {
+					upstreamRequests += 1;
+					credentials.push(req.headers.get("authorization") ?? "");
+					return new Response(JSON.stringify({ error: { message } }), {
+						status,
+						headers: { "Content-Type": "application/json" },
+					});
+				},
 			});
-		try {
-			const first = await request();
-			expect(first.status).toBe(200);
-			await first.text();
-			expect(upstreamRequests).toBe(1);
-			expect(credentials).toEqual(["Bearer gateway-key-one"]);
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-gateway-managed-"));
+			const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "auth.db"));
+			const storage = new AuthStorage(store);
+			const provider = "gateway-managed-test";
+			const model: Model<Api> = {
+				id: "gateway-managed-model",
+				name: "Gateway managed test model",
+				api: "openai-completions",
+				provider,
+				baseUrl: upstream.url.toString(),
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 4_096,
+			};
+			await storage.set(provider, [
+				{ type: "api_key", key: "gateway-key-one" },
+				{ type: "api_key", key: "gateway-key-two" },
+			]);
+			const gateway = startAuthGateway({
+				bind: "127.0.0.1:0",
+				providerScope: { provider },
+				bearerTokens: ["gateway-test-token"],
+				version: "test",
+				storage,
+				...testAuthority(storage, provider),
+				resolveModel: id => (id === model.id ? model : undefined),
+				listModels: () => [model],
+			});
+			const request = () =>
+				fetch(`${gateway.url}/v1/pi/stream`, {
+					method: "POST",
+					headers: { Authorization: "Bearer gateway-test-token", "Content-Type": "application/json" },
+					body: JSON.stringify({
+						modelId: model.id,
+						context: baseContext,
+						stream: true,
+						options: { fallbackManaged: true },
+					}),
+				});
+			try {
+				const first = await request();
+				expect(first.status).toBe(200);
+				await first.text();
+				expect(upstreamRequests).toBe(1);
+				expect(credentials).toEqual(["Bearer gateway-key-one"]);
 
-			const second = await request();
-			expect(second.status).toBe(200);
-			await second.text();
-			expect(upstreamRequests).toBe(2);
-			expect(credentials).toEqual(["Bearer gateway-key-one", "Bearer gateway-key-two"]);
-		} finally {
-			await gateway.close();
-			upstream.stop(true);
-			store.close();
-			await fs.rm(tempDir, { recursive: true, force: true });
-		}
-	});
+				const second = await request();
+				expect(second.status).toBe(200);
+				await second.text();
+				expect(upstreamRequests).toBe(2);
+				expect(credentials).toEqual(["Bearer gateway-key-one", "Bearer gateway-key-two"]);
+			} finally {
+				await gateway.close();
+				upstream.stop(true);
+				store.close();
+				await fs.rm(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
 	it("replays a translated OpenAI request with a refreshed credential after an auth failure", async () => {
 		let upstreamRequests = 0;
 		const credentials: string[] = [];

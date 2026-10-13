@@ -94,60 +94,60 @@ describe("LSP lifecycle behavior", () => {
 		}
 	});
 
-	it.each([
-		"EPIPE",
-		"ERR_STREAM_DESTROYED",
-	] as const)("terminalizes and evicts a client when its owned stdin sink reports %s", async code => {
-		const cwd = await tempDir("gjc-lsp-peer-close-");
-		try {
-			const script = await writeFakeLspServer(cwd);
-			const config = serverConfig(BUN, [script]);
-			const first = await getOrCreateClient(config, cwd, 1_000);
-			const serializationError = Object.assign(new Error("serialization failed"), { code });
-			const params = {
-				toJSON(): never {
-					throw serializationError;
-				},
-			};
-			expect(await captureError(sendNotification(first, "test/serialization", params))).toBe(serializationError);
+	it.each(["EPIPE", "ERR_STREAM_DESTROYED"] as const)(
+		"terminalizes and evicts a client when its owned stdin sink reports %s",
+		async code => {
+			const cwd = await tempDir("gjc-lsp-peer-close-");
+			try {
+				const script = await writeFakeLspServer(cwd);
+				const config = serverConfig(BUN, [script]);
+				const first = await getOrCreateClient(config, cwd, 1_000);
+				const serializationError = Object.assign(new Error("serialization failed"), { code });
+				const params = {
+					toJSON(): never {
+						throw serializationError;
+					},
+				};
+				expect(await captureError(sendNotification(first, "test/serialization", params))).toBe(serializationError);
 
-			const pending = captureError(sendRequest(first, "workspace/neverResponds", null, undefined, 60_000));
-			expect(first.pendingRequests.size).toBe(1);
-			await Bun.sleep(10);
+				const pending = captureError(sendRequest(first, "workspace/neverResponds", null, undefined, 60_000));
+				expect(first.pendingRequests.size).toBe(1);
+				await Bun.sleep(10);
 
-			const unrelatedSinkError = Object.assign(new Error("unrelated sink failure"), { code: "EIO" });
-			Object.defineProperty(first.proc.stdin, "flush", {
-				configurable: true,
-				value: async () => {
-					throw unrelatedSinkError;
-				},
-			});
-			expect(await captureError(sendNotification(first, "test/unrelatedFailure", {}))).toBe(unrelatedSinkError);
-			expect(first.pendingRequests.size).toBe(1);
+				const unrelatedSinkError = Object.assign(new Error("unrelated sink failure"), { code: "EIO" });
+				Object.defineProperty(first.proc.stdin, "flush", {
+					configurable: true,
+					value: async () => {
+						throw unrelatedSinkError;
+					},
+				});
+				expect(await captureError(sendNotification(first, "test/unrelatedFailure", {}))).toBe(unrelatedSinkError);
+				expect(first.pendingRequests.size).toBe(1);
 
-			const peerClosedError = Object.assign(new Error("peer closed"), { code });
-			Object.defineProperty(first.proc.stdin, "flush", {
-				configurable: true,
-				value: async () => {
-					throw peerClosedError;
-				},
-			});
-			await sendNotification(first, "test/afterClose", {});
-			const pendingError = await pending;
-			expect(pendingError.message).toBe("LSP transport closed");
-			expect(pendingError.cause).toBe(peerClosedError);
-			expect(first.pendingRequests.size).toBe(0);
+				const peerClosedError = Object.assign(new Error("peer closed"), { code });
+				Object.defineProperty(first.proc.stdin, "flush", {
+					configurable: true,
+					value: async () => {
+						throw peerClosedError;
+					},
+				});
+				await sendNotification(first, "test/afterClose", {});
+				const pendingError = await pending;
+				expect(pendingError.message).toBe("LSP transport closed");
+				expect(pendingError.cause).toBe(peerClosedError);
+				expect(first.pendingRequests.size).toBe(0);
 
-			const staleRequestError = await captureError(sendRequest(first, "test/stale", null));
-			expect(staleRequestError).toBe(pendingError);
+				const staleRequestError = await captureError(sendRequest(first, "test/stale", null));
+				expect(staleRequestError).toBe(pendingError);
 
-			const second = await getOrCreateClient(config, cwd, 1_000);
-			expect(second).not.toBe(first);
-			expect(second.proc.exitCode).toBeNull();
-		} finally {
-			await fs.rm(cwd, { recursive: true, force: true });
-		}
-	});
+				const second = await getOrCreateClient(config, cwd, 1_000);
+				expect(second).not.toBe(first);
+				expect(second.proc.exitCode).toBeNull();
+			} finally {
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("waitForProjectLoaded removes its abort listener after project loading settles", async () => {
 		const controller = new AbortController();

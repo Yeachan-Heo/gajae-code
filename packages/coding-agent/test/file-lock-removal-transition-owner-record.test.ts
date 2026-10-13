@@ -63,21 +63,18 @@ test("real acquire leaves a live transition owner and payload untouched", async 
 	expect(await Bun.file(`${transition}.owner`).text()).toBe(bytes);
 });
 
-test.each([
-	"before-rename",
-	"after-rename",
-	"after-scrub",
-	"legacy-after-scrub",
-])("SIGKILL %s retains the remover record and recovers", async phase => {
-	const { file, lock, transition } = await fixture();
-	const initial = phase === "legacy-after-scrub" ? transition : lock;
-	await fs.mkdir(initial);
-	await Bun.write(path.join(initial, "info"), JSON.stringify(deadOwner));
-	const child = Bun.spawn(
-		[
-			process.execPath,
-			"-e",
-			`
+test.each(["before-rename", "after-rename", "after-scrub", "legacy-after-scrub"])(
+	"SIGKILL %s retains the remover record and recovers",
+	async phase => {
+		const { file, lock, transition } = await fixture();
+		const initial = phase === "legacy-after-scrub" ? transition : lock;
+		await fs.mkdir(initial);
+		await Bun.write(path.join(initial, "info"), JSON.stringify(deadOwner));
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				"-e",
+				`
 import { acquireFileLock, FileLockTestHooks } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/config/file-lock.ts"))};
 import { exactRemoveDirectoryTree, renameDirectoryNoReplacePath, snapshotDirectoryTree } from "@gajae-code/natives";
 const file = process.env.LOCKED_FILE;
@@ -101,30 +98,31 @@ FileLockTestHooks.nativeQuarantineBindings = () => ({
 });
 await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
 `,
-		],
-		{
-			cwd: path.resolve(import.meta.dir, "../../.."),
-			env: { ...process.env, LOCKED_FILE: file, REMOVAL_CRASH_PHASE: phase },
-			stdout: "pipe",
-			stderr: "pipe",
-		},
-	);
-	const code = await child.exited;
-	const stderr = await new Response(child.stderr).text();
-	expect(stderr).toBe("");
-	expect(code).not.toBe(0);
-	const observedOwner = ((await Bun.file(`${transition}.owner`).json()) as { owner: FileLockOwnerToken }).owner;
-	expect(observedOwner?.pid).toBe(child.pid);
-	expect(observedOwner?.process_incarnation).toBeString();
-	const retained = phase === "before-rename" ? lock : transition;
-	expect(await Bun.file(path.join(retained, "info")).text()).toBe(
-		phase.endsWith("after-scrub") ? "" : JSON.stringify(deadOwner),
-	);
-	const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
-	expect(await fs.exists(transition)).toBe(false);
-	expect(await fs.exists(`${transition}.owner`)).toBe(false);
-	await release();
-});
+			],
+			{
+				cwd: path.resolve(import.meta.dir, "../../.."),
+				env: { ...process.env, LOCKED_FILE: file, REMOVAL_CRASH_PHASE: phase },
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const code = await child.exited;
+		const stderr = await new Response(child.stderr).text();
+		expect(stderr).toBe("");
+		expect(code).not.toBe(0);
+		const observedOwner = ((await Bun.file(`${transition}.owner`).json()) as { owner: FileLockOwnerToken }).owner;
+		expect(observedOwner?.pid).toBe(child.pid);
+		expect(observedOwner?.process_incarnation).toBeString();
+		const retained = phase === "before-rename" ? lock : transition;
+		expect(await Bun.file(path.join(retained, "info")).text()).toBe(
+			phase.endsWith("after-scrub") ? "" : JSON.stringify(deadOwner),
+		);
+		const release = await acquireFileLock(file, { retries: 2, retryDelayMs: 1 });
+		expect(await fs.exists(transition)).toBe(false);
+		expect(await fs.exists(`${transition}.owner`)).toBe(false);
+		await release();
+	},
+);
 
 test("real acquire reclaims an empty stale ownerless transition", async () => {
 	const { file, transition } = await fixture();

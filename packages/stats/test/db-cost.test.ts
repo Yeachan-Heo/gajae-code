@@ -71,21 +71,18 @@ function expectedCodexGptCost() {
 }
 
 describe("stats GPT cost correction", () => {
-	it.each([
-		undefined,
-		null,
-		{},
-		"invalid",
-		{ input: null, output: "1", cacheRead: NaN, total: Infinity },
-	])("repairs malformed cost %j using catalog pricing without losing tokens", async cost => {
-		await initDb();
-		const stats: ParsedMessageStats = createCodexGptStats("malformed");
-		stats.usage = { ...stats.usage, cost };
-		expect(insertMessageStats([stats])).toBe(1);
-		const request = getRecentRequests(1)[0];
-		expect(request.usage.cost).toEqual({ ...expectedCodexGptCost(), cacheWrite: 0 });
-		expect(request.usage.totalTokens).toBe(1700);
-	});
+	it.each([undefined, null, {}, "invalid", { input: null, output: "1", cacheRead: NaN, total: Infinity }])(
+		"repairs malformed cost %j using catalog pricing without losing tokens",
+		async cost => {
+			await initDb();
+			const stats: ParsedMessageStats = createCodexGptStats("malformed");
+			stats.usage = { ...stats.usage, cost };
+			expect(insertMessageStats([stats])).toBe(1);
+			const request = getRecentRequests(1)[0];
+			expect(request.usage.cost).toEqual({ ...expectedCodexGptCost(), cacheWrite: 0 });
+			expect(request.usage.totalTokens).toBe(1700);
+		},
+	);
 
 	it.each([
 		{ input: 0, output: 0, cacheRead: 0, total: 0 },

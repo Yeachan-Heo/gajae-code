@@ -272,17 +272,20 @@ describe("discoverable tool descriptions are stable across first load (#5992)", 
 	it.each([
 		["line-number display", { readLineNumbers: true, readHashLines: false } as Partial<Record<SettingPath, unknown>>],
 		["plain display", { readLineNumbers: false, readHashLines: false } as Partial<Record<SettingPath, unknown>>],
-	])("#given a %s session #when search loads #then its advertised description does not change", async (_label, overrides) => {
-		// given
-		const toolSession = session(overrides);
+	])(
+		"#given a %s session #when search loads #then its advertised description does not change",
+		async (_label, overrides) => {
+			// given
+			const toolSession = session(overrides);
 
-		// when
-		const observed = await descriptionBeforeAndAfterLoad("search", toolSession);
+			// when
+			const observed = await descriptionBeforeAndAfterLoad("search", toolSession);
 
-		// then
-		expect(observed).toBeDefined();
-		expect(observed?.before).toBe(observed?.after);
-	});
+			// then
+			expect(observed).toBeDefined();
+			expect(observed?.before).toBe(observed?.after);
+		},
+	);
 
 	it.each([
 		["python only", { "eval.py": true, "eval.js": false } as Partial<Record<SettingPath, unknown>>, undefined],
@@ -292,16 +295,19 @@ describe("discoverable tool descriptions are stable across first load (#5992)", 
 			{ "eval.py": true, "eval.js": true } as Partial<Record<SettingPath, unknown>>,
 			"js",
 		],
-	])("#given eval allowed for %s #when eval loads #then its advertised description does not change", async (_label, overrides, gjcPy) => {
-		// given
-		if (gjcPy !== undefined) Bun.env.GJC_PY = gjcPy;
-		const toolSession = session(overrides);
+	])(
+		"#given eval allowed for %s #when eval loads #then its advertised description does not change",
+		async (_label, overrides, gjcPy) => {
+			// given
+			if (gjcPy !== undefined) Bun.env.GJC_PY = gjcPy;
+			const toolSession = session(overrides);
 
-		// when
-		const observed = await descriptionBeforeAndAfterLoad("eval", toolSession);
+			// when
+			const observed = await descriptionBeforeAndAfterLoad("eval", toolSession);
 
-		// then
-		expect(observed).toBeDefined();
-		expect(observed?.before).toBe(observed?.after);
-	});
+			// then
+			expect(observed).toBeDefined();
+			expect(observed?.before).toBe(observed?.after);
+		},
+	);
 });

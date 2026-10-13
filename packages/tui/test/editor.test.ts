@@ -2298,22 +2298,22 @@ describe("Editor component", () => {
 			"tui.editor.deleteWordBackward": ["\x17", "\x1b\x7f"],
 		} as const;
 
-		it.each([
-			"tui.editor.deleteToLineStart",
-			"tui.editor.deleteWordBackward",
-		] as const)("routes %s through the registry so a remap moves it", action => {
-			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { [action]: "f8" }));
-			const editor = new Editor(defaultEditorTheme);
-			editor.setText("abc def");
-			const before = editor.getText();
+		it.each(["tui.editor.deleteToLineStart", "tui.editor.deleteWordBackward"] as const)(
+			"routes %s through the registry so a remap moves it",
+			action => {
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { [action]: "f8" }));
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				const before = editor.getText();
 
-			// The action's own former literals are inert once it is remapped away.
-			for (const literal of LITERALS_BY_ACTION[action]) editor.handleInput(literal);
-			expect(editor.getText()).toBe(before);
+				// The action's own former literals are inert once it is remapped away.
+				for (const literal of LITERALS_BY_ACTION[action]) editor.handleInput(literal);
+				expect(editor.getText()).toBe(before);
 
-			editor.handleInput("\x1b[19~"); // F8 now performs the edit
-			expect(editor.getText()).not.toBe(before);
-		});
+				editor.handleInput("\x1b[19~"); // F8 now performs the edit
+				expect(editor.getText()).not.toBe(before);
+			},
+		);
 
 		it("routes the kill-ring yank ids through the registry", () => {
 			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { "tui.editor.yank": "f8" }));

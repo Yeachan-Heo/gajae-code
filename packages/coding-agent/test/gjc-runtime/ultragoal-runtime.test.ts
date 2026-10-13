@@ -2677,7 +2677,7 @@ describe("native GJC ultragoal runtime", () => {
 			finalGoalId: "G004",
 		});
 		const closeLedger = (await readUltragoalLedger(validRoot)).at(-1);
-		expect((closeLedger?.qualityGateJson as Record<string, unknown>).validationBatchClose).toMatchObject({
+		expect((closeLedger?.qualityGateJson as Record<string, unknown>)?.validationBatchClose).toMatchObject({
 			kind: "validation-batch-close",
 			memberIds: ["G002", "G003", "G004"],
 		});

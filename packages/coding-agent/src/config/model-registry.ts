@@ -4991,13 +4991,13 @@ export class ModelRegistry {
 				]
 			) {
 				const authorization = result[index]?.headers?.Authorization;
-				const marker = (result[index]?.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+				const marker = (result[index]?.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })?.[
 					GENERATED_AUTH_HEADER
 				];
 				if (authorization && marker === authorization)
 					this.#generatedAuthHeaders.set(result[index]!, { authorization });
 				else
-					delete (result[index]?.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
+					delete (result[index]?.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })?.[
 						GENERATED_AUTH_HEADER
 					];
 			}

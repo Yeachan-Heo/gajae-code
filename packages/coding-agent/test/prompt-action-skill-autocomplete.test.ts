@@ -61,14 +61,14 @@ describe("prompt action skill autocomplete", () => {
 		expect(applied.lines[0]).toBe("/skill:deep-interview ");
 	});
 
-	it.each([
-		"please use /ra",
-		"/skill:deep-interview first /model",
-	])("does not offer skill completions after existing prompt text: %s", async line => {
-		const provider = createProvider();
+	it.each(["please use /ra", "/skill:deep-interview first /model"])(
+		"does not offer skill completions after existing prompt text: %s",
+		async line => {
+			const provider = createProvider();
 
-		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
-	});
+			expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+		},
+	);
 
 	it("does not offer skill completions from a bare top-level slash token", async () => {
 		const provider = createProvider();
@@ -79,14 +79,14 @@ describe("prompt action skill autocomplete", () => {
 		expect(values.some(value => value.startsWith("skill:"))).toBe(false);
 	});
 
-	it.each([
-		"please use/",
-		"please use /skill",
-	])("keeps skill autocomplete closed for inline slash tokens: %s", async line => {
-		const provider = createProvider();
+	it.each(["please use/", "please use /skill"])(
+		"keeps skill autocomplete closed for inline slash tokens: %s",
+		async line => {
+			const provider = createProvider();
 
-		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
-	});
+			expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+		},
+	);
 
 	it("does not rewrite a nested filesystem path as a skill command", async () => {
 		const provider = createProvider();

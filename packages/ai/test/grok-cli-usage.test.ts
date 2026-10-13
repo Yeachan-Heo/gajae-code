@@ -52,7 +52,7 @@ describe("Grok CLI usage provider", () => {
 			{
 				fetch: (async (url, init) => {
 					requests.push(String(url));
-					expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer token");
+					expect((init?.headers as Record<string, string>)?.Authorization).toBe("Bearer token");
 					expect(init?.signal).toBe(controller.signal);
 					if (String(url).endsWith("/billing")) {
 						return Response.json({
@@ -159,7 +159,7 @@ describe("Grok CLI usage provider", () => {
 						return new Response(null, { status: 404 });
 					}
 					expect(String(url)).toBe("https://cli-chat-proxy.grok.com/v1/billing");
-					expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer token");
+					expect((init?.headers as Record<string, string>)?.Authorization).toBe("Bearer token");
 					return Response.json({
 						config: {
 							monthlyLimit: { val: 10_000 },

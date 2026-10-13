@@ -92,14 +92,12 @@ describe("Vertex location trust boundary", () => {
 		expect(resolved.origin).toBe("https://aiplatform.googleapis.com");
 	});
 
-	it.each([
-		"evil.example.com/",
-		"evil.example.com/x",
-		"us-central1/../..",
-		"a@evil.example.com",
-	])("rejects the authority-shaped location %p even from a trusted source", async value => {
-		const resolved = await resolveIn(projectDir(), { GOOGLE_CLOUD_LOCATION: value });
-		expect(resolved.origin).toBeNull();
-		expect(resolved.error).toContain("Invalid Vertex AI location");
-	});
+	it.each(["evil.example.com/", "evil.example.com/x", "us-central1/../..", "a@evil.example.com"])(
+		"rejects the authority-shaped location %p even from a trusted source",
+		async value => {
+			const resolved = await resolveIn(projectDir(), { GOOGLE_CLOUD_LOCATION: value });
+			expect(resolved.origin).toBeNull();
+			expect(resolved.error).toContain("Invalid Vertex AI location");
+		},
+	);
 });

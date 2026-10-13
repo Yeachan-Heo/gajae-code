@@ -7,14 +7,10 @@ describe("validateDisplayLine", () => {
 		expect(validateDisplayLine(sgr)).toBe(sgr);
 	});
 
-	test.each([
-		"\x1b[38;5;;m",
-		"\x1b[;31m",
-		"\x1b[31;m",
-		"\x1b[999999999m",
-		`\x1b[${"1;".repeat(32)}1m`,
-	])("rejects malformed or oversized SGR parameters: %p", fixture =>
-		expect(validateDisplayLine(`safe${fixture}text`)).toBe("safetext"));
+	test.each(["\x1b[38;5;;m", "\x1b[;31m", "\x1b[31;m", "\x1b[999999999m", `\x1b[${"1;".repeat(32)}1m`])(
+		"rejects malformed or oversized SGR parameters: %p",
+		fixture => expect(validateDisplayLine(`safe${fixture}text`)).toBe("safetext"),
+	);
 
 	test.each([
 		"\x1b]52;c;copy\x07",

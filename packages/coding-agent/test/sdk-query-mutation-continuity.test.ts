@@ -63,8 +63,8 @@ describe("SDK query mutation continuity", () => {
 			cursor: configFirst.page?.continuationCursor,
 			connectionId: "c",
 		});
-		expect((queueNext.page?.items[0] as { text: string }).text).toContain("x");
-		expect((configNext.page?.items[0] as { value: string }).value).toContain("x");
+		expect((queueNext.page?.items[0] as { text: string })?.text).toContain("x");
+		expect((configNext.page?.items[0] as { value: string })?.value).toContain("x");
 	});
 
 	it("refuses new cursors at capacity without disturbing active snapshots and expires deterministically", async () => {

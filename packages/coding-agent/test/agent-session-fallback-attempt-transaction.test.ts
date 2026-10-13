@@ -596,78 +596,77 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(agent.currentManagedLogicalRunId).toBeUndefined();
 	});
 
-	it.each([
-		"throw",
-		"teardown",
-		"timeout",
-	] as const)("settles a %s failure after local empty fallback", async failure => {
-		const calls: string[] = [];
-		const { agent, primary, fallback } = createSession(model => {
-			calls.push(selector(model));
-			if (calls.length === 1) return zeroTokenEmptyStopStream(model, false);
-			if (failure === "throw") throw new Error("fallback stream failed");
-			if (failure === "timeout") return typedFirstEventTimeoutStream(model);
-			return zeroTokenEmptyStopStream(model, false, true);
-		}, 1);
-		const events: AgentSessionEvent[] = [];
-		session!.subscribe(event => events.push(event));
+	it.each(["throw", "teardown", "timeout"] as const)(
+		"settles a %s failure after local empty fallback",
+		async failure => {
+			const calls: string[] = [];
+			const { agent, primary, fallback } = createSession(model => {
+				calls.push(selector(model));
+				if (calls.length === 1) return zeroTokenEmptyStopStream(model, false);
+				if (failure === "throw") throw new Error("fallback stream failed");
+				if (failure === "timeout") return typedFirstEventTimeoutStream(model);
+				return zeroTokenEmptyStopStream(model, false, true);
+			}, 1);
+			const events: AgentSessionEvent[] = [];
+			session!.subscribe(event => events.push(event));
 
-		await withTimeout(session!.prompt("settle failed local empty fallback"), "prompt");
-		await withTimeout(session!.waitForIdle(), "waitForIdle");
+			await withTimeout(session!.prompt("settle failed local empty fallback"), "prompt");
+			await withTimeout(session!.waitForIdle(), "waitForIdle");
 
-		expect(calls).toEqual([selector(primary), selector(fallback)]);
-		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(1);
-		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
-		expect(session!.messages.filter(message => message.role === "assistant")).toEqual([
-			expect.objectContaining({ stopReason: "error" }),
-		]);
-		expect(session!.isStreaming).toBe(false);
-		expect(session!.isRetrying).toBe(false);
-		expect(agent.activeRunId).toBeUndefined();
-		expect(agent.currentManagedLogicalRunId).toBeUndefined();
-	});
+			expect(calls).toEqual([selector(primary), selector(fallback)]);
+			expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(1);
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+			expect(session!.messages.filter(message => message.role === "assistant")).toEqual([
+				expect.objectContaining({ stopReason: "error" }),
+			]);
+			expect(session!.isStreaming).toBe(false);
+			expect(session!.isRetrying).toBe(false);
+			expect(agent.activeRunId).toBeUndefined();
+			expect(agent.currentManagedLogicalRunId).toBeUndefined();
+		},
+	);
 
-	it.each([
-		false,
-		true,
-	])("cancels local empty fallback without accepting a late acknowledgement (late=%s)", async late => {
-		const calls: string[] = [];
-		const pending = new AssistantMessageEventStream();
-		const entered = Promise.withResolvers<void>();
-		const { agent, primary, fallback } = createSession(model => {
-			calls.push(selector(model));
-			if (calls.length === 1) return zeroTokenEmptyStopStream(model, false);
-			entered.resolve();
-			return pending;
-		}, 1);
-		const events: AgentSessionEvent[] = [];
-		session!.subscribe(event => events.push(event));
-		const run = session!.prompt("cancel after local empty fallback selection");
-		await withTimeout(entered.promise, "fallback entered");
-		await session!.abort();
-		if (late) {
-			const accepted = createMockModel({ responses: [{ content: ["late accepted"] }] }).stream(fallback, {
-				systemPrompt: [],
-				messages: [],
-				tools: [],
-			});
-			for await (const event of accepted) pending.push(event);
-		}
-		await withTimeout(run, "prompt");
-		await withTimeout(session!.waitForIdle(), "waitForIdle");
+	it.each([false, true])(
+		"cancels local empty fallback without accepting a late acknowledgement (late=%s)",
+		async late => {
+			const calls: string[] = [];
+			const pending = new AssistantMessageEventStream();
+			const entered = Promise.withResolvers<void>();
+			const { agent, primary, fallback } = createSession(model => {
+				calls.push(selector(model));
+				if (calls.length === 1) return zeroTokenEmptyStopStream(model, false);
+				entered.resolve();
+				return pending;
+			}, 1);
+			const events: AgentSessionEvent[] = [];
+			session!.subscribe(event => events.push(event));
+			const run = session!.prompt("cancel after local empty fallback selection");
+			await withTimeout(entered.promise, "fallback entered");
+			await session!.abort();
+			if (late) {
+				const accepted = createMockModel({ responses: [{ content: ["late accepted"] }] }).stream(fallback, {
+					systemPrompt: [],
+					messages: [],
+					tools: [],
+				});
+				for await (const event of accepted) pending.push(event);
+			}
+			await withTimeout(run, "prompt");
+			await withTimeout(session!.waitForIdle(), "waitForIdle");
 
-		expect(calls).toEqual([selector(primary), selector(fallback)]);
-		expect(events.filter(event => event.type === "agent_end")).toEqual([
-			expect.objectContaining({ stopReason: "cancelled" }),
-		]);
-		expect(
-			session!.messages.filter(message => message.role === "assistant" && message.stopReason === "stop"),
-		).toHaveLength(0);
-		expect(session!.isStreaming).toBe(false);
-		expect(session!.isRetrying).toBe(false);
-		expect(agent.activeRunId).toBeUndefined();
-		expect(agent.currentManagedLogicalRunId).toBeUndefined();
-	});
+			expect(calls).toEqual([selector(primary), selector(fallback)]);
+			expect(events.filter(event => event.type === "agent_end")).toEqual([
+				expect.objectContaining({ stopReason: "cancelled" }),
+			]);
+			expect(
+				session!.messages.filter(message => message.role === "assistant" && message.stopReason === "stop"),
+			).toHaveLength(0);
+			expect(session!.isStreaming).toBe(false);
+			expect(session!.isRetrying).toBe(false);
+			expect(agent.activeRunId).toBeUndefined();
+			expect(agent.currentManagedLogicalRunId).toBeUndefined();
+		},
+	);
 
 	it("disposes a pending local empty fallback once and rejects late stream output", async () => {
 		const calls: string[] = [];

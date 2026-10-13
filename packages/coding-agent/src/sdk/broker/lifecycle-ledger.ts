@@ -238,7 +238,7 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 		((terminal(entry.state) || entry.state === "terminal_uncertain") &&
 			(entry.state !== "terminal_uncertain" || entry.response !== undefined));
 	if (cleanupPendingResponse) {
-		const cleanupSessionId = (response.error?.cleanup as { sessionId?: unknown }).sessionId;
+		const cleanupSessionId = (response.error?.cleanup as { sessionId?: unknown })?.sessionId;
 		if (!canonicalCleanupSessionId(entry.intendedSessionId) || cleanupSessionId !== entry.intendedSessionId)
 			return false;
 	}
