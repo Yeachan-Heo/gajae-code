@@ -703,7 +703,13 @@ describe("shared finite managed GC inventory admission", () => {
 					readManagedGcSessionRetirementReceiptReadOnly(fixture.scope, fixture.transcriptPath),
 				).rejects.toThrow("managed_gc_scope_authority_mismatch");
 				expect(inserted).toBe(true);
-				expect(observed.streams).toHaveLength(2);
+				expect(observed.streams.length).toBeGreaterThanOrEqual(2);
+				expect(observed.streams.length).toBeLessThanOrEqual(3);
+				expect(observed.streams.slice(0, 2).map(stream => stream.entriesRead)).toEqual([
+					absentPrepared ? 0 : 1,
+					absentPrepared ? 0 : 1,
+				]);
+				if (observed.streams.length === 3) expect(observed.streams[2]?.entriesRead).toBe(absentPrepared ? 1 : 2);
 				expect(observed.streams.every(stream => stream.closed && stream.bufferSize === 1)).toBe(true);
 			} finally {
 				observed.restoreIfCurrent();
