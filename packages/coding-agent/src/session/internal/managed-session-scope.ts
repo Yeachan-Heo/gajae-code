@@ -2692,11 +2692,14 @@ function managedGcStreamDirectoryInventory(
 	countEntry: (entry: fs.Dirent) => boolean,
 	retain: (entry: fs.Dirent) => boolean,
 	operation: ManagedGcInventoryOperation,
+	verificationBaseline?: ManagedGcDirectoryInventory,
 ): ManagedGcDirectoryInventory {
 	managedGcReserveInventoryWork(operation);
 	const beforeStat = fs.lstatSync(pathname, { bigint: true });
 	if (!beforeStat.isDirectory() || beforeStat.isSymbolicLink()) throw new Error("managed_gc_scope_authority_mismatch");
 	const before = managedGcDirectoryEvidence(beforeStat);
+	if (verificationBaseline && !managedGcSameDirectoryEvidence(before, verificationBaseline.evidence))
+		throw new Error("managed_gc_scope_authority_mismatch");
 	const scan = (collect: boolean): { count: number; physicalEntryCount: number; entries: fs.Dirent[] } => {
 		managedGcReserveInventoryWork(operation);
 		const entries: fs.Dirent[] = [];
@@ -2742,7 +2745,9 @@ function managedGcStreamDirectoryInventory(
 		managedGcReserveInventoryWork(operation);
 		return { count, physicalEntryCount, entries };
 	};
-	const counted = scan(false);
+	const counted = verificationBaseline
+		? { count: verificationBaseline.entryCount, physicalEntryCount: verificationBaseline.physicalEntryCount }
+		: scan(false);
 	managedGcReserveInventoryWork(operation);
 	const afterCount = fs.lstatSync(pathname, { bigint: true });
 	if (
@@ -2776,6 +2781,7 @@ function managedGcReceiptDirectoryInventory(
 	scope: ManagedScope,
 	store: ManagedSessionDescendantStore,
 	operation: ManagedGcInventoryOperation,
+	verificationBaseline?: ManagedGcDirectoryInventory,
 ): ManagedGcDirectoryInventory {
 	const relativePath = MANAGED_GC_RETIREMENT_RECEIPTS;
 	managedGcReserveInventoryWork(
@@ -2789,6 +2795,7 @@ function managedGcReceiptDirectoryInventory(
 		entry => entry.name.startsWith(MANAGED_GC_RETIREMENT_PREFIX),
 		entry => entry.name.startsWith(MANAGED_GC_RETIREMENT_PREFIX),
 		operation,
+		verificationBaseline,
 	);
 	managedGcReserveInventoryWork(operation);
 	const after = store.captureDirectoryIdentity(relativePath);
@@ -3606,14 +3613,20 @@ export async function readManagedGcSessionRetirementReceiptReadOnly(
 			if (!hasFsCode(error, "ENOENT")) throw error;
 			receiptDirectoryPresent = false;
 		}
-		if (receiptDirectoryPresent)
+		if (receiptDirectoryPresent) {
+			const inventory = managedGcReceiptDirectoryInventory(scope, store, operation);
 			receipt = readManagedGcSessionRetirementReceiptUnlocked(
 				scope,
 				transcriptPath,
 				trusted,
 				store,
 				operation,
+				inventory,
 			).receipt;
+			const after = managedGcReceiptDirectoryInventory(scope, store, operation, inventory);
+			if (!managedGcSameReceiptDirectoryInventory(inventory, after))
+				throw new Error("task_artifact_owner_continuation_authority_mismatch");
+		}
 	} catch (error) {
 		primaryError = error;
 		hasPrimaryError = true;
