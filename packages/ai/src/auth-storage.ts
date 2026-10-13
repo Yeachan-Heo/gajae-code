@@ -2404,6 +2404,82 @@ export class AuthStorage {
 		return this.#getStoredCredentials(storageProvider)[session.index]?.id;
 	}
 
+	/** Return the stored OAuth row pinned by a credential selector without resolving tokens. */
+	getSelectedOAuthCredentialRowId(
+		provider: string,
+		sessionId?: string,
+		options?: Pick<AuthApiKeyOptions, "owner">,
+	): number | undefined {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		try {
+			const selected = this.#resolveSelectedStoredCredential(storageProvider, options, sessionId);
+			return selected?.credential.type === "oauth" ? selected.id : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** Return the usable OAuth row selected by a soft preferred-credential selector. */
+	getPreferredOAuthCredentialRowId(provider: string): number | undefined {
+		const preferredSelector = this.#getPreferredCredentialSelector(provider);
+		if (!preferredSelector) return undefined;
+		const selected = this.#findCredentialBySelector(provider, preferredSelector);
+		if (selected?.credential.type !== "oauth" || !this.isCredentialAvailable(provider, selected.id)) return undefined;
+		return selected.id;
+	}
+
+	/** Return the stored API-key row pinned by a credential selector without resolving values. */
+	getSelectedApiKeyCredentialRowId(
+		provider: string,
+		sessionId?: string,
+		options?: Pick<AuthApiKeyOptions, "owner">,
+	): number | undefined {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		try {
+			const selected = this.#resolveSelectedStoredCredential(storageProvider, options, sessionId);
+			return selected?.credential.type === "api_key" ? selected.id : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Preview the stored API-key row request dispatch would try for this session.
+	 * Requires a session id so the deterministic session order is used instead
+	 * of advancing the provider's round-robin cursor. Does not resolve key values
+	 * or mutate session selection.
+	 */
+	getProspectiveApiKeyCredentialRowId(
+		provider: string,
+		sessionId: string | undefined,
+		options?: Pick<AuthApiKeyOptions, "owner">,
+	): number | undefined {
+		if (!sessionId) return undefined;
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		let selected: IndexedStoredCredential | undefined;
+		try {
+			selected = this.#resolveSelectedStoredCredential(storageProvider, options, sessionId);
+		} catch {
+			return undefined;
+		}
+		if (selected?.credential.type === "api_key") {
+			const usable = this.#storedApiKeyUsability(storageProvider, selected.credential.key);
+			return selected.credential.key.startsWith("!") && usable !== true ? undefined : selected.id;
+		}
+		const candidate = this.#selectApiKeyCredential(storageProvider, sessionId);
+		if (!candidate) return undefined;
+		const usable = this.#storedApiKeyUsability(storageProvider, candidate.credential.key);
+		return candidate.credential.key.startsWith("!") && usable !== true ? undefined : candidate.id;
+	}
+
+	/** Cached usability of a stored API key; never resolves command-backed values. */
+	getStoredApiKeyUsability(provider: string, rowId: number): boolean | undefined {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const entry = this.#getStoredCredentials(storageProvider).find(candidate => candidate.id === rowId);
+		if (entry?.credential.type !== "api_key") return undefined;
+		return this.#storedApiKeyUsability(storageProvider, entry.credential.key);
+	}
+
 	/** Whether an enabled stored row is currently available outside quota backoff. */
 	isCredentialAvailable(provider: string, rowId: number): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);

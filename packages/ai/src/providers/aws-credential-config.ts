@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $credentialEnv, getTrustedHomeDir } from "@gajae-code/utils";
+import { $credentialEnv, $env, getTrustedHomeDir } from "@gajae-code/utils";
+import type { FetchImpl } from "../types";
 import type { AwsCredentials } from "./aws-sigv4";
 
 export type AwsIniFile = Record<string, Record<string, string>>;
@@ -120,6 +121,33 @@ export function hasResolvableAwsProfileSource(
 	const value = classifyAwsProfileCapability(source.profile, credentialsIni, configIni) !== undefined;
 	availabilityCache = { source, credentials, config, value, checkedAt: now };
 	return value;
+}
+
+/** Probe only the IMDSv2 token and role endpoints; never request role credentials for status. */
+export async function hasAwsInstanceProfileCredentialSource(options?: { fetch?: FetchImpl }): Promise<boolean> {
+	if ($env.AWS_EC2_METADATA_DISABLED?.toLowerCase() === "true") return false;
+	const fetchImpl = options?.fetch ?? globalThis.fetch.bind(globalThis);
+	const signal = AbortSignal.timeout(1000);
+	try {
+		const tokenResponse = await fetchImpl("http://169.254.169.254/latest/api/token", {
+			method: "PUT",
+			headers: { "x-aws-ec2-metadata-token-ttl-seconds": "21600" },
+			redirect: "error",
+			signal,
+		});
+		if (!tokenResponse.ok) return false;
+		const token = (await tokenResponse.text()).trim();
+		if (!token) return false;
+
+		const rolesResponse = await fetchImpl("http://169.254.169.254/latest/meta-data/iam/security-credentials/", {
+			headers: { "x-aws-ec2-metadata-token": token },
+			redirect: "error",
+			signal,
+		});
+		return rolesResponse.ok && Boolean((await rolesResponse.text()).trim());
+	} catch {
+		return false;
+	}
 }
 
 export function isValidBedrockBearerToken(token: string | undefined): token is string {

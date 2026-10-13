@@ -6065,6 +6065,67 @@ export class ModelRegistry {
 		return [...this.#configuredProviderIds];
 	}
 
+	/** Configured API-key sources in models.yml precedence order, excluding absent environment values. */
+	getProviderConfigApiKeySources(
+		provider: string,
+	): Array<{ kind: "environment"; name: string; provider: string } | { kind: "models-yml"; provider: string }> {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		const configuredProviders = this.#acceptedConfigValue?.providers;
+		const configuredAliases = Object.entries(configuredProviders ?? {}).filter(
+			([configuredProvider]) => resolveOAuthStorageProvider(configuredProvider) === normalizedProvider,
+		);
+		const sources: Array<
+			{ kind: "environment"; name: string; provider: string } | { kind: "models-yml"; provider: string }
+		> = [];
+		const addSource = (
+			configuredProvider: string,
+			apiKey: string | undefined,
+			apiKeyEnv: string | undefined,
+		): void => {
+			if (apiKey) {
+				if (Bun.env[apiKey]) sources.push({ kind: "environment", name: apiKey, provider: configuredProvider });
+				else sources.push({ kind: "models-yml", provider: configuredProvider });
+				return;
+			}
+			if (apiKeyEnv && $rotatingCredentialEnv(apiKeyEnv)) {
+				sources.push({ kind: "environment", name: apiKeyEnv, provider: configuredProvider });
+			}
+		};
+		for (const [configuredProvider, configured] of configuredAliases) {
+			addSource(configuredProvider, configured.apiKey, configured.apiKeyEnv);
+			addSource(configuredProvider, configured.openaiCompat?.apiKey, configured.openaiCompat?.apiKeyEnv);
+		}
+		return sources.filter(
+			(source, index) =>
+				source.kind === "models-yml" ||
+				sources.findIndex(
+					candidate =>
+						candidate.kind === "environment" &&
+						candidate.name === source.name &&
+						candidate.provider === source.provider,
+				) === index,
+		);
+	}
+
+	/** Environment variable name for a provider API key supplied by runtime setup. */
+	getProviderRuntimeApiKeyEnvName(provider: string): string | undefined {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		return (
+			this.#runtimeProviderApiKeyEnvNames.get(provider) ??
+			[...this.#runtimeProviderApiKeyEnvNames].find(
+				([registeredProvider]) => resolveOAuthStorageProvider(registeredProvider) === normalizedProvider,
+			)?.[1]
+		);
+	}
+
+	/** Whether a runtime extension's provider API key is currently installed in AuthStorage. */
+	hasRuntimeProviderApiKey(provider: string): boolean {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		return [...this.#runtimeProviderCredentialInstalled].some(
+			registeredProvider => resolveOAuthStorageProvider(registeredProvider) === normalizedProvider,
+		);
+	}
+
 	/**
 	 * Whether this registry can serve a provider id from any active source.
 	 *
