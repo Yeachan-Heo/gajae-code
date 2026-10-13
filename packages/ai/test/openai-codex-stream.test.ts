@@ -4548,6 +4548,85 @@ describe("openai-codex streaming", () => {
 		expect(result.usage.premiumRequests).toBeUndefined();
 	});
 
+	it("includes ultrafast service_tier in websocket payloads for supported models", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-ultrafast-");
+		setAgentDir(tempDir.path());
+
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+		const sentRequests: Array<Record<string, unknown>> = [];
+
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class UltraFastWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				this.sendJson({
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg_uf", index: 0, role: "assistant", status: "incomplete" },
+				});
+				this.sendJson({ type: "response.output_text", text: "" });
+				this.sendJson({ type: "response.output_text.delta", delta: "Hello" });
+				this.sendJson({
+					type: "response.output_item.done",
+					item: {
+						type: "message",
+						id: "msg_uf",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "Hello" }],
+					},
+				});
+				this.sendJson({ type: "response.created", response: { id: "resp_uf" } });
+				this.sendJson({
+					type: "response.done",
+					response: { id: "resp_uf", status: "completed", usage: DEFAULT_USAGE },
+				});
+			}
+		}
+
+		global.WebSocket = UltraFastWebSocket as unknown as typeof WebSocket;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1050000,
+			maxTokens: 4096,
+		};
+		const context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			serviceTier: "ultrafast",
+			sessionId: "ws-ultrafast-session",
+			providerSessionState: new Map<string, ProviderSessionState>(),
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests[0]?.type).toBe("response.create");
+		expect(sentRequests[0]?.service_tier).toBe("ultrafast");
+	});
+
 	it("sends websocket continuation deltas after prior assistant response items and records stats", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

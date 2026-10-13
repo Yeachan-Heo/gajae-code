@@ -783,6 +783,8 @@ function getCodexServiceTierCostMultiplier(
 			return 0.5;
 		case "priority":
 			return model.id === "gpt-5.5" ? 2.5 : 2;
+		case "ultrafast":
+			return 8; // Subscription: 8x; Credits/PAYG: 6x (using 8x for subscription)
 		default:
 			return 1;
 	}
@@ -795,9 +797,10 @@ function resolveCodexCostServiceTier(res: unknown, req?: unknown): ServiceTier |
 		case "flex":
 		case "scale":
 		case "priority":
+		case "ultrafast":
 			return res;
 		default:
-			if (req === "flex" || req === "priority") {
+			if (req === "flex" || req === "priority" || req === "ultrafast") {
 				return req;
 			}
 			return "default";
@@ -988,6 +991,12 @@ async function buildTransformedCodexRequestBody(
 	const resolvedServiceTier = resolveServiceTier(options?.serviceTier, model.provider);
 	if (resolvedServiceTier === "flex" || resolvedServiceTier === "scale" || resolvedServiceTier === "priority") {
 		params.service_tier = resolvedServiceTier;
+	} else if (resolvedServiceTier === "ultrafast") {
+		// Ultrafast is only supported for GPT-6.1 Sol and GPT-6 Astra
+		const ultrafastModels = ["gpt-6.1-sol", "gpt-6-astra"];
+		if (ultrafastModels.includes(model.id)) {
+			params.service_tier = "ultrafast";
+		}
 	}
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertOpenAICodexResponsesTools(context.tools, model);
