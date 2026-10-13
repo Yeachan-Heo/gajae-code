@@ -5,6 +5,8 @@ import { Broker } from "../src/sdk/broker/broker";
 import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 
 describe("SDK broker restart", () => {
+	// Local stale-lock fixtures include host identity because PID evidence is usable only for qualified owners;
+	// host-unqualified legacy records are separately covered as fail-closed.
 	it("takes over a stale lock and rotates discovery token", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-restart-"));
 		const a = new Broker({ agentDir: dir });
