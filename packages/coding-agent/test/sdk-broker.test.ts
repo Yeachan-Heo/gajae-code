@@ -49,6 +49,7 @@ import {
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 import * as processIncarnation from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
@@ -1823,7 +1824,6 @@ describe("SDK broker identity and discovery", () => {
 	it("reclaims a broker lock whose live PID has a different incarnation", async () => {
 		const dir = await temp();
 		const lock = path.join(dir, "sdk", "broker.lock");
-		const { brokerLockHostIdentity } = await import("../src/sdk/broker/lock-host-identity");
 		const hostIdentity = await brokerLockHostIdentity(dir);
 		const currentIncarnation = processIncarnation.processIncarnation(process.pid);
 		if (!currentIncarnation) throw new Error("Current process incarnation is unavailable");
@@ -1887,7 +1887,6 @@ describe("SDK broker identity and discovery", () => {
 	it("keeps a broker lock when its live owner's PID and incarnation match", async () => {
 		const dir = await temp();
 		const lock = path.join(dir, "sdk", "broker.lock");
-		const { brokerLockHostIdentity } = await import("../src/sdk/broker/lock-host-identity");
 		const hostIdentity = await brokerLockHostIdentity(dir);
 		const incarnation = processIncarnation.processIncarnation(process.pid);
 		if (!incarnation) throw new Error("Current process incarnation is unavailable");
