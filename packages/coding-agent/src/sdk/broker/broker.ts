@@ -4001,10 +4001,18 @@ export class Broker {
 					current.identity === snapshot.identity &&
 					isBrokerLockOwnerAlive(current, hostIdentity.ownerHostId)
 				) {
+					const hostUnqualified = current.ownerHostId === undefined;
+					const refusal = hostUnqualified
+						? `owner pid ${current.pid} has no host identity; automatic recovery is unsafe for shared agent directories. Stop every broker using this agent directory on all hosts, then follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`
+						: `live pid ${current.pid} has published no discovery record`;
 					logger.warn(
-						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by live pid ${current.pid} that published no discovery record`,
+						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by ${refusal}`,
 					);
-					throw new Error(`Broker lock is held by a live owner (pid ${current.pid})`);
+					throw new Error(
+						hostUnqualified
+							? `Broker lock owner is host-unqualified (pid ${current.pid}); refusing automatic recovery because its host cannot be verified. Stop every broker using this agent directory on all hosts and follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`
+							: `Broker lock is held by a live owner (pid ${current.pid})`,
+					);
 				}
 				continue;
 			}

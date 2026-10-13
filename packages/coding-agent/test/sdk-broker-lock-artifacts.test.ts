@@ -546,7 +546,7 @@ describe("broker lock owner incarnation", () => {
 		const original = await Bun.file(record).text();
 		const broker = new Broker({ agentDir });
 		try {
-			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is host-unqualified");
 			expect(await Bun.file(record).text()).toBe(original);
 			expect(broker.ownsDiscovery).toBe(false);
 		} finally {
@@ -564,7 +564,9 @@ describe("broker lock owner incarnation", () => {
 		const original = await Bun.file(record).text();
 		const broker = new Broker({ agentDir });
 		try {
-			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${pid})`);
+			await expect(broker.start()).rejects.toThrow(
+				`Broker lock owner is host-unqualified (pid ${pid}); refusing automatic recovery because its host cannot be verified. Stop every broker using this agent directory on all hosts and follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`,
+			);
 			expect(await Bun.file(record).text()).toBe(original);
 			expect(broker.ownsDiscovery).toBe(false);
 		} finally {
@@ -693,7 +695,7 @@ describe("broker clean-exit lock contention diagnostics", () => {
 		});
 	});
 
-	it("warns with the holding pid before refusing a lock held by a live owner", async () => {
+	it("warns with the recovery procedure before refusing a host-unqualified lock", async () => {
 		const agentDir = await makeAgentDir();
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const lock = path.join(agentDir, "sdk", "broker.lock");
@@ -705,14 +707,15 @@ describe("broker clean-exit lock contention diagnostics", () => {
 
 		const broker = new Broker({ agentDir });
 
-		await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+		await expect(broker.start()).rejects.toThrow("Broker lock owner is host-unqualified");
 
 		const refusals = warn.mock.calls
 			.map(call => String(call[0]))
 			.filter(message => message.includes("lock contention"));
 		expect(refusals).toHaveLength(1);
 		expect(refusals[0]).toContain("refusing to start");
-		expect(refusals[0]).toContain(`live pid ${process.pid}`);
+		expect(refusals[0]).toContain(`owner pid ${process.pid} has no host identity`);
+		expect(refusals[0]).toContain("#recovering-legacy-broker-locks");
 	});
 });
 

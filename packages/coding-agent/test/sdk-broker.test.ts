@@ -1859,10 +1859,17 @@ describe("SDK broker identity and discovery", () => {
 	it("refuses concurrent launches when a live lock owner has not published discovery", async () => {
 		const dir = await temp();
 		const lock = path.join(dir, "sdk", "broker.lock");
+		const { ownerHostId } = await brokerLockHostIdentity(dir);
 		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(lock, "owner.json"),
-			JSON.stringify({ version: 1, ownerId: "live-unpublished-owner", pid: process.pid, acquiredAt: Date.now() }),
+			JSON.stringify({
+				version: 1,
+				ownerId: "live-unpublished-owner",
+				pid: process.pid,
+				ownerHostId,
+				acquiredAt: Date.now(),
+			}),
 			{ mode: 0o600 },
 		);
 		const contenders = Array.from({ length: 3 }, () => new Broker({ agentDir: dir }));
@@ -1967,7 +1974,7 @@ describe("SDK broker identity and discovery", () => {
 		);
 		const broker = new Broker({ agentDir: dir });
 		try {
-			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is host-unqualified");
 			// Lock should NOT have been reclaimed despite incarnation mismatch
 			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
 				ownerId: "legacy-unqualified-owner",
