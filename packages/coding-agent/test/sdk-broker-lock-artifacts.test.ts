@@ -39,14 +39,18 @@ async function ageTo(target: string, ageMs: number, now: number): Promise<void> 
 async function writeArtifact(
 	agentDir: string,
 	name: string,
-	owner: { pid: number; incarnation?: string; ownerHostId?: string } | "no-record" | "unparseable",
+	owner: { pid: number; incarnation?: string; ownerHostId?: string | null } | "no-record" | "unparseable",
 	ageMs: number,
 	now: number,
 ): Promise<string> {
 	const target = path.join(agentDir, "sdk", name);
 	await fs.mkdir(target, { recursive: true, mode: 0o700 });
 	if (owner === "unparseable") await Bun.write(path.join(target, "owner.json"), "{not json");
-	else if (owner !== "no-record")
+	else if (owner !== "no-record") {
+		const ownerHostId =
+			owner.ownerHostId === undefined
+				? (await brokerLockHostIdentity(agentDir)).ownerHostId
+				: (owner.ownerHostId ?? undefined);
 		await Bun.write(
 			path.join(target, "owner.json"),
 			JSON.stringify({
@@ -54,10 +58,11 @@ async function writeArtifact(
 				ownerId: "owner-a",
 				pid: owner.pid,
 				...(owner.incarnation === undefined ? {} : { incarnation: owner.incarnation }),
-				...(owner.ownerHostId === undefined ? {} : { ownerHostId: owner.ownerHostId }),
+				...(ownerHostId === undefined ? {} : { ownerHostId }),
 				acquiredAt: now - ageMs,
 			}),
 		);
+	}
 	await ageTo(target, ageMs, now);
 	return target;
 }
@@ -149,7 +154,8 @@ describe("broker lock artifact reaper", () => {
 
 	it.each([
 		["a foreign host", "some-foreign-host", (): boolean => false],
-		["no host (legacy)", undefined, (): boolean => true],
+		["a host-unqualified legacy owner with a live PID", undefined, (): boolean => true],
+		["a host-unqualified legacy owner with a locally absent PID", undefined, (): boolean => false],
 	] as const)("retains an aged tombstone owned by %s despite PID evidence", async (_label, ownerHostId, alive) => {
 		const now = Date.now();
 		const agentDir = await makeAgentDir();
@@ -159,7 +165,7 @@ describe("broker lock artifact reaper", () => {
 		const tombstone = await writeArtifact(
 			agentDir,
 			".broker.lock.stale-host-qualified",
-			{ pid: process.pid, incarnation: previousIncarnation, ...(ownerHostId ? { ownerHostId } : {}) },
+			{ pid: process.pid, incarnation: previousIncarnation, ownerHostId: ownerHostId ?? null },
 			30 * HOUR_MS,
 			now,
 		);
@@ -541,6 +547,24 @@ describe("broker lock owner incarnation", () => {
 		const broker = new Broker({ agentDir });
 		try {
 			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			expect(await Bun.file(record).text()).toBe(original);
+			expect(broker.ownsDiscovery).toBe(false);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("does not reclaim a host-unqualified lock from a locally absent PID", async () => {
+		const agentDir = await makeAgentDir();
+		const pid = 2_147_483_646;
+		const record = await writeOwner(agentDir, differentIncarnation(currentIncarnation()), {
+			ownerHostId: null,
+			pid,
+		});
+		const original = await Bun.file(record).text();
+		const broker = new Broker({ agentDir });
+		try {
+			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${pid})`);
 			expect(await Bun.file(record).text()).toBe(original);
 			expect(broker.ownsDiscovery).toBe(false);
 		} finally {

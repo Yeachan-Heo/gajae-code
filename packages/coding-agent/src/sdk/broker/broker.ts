@@ -1184,13 +1184,13 @@ function isBrokerLockOwnerAlive(
 	pidAlive: (pid: number) => boolean = isPidAlive,
 	readProcessIncarnation: (pid: number) => string | undefined = brokerProcessIncarnation,
 ): boolean {
-	// This host's process table says nothing about another host's owner: neither a dead nor a
-	// recycled local PID proves it is gone, so a foreign (or unverifiable) owner is never reclaimed.
-	if (snapshot.ownerHostId !== undefined && snapshot.ownerHostId !== currentHostId) return true;
-	if (snapshot.pid <= 0 || !pidAlive(snapshot.pid)) return false;
-	// A live PID is retained unless this host recorded the owner and its incarnation proves reuse.
-	// Host-unqualified (legacy) owners and missing incarnation evidence remain fail-closed.
-	if (snapshot.ownerHostId === undefined || !snapshot.incarnation) return true;
+	if (snapshot.pid <= 0) return false;
+	// Local PID evidence is meaningful only when the owner record identifies this host.
+	// Foreign and legacy host-unqualified owners are never reclaimed from this process table.
+	if (snapshot.ownerHostId === undefined || snapshot.ownerHostId !== currentHostId) return true;
+	if (!pidAlive(snapshot.pid)) return false;
+	// A live PID is retained unless its recorded incarnation proves reuse.
+	if (!snapshot.incarnation) return true;
 	const incarnation = readProcessIncarnation(snapshot.pid);
 	return !incarnation || incarnation === snapshot.incarnation;
 }
