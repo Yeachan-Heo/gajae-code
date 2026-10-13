@@ -597,7 +597,9 @@ test("ACP lifecycle stops after one uncertain replay and preserves the original 
 	try {
 		await expect(adapter.global("session.create", { cwd: "/workspace" }, "exhaustion-key")).rejects.toBe(original);
 		expect(sdk.frames).toHaveLength(2);
-		expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+		expect(sdk.frames[1]).toEqual({ ...sdk.frames[0], timeoutMs: expect.any(Number) });
+		expect(sdk.frames[1]?.timeoutMs).toBeLessThanOrEqual(sdk.frames[0]?.timeoutMs as number);
+		expect(sdk.frames[1]?.timeoutMs).toBeGreaterThan(0);
 	} finally {
 		await adapter.close();
 	}
@@ -708,7 +710,11 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 	let closes = 0;
 	sdk.global = async (operation, input, options) => {
 		sdk.frames.push({ type: "broker_request", operation, input, ...options });
-		if (sdk.frames.length === 1) throw original;
+		if (sdk.frames.length === 1) {
+			// Spend some of the original budget before the uncertain replay.
+			await Bun.sleep(10);
+			throw original;
+		}
 		return await acknowledgment.promise;
 	};
 	sdk.close = async () => {
@@ -728,7 +734,9 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 		expect(await failure).toBe(original);
 		expect(closes).toBe(1);
 		expect(sdk.frames).toHaveLength(2);
-		expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+		expect(sdk.frames[1]).toEqual({ ...sdk.frames[0], timeoutMs: expect.any(Number) });
+		expect(sdk.frames[1]?.timeoutMs).toBeLessThan(sdk.frames[0]?.timeoutMs as number);
+		expect(sdk.frames[1]?.timeoutMs).toBeGreaterThan(0);
 		expect(sdk.listeners.size).toBe(0);
 		expect(sdk.reconnectListeners.size).toBe(0);
 		expect(sdk.reconnectFailedListeners.size).toBe(0);
