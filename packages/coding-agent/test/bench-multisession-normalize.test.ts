@@ -369,6 +369,52 @@ describe("multi-session evidence normalizer", () => {
 		expect(normalizeEvidenceValue("the local time is 09:21", "/tmp/a")).toBe("the local time is 09:21");
 	});
 
+	test("keeps an extra clock-only reminder and prompt-prefix counts significant", async () => {
+		tempDir = TempDir.createSync("@bench-multisession-normalize-clock-copy-");
+		const left = fixturePaths("left");
+		const right = fixturePaths("right");
+		const writeClockEvidence = async (fixture: { evidence: string; root: string }, extraReminder: boolean) => {
+			await writeEvidence(fixture.evidence, fixture.root, (stream, record) => {
+				if (stream === "requests.jsonl") {
+					const reminder = (time: string) => ({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `<system-reminder>\nToday is 2026-01-01 (Thu), the local time is ${time} UTC+00:00 (UTC), and the current working directory is '${fixture.root}/project'.\n</system-reminder>`,
+							},
+						],
+					});
+					record.context = {
+						messages: [reminder("12:00"), ...(extraReminder ? [reminder("12:01")] : [])],
+					};
+				}
+				if (stream === "transcript.jsonl" && record.type === "message") {
+					const message = record.message as Record<string, unknown>;
+					if (message.role === "assistant") {
+						message.promptPrefix = {
+							hash: "prefix-one",
+							messages: extraReminder ? 2 : 1,
+							previousMessages: extraReminder ? 2 : 1,
+							reusedMessages: extraReminder ? 2 : 1,
+						};
+					}
+				}
+			});
+		};
+		await Promise.all([writeClockEvidence(left, false), writeClockEvidence(right, true)]);
+		await expect(compareEvidence(left.evidence, right.evidence)).resolves.toEqual({
+			equal: false,
+			diffs: [
+				"transcript.jsonl[2].message.promptPrefix.messages",
+				"transcript.jsonl[2].message.promptPrefix.previousMessages",
+				"transcript.jsonl[2].message.promptPrefix.reusedMessages",
+				"requests.jsonl[0].context.messages.length",
+				"requests.jsonl[0].context.messages[1]",
+			],
+		});
+	});
+
 	test("normalizes a home-abbreviated root in the reminder cwd, and nothing outside the root", () => {
 		const reminder = (cwd: string) =>
 			`<system-reminder>\nToday is 2026-10-04 (Sun), the local time is 20:58 UTC+09:00 (Asia/Seoul), and the current working directory is '${cwd}'.\n</system-reminder>`;

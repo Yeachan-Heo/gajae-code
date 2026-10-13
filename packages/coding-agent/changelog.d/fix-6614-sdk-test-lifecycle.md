@@ -5,3 +5,4 @@
 - Synchronize startup-continuation cancellation with actual provider admission instead of scheduler-dependent polling.
 - Scope ACP progress-test prompt failures to their owning invocation so background reverse-provider registration remains available.
 - Keep ACP replay regressions strict about request identity and absolute deadlines while accounting for time already spent from the caller budget.
+- Stabilize the benchmark reproducibility fixture's rendered clock input without discarding extra context messages or changing runtime timers.
