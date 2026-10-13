@@ -268,6 +268,14 @@ function removeTasks(phases: TodoPhase[], entry: TodoOpEntryValue, errors: strin
 	return phases;
 }
 
+/** Type of a value that was expected to be a string, with its article. */
+function describeArgument(value: unknown): string {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "an array";
+	if (typeof value === "object") return "an object";
+	return `a ${typeof value}`;
+}
+
 function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string[]): TodoPhase[] {
 	switch (entry.op) {
 		case "init":
@@ -302,6 +310,16 @@ function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string
 		case "note": {
 			const hit = resolveTaskOrError(phases, entry.task, errors);
 			if (!hit) return phases;
+			// The schema types `text`, but bridges and replays reach `execute` without
+			// raw validation, and `.replace` on a non-string body used to crash the
+			// call. Reject it with a correction instead of storing it.
+			if (entry.text !== undefined && typeof entry.text !== "string") {
+				errors.push(
+					`Note text must be a string; got ${describeArgument(entry.text)}. ` +
+						'Pass the note body as "text", for example { op: "note", task: "<task content>", text: "why" }.',
+				);
+				return phases;
+			}
 			const text = (entry.text ?? "").replace(/\s+$/u, "");
 			if (!text) {
 				errors.push("Missing text for note operation");
@@ -337,6 +355,26 @@ export function applyOpsToPhases(
 // Markdown round-trip
 // =============================================================================
 
+/**
+ * Notes are declared as `string[]`, but the array is only typed, never validated:
+ * a session persisted elsewhere or a bridged caller that reached `execute`
+ * without raw validation can hand over any element, and every render path splits
+ * each note on newlines. One non-string element used to crash the call with a
+ * minified `.split is not a function` TypeError instead of a tool result. String
+ * notes render exactly as before.
+ */
+function noteDisplayText(note: unknown): string {
+	if (typeof note === "string") return note;
+	if (note !== null && typeof note === "object") {
+		try {
+			return JSON.stringify(note) ?? "[unrenderable note]";
+		} catch {
+			return "[unrenderable note]";
+		}
+	}
+	return String(note);
+}
+
 const STATUS_TO_MARKER: Record<TodoStatus, string> = {
 	pending: " ",
 	in_progress: "/",
@@ -356,7 +394,7 @@ export function phasesToMarkdown(phases: TodoPhase[]): string {
 			if (task.notes && task.notes.length > 0) {
 				for (let j = 0; j < task.notes.length; j++) {
 					if (j > 0) out.push("  >");
-					for (const noteLine of task.notes[j].split("\n")) {
+					for (const noteLine of noteDisplayText(task.notes[j]).split("\n")) {
 						out.push(noteLine === "" ? "  >" : `  > ${noteLine}`);
 					}
 				}
@@ -504,7 +542,7 @@ function formatSummary(phases: TodoPhase[], errors: string[]): string {
 			if (task.status === "in_progress" && task.notes && task.notes.length > 0) {
 				for (let j = 0; j < task.notes.length; j++) {
 					if (j > 0) lines.push("        ---");
-					for (const noteLine of task.notes[j].split("\n")) {
+					for (const noteLine of noteDisplayText(task.notes[j]).split("\n")) {
 						lines.push(`        ${noteLine}`);
 					}
 				}
@@ -685,7 +723,7 @@ function renderNoteAttachments(phases: TodoPhase[], uiTheme: Theme): string[] {
 			lines.push(`  ${title}`);
 			for (let j = 0; j < task.notes.length; j++) {
 				if (j > 0) lines.push(`  ${bar}`);
-				for (const noteLine of task.notes[j].split("\n")) {
+				for (const noteLine of noteDisplayText(task.notes[j]).split("\n")) {
 					lines.push(`  ${bar} ${uiTheme.fg("dim", noteLine)}`);
 				}
 			}

@@ -12,6 +12,7 @@ import type {
 	ShellRunResult,
 } from "@gajae-code/natives";
 import { postmortem } from "@gajae-code/utils";
+import { projectDeclaredSpawnHookNames, stripProjectSpawnHooks } from "@gajae-code/utils/shell-config";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import {
@@ -91,6 +92,20 @@ let shellFactoryForTests: ShellFactory | undefined;
 
 export function setShellFactoryForTests(factory: ShellFactory | undefined): void {
 	shellFactoryForTests = factory;
+}
+
+function projectHookUnsetEnv(
+	unsetEnv: string[] | undefined,
+	env: Record<string, string> | undefined,
+	sessionEnv: Record<string, string>,
+): string[] | undefined {
+	// Keys present in `sessionEnv` (e.g. the trusted HOME replacement) already
+	// override the ambient import, so only shadow the ones it does not carry.
+	const hooks = projectDeclaredSpawnHookNames().filter(
+		name => !Object.hasOwn(env ?? {}, name) && !Object.hasOwn(sessionEnv, name),
+	);
+	if (hooks.length === 0) return unsetEnv;
+	return [...(unsetEnv ?? []), ...hooks.filter(name => !unsetEnv?.includes(name))];
 }
 
 async function createShell(
@@ -429,7 +444,11 @@ export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerO
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = options?.settings ?? (await Settings.init());
-	const { shell, env: shellEnv, prefix } = settings.getShellConfig();
+	const { shell, env: configEnv, prefix } = settings.getShellConfig();
+	// The shell config env is shared with other consumers (Python kernels keep
+	// their own documented allowlist). Only the bash tool's shell must not see
+	// project hook variables such as BASH_ENV or GIT_CONFIG_*.
+	const shellEnv = stripProjectSpawnHooks({ ...configEnv });
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
 	const snapshotPath =
 		!options?.disableShellSnapshot && shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;
@@ -580,7 +599,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			command: finalCommand,
 			cwd: commandCwd,
 			env: commandEnv,
-			unsetEnv: options?.unsetEnv,
+			// The native shell imports the host process environment before
+			// `sessionEnv`, and where it runs in-process (Windows) that environment
+			// holds the autoloaded project `.env`. Shadow project hook variables per
+			// run unless this call sets them explicitly.
+			unsetEnv: projectHookUnsetEnv(options?.unsetEnv, options?.env, shellEnv),
 			timeoutMs: executionTimeoutMs,
 			signal: runAbortController.signal,
 		};

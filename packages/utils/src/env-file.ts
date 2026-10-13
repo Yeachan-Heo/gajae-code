@@ -165,6 +165,13 @@ export function parseEnvFileContent(content: string): Record<string, string> {
 export interface ProjectEnvSnapshot {
 	values: Record<string, string>;
 	dynamic: Set<string>;
+	/** True when at least one project dotenv layer could not be read safely. */
+	incomplete?: boolean;
+}
+
+export interface ProjectEnvSnapshotOptions {
+	/** Maximum bytes read from each dotenv layer; unsafe files mark the snapshot incomplete. */
+	maxFileBytes?: number;
 }
 
 /**
@@ -275,17 +282,63 @@ export function projectEnvLayerFiles(nodeEnv: string | undefined): string[] {
 	];
 }
 
-export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
+function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?: string; incomplete: boolean } {
+	let fileDescriptor: number | undefined;
+	try {
+		// Non-blocking open lets fstat reject FIFOs and device files before any read.
+		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+		const initialStat = fs.fstatSync(fileDescriptor);
+		if (!initialStat.isFile() || initialStat.size > maxFileBytes) return { incomplete: true };
+
+		const buffer = Buffer.allocUnsafe(maxFileBytes + 1);
+		let bytesRead = 0;
+		while (bytesRead < buffer.byteLength) {
+			const count = fs.readSync(fileDescriptor, buffer, bytesRead, buffer.byteLength - bytesRead, bytesRead);
+			if (count === 0) break;
+			bytesRead += count;
+		}
+		if (bytesRead > maxFileBytes || fs.fstatSync(fileDescriptor).size > maxFileBytes) {
+			return { incomplete: true };
+		}
+		return { content: buffer.subarray(0, bytesRead).toString("utf-8"), incomplete: false };
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+			return { incomplete: false };
+		}
+		return { incomplete: true };
+	} finally {
+		if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+	}
+}
+
+export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnapshotOptions = {}): ProjectEnvSnapshot {
+	if (
+		options.maxFileBytes !== undefined &&
+		(!Number.isSafeInteger(options.maxFileBytes) || options.maxFileBytes < 0)
+	) {
+		throw new RangeError("maxFileBytes must be a non-negative safe integer");
+	}
 	const files = projectEnvLayerFiles(process.env.NODE_ENV);
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
+	let incomplete = false;
 	for (const file of files) {
 		const filePath = path.join(cwd, file);
 		let content: string;
-		try {
-			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
-			continue;
+		if (options.maxFileBytes === undefined) {
+			try {
+				content = fs.readFileSync(filePath, "utf-8");
+			} catch {
+				continue;
+			}
+		} else {
+			const boundedRead = readBoundedEnvFile(filePath, options.maxFileBytes);
+			if (boundedRead.incomplete) {
+				incomplete = true;
+				continue;
+			}
+			if (boundedRead.content === undefined) continue;
+			content = boundedRead.content;
 		}
 		const quoted = quotedDeclarationKeys(content);
 		const seen = new Set<string>();
@@ -306,5 +359,5 @@ export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
 			dynamic.add(key);
 		}
 	}
-	return { values, dynamic };
+	return incomplete ? { values, dynamic, incomplete: true } : { values, dynamic };
 }

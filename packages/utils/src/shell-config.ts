@@ -1,6 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $credentialEnv, $pickCredentialEnv, $pickflag, filterProcessEnv } from "./env";
+import { canonicalEnvKey, getTrustedHomeDir } from "./dirs";
+import {
+	$credentialEnv,
+	$inheritedEnv,
+	$pickCredentialEnv,
+	$pickflag,
+	filterProcessEnv,
+	startupProjectEnvSnapshot,
+} from "./env";
 import { $which } from "./which";
 
 export interface ShellConfig {
@@ -35,6 +43,92 @@ function isExecutable(path: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Variables that make the shell, Bun, or git run code on their own. Bun's
+ * `BUN_OPTIONS` can preload code before a source-mode worker entrypoint; bash
+ * sources `BASH_ENV` (sh: `ENV`) before every non-interactive command, and zsh
+ * sources `$ZDOTDIR/.zshenv`. git applies `GIT_CONFIG_*`, reads config from
+ * `GIT_DIR`/`GIT_COMMON_DIR`, `$XDG_CONFIG_HOME/git/config` and `$HOME/.gitconfig`;
+ * on Windows it can also derive its home from `USERPROFILE`, `HOMEDRIVE` and
+ * `HOMEPATH`. It runs e.g. `core.fsmonitor` during `git status` and helpers from
+ * `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND` for `git://` remotes,
+ * `GIT_EXTERNAL_DIFF`, `GIT_SSH(_COMMAND)`, `GIT_ASKPASS` (auth prompts, even
+ * with `GIT_TERMINAL_PROMPT=0`) and `GIT_SEQUENCE_EDITOR` (`git rebase -i`).
+ * `GIT_TEMPLATE_DIR` can also seed executable hooks when `git init` creates a
+ * repository. A repository `.env` must not be able to set them, or bash tool
+ * commands could execute repository code.
+ */
+const PROJECT_DENIED_SPAWN_ENV =
+	/^(?:BASH_ENV|BUN_OPTIONS|ENV|ZDOTDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|GIT_PROXY_COMMAND|GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|GIT_SEQUENCE_EDITOR|GIT_TEMPLATE_DIR|GIT_CONFIG_(?:COUNT|PARAMETERS|GLOBAL|SYSTEM|KEY_\d+|VALUE_\d+))$/;
+const PROJECT_HOME_SPAWN_ENV = new Set(["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
+
+/**
+ * Names of hook-capable variables whose live value came from the project `.env`.
+ *
+ * Provenance comes from `$inheritedEnv`, the same launch snapshot that guards
+ * credentials: a value the launching shell exported with a different value than
+ * the project declaration is kept. Bun does not reveal which source supplied a
+ * value, so an inherited value the project repeats verbatim, or a key the project
+ * declares dynamically, is ambiguous and fails closed (dropped).
+ */
+export function projectDeclaredSpawnHookNames(env: Record<string, string | undefined> = Bun.env): string[] {
+	const snapshot = startupProjectEnvSnapshot();
+	const names: string[] = [];
+	for (const name of Object.keys(env)) {
+		const key = canonicalEnvKey(name);
+		const dynamic = snapshot.dynamic.has(key);
+		if (!PROJECT_DENIED_SPAWN_ENV.test(key) || (snapshot.values[key] === undefined && !dynamic)) continue;
+		if (env[name] === undefined || (!dynamic && $inheritedEnv(name) !== undefined)) continue;
+		names.push(name);
+	}
+	return names;
+}
+
+/** The account home GJC trusts, or undefined when none is trustworthy. */
+function trustedHome(): string | undefined {
+	try {
+		return getTrustedHomeDir();
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Remove project-declared hook variables from a spawn environment in place.
+ * If removing a home selector leaves `HOME` unset, provide the trusted account
+ * home when one exists rather than allowing a Windows profile fallback.
+ */
+export function stripProjectSpawnHooks(env: Record<string, string>): Record<string, string> {
+	const removed = projectDeclaredSpawnHookNames(env);
+	for (const name of removed) delete env[name];
+	const removedHomeSelector = removed.some(name => PROJECT_HOME_SPAWN_ENV.has(canonicalEnvKey(name)));
+	if ((env.HOME === undefined || env.HOME === "") && (process.platform !== "win32" || removedHomeSelector)) {
+		const home = trustedHome();
+		if (home !== undefined) env.HOME = home;
+		else delete env.HOME;
+	}
+	return env;
+}
+
+/**
+ * The process environment without project-declared hook variables, for spawning
+ * the bash tool's shell processes (isolated worker chain and PTY sessions).
+ */
+export function projectSafeSpawnEnv(): Record<string, string> {
+	return stripProjectSpawnHooks(filterProcessEnv(Bun.env));
+}
+
+/** Provide the trusted HOME override needed when PTY hook filtering removes a home selector. */
+export function projectSafeHomeOverride(explicit?: Record<string, string>): Record<string, string> {
+	if (Object.hasOwn(explicit ?? {}, "HOME")) return {};
+	const removesHomeSelector = projectDeclaredSpawnHookNames().some(
+		name => !Object.hasOwn(explicit ?? {}, name) && PROJECT_HOME_SPAWN_ENV.has(canonicalEnvKey(name)),
+	);
+	if (!removesHomeSelector) return {};
+	const home = projectSafeSpawnEnv().HOME;
+	return home === undefined ? {} : { HOME: home };
 }
 
 /**
