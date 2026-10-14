@@ -1,7 +1,13 @@
 import { afterEach, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { brokerDiscoveryPath, brokerProcessIncarnation, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import {
+	brokerDiscoveryPath,
+	brokerProcessIncarnation,
+	brokerRestartIntentPath,
+	readBrokerDiscovery,
+	readBrokerRestartIntent,
+} from "../src/sdk/broker/discovery";
 import { ensureBroker, SDK_BROKER_AUTOSTART_ENV } from "../src/sdk/broker/ensure";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -27,6 +33,8 @@ async function agentDir(): Promise<string> {
 function brokerRun(dir: string, extraEnv: Record<string, string> = {}): Bun.Subprocess<"ignore", "pipe", "pipe"> {
 	const env = { ...process.env, ...extraEnv };
 	delete env[SDK_BROKER_AUTOSTART_ENV];
+	delete env.GJC_BROKER_RESTART_REQUEST;
+	delete env.GJC_BROKER_RESTART_DEADLINE;
 	const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "sdk", "broker", "run", "--agent-dir", dir], {
 		stdin: "ignore",
 		stdout: "pipe",
@@ -76,6 +84,47 @@ it("serves in the foreground, refuses a second owner, and stops gracefully on SI
 	expect(await owner.exited).toBe(143);
 	expect(await readBrokerDiscovery(dir)).toBeNull();
 	expect(await fs.readFile(path.join(dir, "sdk", "broker.json"), "utf8").catch(() => null)).toBeNull();
+}, 90_000);
+
+it("refuses an untagged public run while a committed restart is active", async () => {
+	const dir = await agentDir();
+	const requestId = "public-run-restart-admission";
+	await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
+	await fs.writeFile(
+		brokerRestartIntentPath(dir),
+		JSON.stringify({ phase: "committed", requestId, expiresAt: Date.now() + 30_000, lease: "committed-lease" }),
+	);
+	expect(await readBrokerDiscovery(dir)).toBeNull();
+	expect(await readBrokerRestartIntent(dir)).toMatchObject({ phase: "committed", requestId });
+
+	const run = brokerRun(dir);
+	const deadline = Date.now() + 30_000;
+	let outcome:
+		| { kind: "published"; restartRequestId?: string }
+		| { kind: "exited"; exitCode: number }
+		| { kind: "timeout" };
+	for (;;) {
+		const current = await readBrokerDiscovery(dir);
+		if (current) {
+			outcome = { kind: "published", restartRequestId: current.restartRequestId };
+			break;
+		}
+		if (run.exitCode !== null) {
+			outcome = { kind: "exited", exitCode: run.exitCode };
+			break;
+		}
+		if (Date.now() >= deadline) {
+			outcome = { kind: "timeout" };
+			break;
+		}
+		await Bun.sleep(25);
+	}
+	expect(outcome).toEqual({ kind: "exited", exitCode: 1 });
+	if (outcome.kind !== "exited") return;
+	const stderr = await new Response(run.stderr).text();
+	expect(stderr).toContain('ERROR {"code":"operation_failed"');
+	expect(await readBrokerDiscovery(dir)).toBeNull();
+	expect(await readBrokerRestartIntent(dir)).toMatchObject({ phase: "committed", requestId });
 }, 90_000);
 
 it("stops gracefully on SIGINT with the SIGINT status", async () => {

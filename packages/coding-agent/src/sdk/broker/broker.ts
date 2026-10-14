@@ -119,7 +119,13 @@ import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from ".
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { isProcessIncarnation } from "./process-incarnation";
 import { sdkInternalRuntimeImage } from "./runtime";
-import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	SessionIndex,
+	type SessionList,
+	sessionIndexStartupLockOptions,
+} from "./session-index";
 import {
 	type ResolvedScopeV1,
 	resolveScopeRequest,
@@ -4070,7 +4076,26 @@ export class Broker {
 		await this.#reapLockArtifacts();
 		try {
 			this.#throwIfStartupAborted();
-			await this.index.open();
+			// Recheck under the broker ownership lock: a restart can be committed while
+			// an ordinary startup is waiting to acquire this lock.
+			const restartIntent = await readBrokerRestartIntent(this.settings.agentDir);
+			const activeCommittedIntent =
+				restartIntent?.phase === "committed" && restartIntent.expiresAt > Date.now() ? restartIntent : undefined;
+			if (
+				this.settings.restartRequestId === undefined
+					? activeCommittedIntent !== undefined
+					: activeCommittedIntent?.requestId !== this.settings.restartRequestId
+			)
+				throw new Error("A committed SDK broker restart is active; startup requires its exact request ID.");
+			await this.index.open(
+				this.#startupCheckpointDeadline === undefined
+					? undefined
+					: sessionIndexStartupLockOptions(
+							this.#startupCheckpointDeadline,
+							this.#startupAbortSignal,
+							this.settings.restartRequestId === undefined ? "ordinary" : "authorized-successor",
+						),
+			);
 			await this.ledger.open();
 			const brokerIdentityKey = await getBrokerIdentityKey(this.settings.agentDir);
 			this.#spawnAuthority = new SpawnAuthorityStore(this.settings.agentDir, brokerIdentityKey);

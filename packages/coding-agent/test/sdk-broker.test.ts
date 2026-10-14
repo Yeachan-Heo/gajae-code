@@ -27,6 +27,7 @@ import {
 } from "../src/sdk/broker/discovery";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
+	BROKER_DISCOVERY_BUDGET,
 	brokerOwnerForTest,
 	brokerSpawnEnvironmentForTest,
 	ensureBroker,
@@ -2096,47 +2097,51 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("terminates and reaps the spawned broker when discovery times out", async () => {
-		const dir = await temp();
-		// Force ensureBroker's discovery reads to never resolve a live record so the
-		// discovery wait is doomed from the start. The real broker still spawns and
-		// stays alive as a detached daemon, which is exactly the orphan path the reap
-		// must close. Capture its pid from the discovery file (bypassing the spy)
-		// before ensureBroker times out and reaps it.
-		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
-		try {
-			const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
-			void (async () => {
-				const deadline = Date.now() + 12_000;
-				while (Date.now() < deadline) {
-					try {
-						const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
-							pid?: number;
-						};
-						if (typeof raw.pid === "number") return onPid(raw.pid);
-					} catch {}
-					await sleep(25);
-				}
-				onPid(undefined);
-			})();
-			await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
-				"Timed out waiting for detached SDK broker discovery.",
-			);
-			const brokerPid = await gotPid;
-			// The spawned detached broker must have been terminated, not orphaned. The
-			// trampoline reparents it away from this process, so once killed it may stay
-			// an unreaped zombie of whichever subreaper adopted it; `kill(pid, 0)` still
-			// reports such a zombie as present. Process-identity observation classifies
-			// it as absent, which is the same authority the production reap path uses.
-			expect(typeof brokerPid).toBe("number");
-			expect(processIncarnation.observeProcessIncarnation(brokerPid!).status).toBe("absent");
-			// No owner handle leaked for the failed agent dir.
-			expect(brokerOwnerForTest(dir)).toBeUndefined();
-		} finally {
-			spy.mockRestore();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	}, 30_000);
+	it(
+		"terminates and reaps the spawned broker when discovery times out",
+		async () => {
+			const dir = await temp();
+			// Force ensureBroker's discovery reads to never resolve a live record so the
+			// discovery wait is doomed from the start. The real broker still spawns and
+			// stays alive as a detached daemon, which is exactly the orphan path the reap
+			// must close. Capture its pid from the discovery file (bypassing the spy)
+			// before ensureBroker times out and reaps it.
+			const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
+			try {
+				const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
+				void (async () => {
+					const deadline = Date.now() + 12_000;
+					while (Date.now() < deadline) {
+						try {
+							const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
+								pid?: number;
+							};
+							if (typeof raw.pid === "number") return onPid(raw.pid);
+						} catch {}
+						await sleep(25);
+					}
+					onPid(undefined);
+				})();
+				await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
+					"Timed out waiting for detached SDK broker discovery.",
+				);
+				const brokerPid = await gotPid;
+				// The spawned detached broker must have been terminated, not orphaned. The
+				// trampoline reparents it away from this process, so once killed it may stay
+				// an unreaped zombie of whichever subreaper adopted it; `kill(pid, 0)` still
+				// reports such a zombie as present. Process-identity observation classifies
+				// it as absent, which is the same authority the production reap path uses.
+				expect(typeof brokerPid).toBe("number");
+				expect(processIncarnation.observeProcessIncarnation(brokerPid!).status).toBe("absent");
+				// No owner handle leaked for the failed agent dir.
+				expect(brokerOwnerForTest(dir)).toBeUndefined();
+			} finally {
+				spy.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+		BROKER_DISCOVERY_BUDGET.discoveryMs + 5_000,
+	);
 	it("fails fast and reaps the spawned broker when it exits before discovery", async () => {
 		const dir = await temp();
 		// Plant an unsupported session-index snapshot so the spawned broker's start()
