@@ -242,11 +242,44 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(state.status).toBe("uncertain");
 		expect(state.uncertainCalls).toBeGreaterThan(0);
 		expect(manager.has(correlation)).toBe(true);
-		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(false);
 		manager.clearAll();
 	});
 
-	test("a recovered deadline prompt defers terminal frames without restored run evidence", () => {
+	test("an uncaptured real terminal reconciles after deadline uncertainty persistence", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		const recoveryStarted = Promise.withResolvers<void>();
+		const recoveryRelease = Promise.withResolvers<void>();
+		state.uncertainStarted = () => recoveryStarted.resolve();
+		state.uncertainRelease = recoveryRelease.promise;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			onDeadlineTerminalization: async () => "uncertain" as const,
+		});
+		const correlation = { commandId: "cmd-uncertainty-write-fence", turnId: "turn-uncertainty-write-fence" };
+		manager.onAccepted(correlation);
+		await recoveryStarted.promise;
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(false);
+		manager.noteTerminalTransition(
+			correlation,
+			undefined,
+			{ outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } },
+			manager.shouldDeferTerminalTransition(correlation),
+		);
+		recoveryRelease.resolve();
+		const terminalDeadline = Date.now() + 2_000;
+		while (!state.noteTransitionFrames.includes("agent_end") && Date.now() < terminalDeadline) await Bun.sleep(5);
+		expect(state.noteTransitionFrames).toContain("agent_end");
+		expect(state.status).toBe("terminal_ok");
+		expect(manager.has(correlation)).toBe(false);
+		expect(state.uncertainCalls).toBe(1);
+		manager.clearAll();
+	});
+
+	test("uncaptured recovered deadline uncertainty does not defer a real terminal", () => {
 		const { reconciliation } = fakeReconciliation();
 		const manager = new PromptDeadlineManager({
 			reconciliation: reconciliation as never,
@@ -257,10 +290,45 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		const acceptedAt = Date.now();
 		manager.recoverPending(correlation, acceptedAt, acceptedAt + 60_000);
 
-		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(false);
 		manager.onRunStarted(correlation);
 		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(false);
 		manager.clearAll();
+	});
+
+	test("an exact deadline-start capture preserves terminal deferral during expiry", async () => {
+		let now = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		const claimStarted = Promise.withResolvers<void>();
+		const claimRelease = Promise.withResolvers<void>();
+		state.claimStarted = claimStarted.resolve;
+		state.claimRelease = claimRelease.promise;
+		let cleanupCalls = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onDeadlineStarted: () => () => {
+				cleanupCalls += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-exact-deadline-capture", turnId: "turn-exact-deadline-capture" };
+		manager.onAccepted(correlation);
+		now = 20;
+		await claimStarted.promise;
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.noteTerminalTransition(
+			correlation,
+			undefined,
+			{ outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } },
+			true,
+		);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+		claimRelease.resolve();
+		expect(cleanupCalls).toBe(1);
 	});
 
 	test("a recovered run start keeps a captured terminal intent deferred", () => {
@@ -651,6 +719,7 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		now = 1_000;
 		await claimStarted.promise; // expiry is suspended inside claimPendingOutcome
 		expect(manager.isExpiring(correlation)).toBe(true);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(false);
 		// Fresh attributable progress renews the lease while the claim is in flight.
 		now = 2_000;
 		manager.onAttributableEvent(correlation, "tool_execution_start", now);

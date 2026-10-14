@@ -33,12 +33,14 @@ import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation"
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import {
 	createReconciliationStore,
+	type ReconciliationStore,
 	type ReconciliationStoreDocument,
 	reconciliationStorePath,
 } from "../bus/reconciliation-store";
 import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
+import { PromptImageUploadStore } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	type CreateSdkSessionRuntimeOptions,
@@ -4551,6 +4553,7 @@ interface PreflightHooks {
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	expectedSdkRunToken?: string;
 	preflightSignal?: AbortSignal;
+	queuedAtDispatch?: boolean;
 	onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 }
 
@@ -4563,6 +4566,8 @@ interface ResponseFrame {
 		status?: string;
 		commandId?: string;
 		turnId?: string;
+		id?: string;
+		accepted?: boolean;
 		error?: { code: string; message: string };
 	};
 }
@@ -4598,6 +4603,10 @@ async function invocationHarness(
 		invokeSkill?: (name: string, args?: string, options?: PreflightHooks) => Promise<unknown>;
 		abort?: () => void;
 		isIdle?: () => boolean;
+		/** Null omits authoritative transport liveness entirely. */
+		isConnectionOpen?: ((connectionId: string) => boolean) | null;
+		/** False omits transport disconnect notifications. */
+		connectionCloseNotifications?: boolean;
 		settings?: Settings;
 		/** Throw to inject a durable-write failure for matching transitions. */
 		persistInterceptor?: (transition: { type: string }) => void;
@@ -4673,34 +4682,61 @@ async function invocationHarness(
 			? { onInvocationCompletionReconciledForTests: hooks.onInvocationCompletionReconciled }
 			: {}),
 		...(hooks.settings ? { settings: hooks.settings } : {}),
-		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
-			sessionId: id,
-			stateRoot,
-			token,
-			onFrame(handler) {
-				deliver = handler;
-				deliveries.set(id, handler);
-				return () => {
-					if (deliver === handler) deliver = undefined;
-					if (deliveries.get(id) === handler) deliveries.delete(id);
-				};
-			},
-			sendFrame(_connectionId, frame) {
-				const response = frame as ResponseFrame;
-				const frames = sentFrames.get(id) ?? [];
-				frames.push(frame);
-				sentFrames.set(id, frames);
-				if (typeof response.id === "string") waiters.get(response.id)?.(response);
-			},
-			broadcastFrame(frame) {
-				// Interception precedes recording: a frame whose publication throws never
-				// reached the wire, so it must not appear in the observed broadcasts.
-				hooks.broadcastInterceptor?.(frame);
-				broadcasts.push(frame);
-			},
-			start: async () => ({ url: "ws://127.0.0.1:1" }),
-			stop: async () => {},
-		}),
+		createTransport: async ({ sessionId: id, stateRoot, token }) => {
+			let open = false;
+			let closeConnection: ((connectionId: string) => void) | undefined;
+			const openConnections = new Set<string>();
+			return {
+				sessionId: id,
+				stateRoot,
+				token,
+				...(hooks.isConnectionOpen === null ? {} : { isConnectionOpen: hooks.isConnectionOpen ?? (() => open) }),
+				...(hooks.connectionCloseNotifications === false
+					? {}
+					: {
+							onConnectionClose(handler) {
+								closeConnection = handler;
+								return () => {
+									if (closeConnection === handler) closeConnection = undefined;
+								};
+							},
+						}),
+				onFrame(handler) {
+					const receiveFrame = (connectionId: string, frame: SdkFrame): void => {
+						openConnections.add(connectionId);
+						handler(connectionId, frame);
+					};
+					deliver = receiveFrame;
+					deliveries.set(id, receiveFrame);
+					return () => {
+						if (deliver === receiveFrame) deliver = undefined;
+						if (deliveries.get(id) === receiveFrame) deliveries.delete(id);
+					};
+				},
+				sendFrame(_connectionId, frame) {
+					const response = frame as ResponseFrame;
+					const frames = sentFrames.get(id) ?? [];
+					frames.push(frame);
+					sentFrames.set(id, frames);
+					if (typeof response.id === "string") waiters.get(response.id)?.(response);
+				},
+				broadcastFrame(frame) {
+					// Interception precedes recording: a frame whose publication throws never
+					// reached the wire, so it must not appear in the observed broadcasts.
+					hooks.broadcastInterceptor?.(frame);
+					broadcasts.push(frame);
+				},
+				start: async () => {
+					open = true;
+					return { url: "ws://127.0.0.1:1" };
+				},
+				stop: async () => {
+					open = false;
+					for (const connectionId of openConnections) closeConnection?.(connectionId);
+					openConnections.clear();
+				},
+			};
+		},
 	});
 	const ctx = {
 		cwd,
@@ -5276,6 +5312,531 @@ test.each([
 		await harness?.stop();
 		await session?.dispose();
 		authStorage?.close();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+test("SDK-only transport without liveness omits image capabilities and dispatch but preserves direct prompts", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-no-image-liveness-"));
+	let harness: InvocationHarness | undefined;
+	try {
+		const sent: unknown[] = [];
+		harness = await invocationHarness("sdk-no-image-liveness", cwd, {
+			isConnectionOpen: null,
+			sendUserMessage: async (content, options) => {
+				sent.push(content);
+				await options?.onPreflightAcceptCommit?.();
+			},
+		});
+		const capabilities = await harness.query("runtime.capabilities", {});
+		expect(capabilities.ok).toBe(true);
+		const operations = (capabilities as unknown as { page: { items: Array<{ operations: string[] }> } }).page
+			.items[0]!.operations;
+		expect(operations).toContain("turn.prompt");
+		expect(operations.filter(operation => operation.startsWith("turn.image."))).toEqual([]);
+		for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"]) {
+			expect(await harness.control(operation, {})).toMatchObject({
+				ok: false,
+				error: { code: "operation_not_session_owned" },
+			});
+		}
+		expect(
+			await harness.control("turn.prompt", { text: "Unsupported", stagedImages: [{ id: "missing" }] }),
+		).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
+		expect(sent).toEqual([]);
+		expect(await harness.control("turn.prompt", { text: "Plain text" })).toMatchObject({ ok: true });
+		const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+		expect(
+			await harness.control("turn.prompt", {
+				text: "Direct image",
+				images: [{ type: "image", mimeType: "image/png", data }],
+			}),
+		).toMatchObject({ ok: true });
+		expect(sent).toEqual([
+			"Plain text",
+			[
+				{ type: "text", text: "Direct image" },
+				{ type: "image", mimeType: "image/png", data },
+			],
+		]);
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only transport without disconnect notifications omits staged-image controls", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-no-image-disconnect-notifications-"));
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("sdk-no-image-disconnect-notifications", cwd, {
+			isConnectionOpen: connectionId => connectionId !== "closed",
+			connectionCloseNotifications: false,
+		});
+		const capabilities = await harness.query("runtime.capabilities", {});
+		expect(capabilities.ok).toBe(true);
+		const operations = (capabilities as unknown as { page: { items: Array<{ operations: string[] }> } }).page
+			.items[0]!.operations;
+		expect(operations).toContain("turn.prompt");
+		expect(operations.filter(operation => operation.startsWith("turn.image."))).toEqual([]);
+		for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"])
+			expect(await harness.control(operation, {})).toMatchObject({
+				ok: false,
+				error: { code: "operation_not_session_owned" },
+			});
+		expect(
+			await harness.control("turn.prompt", { text: "Unsupported", stagedImages: [{ id: "missing" }] }),
+		).toMatchObject({ ok: false, error: { code: "operation_prohibited" } });
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only transport with liveness advertises image controls but rejects a closed staging owner", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-closed-image-owner-"));
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("sdk-closed-image-owner", cwd, {
+			isConnectionOpen: connectionId => connectionId !== "closed",
+		});
+		const capabilities = await harness.query("runtime.capabilities", {});
+		expect(capabilities.ok).toBe(true);
+		const operations = (capabilities as unknown as { page: { items: Array<{ operations: string[] }> } }).page
+			.items[0]!.operations;
+		for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"])
+			expect(operations).toContain(operation);
+		expect(
+			await harness.controlAs("closed", "turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: 5,
+				sha256: createHash("sha256").update("image").digest("hex"),
+			}),
+		).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only host retains accepted staged bytes until terminal and releases rejected images", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-staged-image-"));
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const releases: string[] = [];
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases.push("released");
+				reservation.release();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		const sent: unknown[] = [];
+		const queuedPromotions: Array<NonNullable<PreflightHooks["onQueuedPromoted"]>> = [];
+		const activeHarness = await invocationHarness("sdk-only-image-test", cwd, {
+			sendUserMessage: async (content, options) => {
+				sent.push(content);
+				if (options?.onQueuedPromoted) queuedPromotions.push(options.onQueuedPromoted);
+				await options?.onPreflightAcceptCommit?.();
+				await Promise.withResolvers<void>().promise;
+			},
+		});
+		harness = activeHarness;
+		const bytes = Buffer.from(
+			await Bun.file(new URL("../../../test/fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		expect(bytes.length).toBeGreaterThan(256 * 1024);
+		const digest = createHash("sha256").update(bytes).digest("hex");
+		const stage = async (): Promise<string> => {
+			const begun = await activeHarness.control("turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: bytes.length,
+				sha256: digest,
+			});
+			const id = begun.result?.id;
+			expect(begun.ok).toBe(true);
+			if (!id) throw new Error("Host did not return a staged image ID.");
+			expect(id).toMatch(/^[0-9a-f]{8}-/);
+			let sequence = 0;
+			for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+				const data = bytes.subarray(offset, offset + 96 * 1024).toString("base64");
+				expect(Buffer.byteLength(JSON.stringify({ id, sequence, data }))).toBeLessThan(256 * 1024);
+				expect((await activeHarness.control("turn.image.append", { id, sequence, data })).ok).toBe(true);
+				sequence++;
+			}
+			expect((await activeHarness.control("turn.image.finish", { id })).ok).toBe(true);
+			return id;
+		};
+		const id = await stage();
+		const accepted = await harness.control("turn.prompt", { text: "Read image", stagedImages: [{ id }] });
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toEqual([]);
+		expect((sent[0] as Array<{ type: string; data?: string; mimeType?: string }>)[1]).toEqual({
+			type: "image",
+			mimeType: "image/png",
+			data: bytes.toString("base64"),
+		});
+		const rejectedId = await stage();
+		expect(
+			await harness.control("turn.prompt", {
+				text: "Reject this",
+				stagedImages: [{ id: rejectedId }],
+				clientRef: " ",
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(releases).toHaveLength(1);
+		expect(sent).toHaveLength(1);
+		await harness.emit("agent_start", { type: "agent_start" });
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "Completed." }],
+		});
+		expect(releases).toHaveLength(2);
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "Completed." }],
+		});
+		expect(releases).toHaveLength(2);
+		const racedId = await stage();
+		const removed = await harness.control("turn.prompt", {
+			text: "Diverted after idle snapshot",
+			stagedImages: [{ id: racedId }],
+		});
+		expect(removed).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toHaveLength(2);
+		queuedPromotions[1]?.({ startsOwnRun: false, removed: true });
+		expect(
+			await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				commandId: removed.result?.commandId,
+				turnId: removed.result?.turnId,
+			}),
+		).toMatchObject({ status: "failed", error: { code: "cancelled" } });
+		expect(releases).toHaveLength(3);
+		await harness.stop();
+		harness = undefined;
+		expect(releases).toHaveLength(3);
+	} finally {
+		await harness?.stop();
+		redeemSpy.mockRestore();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test.each(["natural", "removed"] as const)("SDK-only staged diversion has a durable terminal (%s)", async mode => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-diverted-image-"));
+	let harness: InvocationHarness | undefined;
+	let promotion: PreflightHooks["onQueuedPromoted"];
+	try {
+		harness = await invocationHarness(`sdk-only-diverted-${mode}`, cwd, {
+			sendUserMessage: async (content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (Array.isArray(content)) {
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+					promotion = options?.onQueuedPromoted;
+					return;
+				}
+				await neverSettlingPromise();
+			},
+		});
+		const original = await harness.control("turn.prompt", { text: "original" });
+		expect(original.ok).toBe(true);
+		await harness.emit("agent_start");
+		const bytes = Buffer.from(
+			await Bun.file(new URL("../../../test/fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const begun = await harness.control("turn.image.begin", {
+			mimeType: "image/png",
+			byteLength: bytes.length,
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		});
+		expect(begun.ok).toBe(true);
+		const id = begun.result?.id;
+		let sequence = 0;
+		for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+			expect(
+				await harness.control("turn.image.append", {
+					id,
+					sequence: sequence++,
+					data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+				}),
+			).toMatchObject({ ok: true });
+		}
+		expect(await harness.control("turn.image.finish", { id })).toMatchObject({ ok: true });
+		const admitted = await harness.control("turn.prompt", { text: "joined image", stagedImages: [{ id }] });
+		expect(admitted).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = { commandId: admitted.result?.commandId, turnId: admitted.result?.turnId };
+		expect((await harness.query("turn.result", { kind: "prompt", ...correlation })).result?.status).toBe("accepted");
+		expect(promotion).toBeDefined();
+		promotion?.({ startsOwnRun: false, ...(mode === "removed" ? { removed: true } : {}) });
+		if (mode === "natural")
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "stop", content: "image done" }],
+			});
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...correlation })).toMatchObject(
+			mode === "natural" ? { status: "terminal_ok" } : { status: "failed", error: { code: "cancelled" } },
+		);
+		await harness.emit("agent_start");
+		await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: "unrelated" }] });
+		expect(
+			harness.broadcasts.filter(
+				frame =>
+					frame.type === "event" &&
+					frame.kind === "agent_end" &&
+					(frame.payload as { commandId?: string; turnId?: string } | undefined)?.commandId ===
+						correlation.commandId &&
+					(frame.payload as { commandId?: string; turnId?: string } | undefined)?.turnId === correlation.turnId,
+			),
+		).toHaveLength(1);
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"ordinary",
+	"terminal",
+] as const)("SDK-only %s abort cancels only its accepted image queue owner behind a real active AgentSession run", async mode => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-sdk-queued-image-${mode}-`));
+	const rootGate = Promise.withResolvers<void>();
+	const rootStarted = Promise.withResolvers<void>();
+	const failedRemovalWrite = Promise.withResolvers<void>();
+	const modelCalls: number[] = [];
+	let rootAbortCalls = 0;
+	let imagePreflightSignal: AbortSignal | undefined;
+	let harness: InvocationHarness | undefined;
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	try {
+		authStorage = await AuthStorage.create(path.join(cwd, "testauth.db"));
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					modelCalls.push(Date.now());
+					rootStarted.resolve();
+					await rootGate.promise;
+					return { content: ["B root completed"] };
+				},
+				() => {
+					modelCalls.push(Date.now());
+					return { content: ["unrelated queued steer completed"] };
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings,
+			modelRegistry,
+		});
+		const hooks: Parameters<typeof invocationHarness>[2] = {
+			isIdle: () => !session!.isStreaming,
+			abort: () => {
+				rootAbortCalls += 1;
+			},
+			sendUserMessage: (content, sendOptions) => {
+				if (
+					Array.isArray(content) &&
+					content.some(block => typeof block === "object" && block !== null && block.type === "image")
+				)
+					imagePreflightSignal = sendOptions?.preflightSignal;
+				return session!.sendUserMessage(content as never, sendOptions as never);
+			},
+			...(mode === "ordinary"
+				? {
+						persistInterceptor: transition => {
+							if (transition.type === "agent_failed") failedRemovalWrite.resolve();
+						},
+						agentFailedWriteFailures: 1,
+						onDurableAttempt: attempt => {
+							if (attempt.type === "agent_failed" && attempt.outcome === "rejected")
+								failedRemovalWrite.resolve();
+						},
+					}
+				: {
+						terminalAbortSeams: {
+							getTerminalTurnEpoch: () => (session?.isStreaming ? 17 : undefined),
+							getActivePromptHandle: () => (session?.isStreaming ? "B-root-handle" : undefined),
+							getActivePromptOwnerConnectionId: () => (session?.isStreaming ? "B" : undefined),
+							cancelPendingPreflightForTerminalAbort: () => {},
+							abortPromptAndWaitWithTerminal: async () => {
+								rootAbortCalls += 1;
+								return { status: "settled", terminalScope: {} };
+							},
+						},
+					}),
+		};
+		harness = await invocationHarness(`queued-image-${mode}`, cwd, hooks);
+		session.subscribe(async event => {
+			await harness?.emit(event.type, event);
+		});
+
+		const rootAccepted = await harness.controlAs("B", "turn.prompt", { text: "B owns the active root" });
+		expect(rootAccepted).toMatchObject({ ok: true, result: { accepted: true } });
+		await rootStarted.promise;
+		const keepQueued = await harness.controlAs("C", "turn.prompt", { text: "keep unrelated queue item" });
+		expect(keepQueued).toMatchObject({ ok: true, result: { accepted: true } });
+
+		const imageBytes = Buffer.from(
+			await Bun.file(new URL("../../../test/fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const begun = await harness.controlAs("A", "turn.image.begin", {
+			mimeType: "image/png",
+			byteLength: imageBytes.length,
+			sha256: createHash("sha256").update(imageBytes).digest("hex"),
+		});
+		const imageId = begun.result?.id;
+		expect(begun.ok).toBe(true);
+		if (typeof imageId !== "string") throw new Error("SDK host did not return a staged image ID.");
+		let sequence = 0;
+		for (let offset = 0; offset < imageBytes.length; offset += 96 * 1024) {
+			const data = imageBytes.subarray(offset, offset + 96 * 1024).toString("base64");
+			expect(
+				await harness.controlAs("A", "turn.image.append", { id: imageId, sequence: sequence++, data }),
+			).toMatchObject({ ok: true });
+		}
+		expect(await harness.controlAs("A", "turn.image.finish", { id: imageId })).toMatchObject({ ok: true });
+		const acceptedImage = await harness.controlAs("A", "turn.prompt", {
+			text: "cancel exact queued image",
+			stagedImages: [{ id: imageId }],
+		});
+		expect(acceptedImage).toMatchObject({ ok: true, result: { accepted: true } });
+		const imageCorrelation = {
+			commandId: acceptedImage.result?.commandId,
+			turnId: acceptedImage.result?.turnId,
+		};
+		expect(imagePreflightSignal).toBeInstanceOf(AbortSignal);
+		expect(imagePreflightSignal?.aborted).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual(["keep unrelated queue item", "cancel exact queued image"]);
+
+		let abortCompleted = false;
+		const abortRequest =
+			mode === "ordinary"
+				? harness.controlAs("A", "turn.abort", { mode: "turn" })
+				: harness.controlAs("A", "turn.abort", { mode: "terminal" }, `queued-image-${mode}-key`);
+		const observedAbort = abortRequest.then(response => {
+			abortCompleted = true;
+			return response;
+		});
+		if (mode === "ordinary") {
+			await failedRemovalWrite.promise;
+			await Bun.sleep(0);
+			expect(abortCompleted).toBe(false);
+		}
+		const abortResponse = await observedAbort;
+		if (mode === "ordinary") expect(abortResponse).toMatchObject({ ok: true, result: { aborted: true } });
+		else
+			expect(abortResponse).toMatchObject({
+				ok: true,
+				result: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+			});
+		expect(imagePreflightSignal?.aborted).toBe(true);
+		expect(rootAbortCalls).toBe(0);
+		expect(session.isStreaming).toBe(true);
+		expect(session.getQueuedMessages().steering).toEqual(["keep unrelated queue item"]);
+		expect(await settledStatus(harness, "turn.result", { kind: "prompt", ...imageCorrelation })).toMatchObject({
+			status: "failed",
+			error: { code: "cancelled" },
+		});
+		if (mode === "ordinary") {
+			const repeatedAbort = await harness.controlAs("A", "turn.abort", { mode: "turn" });
+			expect(repeatedAbort).toMatchObject({
+				ok: true,
+				result: { aborted: false, turn: "no_active_turn" },
+			});
+			expect(rootAbortCalls).toBe(0);
+			expect(session.isStreaming).toBe(true);
+			expect(session.getQueuedMessages().steering).toEqual(["keep unrelated queue item"]);
+		}
+
+		rootGate.resolve();
+		await session.waitForIdle();
+		const userMessages = session.agent.state.messages;
+		const hasUserText = (text: string): boolean =>
+			userMessages.some(message => {
+				if (message.role !== "user") return false;
+				return typeof message.content === "string"
+					? message.content === text
+					: message.content.some(block => block.type === "text" && block.text === text);
+			});
+		expect(hasUserText("keep unrelated queue item")).toBe(true);
+		expect(hasUserText("cancel exact queued image")).toBe(false);
+		expect(
+			userMessages.some(
+				message =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(block => block.type === "image" && block.data === imageBytes.toString("base64")),
+			),
+		).toBe(false);
+		expect(modelCalls).toHaveLength(2);
+		const correlatedTerminals = harness.broadcasts.filter(
+			frame =>
+				frame.type === "event" &&
+				frame.kind === "agent_end" &&
+				(frame.payload as { commandId?: string; turnId?: string } | undefined)?.commandId ===
+					imageCorrelation.commandId &&
+				(frame.payload as { commandId?: string; turnId?: string } | undefined)?.turnId === imageCorrelation.turnId,
+		);
+		expect(correlatedTerminals).toHaveLength(1);
+	} finally {
+		rootGate.resolve();
+		await session?.waitForIdle().catch(() => undefined);
+		await harness?.stop();
+		await session?.dispose();
+		authStorage?.close();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only ordinary abort selects its owned root ahead of same-connection queued input", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-owned-root-selection-"));
+	let harness: InvocationHarness | undefined;
+	let idle = true;
+	let rootAborts = 0;
+	let queuedSignal: AbortSignal | undefined;
+	let queuedPromotion: PreflightHooks["onQueuedPromoted"];
+	try {
+		harness = await invocationHarness("sdk-only-owned-root-selection", cwd, {
+			isIdle: () => idle,
+			abort: () => {
+				rootAborts++;
+			},
+			sendUserMessage: async (content, options) => {
+				await options?.onPreflightAcceptCommit?.();
+				if (content === "root") await neverSettlingPromise();
+				else {
+					queuedSignal = options?.preflightSignal;
+					queuedPromotion = options?.onQueuedPromoted;
+					options?.onDispatchDisposition?.({ startsOwnRun: false });
+				}
+			},
+		});
+		expect(await harness.control("turn.prompt", { text: "root" })).toMatchObject({ ok: true });
+		idle = false;
+		await harness.emit("agent_start");
+		expect(await harness.control("turn.prompt", { text: "queued for later" })).toMatchObject({ ok: true });
+		expect(queuedSignal?.aborted).toBe(false);
+		expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true, result: { aborted: true } });
+		expect(rootAborts).toBe(1);
+		expect(queuedSignal?.aborted).toBe(false);
+		queuedPromotion?.({ startsOwnRun: false, removed: true });
+	} finally {
+		await harness?.stop();
 		await rm(cwd, { recursive: true, force: true });
 	}
 });
@@ -8430,6 +8991,39 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
 			return payload?.commandId === correlation.commandId && payload?.turnId === correlation.turnId;
 		});
+	const observeDeadlineClaim = (
+		store: ReconciliationStore,
+	): { store: ReconciliationStore; committed: Promise<void> } => {
+		const committed = Promise.withResolvers<void>();
+		let startCommitted = false;
+		return {
+			committed: committed.promise,
+			store: {
+				...store,
+				transact: async mutator => {
+					const hadStartCommit = startCommitted;
+					let deadlineClaim = false;
+					let startedPrompt = false;
+					await store.transact(records => {
+						const updated = mutator(records);
+						startedPrompt = updated.some(record => record.kind === "prompt" && record.startedAt !== undefined);
+						deadlineClaim = updated.some(
+							record =>
+								record.kind === "prompt" &&
+								record.pendingOutcome?.kind === "failed" &&
+								record.pendingOutcome.code === "prompt_deadline_exceeded" &&
+								record.pendingOutcome.provenance === "deadline",
+						);
+						return updated;
+					});
+					if (startedPrompt) startCommitted = true;
+					// A queued START write can already contain later deadline intent.
+					// Require a later committed transaction, not that coalesced snapshot.
+					if (hadStartCommit && deadlineClaim) committed.resolve();
+				},
+			},
+		};
+	};
 
 	test("prompt agent_end waits for durable reconciliation before publication", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-prompt-terminal-durable-first-"));
@@ -8476,6 +9070,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 
 	test("a prompt deadline stays nonterminal when its dispatched tool cannot be fenced", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-deadline-tool-boundary-"));
+		const sessionId = "sdk-only-deadline-tool-boundary";
+		const sessionFile = path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`);
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		const { store: observedStore, committed: claimCommitted } = observeDeadlineClaim(store);
+		const started = Promise.withResolvers<void>();
 		const activeTools = new Set(["sdk-only-mutating-tool"]);
 		let boundaryWaitStarted = false;
 		const epoch = 23;
@@ -8483,7 +9082,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const pendingLedgerReads: string[] = [];
 		let harness: InvocationHarness | undefined;
 		try {
-			harness = await invocationHarness("sdk-only-deadline-tool-boundary", cwd, {
+			harness = await invocationHarness(sessionId, cwd, {
+				broadcastInterceptor: frame => {
+					if (frame.kind === "agent_start") started.resolve();
+				},
 				settings: {
 					get: (key: string) =>
 						key === "sdk.promptDeadlineMs" ? 250 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
@@ -8493,6 +9095,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					await neverSettlingPromise();
 				},
 				terminalAbortSeams: {
+					getReconciliationStore: () => observedStore,
 					getTerminalTurnEpoch: () => epoch,
 					getActivePromptHandle: () => "sdk-only-deadline-handle",
 					pendingToolExecutions: handle => {
@@ -8513,13 +9116,17 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const accepted = await harness.control("turn.prompt", { text: "sdk-only deadline" });
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			await harness.emit("agent_start");
+			const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
+			await harness.emit("agent_start", { sdkRunToken });
+			await started.promise;
 			await harness.emit("tool_execution_start", {
 				type: "tool_execution_start",
+				sdkRunToken,
 				toolCallId: "sdk-only-mutating-tool",
 				toolName: "apply_patch",
 				args: {},
 			});
+			await claimCommitted;
 			const boundaryWaitDeadline = Date.now() + 2_000;
 			while (!boundaryWaitStarted && Date.now() < boundaryWaitDeadline) await Bun.sleep(10);
 			expect(boundaryWaitStarted).toBe(true);
@@ -8557,6 +9164,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				);
 			},
 		});
+		const { store: observedStore, committed: claimCommitted } = observeDeadlineClaim(store);
 		const activeTools = new Set(["unfenced-tool"]);
 		const toolDrainObserved = Promise.withResolvers<void>();
 		const terminalPublication = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
@@ -8564,9 +9172,13 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
 		let boundaryWaitStarted = false;
 		let abortCalls = 0;
+		const started = Promise.withResolvers<void>();
 		let harness: InvocationHarness | undefined;
 		try {
 			harness = await invocationHarness(sessionId, cwd, {
+				broadcastInterceptor: frame => {
+					if (frame.kind === "agent_start") started.resolve();
+				},
 				settings: {
 					// This test covers deferred terminal recovery, not deadline-triggered worktree persistence.
 					get: (key: string) =>
@@ -8581,7 +9193,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					persistenceLog.push({ ...event, label });
 				},
 				terminalAbortSeams: {
-					getReconciliationStore: () => store,
+					getReconciliationStore: () => observedStore,
 					getTerminalTurnEpoch: () => 109,
 					getActivePromptHandle: () => "deadline-captured-uncertain-run",
 					onDeadlineRecoveryCheckpointForTests: checkpoint => {
@@ -8607,17 +9219,25 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const turnId = accepted.result?.turnId;
 			if (commandId === undefined || turnId === undefined) throw new Error("Expected prompt correlation");
 			const correlation = { commandId, turnId };
-			await harness.emit("agent_start");
+			const sdkRunToken = `${commandId}:${turnId}`;
+			await harness.emit("agent_start", { sdkRunToken });
+			await started.promise;
 			await harness.emit("tool_execution_start", {
 				type: "tool_execution_start",
+				sdkRunToken,
 				toolCallId: "unfenced-tool",
 				toolName: "apply_patch",
 				args: {},
 			});
+			// Boundary timing begins after the recovery claim reaches disk, not while fsync is pending.
+			await claimCommitted;
 			const waitDeadline = Date.now() + 2_000;
 			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
-			expect(boundaryWaitStarted).toBe(true);
-			await harness.emit("agent_end", { stopReason: "cancelled" });
+			expect(
+				boundaryWaitStarted,
+				JSON.stringify({ records: store.snapshot(), frames: correlatedFrames(harness, correlation) }),
+			).toBe(true);
+			await harness.emit("agent_end", { sdkRunToken, stopReason: "cancelled" });
 			await Bun.sleep(5_200);
 			expect(abortCalls).toBe(0);
 			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({ status: "in_flight" });
@@ -9118,6 +9738,103 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a real agent_end settles while expiry is reconciling without an exact run observation", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-uncaptured-real-end-"));
+		const claimEntered = Promise.withResolvers<void>();
+		const releaseClaim = Promise.withResolvers<void>();
+		const durableAttempts: Array<{
+			type: string | undefined;
+			commandId?: string;
+			turnId?: string;
+			outcome: "rejected" | "committed";
+		}> = [];
+		let harness: InvocationHarness | undefined;
+		let handleReads = 0;
+		let epochReads = 0;
+		let claimWasEntered = false;
+		const observationAttempted = Promise.withResolvers<void>();
+		try {
+			harness = await invocationHarness("deadline-uncaptured-real-end", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 0,
+				onDurableAttempt: attempt => durableAttempts.push(attempt),
+				persistHolds: [
+					{
+						type: "deadline_claim",
+						onEntered: () => {
+							claimWasEntered = true;
+							claimEntered.resolve();
+						},
+						release: releaseClaim.promise,
+					},
+				],
+				terminalAbortSeams: {
+					getActivePromptHandle: () => {
+						handleReads += 1;
+						observationAttempted.resolve();
+						return undefined;
+					},
+					getTerminalTurnEpoch: () => {
+						epochReads += 1;
+						return undefined;
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "complete during uncaptured expiry" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await claimEntered.promise;
+			expect(claimWasEntered).toBe(true);
+			await harness.emit("agent_start");
+			await observationAttempted.promise;
+			expect(handleReads).toBeGreaterThan(0);
+			expect(epochReads).toBeGreaterThan(0);
+
+			const ending = harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "stop", content: "actual real completion" }],
+			});
+			let endingSettled = false;
+			void ending.then(
+				() => (endingSettled = true),
+				() => (endingSettled = true),
+			);
+			await Bun.sleep(0);
+			expect(endingSettled).toBe(false);
+			expect((await harness.query("turn.prompt_status", correlation)).result?.status).toBe("in_flight");
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+			releaseClaim.resolve();
+			await ending;
+
+			const terminal = await settledStatus(harness, "turn.prompt_status", correlation);
+			expect(terminal).toMatchObject({
+				status: "terminal_ok",
+				content: { text: "actual real completion" },
+				outcome: { kind: "stopped" },
+			});
+			expect(terminal.error).toBeUndefined();
+			expect(
+				durableAttempts.filter(
+					attempt =>
+						attempt.type === "agent_end" &&
+						attempt.commandId === correlation.commandId &&
+						attempt.turnId === correlation.turnId &&
+						attempt.outcome === "committed",
+				),
+			).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
+		} finally {
+			releaseClaim.resolve();
+			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});

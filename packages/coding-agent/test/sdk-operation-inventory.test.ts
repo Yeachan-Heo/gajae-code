@@ -40,7 +40,7 @@ afterEach(async () => {
 
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
-		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
+		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(57);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(10);
 		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(31);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
@@ -147,6 +147,18 @@ describe("SDK operation inventory", () => {
 			[
 				"agent_session:abortPromptAndWait",
 				"internal SDK prompt-terminalization resource fence over a host-captured run handle, not an independent public SDK control seam",
+			],
+			[
+				"agent_session:getUserModelSelectionRevision",
+				"internal session-scoped model selection revision tracking behind the reviewed model.set seam, not an independent public SDK operation",
+			],
+			[
+				"agent_session:getUserCanonicalVariantSelection",
+				"internal session-scoped model variant selection state behind the reviewed model.set seam, not an independent public SDK operation",
+			],
+			[
+				"agent_session:markUserModelSelection",
+				"internal session-scoped model selection revision marker behind the reviewed model.set seam, not an independent public SDK operation",
 			],
 		]);
 		for (const [sourceId, rationale] of expected) {

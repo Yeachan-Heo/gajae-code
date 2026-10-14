@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import * as path from "node:path";
 import { BrokerWorkflowGateEmitter, FileGateStore } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { CURSOR_TTL_MS, CursorRegistry, cursorMac, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
 import { Q10ThinkingMetadataError } from "../src/sdk/models.js";
@@ -361,39 +361,72 @@ describe("SDK query pagination", () => {
 	}, 30000);
 
 	it("writes owner-private chunked spills atomically with bounded buffering", async () => {
-		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
-		const snapshotDir = join(stateRoot, "sdk", "snapshots", "s1");
+		const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-query-test-"));
+		const snapshotDir = path.join(stateRoot, "sdk", "snapshots", "s1");
 		const store = new RevisionStore("s1", Date.now, { storageDir: stateRoot });
 		const value = { body: "x".repeat(40 * 1024 * 1024) };
 		const revision = await store.createRevision("large", "id", value);
-		const objects = join(snapshotDir, "objects");
-		const manifests = join(snapshotDir, "manifests");
+		const objects = path.join(snapshotDir, "objects");
+		const manifests = path.join(snapshotDir, "manifests");
 		const files = await readdir(objects);
 		expect(files.length).toBeGreaterThan(1);
-		for (const file of files) expect((await stat(join(objects, file))).size).toBeLessThanOrEqual(4 * 1024 * 1024);
+		for (const file of files)
+			expect((await stat(path.join(objects, file))).size).toBeLessThanOrEqual(4 * 1024 * 1024);
 		const manifest = JSON.parse(
 			await readFile(
-				join(manifests, `${createHash("sha256").update(JSON.stringify(value)).digest("hex")}.json`),
+				path.join(manifests, `${createHash("sha256").update(JSON.stringify(value)).digest("hex")}.json`),
 				"utf8",
 			),
 		) as { chunks: { hash: string; length: number }[] };
 		expect(new Set(manifest.chunks.map(chunk => chunk.hash))).toEqual(new Set(files));
 		expect(manifest.chunks.every(chunk => chunk.length <= 4 * 1024 * 1024)).toBe(true);
 		expect(store.peakBufferedBytes).toBeLessThanOrEqual(8 * 1024 * 1024);
-		for (const entry of manifest.chunks) await expect(stat(join(objects, entry.hash))).resolves.toBeDefined();
+		for (const entry of manifest.chunks) await expect(stat(path.join(objects, entry.hash))).resolves.toBeDefined();
 		const page = await store.readStringRange("large", "id", revision, "body", 8 * 1024 * 1024, 256 * 1024);
 		expect(page).toMatchObject({ body: "x".repeat(256 * 1024), complete: false });
 		expect(store.peakReadBufferedBytes).toBeLessThanOrEqual(5 * 1024 * 1024);
 		if (process.platform !== "win32") {
 			expect((await stat(snapshotDir)).mode & 0o777).toBe(0o700);
-			expect((await stat(join(objects, files[0]!))).mode & 0o777).toBe(0o600);
+			expect((await stat(path.join(objects, files[0]!))).mode & 0o777).toBe(0o600);
 		}
 		await store.close();
 	});
 
+	it("reads relative-root spills and joins writes before removing only its snapshot child", async () => {
+		const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-query-relative-root-"));
+		const snapshotParent = path.join(stateRoot, "sdk", "snapshots");
+		const snapshotDir = path.join(snapshotParent, "relative-root");
+		const rootMarker = path.join(stateRoot, "root-marker");
+		const parentMarker = path.join(snapshotParent, "parent-marker");
+		const siblingMarker = path.join(snapshotParent, "sibling", "marker");
+		await Bun.write(rootMarker, "root survives");
+		await Bun.write(parentMarker, "parent survives");
+		await Bun.write(siblingMarker, "sibling survives");
+		const store = new RevisionStore("relative-root", Date.now, {
+			storageDir: path.relative(process.cwd(), stateRoot),
+		});
+		try {
+			const value = { body: "snapshot-".repeat(2 * 1024 * 1024) };
+			const revision = await store.createRevision("large", "id", value);
+			expect((await readdir(path.join(snapshotDir, "objects"))).length).toBeGreaterThan(1);
+			expect(await store.readRevision("large", "id", revision)).toEqual(value);
+			const write = store.createRevision("large", "pending", { body: "pending-".repeat(1024 * 1024) });
+			const close = store.close();
+			expect(await write).toBe("1");
+			await expect(close).resolves.toBeUndefined();
+			await expect(stat(snapshotDir)).rejects.toMatchObject({ code: "ENOENT" });
+			expect((await readdir(snapshotParent)).sort()).toEqual(["parent-marker", "sibling"]);
+			expect(await readFile(rootMarker, "utf8")).toBe("root survives");
+			expect(await readFile(parentMarker, "utf8")).toBe("parent survives");
+			expect(await readFile(siblingMarker, "utf8")).toBe("sibling survives");
+		} finally {
+			await store.close();
+		}
+	});
+
 	it("settles in-progress spill writes before terminal cleanup", async () => {
 		for (let index = 0; index < 3; index++) {
-			const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-close-race-"));
+			const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-query-close-race-"));
 			const store = new RevisionStore(`close-race-${index}`, Date.now, { storageDir: stateRoot });
 			const write = store.createRevision("large", "id", { body: "x".repeat(8 * 1024 * 1024) });
 			const close = store.close();
@@ -403,15 +436,15 @@ describe("SDK query pagination", () => {
 	});
 
 	it("splits large CJK and emoji snapshots at UTF-8 boundaries", async () => {
-		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
-		const snapshotDir = join(stateRoot, "sdk", "snapshots", "s1");
+		const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-query-test-"));
+		const snapshotDir = path.join(stateRoot, "sdk", "snapshots", "s1");
 		const body = "漢🙂".repeat(3 * 1024 * 1024);
 		const store = new RevisionStore("s1", Date.now, { storageDir: stateRoot });
 		const revision = await store.createRevision("large", "multibyte", { body });
-		const files = await readdir(join(snapshotDir, "objects"));
+		const files = await readdir(path.join(snapshotDir, "objects"));
 		expect(files.length).toBeGreaterThan(1);
 		for (const file of files) {
-			const chunk = await readFile(join(snapshotDir, "objects", file));
+			const chunk = await readFile(path.join(snapshotDir, "objects", file));
 			expect(chunk.length).toBeLessThanOrEqual(4 * 1024 * 1024);
 			expect(Buffer.from(chunk.toString("utf8"))).toEqual(chunk);
 		}
@@ -421,7 +454,7 @@ describe("SDK query pagination", () => {
 	});
 
 	it("reads a 40 MiB transcript body page from its indexed manifest range", async () => {
-		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
+		const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-query-test-"));
 		const body = "t".repeat(40 * 1024 * 1024);
 		const store = new RevisionStore("s1", Date.now, { storageDir: stateRoot });
 		const cursors = new CursorRegistry("token", store);
@@ -628,7 +661,7 @@ it("keeps random-sized paginated responses below the one MiB ceiling", async () 
 }, 30_000);
 
 it("describes an arbitrarily large indexed item from manifest metadata before reading its body", async () => {
-	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
+	const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-query-test-"));
 	const value = "x".repeat(40 * 1024 * 1024);
 	const store = new RevisionStore("s1", Date.now, { storageDir: stateRoot });
 	const cursors = new CursorRegistry("token", store);
@@ -680,7 +713,7 @@ it("streams an oversized root object as monotonic bounded canonical JSON ranges"
 });
 
 it("incrementally continues very large escaped emoji fields through bounded snapshot reads", async () => {
-	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
+	const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-query-test-"));
 	const reads: { start: number; end: number }[] = [];
 	const unit = `"\\${String.fromCharCode(0x08, 0x0c, 0x0a, 0x0d, 0x09, 0x00)}🙂`;
 	const body = unit.repeat(750_000);
@@ -725,8 +758,8 @@ it("incrementally continues very large escaped emoji fields through bounded snap
 }, 30_000);
 
 it("reconstructs Q12 workflow gate state after a client restart without reviving the orphaned gate", async () => {
-	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-q12-restart-"));
-	const storePath = join(stateRoot, "workflow-gates.json");
+	const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-q12-restart-"));
+	const storePath = path.join(stateRoot, "workflow-gates.json");
 	const first = new BrokerWorkflowGateEmitter("q12-session", new FileGateStore(storePath));
 	void first.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } });
 	const restarted = new BrokerWorkflowGateEmitter("q12-session", new FileGateStore(storePath));
@@ -759,8 +792,8 @@ it("reconstructs Q12 workflow gate state after a client restart without reviving
 });
 
 it("reports an accepted gate answer and its originating turn through Q12", async () => {
-	const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-q12-accepted-"));
-	const storePath = join(stateRoot, "workflow-gates.json");
+	const stateRoot = await mkdtemp(path.join(tmpdir(), "gjc-sdk-q12-accepted-"));
+	const storePath = path.join(stateRoot, "workflow-gates.json");
 	const emitter = new BrokerWorkflowGateEmitter("q12-accepted", new FileGateStore(storePath));
 	emitter.setRuntimeTurnProvider?.(() => "runtime-turn-5599");
 	const continuation = emitter.emitGate({

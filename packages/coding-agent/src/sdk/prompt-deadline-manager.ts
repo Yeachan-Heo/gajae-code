@@ -101,6 +101,8 @@ export class PromptDeadlineManager {
 	readonly #expiryRetries = new Map<string, number>();
 	readonly #uncertaintyRetries = new Map<string, number>();
 	readonly #uncertaintyRecoveryPending = new Set<string>();
+	readonly #uncertaintyRecoveryPersisted = new Set<string>();
+	readonly #uncertaintyRecoveryWrites = new Map<string, object>();
 	readonly #expiring = new Set<string>();
 	readonly #deadlineAttempts = new Set<string>();
 	/**
@@ -666,26 +668,47 @@ export class PromptDeadlineManager {
 			typeof this.#reconciliation.markUncertain !== "function"
 		)
 			return;
-		if (this.#uncertaintyRecoveryPending.has(key)) {
+		if (this.#uncertaintyRecoveryPending.has(key) && this.#uncertaintyRecoveryPersisted.has(key)) {
 			this.#expiring.delete(key);
 			this.#expiryRetries.delete(key);
 			this.#schedule(key);
 			return;
 		}
+		if (this.#uncertaintyRecoveryWrites.has(key)) return;
 		const attempts = (this.#uncertaintyRetries.get(key) ?? 0) + 1;
 		this.#uncertaintyRetries.set(key, attempts);
+		const recoveryWrite = {};
+		this.#uncertaintyRecoveryPending.add(key);
+		this.#uncertaintyRecoveryWrites.set(key, recoveryWrite);
 		void this.#reconciliation
 			.markUncertain(
 				"prompt",
 				correlation,
 				() => {
 					const current = this.#leases.get(key);
-					return current === lease && this.#now() >= promptDeadlineAt(current);
+					return (
+						this.#uncertaintyRecoveryWrites.get(key) === recoveryWrite &&
+						current === lease &&
+						current.generation === generation &&
+						this.#now() >= promptDeadlineAt(current)
+					);
 				},
 				lease.acceptedAt + lease.maxMs,
 			)
 			.then(() => {
+				if (this.#uncertaintyRecoveryWrites.get(key) !== recoveryWrite) return;
+				this.#uncertaintyRecoveryWrites.delete(key);
 				const current = this.#leases.get(key);
+				if (current !== lease) return;
+				if (current.generation !== generation || this.#now() < promptDeadlineAt(current)) {
+					this.#uncertaintyRecoveryPending.delete(key);
+					this.#uncertaintyRecoveryPersisted.delete(key);
+					this.#expiring.delete(key);
+					this.#expiryRetries.delete(key);
+					this.#schedule(key);
+					return;
+				}
+				this.#uncertaintyRecoveryPersisted.add(key);
 				if (current === lease && this.#now() >= lease.acceptedAt + lease.maxMs) {
 					// The acceptance-anchored hard maximum has expired. Keep the durable
 					// uncertainty owner, but retry at a bounded cadence instead of
@@ -719,11 +742,15 @@ export class PromptDeadlineManager {
 				}
 			})
 			.catch(() => {
+				if (this.#uncertaintyRecoveryWrites.get(key) !== recoveryWrite) return;
+				this.#uncertaintyRecoveryWrites.delete(key);
 				const current = this.#leases.get(key);
-				if (current !== lease || this.#now() < promptDeadlineAt(current)) {
+				if (current !== lease || current.generation !== generation || this.#now() < promptDeadlineAt(current)) {
 					// Validate authority before applying the exhaustion branch too. A stale
 					// third rejection must not mark or reschedule a renewed/replacement
 					// lease's recovery state.
+					if (current === lease && !this.#uncertaintyRecoveryPersisted.has(key))
+						this.#uncertaintyRecoveryPending.delete(key);
 					this.#expiring.delete(key);
 					this.#expiryRetries.delete(key);
 					if (current) this.#schedule(key);
@@ -780,6 +807,8 @@ export class PromptDeadlineManager {
 			!this.#deadlineDeferredTerminalTransitions.has(key)
 		) {
 			this.#uncertaintyRecoveryPending.delete(key);
+			this.#uncertaintyRecoveryPersisted.delete(key);
+			this.#uncertaintyRecoveryWrites.delete(key);
 			this.#uncertaintyRetries.delete(key);
 			this.#schedule(key);
 		}
@@ -862,6 +891,8 @@ export class PromptDeadlineManager {
 		this.#expiryRetries.delete(key);
 		this.#uncertaintyRetries.delete(key);
 		this.#uncertaintyRecoveryPending.delete(key);
+		this.#uncertaintyRecoveryPersisted.delete(key);
+		this.#uncertaintyRecoveryWrites.delete(key);
 		this.#expiring.delete(key);
 		this.#pendingTerminalTransitions.delete(key);
 		this.#deadlineDeferredTerminalTransitions.delete(key);
@@ -885,6 +916,8 @@ export class PromptDeadlineManager {
 		this.#expiryRetries.clear();
 		this.#uncertaintyRetries.clear();
 		this.#uncertaintyRecoveryPending.clear();
+		this.#uncertaintyRecoveryPersisted.clear();
+		this.#uncertaintyRecoveryWrites.clear();
 		this.#expiring.clear();
 		this.#pendingTerminalTransitions.clear();
 		this.#deadlineDeferredTerminalTransitions.clear();
@@ -920,14 +953,10 @@ export class PromptDeadlineManager {
 		this.#captureDeadlineStart(key, correlation, lease.acceptedAt + lease.maxMs);
 	}
 
-	/** Whether a deadline has captured exact active-run terminal evidence for this prompt. */
+	/** Whether exact deadline evidence or a previously deferred terminal intent protects this prompt. */
 	shouldDeferTerminalTransition(correlation: InvocationCorrelation): boolean {
 		const key = leaseKey(correlation);
-		return (
-			this.#deadlineDeferredTerminalTransitions.has(key) ||
-			this.#uncertaintyRecoveryPending.has(key) ||
-			(this.#expiring.has(key) && this.#deadlineStartCleanup.has(key))
-		);
+		return this.#deadlineDeferredTerminalTransitions.has(key) || this.#deadlineStartCleanup.has(key);
 	}
 
 	/** Whether bounded uncertainty writes exhausted with recovery ownership retained. */

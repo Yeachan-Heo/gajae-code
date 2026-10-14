@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { acpPromptPayload } from "../src/modes/acp/acp-agent";
+import { validateRequiredPromptText } from "../src/sdk/protocol/adapter-validation";
 
 /**
  * ACP conformance regressions found while smoke-testing GJC against the Paseo
@@ -16,22 +17,17 @@ describe("ACP prompt conformance", () => {
 		expect(payload.images).toEqual([{ data: "aGVsbG8=", mimeType: "image/png" }]);
 	});
 
-	test("an oversize prompt frame is refused before it reaches the 256 KiB transport cap", () => {
-		// The SDK WebSocket server sets max_message_size/max_frame_size to
-		// REQUEST_FRAME_BYTES (crates/gjc-sdk/src/query.rs) and answers an oversize
-		// frame by closing the socket, which reaches the client as an opaque
-		// connection_closed. The prompt must be measured against the same ceiling.
-		const limit = 256 * 1024;
-		const oversize = acpPromptPayload([
-			{ type: "image", mimeType: "image/png", data: "A".repeat(limit + 1_000) },
-		] as never);
-		const frameBytes = Buffer.byteLength(JSON.stringify({ text: oversize.text, images: oversize.images }));
-		expect(frameBytes).toBeGreaterThan(limit);
-
-		const withinLimit = acpPromptPayload([
-			{ type: "image", mimeType: "image/png", data: "A".repeat(1_000) },
-		] as never);
-		const smallBytes = Buffer.byteLength(JSON.stringify({ text: withinLimit.text, images: withinLimit.images }));
-		expect(smallBytes).toBeLessThan(limit);
+	test("image-only prompts retain the image and accept staged IDs only on turn.prompt", () => {
+		const payload = acpPromptPayload([{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] as never);
+		expect(payload).toEqual({ text: "", images: [{ data: "aGVsbG8=", mimeType: "image/png" }] });
+		expect(
+			validateRequiredPromptText("turn.prompt", { text: payload.text, stagedImages: [{ id: "host-owned" }] }),
+		).toBeUndefined();
+		expect(validateRequiredPromptText("turn.prompt", { text: "", stagedImages: [{ id: "" }] })).toMatchObject({
+			code: "invalid_input",
+		});
+		expect(
+			validateRequiredPromptText("turn.steer", { text: "", stagedImages: [{ id: "host-owned" }] }),
+		).toMatchObject({ code: "invalid_input" });
 	});
 });

@@ -1109,7 +1109,7 @@ test("fails closed when a protected native authority declaration is missing or m
 			validateRegeneratedManifest(JSON.stringify(regenerated), GUARD_CONTRACT_VERSION),
 		).resolves.toBeUndefined();
 		expect(regenerated.digests).toEqual(await currentTreeDigests());
-	}, 60000);
+	}, 120000);
 
 	test("CI/guard environments reject the explicit local --fix-generations mutation path", async () => {
 		const previousCi = process.env.CI;

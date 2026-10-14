@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 
 /**
@@ -121,7 +121,7 @@ class ChunkJsonParser {
 	async #fill(): Promise<boolean> {
 		while (this.#offset >= this.#text.length && this.#chunkIndex < this.chunks.length) {
 			const chunk = this.chunks[this.#chunkIndex]!;
-			const data = await readFile(join(this.directory, "objects", chunk));
+			const data = await readFile(path.join(this.directory, "objects", chunk));
 			const expectedLength = this.lengths[this.#chunkIndex];
 			if (expectedLength !== undefined && data.length !== expectedLength)
 				throw new SyntaxError("snapshot chunk length does not match manifest");
@@ -319,7 +319,9 @@ export class RevisionStore {
 		private readonly now: () => number = Date.now,
 		options?: { storageDir?: string; onReadRange?: (start: number, end: number) => void },
 	) {
-		this.#directory = options?.storageDir ? join(options.storageDir, "sdk", "snapshots", sessionId) : undefined;
+		this.#directory = options?.storageDir
+			? path.join(path.resolve(options.storageDir), "sdk", "snapshots", sessionId)
+			: undefined;
 		this.#onReadRange = options?.onReadRange;
 	}
 
@@ -626,7 +628,7 @@ export class RevisionStore {
 			const data = buffer.subarray(0, bufferBytes);
 			bufferBytes = 0;
 			const chunkHash = createHash("sha256").update(data).digest("hex");
-			const file = join(directory, "objects", chunkHash);
+			const file = path.join(directory, "objects", chunkHash);
 			await this.#writeAtomic(file, data);
 			chunks.push(chunkHash);
 			chunkLengths.push(data.length);
@@ -686,7 +688,7 @@ export class RevisionStore {
 		} else await this.#encode(root, append, false);
 		await flush();
 		const revisionHash = hash.digest("hex");
-		const manifest = join(directory, "manifests", `${revisionHash}.json`);
+		const manifest = path.join(directory, "manifests", `${revisionHash}.json`);
 		const manifestChunks = chunks.map((hash, index) => ({ hash, length: chunkLengths[index]! }));
 		await this.#writeAtomic(manifest, Buffer.from(JSON.stringify({ chunks: manifestChunks, index })));
 		return {
@@ -1091,7 +1093,7 @@ export class RevisionStore {
 			const length = revision.chunkLengths[index]!;
 			const chunkEnd = position + length;
 			if (chunkEnd > start && position < end) {
-				const data = await readFile(join(this.#directory, "objects", chunk));
+				const data = await readFile(path.join(this.#directory, "objects", chunk));
 				if (data.length !== length || createHash("sha256").update(data).digest("hex") !== chunk)
 					throw new SyntaxError("snapshot chunk does not match manifest");
 				const sliceStart = Math.max(0, start - position);
@@ -1109,7 +1111,7 @@ export class RevisionStore {
 		if (!this.#directory || chunks.length === 0) return undefined;
 		const values: Buffer[] = [];
 		for (const [index, chunk] of chunks.entries()) {
-			const data = await readFile(join(this.#directory, "objects", chunk));
+			const data = await readFile(path.join(this.#directory, "objects", chunk));
 			if (data.length !== lengths[index] || createHash("sha256").update(data).digest("hex") !== chunk)
 				throw new SyntaxError("snapshot chunk does not match manifest");
 			values.push(data);
@@ -1126,13 +1128,13 @@ export class RevisionStore {
 
 	async #spillDirectory(): Promise<string> {
 		if (!this.#directory) {
-			this.#directory = await mkdtemp(join(tmpdir(), "gjc-sdk-snapshots-"));
+			this.#directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-snapshots-"));
 			// Only temp spill directories are swept on abnormal exit; a caller-supplied
 			// storageDir is durable and never enters this set.
 			processSpillDirectories.add(this.#directory);
 		}
-		await mkdir(join(this.#directory, "objects"), { recursive: true, mode: 0o700 });
-		await mkdir(join(this.#directory, "manifests"), { recursive: true, mode: 0o700 });
+		await mkdir(path.join(this.#directory, "objects"), { recursive: true, mode: 0o700 });
+		await mkdir(path.join(this.#directory, "manifests"), { recursive: true, mode: 0o700 });
 		await chmod(this.#directory, 0o700);
 		return this.#directory;
 	}
@@ -1190,7 +1192,7 @@ export class RevisionStore {
 		if (refs > 0) this.#chunkRefs.set(chunk, refs);
 		else {
 			this.#chunkRefs.delete(chunk);
-			if (this.#directory) void unlink(join(this.#directory, "objects", chunk)).catch(() => undefined);
+			if (this.#directory) void unlink(path.join(this.#directory, "objects", chunk)).catch(() => undefined);
 		}
 	}
 
@@ -1208,7 +1210,9 @@ export class RevisionStore {
 			chunks
 				.filter(chunk => !this.#chunkRefs.has(chunk))
 				.map(chunk =>
-					this.#directory ? unlink(join(this.#directory, "objects", chunk)).catch(() => undefined) : undefined,
+					this.#directory
+						? unlink(path.join(this.#directory, "objects", chunk)).catch(() => undefined)
+						: undefined,
 				),
 		);
 		if (!this.#manifestRefs.has(manifest)) await unlink(manifest).catch(() => undefined);

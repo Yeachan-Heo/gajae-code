@@ -125,12 +125,18 @@ const perAdapter = new Map<string, number>();
  * not free, though: receipts that each spawn a detached SDK broker and load
  * Node-API addons fail when they race, so concurrency is never assumed. It stays
  * sequential unless the caller opts a specific manifest in through
- * `GJC_MANIFEST_RECEIPT_CONCURRENCY`, and every receipt keeps its own process,
- * its own argv, and its own receipt line either way.
+ * `GJC_MANIFEST_RECEIPT_CONCURRENCY`. The command phase can use a lower
+ * `GJC_MANIFEST_COMMAND_RECEIPT_CONCURRENCY` when its behavioral tests are
+ * heavier than the independent parity rows; every receipt still keeps its own
+ * process, argv, and receipt line.
  */
 const receiptConcurrency = (() => {
 	const configured = Number(process.env.GJC_MANIFEST_RECEIPT_CONCURRENCY);
 	return Number.isSafeInteger(configured) && configured >= 1 ? configured : 1;
+})();
+const commandReceiptConcurrency = (() => {
+	const configured = Number(process.env.GJC_MANIFEST_COMMAND_RECEIPT_CONCURRENCY);
+	return Number.isSafeInteger(configured) && configured >= 1 ? configured : receiptConcurrency;
 })();
 
 type ReceiptOutcome = { stdout: string; stderr: string; exitCode: number; tests: number | undefined };
@@ -155,7 +161,7 @@ async function runReceipt(argv: string[]): Promise<ReceiptOutcome> {
  * gate still fails closed; receipts already in flight are drained rather than
  * abandoned, and receipts that were never claimed are never reported as evidence.
  */
-async function executePhase(argvs: string[][]): Promise<void> {
+async function executePhase(argvs: string[][], concurrency: number): Promise<void> {
 	const outcomes = new Array<ReceiptOutcome | undefined>(argvs.length);
 	let claimed = 0;
 	let stopped = false;
@@ -168,7 +174,7 @@ async function executePhase(argvs: string[][]): Promise<void> {
 			if (!satisfiesReceipt(outcome)) stopped = true;
 		}
 	};
-	await Promise.all(Array.from({ length: Math.min(receiptConcurrency, argvs.length) }, drain));
+	await Promise.all(Array.from({ length: Math.min(concurrency, argvs.length) }, drain));
 	for (const [index, argv] of argvs.entries()) {
 		const outcome = outcomes[index];
 		if (!outcome) continue;
@@ -182,10 +188,16 @@ async function executePhase(argvs: string[][]): Promise<void> {
 	}
 }
 
-await executePhase(manifest.commands.map(command => command.argv));
+await executePhase(
+	manifest.commands.map(command => command.argv),
+	commandReceiptConcurrency,
+);
 process.stdout.write(`manifest command receipts complete: ${manifest.commands.length}\n`);
 
-await executePhase(rows.map(row => row.argv));
+await executePhase(
+	rows.map(row => row.argv),
+	receiptConcurrency,
+);
 for (const row of rows) perAdapter.set(row.adapter, (perAdapter.get(row.adapter) ?? 0) + 1);
 if (rows.length > 0) {
 	process.stdout.write(
