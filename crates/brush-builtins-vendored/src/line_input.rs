@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use brush_core::{
 	openfiles::OpenFile,
 	output_decode::{
-		OutputDecoderState, decode_bytes_without_eof, decode_owned_bytes, decode_owned_bytes_with_state,
+		OutputDecoderState, decode_owned_bytes, decode_owned_bytes_with_state,
 	},
 };
 
@@ -97,18 +97,13 @@ impl LineInput {
 		decoded
 	}
 
-	/// Decodes a buffer without finalizing partial characters. Incomplete bytes
-	/// are returned to the shared input so a later read can complete them.
-	pub(crate) fn decode_bytes_temporary(&self, line: &[u8]) -> String {
-		let (decoded, pending, state) = decode_bytes_without_eof(line, self.decoder_state());
-		if !pending.is_empty() {
-			self.unread(&pending);
-		}
-		// ACP selection is permanent for the input stream, even when the bytes
-		// that selected it decoded completely and left no suffix to put back.
-		if state.uses_acp() {
-			self.set_decoder_state(state);
-		}
+	/// Finalizes bytes consumed before a `read -t` timeout into its partial
+	/// result. The timeout ends this line, so incomplete characters cannot be
+	/// deferred in held input where native readers would not see them.
+	pub(crate) fn decode_bytes_on_timeout(&self, line: Vec<u8>) -> String {
+		let mut state = self.decoder_state();
+		let decoded = decode_owned_bytes_with_state(line, &mut state);
+		self.set_decoder_state(state);
 		decoded
 	}
 }
@@ -232,7 +227,7 @@ mod tests {
 
 	#[cfg(windows)]
 	#[test]
-	fn temporary_decode_uses_shared_acp_selection() -> Result<()> {
+	fn timeout_decode_uses_shared_acp_selection() -> Result<()> {
 		let (reader, _writer) = std::io::pipe()?;
 		let input = OpenFile::from(reader);
 		let held = input.held_input().expect("pipe holds input").clone();
@@ -243,29 +238,30 @@ mod tests {
 		assert!(held.output_decoder_state().uses_acp());
 
 		let timed_out = LineInput::new(input);
-		assert_eq!(timed_out.decode_bytes_temporary(&[0xd2, 0xbb]), "一");
+		assert_eq!(timed_out.decode_bytes_on_timeout(vec![0xd2, 0xbb]), "一");
 		assert!(held.output_decoder_state().uses_acp());
 		Ok(())
 	}
 
 	#[cfg(windows)]
 	#[test]
-	fn temporary_decode_keeps_incomplete_acp_bytes_and_selection() -> Result<()> {
+	fn timeout_decode_finalizes_incomplete_acp_bytes_and_selection() -> Result<()> {
 		let (reader, _writer) = std::io::pipe()?;
 		let input = OpenFile::from(reader);
 		let held = input.held_input().expect("pipe holds input").clone();
 		held.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(936));
 
 		let timed_out = LineInput::new(input);
-		let _ = timed_out.decode_bytes_temporary(&[0xff, 0xd2]);
+		let partial = timed_out.decode_bytes_on_timeout(vec![0xff, 0xd2]);
+		assert!(!partial.is_empty());
 		assert!(held.output_decoder_state().uses_acp());
-		assert_eq!(timed_out.take_held(), Some(0xd2));
+		assert!(held.is_empty());
 		Ok(())
 	}
 
 	#[cfg(windows)]
 	#[test]
-	fn temporary_decode_persists_acp_fallback_for_the_stream() -> Result<()> {
+	fn timeout_decode_persists_acp_fallback_for_the_stream() -> Result<()> {
 		// ACP selection applies to the whole stream, including bytes received
 		// after a timed-out read.
 		let (reader, _writer) = std::io::pipe()?;
@@ -274,7 +270,7 @@ mod tests {
 		held.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(1252));
 
 		let timed_out = LineInput::new(input.try_clone()?);
-		assert_eq!(timed_out.decode_bytes_temporary(&[0x80]), "€");
+		assert_eq!(timed_out.decode_bytes_on_timeout(vec![0x80]), "€");
 		assert!(timed_out.decoder_state().uses_acp());
 
 		// These bytes are valid UTF-8 as £ but are CP1252 "Â£" once this

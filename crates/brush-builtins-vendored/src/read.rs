@@ -717,10 +717,11 @@ where
 					line.push(BACKSLASH);
 					raw_backslashes.push(false);
 				}
-				// Decode without finalizing partial characters; stream-level ACP
-				// selection is still retained by the input source.
+				// Finalize consumed bytes into the partial value. The read has
+				// returned, so an incomplete character cannot remain pending for
+				// a later builtin-only read.
 				return Ok(ReadResult::TimedOut(
-					(!line.is_empty()).then(|| reader.source.decode_bytes_temporary(&line)),
+					(!line.is_empty()).then(|| reader.source.decode_bytes_on_timeout(line)),
 				));
 			},
 
@@ -778,6 +779,18 @@ where
 				// from native child processes. Instead, finalize incomplete input without
 				// consuming lookahead bytes: if we have pending at a limit boundary, return.
 				if count.len > 0 {
+					// A delimiter that cannot continue the pending multibyte
+					// character marks the record boundary. If that character reaches
+					// a limit, retain the delimiter for the next read.
+					if config.delimiter == Some(byte)
+						&& !count.is_acp_character_continuation(byte)
+					{
+						if matches!(count.finish(config.char_limit), Limit::Reached) {
+							reader.source.unread(&[byte]);
+						}
+						return Ok(ReadResult::Line(reader.source.decode_line(line)));
+					}
+
 					// Check if we're at the character limit already with pending input.
 					// If so, finalize the pending character(s) and return without consuming this byte.
 					if config.char_limit.is_some_and(|limit| count.chars >= limit) {
@@ -1734,15 +1747,18 @@ mod tests {
 		Ok(())
 	}
 
-	/// A timed-out multibyte prefix is put back so a later read can complete it.
+	/// A timed-out incomplete character is finalized into the partial result.
 	#[test]
 	#[expect(clippy::panic_in_result_fn)]
-	fn test_read_timeout_preserves_incomplete_utf8_for_next_read() -> anyhow::Result<()> {
+	fn test_read_timeout_returns_incomplete_utf8_in_partial_result() -> anyhow::Result<()> {
 		use std::io::Write;
 
 		let (reader, mut writer) = std::io::pipe()?;
 		let input = OpenFile::from(reader);
-		writer.write_all(&[0xc3])?;
+		let held = input.held_input().expect("pipe holds timed-out input").clone();
+		#[cfg(windows)]
+		held.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(65001));
+		writer.write_all(&[b'A', 0xc3])?;
 
 		let timed_out = test_command().read_line(
 			input.try_clone()?,
@@ -1750,16 +1766,12 @@ mod tests {
 			Some(Duration::from_millis(100)),
 			|| false,
 		)?;
-		assert!(matches!(timed_out, ReadResult::TimedOut(Some(ref text)) if text.is_empty()));
-
-		writer.write_all(&[0xa9, b'\n'])?;
-		let completed = test_command().read_line(
-			input,
-			Vec::<u8>::new(),
-			Some(Duration::from_secs(1)),
-			|| false,
-		)?;
-		assert!(matches!(completed, ReadResult::Line(ref text) if text == "é"));
+		let partial = match timed_out {
+			ReadResult::TimedOut(Some(partial)) => partial,
+			other => panic!("expected partial input on timeout, got {other:?}"),
+		};
+		assert_eq!(partial, "A\u{FFFD}");
+		assert!(held.is_empty(), "timed-out bytes must not be hidden from non-builtin readers");
 		Ok(())
 	}
 
@@ -1833,6 +1845,61 @@ mod tests {
 		// Third read: should get 'X'
 		let third = test_command().read_line(input, Vec::<u8>::new(), None, || false)?;
 		assert!(matches!(third, ReadResult::Line(ref text) if text == "X"));
+		Ok(())
+	}
+
+	/// An unbounded raw read treats the delimiter after malformed UTF-8 as the
+	/// record boundary, for both the default newline and a custom delimiter.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_unbounded_read_preserves_delimiters_after_malformed_utf8() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		for (delimiter, delimiter_byte) in [(None, b'\n'), (Some("|".to_owned()), b'|')] {
+			let (reader, mut writer) = std::io::pipe()?;
+			let input = OpenFile::from(reader);
+			#[cfg(windows)]
+			input
+				.held_input()
+				.expect("pipe holds decoder state")
+				.set_output_decoder_state(OutputDecoderState::with_fallback_codepage(65001));
+			writer.write_all(&[0xc3, delimiter_byte])?;
+			writer.write_all(b"next")?;
+			writer.write_all(&[delimiter_byte])?;
+			drop(writer);
+
+			let command = ReadCommand { raw_mode: true, delimiter, ..test_command() };
+			let first = command.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(first, ReadResult::Line(ref text) if !text.is_empty()));
+
+			let second = command.read_line(input, Vec::<u8>::new(), None, || false)?;
+			assert!(matches!(second, ReadResult::Line(ref text) if text == "next"));
+		}
+		Ok(())
+	}
+
+	/// `-N` ignores delimiters even when a delimiter byte resolves an incomplete
+	/// UTF-8 prefix; only a reached character limit pushes that byte back.
+	#[test]
+	#[expect(clippy::panic_in_result_fn)]
+	fn test_read_cap_ignores_delimiter_after_malformed_utf8() -> anyhow::Result<()> {
+		use std::io::Write;
+
+		let (reader, mut writer) = std::io::pipe()?;
+		let input = OpenFile::from(reader);
+		writer.write_all(&[0xc3, b'\n', b'X', b'\n'])?;
+		drop(writer);
+
+		let capped = ReadCommand {
+			raw_mode: true,
+			return_after_n_chars_no_delimiter: Some(1),
+			..test_command()
+		};
+		let first = capped.read_line(input.try_clone()?, Vec::<u8>::new(), None, || false)?;
+		assert!(matches!(first, ReadResult::Line(ref text) if !text.is_empty()));
+
+		let second = capped.read_line(input, Vec::<u8>::new(), None, || false)?;
+		assert!(matches!(second, ReadResult::Line(ref text) if text == "\n"));
 		Ok(())
 	}
 
