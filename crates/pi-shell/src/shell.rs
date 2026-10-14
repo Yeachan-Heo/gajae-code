@@ -3778,10 +3778,10 @@ mod tests {
 		assert_eq!(output, "é|ü\n");
 	}
 
-	/// Contract: a timed-out partial UTF-8 character remains available to the
-	/// next read of the same input stream.
+	/// Contract: a timed-out incomplete UTF-8 character is assigned to the
+	/// partial result instead of being hidden from the caller.
 	#[tokio::test(flavor = "multi_thread")]
-	async fn read_timeout_preserves_a_partial_utf8_character() {
+	async fn read_timeout_assigns_an_incomplete_utf8_character() {
 		let (result, output) = execute_captured(
 			"{ printf '\\303'; sleep 0.2; printf '\\251\\n'; } | { read -r -t 0.05 first; rc=$?; \
 			 read -r second; printf '[%s][%s][%s]\\n' \"$rc\" \"$first\" \"$second\"; }"
@@ -3789,7 +3789,7 @@ mod tests {
 		)
 		.await;
 		assert_eq!(result.exit_code, Some(0), "{output:?}");
-		assert_eq!(output, "[142][][é]\n");
+		assert_eq!(output, "[142][�][�]\n");
 	}
 
 	/// Contract: `read` preserves Windows ACP bytes from an external producer.
