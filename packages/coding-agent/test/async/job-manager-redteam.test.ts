@@ -186,4 +186,100 @@ describe("AsyncJobManager red-team invariants", () => {
 
 		await manager.dispose({ timeoutMs: 200 });
 	});
+
+	test("rejects malformed queued IDs with invalid sequence numbers", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+
+		// Register a valid subagent to get a queued ID to test
+		const subagentRecord: SubagentRecord = {
+			subagentId: "test-sub",
+			currentJobId: "test-job",
+			historicalJobIds: [],
+			status: "queued",
+			queued: { seq: 1, createdAt: Date.now() },
+			sessionFile: `/tmp/test-sub.jsonl`,
+			resumable: true,
+		};
+		manager.registerSubagentRecord(subagentRecord);
+		manager.registerResumeDescriptor(descriptor("test-sub"));
+
+		// Malformed IDs should return false (not cancel)
+		const malformedIds = [
+			"queued:test-sub:1junk", // Invalid: contains non-digit suffix
+			"queued:test-sub:1.5", // Invalid: decimal number
+			"queued:test-sub:01", // Invalid: leading zero
+			"queued:test-sub:0", // Invalid: zero (seq starts at 1)
+			"queued:test-sub:", // Invalid: empty suffix
+			"queued:test-sub: 1", // Invalid: space before number
+			"queued:test-sub:1 ", // Invalid: space after number
+		];
+
+		for (const id of malformedIds) {
+			const result = manager.cancel(id);
+			expect(result).toBe(false);
+		}
+
+		// Verify the subagent record still exists and was not cancelled by malformed attempts
+		let rec = manager.getSubagentRecord("test-sub");
+		expect(rec?.status).toBe("queued");
+		expect(rec?.queued?.seq).toBe(1);
+
+		// Valid queued ID should now cancel successfully
+		const validId = "queued:test-sub:1";
+		expect(manager.cancel(validId)).toBe(true);
+		rec = manager.getSubagentRecord("test-sub");
+		expect(rec?.status).toBe("cancelled");
+
+		await manager.dispose({ timeoutMs: 200 });
+	});
+
+	test("rejects queued cancellation for stale generation when replacement is registered (regression)", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+
+		// Register initial queued subagent with seq=1
+		const initialRecord: SubagentRecord = {
+			subagentId: "test-sub",
+			currentJobId: "test-job-1",
+			historicalJobIds: [],
+			status: "queued",
+			queued: { seq: 1, createdAt: Date.now() },
+			sessionFile: `/tmp/test-sub-1.jsonl`,
+			resumable: true,
+		};
+		manager.registerSubagentRecord(initialRecord);
+		manager.registerResumeDescriptor(descriptor("test-sub"));
+
+		// Cancel the first generation successfully
+		const firstId = "queued:test-sub:1";
+		expect(manager.cancel(firstId)).toBe(true);
+		let rec = manager.getSubagentRecord("test-sub");
+		expect(rec?.status).toBe("cancelled");
+
+		// Register replacement with same stable ID but seq=2
+		const replacementRecord: SubagentRecord = {
+			subagentId: "test-sub",
+			currentJobId: "test-job-2",
+			historicalJobIds: ["test-job-1"],
+			status: "queued",
+			queued: { seq: 2, createdAt: Date.now() },
+			sessionFile: `/tmp/test-sub-2.jsonl`,
+			resumable: true,
+		};
+		manager.registerSubagentRecord(replacementRecord);
+
+		// Attempt to cancel with old seq should fail (generation mismatch)
+		const staleId = "queued:test-sub:1";
+		expect(manager.cancel(staleId)).toBe(false);
+		rec = manager.getSubagentRecord("test-sub");
+		expect(rec?.status).toBe("queued");
+		expect(rec?.queued?.seq).toBe(2);
+
+		// Cancel with correct seq should succeed
+		const correctId = "queued:test-sub:2";
+		expect(manager.cancel(correctId)).toBe(true);
+		rec = manager.getSubagentRecord("test-sub");
+		expect(rec?.status).toBe("cancelled");
+
+		await manager.dispose({ timeoutMs: 200 });
+	});
 });

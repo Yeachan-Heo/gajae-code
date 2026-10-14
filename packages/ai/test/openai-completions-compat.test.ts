@@ -387,6 +387,7 @@ describe("openai-completions compatibility", () => {
 			supportsUsageInStreaming: true,
 			supportsToolChoice: true,
 			supportsForcedToolChoice: true,
+			supportsUltrafastTier: false,
 			toolChoiceSupport: "named",
 			disableReasoningOnForcedToolChoice: false,
 			disableReasoningOnToolChoice: false,

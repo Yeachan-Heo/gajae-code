@@ -12,15 +12,20 @@ import {
 	modelSupportsReasoningControl,
 	requireSupportedEffort,
 } from "@gajae-code/ai/model-thinking";
-import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
+import type { Api, Context, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
+import { hookFetch } from "@gajae-code/utils";
+import { streamSimple } from "../src/stream";
 
 const TEST_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
 	"alibaba-token-plan": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+	google: "https://generativelanguage.googleapis.com/v1beta",
+	kilo: "https://api.kilo.ai/api/gateway",
 	"kimi-code": "https://api.kimi.com/coding/v1",
 	"opencode-go": "https://opencode.ai/zen/go/v1",
 	"opencode-zen": "https://opencode.ai/zen/v1",
 	"openai-codex": "https://chatgpt.com/backend-api",
 	openrouter: "https://openrouter.ai/api/v1",
+	"vercel-ai-gateway": "https://ai-gateway.vercel.sh",
 	xai: "https://api.x.ai/v1",
 	zai: "https://api.z.ai/v1",
 };
@@ -279,6 +284,50 @@ describe("model thinking metadata", () => {
 		expect(requireSupportedEffort(flash36, Effort.Minimal)).toBe(Effort.Minimal);
 	});
 
+	it("sends thinkingLevel for Gemini 4 Argon with low/medium/high only", () => {
+		const argon = createModel({
+			id: "gemini-4-argon",
+			api: "google-generative-ai",
+			provider: "google",
+		});
+
+		expect(argon.thinking).toEqual({
+			mode: "google-level",
+			minLevel: Effort.Low,
+			maxLevel: Effort.High,
+		});
+		expect(mapEffortToGoogleThinkingLevel(argon, Effort.Low)).toBe("LOW");
+		expect(mapEffortToGoogleThinkingLevel(argon, Effort.Medium)).toBe("MEDIUM");
+		expect(mapEffortToGoogleThinkingLevel(argon, Effort.High)).toBe("HIGH");
+		expect(() => requireSupportedEffort(argon, Effort.Minimal)).toThrow(/not supported/);
+	});
+
+	it("sends thinkingLevel through the Google transport for Gemini 4 Argon", async () => {
+		const argon = createModel({
+			id: "gemini-4-argon",
+			api: "google-generative-ai",
+			provider: "google",
+		});
+		const context: Context = {
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+		};
+		let requestBody: string | undefined;
+		using _hook = hookFetch((_input, init) => {
+			requestBody = typeof init?.body === "string" ? init.body : undefined;
+			return new Response('{"error":{"message":"captured request"}}', { status: 400 });
+		});
+
+		await streamSimple(argon, context, { apiKey: "test-key", reasoning: Effort.High }).result();
+
+		const request = JSON.parse(requestBody ?? "{}") as {
+			generationConfig?: {
+				thinkingConfig?: { thinkingLevel?: string; thinkingBudget?: number };
+			};
+		};
+		expect(request.generationConfig?.thinkingConfig?.thinkingLevel).toBe("HIGH");
+		expect(request.generationConfig?.thinkingConfig?.thinkingBudget).toBeUndefined();
+	});
+
 	it("encodes anthropic transport mode in metadata", () => {
 		const opus45 = createModel({
 			id: "claude-opus-4-5",
@@ -396,6 +445,38 @@ describe("model thinking metadata", () => {
 });
 
 describe("generated model policies", () => {
+	it("normalizes negative and non-finite catalog prices without changing valid prices", () => {
+		const model = createModel({ id: "pareto-code", api: "openai-completions", provider: "openrouter" });
+		model.cost = { input: -1_000_000, output: 0.5, cacheRead: Number.NaN, cacheWrite: 0 };
+		const models = [model];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.cost).toEqual({ input: 0, output: 0.5, cacheRead: 0, cacheWrite: 0 });
+	});
+
+	it("caps Gemini 4 Argon output across provider aliases", () => {
+		const models = [
+			createModel({ id: "gemini-4-argon", api: "google-generative-ai", provider: "google" }),
+			createModel({ id: "google/gemini-4-argon", api: "openai-completions", provider: "kilo" }),
+			createModel({ id: "google/gemini-4-argon:batch", api: "openai-completions", provider: "openrouter" }),
+			createModel({ id: "google/gemini-4-argon", api: "anthropic-messages", provider: "vercel-ai-gateway" }),
+		];
+		models[0]!.maxTokens = 1_000_000;
+		models[1]!.maxTokens = 65_536;
+		models[2]!.maxTokens = 943_718;
+		models[3]!.maxTokens = 1_000_000;
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models.map(model => model.maxTokens)).toEqual([65_536, 65_536, 65_536, 65_536]);
+	});
+
+	it("bundles the Argon output cap for gateway aliases", () => {
+		expect(getBundledModel("openrouter", "google/gemini-4-argon:batch")?.maxTokens).toBe(65_536);
+		expect(getBundledModel("vercel-ai-gateway", "google/gemini-4-argon")?.maxTokens).toBe(65_536);
+	});
+
 	it("corrects stale direct xAI Grok reasoning metadata before enrichment", () => {
 		const models = [
 			createModel({ id: "grok-4.5", api: "openai-completions", provider: "xai", reasoning: false }),

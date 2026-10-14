@@ -6,8 +6,12 @@ import * as os from "node:os";
 import path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import packageJson from "../../../package.json" with { type: "json" };
-import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
-import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
+import {
+	acquireFileLock,
+	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+	type FileLockOptions,
+	withFileLock,
+} from "../../config/file-lock";
 import { SdkClient, SdkClientError } from "../client/client";
 import { type BrokerStartupExitRecord, clearBrokerStartupExitRecord, readBrokerStartupExitRecord } from "./broker-exit";
 import {
@@ -17,6 +21,7 @@ import {
 	readBrokerRestartIntent,
 } from "./discovery";
 import { BROKER_HANDOFF_ABORT, BROKER_HANDOFF_ACKNOWLEDGEMENT, BROKER_HANDOFF_COMMIT } from "./hop";
+import { brokerLockHostIdentity } from "./lock-host-identity";
 import {
 	isProcessIncarnation,
 	observeProcessIncarnation,
@@ -617,6 +622,8 @@ function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): s
 	if (!record) return undefined;
 	if (record.reason === "startup-lock-blocked")
 		return `SDK broker startup blocked by retained removal transition ${record.blockingLockPath}.`;
+	if (record.reason === "startup-lock-unavailable")
+		return `SDK broker startup could not acquire required lock ${record.blockingLockPath}.`;
 	if (record.reason === "startup-deadline")
 		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
 	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
@@ -670,13 +677,17 @@ export interface EnsureBrokerSettings {
 }
 
 const BROKER_PUBLICATION_TIMEOUT_MS = 15_000;
-const STARTUP_LOCK_WAIT_MS = 9_000;
 const STALE_BROKER_RETIREMENT_TIMEOUT_MS = 5_000;
+const SPAWN_LOCK_RETRY_DELAY_MS = 50;
+/** Keep the startup fence alive long enough to adopt an ownerless removal transition. */
+const STARTUP_LOCK_WAIT_MS = Math.max(
+	9_000,
+	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS + SPAWN_LOCK_RETRY_DELAY_MS * 2,
+);
 /** Parent budget covers stale retirement, a full child-fence wait, and one publication attempt. */
 const DISCOVERY_TIMEOUT_MS = STALE_BROKER_RETIREMENT_TIMEOUT_MS + STARTUP_LOCK_WAIT_MS + BROKER_PUBLICATION_TIMEOUT_MS;
 /** A process that loses the spawn lock waits this long for the winner's discovery before giving up. */
 const SPAWN_LOCK_WAIT_MS = STALE_BROKER_RETIREMENT_TIMEOUT_MS + DISCOVERY_TIMEOUT_MS + 5_000;
-const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
 const STARTUP_LOCK_TARGET_NAME = "broker.startup";
 const BROKER_SESSION_ENV_NAMES = new Set([
@@ -708,7 +719,9 @@ const BROKER_SESSION_ENV_PREFIXES = [
 	"GJC_MANAGED_OWNER_",
 ] as const;
 
-export interface BrokerStartupLockTestHooks {
+export interface BrokerStartupLockOptions {
+	/** Stop waiting for the startup lock at this absolute wall-clock deadline. */
+	deadlineAt?: number;
 	onAcquired?: () => void;
 	onContended?: () => void;
 }
@@ -776,33 +789,6 @@ export function setEnsureBrokerTimingForTest(timing: EnsureBrokerTiming | undefi
 
 type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
 
-interface BrokerLockHostIdentity {
-	ownerHostId: string;
-	previousOwnerHostIds: readonly string[];
-}
-
-const brokerLockHostIdentityPromises = new Map<string, Promise<BrokerLockHostIdentity>>();
-
-async function brokerLockHostIdentity(agentDir: string): Promise<BrokerLockHostIdentity> {
-	const coordinationRoot = path.resolve(agentDir, "sdk");
-	const pending =
-		brokerLockHostIdentityPromises.get(coordinationRoot) ??
-		Promise.all([loadInstallationHostId({ configRootDir: coordinationRoot }), loadLegacyInstallationHostId()]).then(
-			([ownerHostId, legacyHostId]) => ({
-				ownerHostId,
-				previousOwnerHostIds: legacyHostId === ownerHostId ? [] : [legacyHostId],
-			}),
-		);
-	brokerLockHostIdentityPromises.set(coordinationRoot, pending);
-	try {
-		return await pending;
-	} catch (error) {
-		if (brokerLockHostIdentityPromises.get(coordinationRoot) === pending)
-			brokerLockHostIdentityPromises.delete(coordinationRoot);
-		throw error;
-	}
-}
-
 async function readBrokerDiscoveryBeforeDeadline(
 	agentDir: string,
 	heartbeatTtlMs: number | undefined,
@@ -855,17 +841,30 @@ async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}
 export async function withBrokerStartupLock<T>(
 	agentDir: string,
 	operation: (deadline: number) => Promise<T>,
-	testHooks: BrokerStartupLockTestHooks = {},
+	options: BrokerStartupLockOptions = {},
 ): Promise<T> {
+	if (options.deadlineAt !== undefined && !Number.isFinite(options.deadlineAt))
+		throw new TypeError("Broker startup-lock deadline must be finite.");
 	const hostIdentity = await brokerLockHostIdentity(agentDir);
+	const now = ensureBrokerTiming.now();
+	const lockWaitMs =
+		options.deadlineAt === undefined
+			? STARTUP_LOCK_WAIT_MS
+			: Math.max(0, Math.min(STARTUP_LOCK_WAIT_MS, options.deadlineAt - now));
 	return withFileLock(
 		path.join(agentDir, "sdk", STARTUP_LOCK_TARGET_NAME),
-		() => operation(ensureBrokerTiming.now() + BROKER_DISCOVERY_BUDGET.fenceOperationMs),
+		() => {
+			const operationDeadline = ensureBrokerTiming.now() + BROKER_DISCOVERY_BUDGET.fenceOperationMs;
+			return operation(
+				options.deadlineAt === undefined ? operationDeadline : Math.min(operationDeadline, options.deadlineAt),
+			);
+		},
 		{
-			retries: Math.ceil(STARTUP_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
+			retries: Math.ceil(lockWaitMs / SPAWN_LOCK_RETRY_DELAY_MS),
 			retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
-			onAcquired: testHooks.onAcquired,
-			onContended: testHooks.onContended,
+			orphanTransitionAgeMs: FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+			onAcquired: options.onAcquired,
+			onContended: options.onContended,
 			...hostIdentity,
 		},
 	);
@@ -1398,6 +1397,7 @@ async function retireUnusableBroker(
 			}
 			return;
 		}
+		// If pid === process.pid, fall through to wait on identity
 	}
 	await waitForBrokerIdentityGone(stale, deadline);
 }
@@ -1457,7 +1457,11 @@ function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtu
 	return createFixtureLeaseFromChild(child, () => owner.stop());
 }
 
-async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
+async function ensureBrokerOnce(
+	settings: EnsureBrokerSettings,
+	initiator: EnsureInitiator,
+	retriedStartupLockUnavailable = false,
+): Promise<EnsureOutcome> {
 	const initialDiscoveryDeadline =
 		ensureBrokerTiming.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
 	const priorOwner = owners.get(settings.agentDir);
@@ -1498,6 +1502,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	// Fixture leases always spawn their own.
 	let spawnLog: BrokerSpawnLog | undefined;
 	const releaseSpawnLock = initiator === "fixture-lease" ? async () => {} : await acquireSpawnLock(settings.agentDir);
+	let spawnLockReleased = false;
 	try {
 		const deadline =
 			ensureBrokerTiming.now() +
@@ -1776,10 +1781,20 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				"SDK broker discovery and spawned broker cleanup both failed.",
 			);
 		}
+		if (
+			!retriedStartupLockUnavailable &&
+			initiator === "discovery" &&
+			trustedStartupExitRecord?.reason === "startup-lock-unavailable"
+		) {
+			await releaseSpawnLock();
+			spawnLockReleased = true;
+			await ensureBrokerTiming.sleep(SPAWN_LOCK_RETRY_DELAY_MS);
+			return ensureBrokerOnce(settings, initiator, true);
+		}
 		throw failure;
 	} finally {
 		if (spawnLog) await removeBrokerSpawnLog(spawnLog.path);
-		await releaseSpawnLock();
+		if (!spawnLockReleased) await releaseSpawnLock();
 	}
 }
 

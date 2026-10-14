@@ -193,7 +193,7 @@ providers:
 | `deepinfra` | `service_tier: "priority"` | Sent only for the first-class `deepinfra` provider ID and only with the `priority` tier. |
 | `opencodex` | `service_tier: "priority"` | First-class OpenCodex discovery opts in automatically; OpenCodex Fast Mode must remain `Auto` for client passthrough. When OpenCodex uses ChatGPT authentication, a final `service_tier: "default"` is not downgrade evidence. |
 
-Custom OpenAI-compatible providers remain fail-closed unless their provider or model configuration explicitly sets `compat.supportsServiceTier: true`. Use that opt-in only when the proxy preserves or intentionally realizes OpenAI's `service_tier` contract:
+Custom OpenAI-compatible providers remain fail-closed for `priority`, `flex`, and `scale` unless their provider or model configuration explicitly sets `compat.supportsServiceTier: true`. Ultrafast is separate: only models that explicitly set `compat.supportsUltrafastTier: true` send that tier, and this flag does not enable the other service tiers.
 
 ```yaml
 providers:
@@ -477,6 +477,20 @@ providers:
 
 Use provider-level `headers` for proxy-required headers. Keep the provider `api` set to `openai-completions` when the proxy exposes Chat Completions-compatible `/v1/chat/completions` semantics. `auth: apiKey` sends the resolved token as bearer auth; use `auth: none` only for trusted local/no-auth endpoints.
 
+For long reasoning gaps on an OpenAI-compatible endpoint, configure `streamIdleTimeoutMs` in milliseconds at the provider level, on an individual model, or in that model's `modelOverrides` entry. A model-level value overrides the provider value; `0` disables the inter-event watchdog. A request's explicit `streamIdleTimeoutMs` wins first, followed by the environment override, the models.yml value, then the built-in provider/model floor and 120-second default. Values must not exceed 2,147,483,647 ms, and model-configured values are not supported with `transport: pi-native`; configure the upstream model in the auth-gateway instead. This setting applies to `openai-completions` and `openai-responses` models.
+
+```yaml
+providers:
+  reasoning-proxy:
+    baseUrl: https://api.proxy.example/v1
+    apiKeyEnv: PROXY_API_KEY
+    api: openai-responses
+    streamIdleTimeoutMs: 300000
+    models:
+      - id: claude-opus-5-5
+        streamIdleTimeoutMs: 450000
+```
+
 For an unknown custom endpoint, `reasoning: true` declares model capability but does not prove the proxy accepts a control parameter. A familiar provider id or model-family name is not transport evidence: configurable LiteLLM/vLLM/local endpoints still fail closed. Add `thinking` and `compat.supportsReasoningEffort: true` only when the endpoint documents OpenAI-style `reasoning_effort`; set `compat.thinkingFormat` as well when it uses a different documented request shape. Otherwise GJC keeps reasoning-level controls unavailable and omits the parameter.
 
 `auth` selects the transport scheme only; it never supplies a credential. A provider that declares `models:` must therefore also declare where its key comes from, and `models.yml` validation rejects the config before model discovery otherwise:
@@ -572,6 +586,7 @@ Must define at least one of:
 - `headers`
 - `compat`
 - `requestTransform`
+- `streamIdleTimeoutMs`
 - `disableStrictTools`
 - `modelOverrides`
 - `discovery`
@@ -775,6 +790,8 @@ Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entrie
 ### Explicit provider discovery
 
 You can configure discovery yourself:
+
+For `openai-models-list`, `apiByModelPrefix` routes are matched against model IDs without case sensitivity; the longest matching prefix wins.
 
 ```yaml
 providers:
@@ -1018,6 +1035,8 @@ Request shaping:
 - `supportsMultipleSystemMessages` — send system-prompt content as multiple separate blocks instead of merging it into one. Default: `true` for canonical Anthropic endpoints and `false` for unknown or strict-template hosts. Setting it to `true` preserves separate blocks, which is preferred for KV-cache reuse when the trailing prompt changes between calls.
 - `sendSessionHeaders` — forward the agent session id as `session_id` and `x-session-id` request headers so OpenAI-compatible relays/proxies can do session-affinity routing and reuse a server-side prompt cache. Default: `false`. Caller-set `headers`/`requestTransform` values are never overwritten.
 - `supportsResponsesSessionAffinity` — for `openai-responses`, opt in to forwarding `session_id` and `x-client-request-id` affinity headers to a custom OpenAI-compatible relay. Canonical OpenAI routing remains automatic; known non-OpenAI provider IDs are rejected. Default: `false`.
+- `supportsServiceTier` — opt a custom OpenAI-compatible endpoint into `priority`, `flex`, and `scale` request fields. This does not imply ultrafast support.
+- `supportsUltrafastTier` — opt a specific model into `service_tier: "ultrafast"` when the endpoint documents that capability. This is independent of `supportsServiceTier`; models without this flag fail closed.
 - `supportsUsageInStreaming` — send `stream_options: { include_usage: true }` to receive token usage on streaming responses. Default: `true`.
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).

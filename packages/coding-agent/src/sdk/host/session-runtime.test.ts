@@ -45,7 +45,9 @@ import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
 	createSdkSurfaceFactory,
+	type PersistenceInstrumentationEvent,
 	RetainedTerminalBoundaryRegistry,
+	type SdkOnlyDeadlineRecoveryCheckpoint,
 	type SdkOnlyInvocationRecord,
 	type SdkOnlyReconciliationStore,
 	type SdkOnlyTerminalAbortSeams,
@@ -4616,6 +4618,8 @@ async function invocationHarness(
 		}) => void;
 		branch?: unknown[];
 		onInvocationCompletionReconciled?: (kind: string, correlation: { commandId: string; turnId: string }) => void;
+		/** Test-only instrumentation of the persistence chain. */
+		onPersistenceInstrumentation?: (event: PersistenceInstrumentationEvent) => void;
 		/** Override/extend the INTERNAL terminal-abort seams the runtime is threaded. */
 		terminalAbortSeams?: Partial<SdkOnlyTerminalAbortSeams>;
 	},
@@ -4647,7 +4651,7 @@ async function invocationHarness(
 	createTestRuntimeExtension(api, {
 		agentDir: cwd,
 		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
-		...(interceptorStore || hooks.terminalAbortSeams
+		...(interceptorStore || hooks.terminalAbortSeams || hooks.onPersistenceInstrumentation
 			? {
 					terminalAbortSeams: {
 						getTerminalTurnEpoch: () => undefined,
@@ -4655,6 +4659,9 @@ async function invocationHarness(
 						cancelPendingPreflightForTerminalAbort: () => {},
 						abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
 						...(interceptorStore ? { getReconciliationStore: () => interceptorStore } : {}),
+						...(hooks.onPersistenceInstrumentation
+							? { onPersistenceInstrumentationForTests: hooks.onPersistenceInstrumentation }
+							: {}),
 						...hooks.terminalAbortSeams,
 					},
 				}
@@ -6183,6 +6190,7 @@ describe("post-acceptance invocation terminalization", () => {
 		let harness: InvocationHarness | undefined;
 		let session: AgentSession | undefined;
 		let authStorage: AuthStorage | undefined;
+		let restoreEmission: (() => void) | undefined;
 		let providerCalls = 0;
 		try {
 			const real = await createTerminalizationSession(
@@ -6193,6 +6201,7 @@ describe("post-acceptance invocation terminalization", () => {
 					return createMockModel({ responses: [{ content: ["started"] }] }).stream(model, context, options);
 				},
 				{ "todo.enabled": true, "todo.reminders": true, "todo.reminders.max": 1, "retry.enabled": false },
+				true,
 			);
 			session = real.session;
 			session.setConfiguredModelChain("default", [selector(real.model)], "terminal-throw-test");
@@ -6204,9 +6213,16 @@ describe("post-acceptance invocation terminalization", () => {
 				isIdle: () => !session?.isStreaming,
 				sendUserMessage: realSendUserMessage(session),
 			});
-			session.subscribe(async event => {
-				await harness?.emit(event.type, event);
+			const runner = session.extensionRunner;
+			if (!runner) throw new Error("Expected the real awaited terminal extension bridge.");
+			const emit = runner.emit.bind(runner);
+			const emission = spyOn(runner, "emit").mockImplementation(async event => {
+				const result = await emit(event);
+				if (event.type === "agent_start" || event.type === "agent_failed" || event.type === "agent_end")
+					await harness?.emit(event.type, event);
+				return result;
 			});
+			restoreEmission = () => emission.mockRestore();
 			const accepted = await harness.control("turn.prompt", { text: "finish the outstanding work" });
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
@@ -6233,6 +6249,7 @@ describe("post-acceptance invocation terminalization", () => {
 				outcome: { kind: "failed" },
 			});
 		} finally {
+			restoreEmission?.();
 			await session?.dispose();
 			authStorage?.close();
 			await harness?.stop();
@@ -8528,8 +8545,23 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const sessionId = "deadline-captured-uncertain";
 		const sessionFile = path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`);
 		await Bun.write(sessionFile, "");
-		const store = createReconciliationStore({ sessionFile, sessionId });
+		// Chain-level evidence for the CI-only hang: every serialized store op
+		// (including the terminal variants the runtime persistence log cannot see).
+		const storeLog: string[] = [];
+		const store = createReconciliationStore({
+			sessionFile,
+			sessionId,
+			onInstrumentationForTests: event => {
+				storeLog.push(
+					`${event.at}:${event.phase}:${event.operation ?? ""}:${event.substep ?? ""}:${event.detail ?? ""}${event.error ? `:${event.error}` : ""}`,
+				);
+			},
+		});
 		const activeTools = new Set(["unfenced-tool"]);
+		const toolDrainObserved = Promise.withResolvers<void>();
+		const terminalPublication = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
+		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
+		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
 		let boundaryWaitStarted = false;
 		let abortCalls = 0;
 		let harness: InvocationHarness | undefined;
@@ -8538,25 +8570,30 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				settings: {
 					// This test covers deferred terminal recovery, not deadline-triggered worktree persistence.
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs"
-							? 150
-							: key === "sdk.promptMaxRuntimeMs"
-								? 60_000
-								: key === "sdk.flushWorktreeOnDeadline"
-									? false
-									: undefined,
+						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					await neverSettlingPromise();
 				},
+				onPersistenceInstrumentation: event => {
+					const label = `${event.phase}:${event.operation ?? "main"}:${event.substep ?? ""}`;
+					persistenceLog.push({ ...event, label });
+				},
 				terminalAbortSeams: {
 					getReconciliationStore: () => store,
 					getTerminalTurnEpoch: () => 109,
 					getActivePromptHandle: () => "deadline-captured-uncertain-run",
+					onDeadlineRecoveryCheckpointForTests: checkpoint => {
+						recoveryCheckpoints.push(checkpoint);
+						if (checkpoint.stage === "publication-result" && checkpoint.result === "published")
+							terminalPublication.resolve(checkpoint);
+					},
 					pendingToolExecutions: () => {
 						if (activeTools.size > 0) boundaryWaitStarted = true;
-						return [...activeTools];
+						const pending = [...activeTools];
+						if (pending.length === 0) toolDrainObserved.resolve();
+						return pending;
 					},
 					abortPromptAndWaitWithTerminal: async () => {
 						abortCalls += 1;
@@ -8566,7 +8603,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const accepted = await harness.control("turn.prompt", { text: "capture uncertain end" });
 			expect(accepted.ok).toBe(true);
-			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			const commandId = accepted.result?.commandId;
+			const turnId = accepted.result?.turnId;
+			if (commandId === undefined || turnId === undefined) throw new Error("Expected prompt correlation");
+			const correlation = { commandId, turnId };
 			await harness.emit("agent_start");
 			await harness.emit("tool_execution_start", {
 				type: "tool_execution_start",
@@ -8604,8 +8644,37 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 
 			activeTools.clear();
-			// Keep this inside the 60s hard-runtime budget while tolerating a slow CI retry tick.
-			expect(await settledStatus(harness, "turn.prompt_status", correlation, 30_000)).toMatchObject({
+			// Wait until the deadline recovery loop has actually observed the exact
+			// tool-set drain; clearing the test seam alone does not wake its bounded
+			// retry timer.
+			await toolDrainObserved.promise;
+			// Wait for the durable terminal boundary itself, not an arbitrary status
+			// polling budget that can expire while a slow CI filesystem is flushing it.
+			const published = await terminalPublication.promise;
+			expect(published.correlation).toEqual(correlation);
+			let terminalStatus: NonNullable<ResponseFrame["result"]>;
+			try {
+				terminalStatus = await settledStatus(harness, "turn.prompt_status", correlation);
+			} catch (error) {
+				const finalRecord = store.snapshot().find(record => record.commandId === correlation.commandId) as
+					| (SdkOnlyInvocationRecord & {
+							pendingOutcome?: unknown;
+							deadlineRecoveryPending?: boolean;
+							terminalAt?: number;
+					  })
+					| undefined;
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)}; persistence_log=${JSON.stringify(persistenceLog)}; store_log=${JSON.stringify(storeLog)}; deadline checkpoints=${JSON.stringify(recoveryCheckpoints)}; durable=${JSON.stringify(
+						{
+							status: finalRecord?.status,
+							terminalAt: finalRecord?.terminalAt,
+							deadlineRecoveryPending: finalRecord?.deadlineRecoveryPending,
+							pendingOutcome: finalRecord?.pendingOutcome,
+						},
+					)}`,
+				);
+			}
+			expect(terminalStatus).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
@@ -8625,6 +8694,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const sessionFile = path.join(cwd, "session.json");
 		await Bun.write(sessionFile, "");
 		const store = createReconciliationStore({ sessionFile, sessionId });
+		const deadlineStarted = Promise.withResolvers<void>();
 		let abortCalls = 0;
 		let harness: InvocationHarness | undefined;
 		try {
@@ -8640,7 +8710,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				terminalAbortSeams: {
 					getReconciliationStore: () => store,
 					getTerminalTurnEpoch: () => 17,
-					getActivePromptHandle: () => "unobservable-tool-run",
+					getActivePromptHandle: () => {
+						deadlineStarted.resolve();
+						return "unobservable-tool-run";
+					},
 					abortPromptAndWaitWithTerminal: async () => {
 						abortCalls += 1;
 						return { status: "settled" };
@@ -8654,7 +8727,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness.emit("agent_failed", {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
-			await Bun.sleep(150);
+			// Expiry must install its recoverable observation before the real end
+			// arrives; otherwise an end racing the durable uncertainty write can
+			// terminalize from the diagnostic alone.
+			await deadlineStarted.promise;
 			expect(abortCalls).toBe(0);
 			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({
 				result: { status: "in_flight" },
@@ -8662,7 +8738,6 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
 			await harness.emit("agent_end", { stopReason: "cancelled" });
-			await Bun.sleep(100);
 			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({
 				result: { status: "in_flight" },
 			});
@@ -11644,6 +11719,7 @@ test.each([
 ])("SDK-only queued terminal recovery permits replacement after EIO (early shutdown=%s)", async earlyShutdown => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-recovery-"));
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const recoveryRetired = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
 	let transport = memoryTransport();
 	const sessionId = transport.sessionId;
 	const sessionFile = path.join(cwd, `${sessionId}.json`);
@@ -11690,6 +11766,9 @@ test.each([
 			getActivePromptHandle: () => "unrelated-handle",
 			cancelPendingPreflightForTerminalAbort: () => {},
 			abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+			onDeadlineRecoveryCheckpointForTests: checkpoint => {
+				if (checkpoint.stage === "deadline-recovery-retired") recoveryRetired.resolve(checkpoint);
+			},
 		},
 	});
 	const ctx = { ...extensionContext(sessionId, cwd), isIdle: () => true } as unknown as ExtensionContext;
@@ -11731,7 +11810,7 @@ test.each([
 		expect(accepted.ok).toBe(true);
 		commandId = accepted.result?.commandId;
 		const turnId = accepted.result?.turnId;
-		expect(commandId).toBeDefined();
+		if (commandId === undefined || turnId === undefined) throw new Error("Expected queued prompt correlation");
 		await waitFor(() => queued && queueSignal !== undefined, "queued admission");
 		expect(await request({ type: "control_request", operation: "turn.abort", input: {} })).toMatchObject({
 			ok: true,
@@ -11756,6 +11835,8 @@ test.each([
 			status: "failed",
 			error: { code: "cancelled" },
 		});
+		const retired = await recoveryRetired.promise;
+		expect(retired.correlation).toEqual({ commandId, turnId });
 		if (!earlyShutdown) await handlers.get("session_shutdown")?.({}, ctx);
 		await handlers.get("session_start")?.({}, ctx);
 		expect(creations).toBe(2);

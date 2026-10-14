@@ -239,11 +239,13 @@ describe("auth-gateway openai-chat: encodeResponse", () => {
 			],
 			usage: { ...baseUsage, input: 10, output: 20, cacheRead: 4, cacheWrite: 6, totalTokens: 40 },
 			stopReason: "toolUse",
+			serviceTier: "default",
 		};
 
 		const out = encodeResponse(message, "gpt-5.2");
 		expect(out.object).toBe("chat.completion");
 		expect(out.model).toBe("gpt-5.2");
+		expect(out.service_tier).toBe("default");
 		expect(typeof out.id).toBe("string");
 		expect(String(out.id).startsWith("chatcmpl-")).toBe(true);
 
@@ -387,7 +389,7 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 			{
 				type: "done",
 				reason: "toolUse",
-				message: { ...partial, stopReason: "toolUse" },
+				message: { ...partial, stopReason: "toolUse", serviceTier: "default" },
 			},
 		];
 
@@ -401,6 +403,7 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 			id: string;
 			object: string;
 			model: string;
+			service_tier?: string;
 			choices: Array<{ delta: Record<string, unknown>; finish_reason: string | null }>;
 		}>;
 
@@ -444,6 +447,7 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		const finishChunk = chunks[chunks.length - 1];
 		expect(finishChunk.choices[0].delta).toEqual({});
 		expect(finishChunk.choices[0].finish_reason).toBe("tool_calls");
+		expect(finishChunk.service_tier).toBe("default");
 	});
 
 	it("buffers unclassified Responses thinking until final provenance while summaries remain live", async () => {

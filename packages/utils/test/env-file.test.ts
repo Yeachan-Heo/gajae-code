@@ -36,6 +36,45 @@ describe("projectEnvSnapshot quoted declarations", () => {
 	});
 });
 
+describe("projectEnvSnapshot bounded reads", () => {
+	test("marks an oversized dotenv layer incomplete without parsing partial declarations", () => {
+		const cwd = tempDir("gjc-env-bounded-large-");
+		fs.writeFileSync(path.join(cwd, ".env"), `TMPDIR=/tmp/planted\n${"x".repeat(128)}`);
+
+		const snapshot = projectEnvSnapshot(cwd, { maxFileBytes: 16 });
+		expect(snapshot.incomplete).toBe(true);
+		expect(snapshot.values.TMPDIR).toBeUndefined();
+	});
+
+	test("rejects a device-file dotenv layer without blocking", async () => {
+		if (process.platform === "win32") return;
+		const cwd = tempDir("gjc-env-bounded-device-");
+		const processCwd = tempDir("gjc-env-bounded-runner-");
+		fs.symlinkSync("/dev/zero", path.join(cwd, ".env"));
+		const source = path.resolve(import.meta.dir, "../src/env-file.ts");
+		const script = path.join(processCwd, "snapshot-probe.ts");
+		await Bun.write(
+			script,
+			`import { projectEnvSnapshot } from ${JSON.stringify(source)};\n` +
+				`console.log(JSON.stringify({ incomplete: projectEnvSnapshot(${JSON.stringify(cwd)}, { maxFileBytes: 64 }).incomplete }));\n`,
+		);
+		const proc = Bun.spawn([process.execPath, script], {
+			cwd: processCwd,
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 5_000,
+			killSignal: "SIGKILL",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(stdout.trim())).toEqual({ incomplete: true });
+	}, 10_000);
+});
+
 const dirsSource = path.join(import.meta.dir, "../src/dirs.ts");
 
 async function printedAgentDir(cwd: string, env: Record<string, string | undefined> = {}): Promise<string> {

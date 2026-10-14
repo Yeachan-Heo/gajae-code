@@ -1097,6 +1097,61 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		},
 	);
 
+	test.skipIf(process.platform === "win32")(
+		"reclaims an eight-second orphan transition within the default retry budget",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "default-transition-age.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			// Default callers keep the 10-second stale threshold and 5-second wait budget.
+			const old = new Date(Date.now() - 8_000);
+			await fs.utimes(detachedPath, old, old);
+			let entered = false;
+
+			await withFileLock(lockedFile, async () => {
+				entered = true;
+			});
+
+			expect(entered).toBe(true);
+			expect(await fs.exists(detachedPath)).toBe(false);
+		},
+	);
+
+	test.each([
+		-1,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+	])("rejects invalid orphan-transition adoption age %s", async orphanTransitionAgeMs => {
+		const lockedFile = path.join(await makeTemp(), "invalid-transition-age.json");
+		await expect(withFileLock(lockedFile, async () => undefined, { orphanTransitionAgeMs })).rejects.toThrow(
+			"orphanTransitionAgeMs must be a finite, non-negative number",
+		);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"reclaims a young orphan transition within a longer acquisition budget",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "short-grace-transition.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			const old = new Date(Date.now() - 20_000);
+			await fs.utimes(detachedPath, old, old);
+			vi.spyOn(Bun, "sleep").mockImplementation(async () => {});
+			let entered = false;
+
+			await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 2, retryDelayMs: 30_000 },
+			);
+
+			expect(entered).toBe(true);
+			expect(await fs.exists(detachedPath)).toBe(false);
+		},
+	);
+
 	const invalidOrphanAdoptionReceipts: [string, (detachedPath: string) => unknown][] = [
 		["missing durable scrub proof", detachedPath => ({ ok: false, code: "cleanup_pending", detachedPath })],
 		[
@@ -1221,7 +1276,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 				code: "orphan_transition",
 				reason: "orphan_transition",
 				orphanPath: detachedPath,
-				attempts: 1,
+				attempts: 2,
 			});
 			expect(entered).toBe(false);
 			expect(await fs.exists(detachedPath)).toBe(true);
@@ -1284,6 +1339,40 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			await expect(
 				withFileLock(lockedFile, async () => undefined, { retries: 2, retryDelayMs: 1 }),
 			).resolves.toBeUndefined();
+			expect(await fs.exists(detachedPath)).toBe(false);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"retries a refused orphan adoption and acquires after the cleanup race clears",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "orphan-adoption-retry.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			await fs.mkdir(detachedPath);
+			const old = new Date(Date.now() - 20_000);
+			await fs.utimes(detachedPath, old, old);
+			let removalAttempts = 0;
+			FileLockTestHooks.nativeQuarantineBindings = () => ({
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: (target, snapshot) => {
+					if (target === detachedPath) {
+						removalAttempts++;
+						if (removalAttempts === 1) return { ok: false, code: "identity_mismatch" } as NativeExactUnlinkResult;
+					}
+					return exactRemoveDirectoryTree(target, snapshot);
+				},
+			});
+
+			let entered = false;
+			await withFileLock(
+				lockedFile,
+				async () => {
+					entered = true;
+				},
+				{ retries: 3, retryDelayMs: 1 },
+			);
+			expect(entered).toBe(true);
+			expect(removalAttempts).toBe(2);
 			expect(await fs.exists(detachedPath)).toBe(false);
 		},
 	);

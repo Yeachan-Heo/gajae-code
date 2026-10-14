@@ -10,6 +10,7 @@ packages/*/dist-chrome/
 packages/*/dist-firefox/
 target/
 *.tsbuildinfo
+packages/natives/native/diagnostic-artifact.local.json
 *.node
 *.node.build.json
 *.node.provenance.json

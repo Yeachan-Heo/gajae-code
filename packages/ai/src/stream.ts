@@ -36,6 +36,7 @@ import {
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import {
+	hasAwsInstanceProfileCredentialSource,
 	hasResolvableAwsProfileSource,
 	isValidBedrockBearerToken,
 	readAwsStaticEnvironmentCredentials,
@@ -43,6 +44,7 @@ import {
 import type { CursorOptions } from "./providers/cursor";
 import type { DevinAcpOptions } from "./providers/devin-acp";
 import type { GoogleOptions } from "./providers/google";
+import { getVertexCredentialSource, isValidVertexLocation } from "./providers/google-auth";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
 import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
@@ -73,6 +75,7 @@ import type {
 	AssistantMessageEvent,
 	AuthRetryCredential,
 	Context,
+	FetchImpl,
 	Model,
 	OptionsForApi,
 	SimpleStreamOptions,
@@ -82,8 +85,6 @@ import type {
 } from "./types";
 import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
-
-let cachedVertexAdcCredentialsExists: boolean | null = null;
 
 function assertCustomApiRegistryActive(registry: CustomApiRegistry | undefined): void {
 	if (registry !== undefined) CustomApiRegistry.assertActive(registry);
@@ -111,20 +112,18 @@ function isBuiltInApi(api: Api): boolean {
 }
 
 function hasVertexAdcCredentials(): boolean {
-	if (cachedVertexAdcCredentialsExists === null) {
-		const gacPath = $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
-		if (gacPath) {
-			cachedVertexAdcCredentialsExists = fs.existsSync(gacPath);
-		} else {
-			cachedVertexAdcCredentialsExists = fs.existsSync(
-				path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json"),
-			);
-		}
-	}
-	return cachedVertexAdcCredentialsExists;
+	const gacPath = $credentialEnv("GOOGLE_APPLICATION_CREDENTIALS");
+	if (gacPath) return fs.existsSync(gacPath);
+	return fs.existsSync(path.join(getTrustedHomeDir(), ".config", "gcloud", "application_default_credentials.json"));
 }
 
 type KeyResolver = string | (() => string | undefined);
+
+export type EnvApiKeyCredentialSource =
+	| { kind: "environment"; name: string }
+	| { kind: "google-adc"; source: "explicit-file" | "default-file" | "metadata-server" }
+	| { kind: "aws"; source: "bearer-token" | "environment-credentials" | "profile" | "instance-profile" }
+	| { kind: "unknown" };
 
 const serviceProviderMap: Record<string, KeyResolver> = {
 	"alibaba-token-plan": "ALIBABA_TOKEN_PLAN_API_KEY",
@@ -223,6 +222,25 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	xiaomi: "XIAOMI_API_KEY",
 };
 
+const functionResolverEnvNames: Record<string, readonly string[]> = {
+	openai: ["OPENAI_API_KEY"],
+	kiro: ["KIRO_API_KEY", "AWS_BEARER_TOKEN_KIRO"],
+	"github-copilot": ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+	"google-vertex": ["GOOGLE_CLOUD_API_KEY"],
+	"amazon-bedrock": ["AWS_BEARER_TOKEN_BEDROCK"],
+	huggingface: ["HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"],
+	"qwen-portal": ["QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"],
+};
+
+function getFunctionResolverEnvNames(provider: string): readonly string[] {
+	if (provider === "anthropic") {
+		return isFoundryEnabled()
+			? ["ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
+			: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"];
+	}
+	return functionResolverEnvNames[provider] ?? [];
+}
+
 /**
  * Get API key for provider from known environment variables, e.g. OPENAI_API_KEY.
  *
@@ -235,6 +253,82 @@ export function getEnvApiKey(provider: string): string | undefined {
 		return $credentialEnv(resolver);
 	}
 	return resolver?.();
+}
+
+/**
+ * List configured environment variable names consulted for a provider's
+ * environment credential. Values are never returned. This intentionally uses
+ * the same credential-only environment reader as {@link getEnvApiKey}.
+ */
+export function getEnvApiKeyEnvNames(provider: string): string[] {
+	const resolver = serviceProviderMap[provider];
+	const names = typeof resolver === "string" ? [resolver] : getFunctionResolverEnvNames(provider);
+	return names.filter(name => {
+		const value = $credentialEnv(name);
+		if (value === undefined) return false;
+		if (provider === "kiro" && name === "KIRO_API_KEY") {
+			return value.trim().startsWith("ksk_") && !/[\x00-\x1f\x7f]/.test(value);
+		}
+		if (provider === "amazon-bedrock" && name === "AWS_BEARER_TOKEN_BEDROCK") {
+			return isValidBedrockBearerToken(value);
+		}
+		return true;
+	});
+}
+
+/** Describe the selected source without exposing credential values or unvalidated ADC files. */
+export async function getEnvApiKeyCredentialSource(
+	provider: string,
+	options?: { fetch?: FetchImpl },
+): Promise<EnvApiKeyCredentialSource | undefined> {
+	return (await getEnvApiKeyCredentialSources(provider, options))[0];
+}
+
+/** Enumerate usable credential candidates in provider dispatch precedence without exposing credentials. */
+export async function getEnvApiKeyCredentialSources(
+	provider: string,
+	options?: { fetch?: FetchImpl },
+): Promise<EnvApiKeyCredentialSource[]> {
+	const sources: EnvApiKeyCredentialSource[] = getEnvApiKeyEnvNames(provider).map(
+		(name): EnvApiKeyCredentialSource =>
+			provider === "amazon-bedrock" && name === "AWS_BEARER_TOKEN_BEDROCK"
+				? { kind: "aws", source: "bearer-token" }
+				: { kind: "environment", name },
+	);
+
+	if (provider === "google-vertex") {
+		const project = $credentialEnv("GOOGLE_CLOUD_PROJECT") || $credentialEnv("GCLOUD_PROJECT");
+		const location = $credentialEnv("GOOGLE_CLOUD_LOCATION");
+		if (project && location && isValidVertexLocation(location)) {
+			const source = await getVertexCredentialSource({ fetch: options?.fetch });
+			if (source) sources.push({ kind: "google-adc", source });
+		}
+	} else if (provider === "amazon-bedrock") {
+		const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
+		if (bearerToken && !isValidBedrockBearerToken(bearerToken)) return sources;
+		if (readAwsStaticEnvironmentCredentials()) {
+			sources.push({ kind: "aws", source: "environment-credentials" });
+		}
+		if (hasResolvableAwsProfileSource()) sources.push({ kind: "aws", source: "profile" });
+		if (await hasAwsInstanceProfileCredentialSource({ fetch: options?.fetch })) {
+			sources.push({ kind: "aws", source: "instance-profile" });
+		}
+	}
+
+	return sources;
+}
+
+/** Resolve Vertex ADC provenance, including metadata-server credentials, without acquiring a token. */
+export async function getGoogleVertexCredentialSource(options?: {
+	fetch?: FetchImpl;
+}): Promise<EnvApiKeyCredentialSource | undefined> {
+	return (await getEnvApiKeyCredentialSources("google-vertex", options))[0];
+}
+
+/** Name of the environment variable whose value is selected by `getEnvApiKey`, when identifiable. */
+export async function getEnvApiKeyEnvName(provider: string): Promise<string | undefined> {
+	const source = await getEnvApiKeyCredentialSource(provider);
+	return source?.kind === "environment" ? source.name : undefined;
 }
 
 /**

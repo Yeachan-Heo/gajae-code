@@ -454,6 +454,20 @@ function assertRequestTransformSupportedForKnownProvider(providerName: string, s
 	}
 }
 
+function assertStreamIdleTimeoutSupportedForKnownProvider(providerName: string, source: string): void {
+	const apis = getKnownProviderApis(providerName);
+	if (apis.size === 0) {
+		throw new Error(
+			`Provider ${providerName}: ${source} requires an OpenAI-compatible "api" when the provider is not built in.`,
+		);
+	}
+	if (![...apis].some(isRequestTransformApi)) {
+		throw new Error(
+			`Provider ${providerName}: ${source} is only supported with openai-completions or openai-responses APIs.`,
+		);
+	}
+}
+
 function assertRequestTransformSupportedForModelApi(
 	providerName: string,
 	modelId: string,
@@ -468,8 +482,54 @@ function assertRequestTransformSupportedForModelApi(
 }
 
 function getKnownProviderModelApi(providerName: string, modelId: string): Api | undefined {
-	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(model => model.id === modelId)
-		?.api as Api | undefined;
+	return getBundledModels(providerName as Parameters<typeof getBundledModels>[0]).find(
+		model => model.id.toLowerCase() === modelId.toLowerCase(),
+	)?.api as Api | undefined;
+}
+
+function resolveModelApiOverrideFromDiscovery(
+	providerApi: Api,
+	discovery: ProviderDiscovery,
+	modelId: string,
+	entry?: { id?: unknown; owned_by?: unknown },
+	allowModelIdDetection = true,
+): Api | undefined {
+	// Explicit per-prefix routing always wins over model-id detection.
+	const normalizedModelId = modelId.toLowerCase();
+	let matchedPrefixLength = -1;
+	let prefixApi: Api | undefined;
+	for (const [prefix, routedApi] of Object.entries(discovery.apiByModelPrefix ?? {})) {
+		const normalizedPrefix = prefix.toLowerCase();
+		if (normalizedModelId.startsWith(normalizedPrefix) && normalizedPrefix.length > matchedPrefixLength) {
+			prefixApi = routedApi;
+			matchedPrefixLength = normalizedPrefix.length;
+		}
+	}
+	if (prefixApi !== undefined) return prefixApi;
+
+	// An OpenAI-shaped models list can advertise Anthropic models that must use
+	// the Anthropic transport even when the provider's default is OpenAI-family.
+	if (discovery.type === "openai-models-list") {
+		let candidateEntry = entry;
+		if (candidateEntry === undefined && allowModelIdDetection) {
+			candidateEntry = { id: modelId };
+		}
+		const detected = candidateEntry === undefined ? undefined : detectDiscoveredApiFamily(candidateEntry);
+		if (detected === "anthropic-messages") return "anthropic-messages";
+		if (detected === "openai-completions") {
+			return isOpenAIFamilyApi(providerApi) ? providerApi : "openai-completions";
+		}
+	}
+	return undefined;
+}
+
+function resolveModelApiFromDiscovery(
+	providerApi: Api,
+	discovery: ProviderDiscovery,
+	modelId: string,
+	entry?: { id?: unknown; owned_by?: unknown },
+): Api {
+	return resolveModelApiOverrideFromDiscovery(providerApi, discovery, modelId, entry) ?? providerApi;
 }
 
 function isCanonicalOpenAIAffinityBaseUrl(baseUrl: string | undefined): boolean {
@@ -518,6 +578,7 @@ interface ProviderValidationModel {
 	maxTokens?: number;
 	compat?: Model<Api>["compat"];
 	requestTransform?: ModelRequestTransform;
+	streamIdleTimeoutMs?: number;
 }
 
 interface ProviderValidationConfig {
@@ -526,6 +587,7 @@ interface ProviderValidationConfig {
 	apiKey?: string;
 	apiKeyEnv?: string;
 	api?: Api;
+	transport?: Model<Api>["transport"];
 	auth?: ProviderAuthMode;
 	oauthConfigured?: boolean;
 	discovery?: ProviderDiscovery;
@@ -533,6 +595,7 @@ interface ProviderValidationConfig {
 	requestTransform?: ModelRequestTransform;
 	disableStrictTools?: boolean;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 	openaiCompat?: { baseUrl: string; apiKey?: string; apiKeyEnv?: string };
 	modelOverrides?: Record<string, unknown>;
 	models: ProviderValidationModel[];
@@ -548,7 +611,20 @@ function validateProviderConfiguration(
 	mode: ProviderValidationMode,
 ): void {
 	const hasProviderApi = !!config.api;
+	const configuredApi = config.api ?? (config.openaiCompat ? "openai-completions" : undefined);
 	const models = config.models;
+	if (
+		config.transport === "pi-native" &&
+		(config.streamIdleTimeoutMs !== undefined ||
+			models.some(model => model.streamIdleTimeoutMs !== undefined) ||
+			Object.values(config.modelOverrides ?? {}).some(
+				override => (override as ModelOverride).streamIdleTimeoutMs !== undefined,
+			))
+	) {
+		throw new Error(
+			`Provider ${providerName}: "streamIdleTimeoutMs" is not supported with "transport: pi-native"; configure it on the auth-gateway's upstream model.`,
+		);
+	}
 
 	if (models.length === 0) {
 		if (mode === "models-config") {
@@ -562,12 +638,13 @@ function validateProviderConfiguration(
 				!config.disableStrictTools &&
 				!config.requestTransform &&
 				!config.cacheRetention &&
+				config.streamIdleTimeoutMs === undefined &&
 				!config.openaiCompat &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "cacheRetention", "disableStrictTools", "modelOverrides", "discovery", "openaiCompat", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "compat", "requestTransform", "cacheRetention", "streamIdleTimeoutMs", "disableStrictTools", "modelOverrides", "discovery", "openaiCompat", or "models"`,
 				);
 			}
 		}
@@ -628,10 +705,55 @@ function validateProviderConfiguration(
 	}
 	for (const [modelId, rawOverride] of Object.entries(config.modelOverrides ?? {})) {
 		const override = rawOverride as ModelOverride;
+		const configuredModel = models.find(model => model.id.toLowerCase() === modelId.toLowerCase());
+		const discoveryProviderApi =
+			(config.api as Api | undefined) ??
+			dominantOpenAIFamilyModelApi(models) ??
+			(config.openaiCompat ? "openai-completions" : undefined);
+		const implicitDiscoveryBaseUrl = config.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName);
+		const implicitDiscovery: ProviderDiscovery | undefined =
+			!config.discovery &&
+			(config.openaiCompat !== undefined ||
+				(providerName !== "vllm" &&
+					providerName !== "sglang" &&
+					discoveryProviderApi !== undefined &&
+					isOpenAIFamilyApi(discoveryProviderApi) &&
+					implicitDiscoveryBaseUrl !== undefined))
+				? { type: "openai-models-list" }
+				: undefined;
+		const effectiveDiscovery = config.discovery ?? implicitDiscovery;
+		const discoveryApi =
+			configuredModel || !effectiveDiscovery || !discoveryProviderApi
+				? undefined
+				: resolveModelApiOverrideFromDiscovery(discoveryProviderApi, effectiveDiscovery, modelId);
+		const discoveryTimeoutApi =
+			configuredModel || !effectiveDiscovery || !discoveryProviderApi
+				? undefined
+				: resolveModelApiOverrideFromDiscovery(discoveryProviderApi, effectiveDiscovery, modelId, undefined, false);
+		const bundledModelApi = getKnownProviderModelApi(providerName, modelId);
+		// An OpenAI models-list row may override both its ID-based family and the
+		// provider default via `owned_by`. Defer ambiguous timeout validation until
+		// discovery supplies that metadata; applying the override validates the
+		// resolved model API before it can take effect.
+		const deferTimeoutValidation =
+			!configuredModel &&
+			effectiveDiscovery?.type === "openai-models-list" &&
+			discoveryTimeoutApi === undefined &&
+			bundledModelApi === undefined;
 		const effectiveApi =
-			models.find(model => model.id === modelId)?.api ??
-			config.api ??
-			getKnownProviderModelApi(providerName, modelId);
+			configuredModel?.api ??
+			(configuredModel ? config.api : undefined) ??
+			discoveryApi ??
+			bundledModelApi ??
+			config.api;
+		const effectiveTimeoutApi =
+			configuredModel?.api ??
+			(configuredModel ? config.api : undefined) ??
+			discoveryTimeoutApi ??
+			bundledModelApi ??
+			(deferTimeoutValidation
+				? undefined
+				: (config.api ?? (config.openaiCompat ? "openai-completions" : undefined)));
 		if (override.compat?.supportsResponsesSessionAffinity !== undefined) {
 			assertResponsesSessionAffinitySupported(
 				providerName,
@@ -639,6 +761,21 @@ function validateProviderConfiguration(
 				config.baseUrl,
 				`modelOverrides ${modelId} "compat.supportsResponsesSessionAffinity"`,
 			);
+		}
+		if (override.streamIdleTimeoutMs !== undefined) {
+			if (effectiveTimeoutApi) {
+				assertRequestTransformSupportedForModelApi(
+					providerName,
+					modelId,
+					effectiveTimeoutApi,
+					'modelOverrides "streamIdleTimeoutMs"',
+				);
+			} else if (!deferTimeoutValidation) {
+				assertRequestTransformSupportedForKnownProvider(
+					providerName,
+					`modelOverrides ${modelId} "streamIdleTimeoutMs"`,
+				);
+			}
 		}
 		if (!override.requestTransform) continue;
 		if (effectiveApi) {
@@ -662,6 +799,54 @@ function validateProviderConfiguration(
 			assertRequestTransformSupportedForKnownProvider(providerName, '"requestTransform"');
 		}
 	}
+	if (config.streamIdleTimeoutMs !== undefined) {
+		const bundledApis = getKnownProviderApis(providerName);
+		const hasCompatibleBundledApi = [...bundledApis].some(isRequestTransformApi);
+		const hasCompatibleModelApi = models.some(model => {
+			const api = model.api ?? config.api;
+			return api !== undefined && isRequestTransformApi(api);
+		});
+		const hasCompatibleDiscoveryApi =
+			config.openaiCompat !== undefined ||
+			(config.discovery !== undefined &&
+				((configuredApi !== undefined && isRequestTransformApi(configuredApi)) ||
+					Object.values(config.discovery.apiByModelPrefix ?? {}).some(isRequestTransformApi)));
+		const implicitDiscoveryApi =
+			(config.api as Api | undefined) ??
+			dominantOpenAIFamilyModelApi(models) ??
+			(config.openaiCompat ? "openai-completions" : undefined);
+		const implicitDiscoveryBaseUrl = config.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName);
+		const hasCompatibleImplicitDiscoveryApi =
+			!config.discovery &&
+			(config.openaiCompat !== undefined ||
+				(providerName !== "vllm" &&
+					providerName !== "sglang" &&
+					implicitDiscoveryApi !== undefined &&
+					isOpenAIFamilyApi(implicitDiscoveryApi) &&
+					implicitDiscoveryBaseUrl !== undefined));
+		const hasCompatibleDiscoveryRoute = hasCompatibleDiscoveryApi || hasCompatibleImplicitDiscoveryApi;
+		if (models.length > 0) {
+			if (!hasCompatibleModelApi && !hasCompatibleBundledApi && !hasCompatibleDiscoveryRoute) {
+				throw new Error(
+					`Provider ${providerName}: "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs.`,
+				);
+			}
+		} else {
+			if (!hasCompatibleBundledApi && !hasCompatibleDiscoveryRoute) {
+				if (bundledApis.size > 0) {
+					assertStreamIdleTimeoutSupportedForKnownProvider(providerName, '"streamIdleTimeoutMs"');
+				} else if (configuredApi) {
+					if (!isRequestTransformApi(configuredApi)) {
+						throw new Error(
+							`Provider ${providerName}: "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs.`,
+						);
+					}
+				} else {
+					assertStreamIdleTimeoutSupportedForKnownProvider(providerName, '"streamIdleTimeoutMs"');
+				}
+			}
+		}
+	}
 
 	for (const modelDef of models) {
 		if (!hasProviderApi && !modelDef.api) {
@@ -675,6 +860,14 @@ function validateProviderConfiguration(
 			throw new Error(`Provider ${providerName}: model missing "id"`);
 		}
 		const effectiveApi = modelDef.api ?? config.api;
+		if (modelDef.streamIdleTimeoutMs !== undefined && effectiveApi) {
+			assertRequestTransformSupportedForModelApi(
+				providerName,
+				modelDef.id,
+				effectiveApi,
+				'model "streamIdleTimeoutMs"',
+			);
+		}
 		const modelCompat = modelDef.compat;
 		if (modelCompat && "supportsResponsesSessionAffinity" in modelCompat) {
 			assertResponsesSessionAffinitySupported(
@@ -721,12 +914,14 @@ function validateModelsConfig(config: ModelsConfig): void {
 				apiKey: providerConfig.apiKey,
 				apiKeyEnv: providerConfig.apiKeyEnv,
 				api: providerConfig.api as Api | undefined,
+				transport: providerConfig.transport,
 				auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
 				discovery: providerConfig.discovery as ProviderDiscovery | undefined,
 				compat: providerConfig.compat,
 				requestTransform: providerConfig.requestTransform,
 				disableStrictTools: providerConfig.disableStrictTools,
 				cacheRetention: providerConfig.cacheRetention,
+				streamIdleTimeoutMs: providerConfig.streamIdleTimeoutMs,
 				openaiCompat: providerConfig.openaiCompat,
 				modelOverrides: providerConfig.modelOverrides,
 				models: (providerConfig.models ?? []) as ProviderValidationModel[],
@@ -797,6 +992,7 @@ interface ProviderOverride {
 	transport?: Model<Api>["transport"];
 	requestTransform?: ModelRequestTransform;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 	isOAuth?: boolean;
 }
 
@@ -830,6 +1026,7 @@ function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Parti
 		contextWindow: model.contextWindow,
 		maxTokens: model.maxTokens,
 	};
+	if (model.streamIdleTimeoutMs !== undefined) metadata.streamIdleTimeoutMs = model.streamIdleTimeoutMs;
 	if (model.longContextPricing !== undefined) metadata.longContextPricing = model.longContextPricing;
 	if (model.premiumMultiplier !== undefined) metadata.premiumMultiplier = model.premiumMultiplier;
 	if (model.priority !== undefined) metadata.priority = model.priority;
@@ -993,10 +1190,15 @@ export function mergeDiscoveredModel<TApi extends Api>(
 	existing: Model<Api> | undefined,
 	providerOverride?: Pick<
 		ProviderOverride,
-		"baseUrl" | "headers" | "transport" | "requestTransform" | "cacheRetention"
+		"baseUrl" | "headers" | "transport" | "requestTransform" | "cacheRetention" | "streamIdleTimeoutMs"
 	>,
 ): Model<TApi> {
 	if (existing) {
+		const streamIdleTimeoutMs =
+			model.streamIdleTimeoutMs ??
+			(isRequestTransformApi(model.api)
+				? (existing.streamIdleTimeoutMs ?? providerOverride?.streamIdleTimeoutMs)
+				: undefined);
 		return {
 			...model,
 			baseUrl: providerOverride?.baseUrl ?? model.baseUrl ?? existing.baseUrl,
@@ -1006,15 +1208,20 @@ export function mergeDiscoveredModel<TApi extends Api>(
 				providerOverride?.requestTransform,
 			),
 			cacheRetention: model.cacheRetention ?? existing.cacheRetention ?? providerOverride?.cacheRetention,
+			...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		};
 	}
 	if (providerOverride) {
+		const streamIdleTimeoutMs =
+			model.streamIdleTimeoutMs ??
+			(isRequestTransformApi(model.api) ? providerOverride.streamIdleTimeoutMs : undefined);
 		return {
 			...model,
 			baseUrl: providerOverride.baseUrl ?? model.baseUrl,
 			headers: mergeCaseInsensitiveHeaders(model.headers, providerOverride.headers),
 			...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
 			requestTransform: mergeRequestTransform(model.requestTransform, providerOverride.requestTransform),
+			...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		};
 	}
 	return model;
@@ -1330,6 +1537,20 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.output !== undefined) result.output = override.output as ("text" | "image")[];
 	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
+	if (override.streamIdleTimeoutMs !== undefined) {
+		if (isRequestTransformApi(model.api)) {
+			result.streamIdleTimeoutMs = override.streamIdleTimeoutMs;
+		} else {
+			// Discovery ownership can reveal an incompatible route after config
+			// validation, including while hydrating a cached model at startup.
+			// Reject only this override so the otherwise-valid model stays usable.
+			logger.warn("model stream idle timeout override ignored for incompatible API", {
+				model: model.id,
+				provider: model.provider,
+				api: model.api,
+			});
+		}
+	}
 	const contextWindowOverride = toPositiveNumberOrUndefined(override.contextWindow);
 	if (contextWindowOverride !== undefined) {
 		result.contextWindow = contextWindowOverride;
@@ -1419,6 +1640,7 @@ interface CustomModelDefinitionLike {
 	wireModelId?: string;
 	requestTransform?: ModelRequestTransform;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 }
 
 interface CustomModelBuildOptions {
@@ -1446,6 +1668,7 @@ type CustomModelOverlay = {
 	wireModelId?: string;
 	requestTransform?: ModelRequestTransform;
 	cacheRetention?: CacheRetention;
+	streamIdleTimeoutMs?: number;
 	transport?: Model<Api>["transport"];
 	isOAuth?: boolean;
 };
@@ -1560,9 +1783,13 @@ function buildCustomModelOverlay(
 	providerCacheRetention: CacheRetention | undefined,
 	providerTransport: Model<Api>["transport"] | undefined,
 	modelDef: CustomModelDefinitionLike,
+	providerStreamIdleTimeoutMs?: number,
 ): CustomModelOverlay | undefined {
 	const api = modelDef.api ?? providerApi;
 	if (!api) return undefined;
+	const streamIdleTimeoutMs = isRequestTransformApi(api)
+		? (modelDef.streamIdleTimeoutMs ?? providerStreamIdleTimeoutMs)
+		: undefined;
 	return {
 		id: modelDef.id,
 		provider: providerName,
@@ -1587,6 +1814,7 @@ function buildCustomModelOverlay(
 		contextPromotionTarget: modelDef.contextPromotionTarget,
 		premiumMultiplier: modelDef.premiumMultiplier,
 		cacheRetention: modelDef.cacheRetention ?? providerCacheRetention,
+		...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		transport: providerTransport,
 		isOAuth: resolveCustomModelIsOAuth(api, providerAuth),
 	};
@@ -1723,6 +1951,9 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		wireModelId: resolvedModel.wireModelId,
 		requestTransform: resolvedModel.requestTransform,
 		cacheRetention: resolvedModel.cacheRetention ?? reference?.cacheRetention,
+		...(resolvedModel.streamIdleTimeoutMs !== undefined
+			? { streamIdleTimeoutMs: resolvedModel.streamIdleTimeoutMs }
+			: {}),
 		transport: resolvedModel.transport,
 		premiumMultiplier: resolvedModel.premiumMultiplier,
 		isOAuth: resolvedModel.isOAuth,
@@ -3337,6 +3568,9 @@ export class ModelRegistry {
 				const inheritedCompat = explicitTransportMatches
 					? explicitTransport?.compat
 					: commonRegistryTransportCompat(transportTemplates);
+				const streamIdleTimeoutMs = isRequestTransformApi(registryModel.api)
+					? (registryModel.streamIdleTimeoutMs ?? explicitTransport?.streamIdleTimeoutMs)
+					: undefined;
 				const hydratedRegistryModel = {
 					...registryModel,
 					baseUrl: transportSource.baseUrl!,
@@ -3344,6 +3578,7 @@ export class ModelRegistry {
 					transport: transportSource.transport,
 					requestTransform: transportSource.requestTransform,
 					cacheRetention: transportSource.cacheRetention,
+					...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 					isOAuth: transportSource.isOAuth,
 					compat:
 						inheritedCompat || registryModel.compat || explicitTransport?.compat
@@ -3359,14 +3594,23 @@ export class ModelRegistry {
 				continue;
 			}
 			const existing = merged[existingIndex]!;
+			const { streamIdleTimeoutMs: existingStreamIdleTimeoutMs, ...existingWithoutStreamIdleTimeout } = existing;
 			const effectiveApi = explicitTransport?.api ?? existing.api;
 			const registryApiMatchesEffectiveTransport = registryModel.api === effectiveApi;
 			const registryMetadata = registryApiMatchesEffectiveTransport
 				? registryModel
 				: registryModelMetadataWithoutApiSpecificFields(registryModel);
+			const {
+				streamIdleTimeoutMs: registryMetadataStreamIdleTimeoutMs,
+				...registryMetadataWithoutStreamIdleTimeout
+			} = registryMetadata;
+			const streamIdleTimeoutMs = isRequestTransformApi(effectiveApi)
+				? (registryMetadataStreamIdleTimeoutMs ?? existingStreamIdleTimeoutMs)
+				: undefined;
 			merged[existingIndex] = {
-				...existing,
-				...registryMetadata,
+				...existingWithoutStreamIdleTimeout,
+				...registryMetadataWithoutStreamIdleTimeout,
+				...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 				api: explicitTransport?.api ?? existing.api,
 				baseUrl: existing.baseUrl,
 				headers: existing.headers,
@@ -3403,9 +3647,14 @@ export class ModelRegistry {
 			const existingIndex = indexByKey.get(key);
 			if (existingIndex !== undefined) {
 				const existingModel = merged[existingIndex];
+				const { streamIdleTimeoutMs: existingStreamIdleTimeoutMs, ...existingModelWithoutStreamIdleTimeout } =
+					existingModel;
 				const referenceModel = resolveCustomModelReference(customModel.id);
+				const streamIdleTimeoutMs = isRequestTransformApi(customModel.api)
+					? (customModel.streamIdleTimeoutMs ?? existingStreamIdleTimeoutMs)
+					: undefined;
 				merged[existingIndex] = enrichModelThinking({
-					...existingModel,
+					...existingModelWithoutStreamIdleTimeout,
 					id: customModel.id,
 					provider: customModel.provider,
 					api: customModel.api,
@@ -3429,6 +3678,7 @@ export class ModelRegistry {
 					wireModelId: customModel.wireModelId,
 					requestTransform: customModel.requestTransform,
 					premiumMultiplier: customModel.premiumMultiplier ?? existingModel.premiumMultiplier,
+					...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 				} as Model<Api>);
 			} else {
 				merged.push(finalizeCustomModel(customModel, { useDefaults: true }));
@@ -3601,10 +3851,12 @@ export class ModelRegistry {
 		});
 	}
 	#sanitizeDiscoverableModelsForCache(_providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		return this.#stripModelBaseUrlQueries(models).map(model => ({
-			...model,
-			headers: undefined,
-		}));
+		return this.#stripModelBaseUrlQueries(models).map(model => {
+			const cachedModel = { ...model, headers: undefined };
+			// Model idle timeouts come from local config and must be re-derived on cache load.
+			delete cachedModel.streamIdleTimeoutMs;
+			return cachedModel;
+		});
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
 		return models.map(model => createTrustedStrippedModelClone(model));
@@ -3807,10 +4059,11 @@ export class ModelRegistry {
 				providerConfig.disableStrictTools ||
 				providerConfig.requestTransform ||
 				providerConfig.transport ||
-				providerConfig.cacheRetention
+				providerConfig.cacheRetention ||
+				providerConfig.streamIdleTimeoutMs !== undefined
 			) {
 				const disableStrictCompat = providerConfig.disableStrictTools ? { disableStrictTools: true } : undefined;
-				overrides.set(providerName, {
+				const providerOverride: ProviderOverride = {
 					api: providerConfig.api as Api | undefined,
 					baseUrl: providerConfig.baseUrl,
 					headers: providerConfig.headers,
@@ -3820,8 +4073,14 @@ export class ModelRegistry {
 					transport: providerConfig.transport,
 					requestTransform: providerConfig.requestTransform,
 					cacheRetention: providerConfig.cacheRetention,
+					streamIdleTimeoutMs: providerConfig.streamIdleTimeoutMs,
 					isOAuth,
-				});
+				};
+				const existingOverride = overrides.get(providerName);
+				overrides.set(
+					providerName,
+					existingOverride ? this.#mergeProviderOverride(existingOverride, providerOverride) : providerOverride,
+				);
 			}
 
 			if (authMode === "none") {
@@ -5191,36 +5450,7 @@ export class ModelRegistry {
 		modelId: string,
 		entry?: { id?: unknown; owned_by?: unknown },
 	): Api {
-		// 1. Explicit per-prefix routing from models.yml always wins — the user
-		//    stated the transport for these ids, so never second-guess it.
-		let matchedPrefixLength = -1;
-		let prefixApi: Api | undefined;
-		for (const [prefix, routedApi] of Object.entries(providerConfig.discovery.apiByModelPrefix ?? {})) {
-			if (modelId.startsWith(prefix) && prefix.length > matchedPrefixLength) {
-				prefixApi = routedApi;
-				matchedPrefixLength = prefix.length;
-			}
-		}
-		if (prefixApi !== undefined) return prefixApi;
-		// 2. For OpenAI-compatible gateways that can front both OpenAI and
-		//    Anthropic upstreams (e.g. CLIProxyAPI), auto-detect the wire family
-		//    per model from the `/v1/models` `owned_by` owner and the model id.
-		//    A mixed gateway then routes `claude-*` through Anthropic Messages
-		//    with zero manual config. OpenAI-family models keep the provider's
-		//    configured OpenAI transport (e.g. `openai-responses` vs
-		//    `openai-completions`) rather than being forced to chat-completions,
-		//    because a `/v1/models` list cannot reveal which OpenAI API the
-		//    gateway expects. Only override to `openai-completions` when the
-		//    provider default is not itself an OpenAI-family api.
-		if (providerConfig.discovery.type === "openai-models-list") {
-			const detected = detectDiscoveredApiFamily(entry ?? { id: modelId });
-			if (detected === "anthropic-messages") return "anthropic-messages";
-			if (detected === "openai-completions") {
-				return isOpenAIFamilyApi(providerConfig.api) ? providerConfig.api : "openai-completions";
-			}
-		}
-		// 3. Fall back to the provider-level default api.
-		return providerConfig.api;
+		return resolveModelApiFromDiscovery(providerConfig.api, providerConfig.discovery, modelId, entry);
 	}
 
 	async #discoverModelsDevProvider(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
@@ -5695,6 +5925,7 @@ export class ModelRegistry {
 			transport: override.transport ?? baseOverride?.transport,
 			requestTransform: mergeRequestTransform(baseOverride?.requestTransform, override.requestTransform),
 			cacheRetention: override.cacheRetention ?? baseOverride?.cacheRetention,
+			streamIdleTimeoutMs: override.streamIdleTimeoutMs ?? baseOverride?.streamIdleTimeoutMs,
 			isOAuth: override.isOAuth ?? baseOverride?.isOAuth,
 		};
 	}
@@ -5710,6 +5941,7 @@ export class ModelRegistry {
 			| "transport"
 			| "requestTransform"
 			| "cacheRetention"
+			| "streamIdleTimeoutMs"
 		>,
 	): T {
 		const overrideHeaders = (
@@ -5744,6 +5976,8 @@ export class ModelRegistry {
 			delete overrideHeaders[GENERATED_AUTH_HEADER];
 		}
 		const headers = mergeAuthHeader(overrideHeaders, canInject, canInject ? override.apiKey : undefined);
+		const streamIdleTimeoutMs =
+			entry.streamIdleTimeoutMs ?? (isRequestTransformApi(entry.api) ? override.streamIdleTimeoutMs : undefined);
 		const result = {
 			...entry,
 			compat: mergeProviderCompat(entry.compat, override.compat),
@@ -5757,6 +5991,7 @@ export class ModelRegistry {
 				override.requestTransform,
 			),
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
+			...(streamIdleTimeoutMs !== undefined ? { streamIdleTimeoutMs } : {}),
 		};
 		if (!canInject && explicitAuthKey !== undefined) {
 			delete (result.headers as Record<string, string> & { [GENERATED_AUTH_HEADER]?: string })[
@@ -6044,6 +6279,7 @@ export class ModelRegistry {
 					providerConfig.cacheRetention,
 					providerConfig.transport,
 					modelDef as CustomModelDefinitionLike,
+					providerConfig.streamIdleTimeoutMs,
 				);
 				if (!model) continue;
 				models.push(model);
@@ -6063,6 +6299,67 @@ export class ModelRegistry {
 	/** Provider ids declared in models.yml, including override-only providers. */
 	getConfiguredProviderIds(): readonly string[] {
 		return [...this.#configuredProviderIds];
+	}
+
+	/** Configured API-key sources in models.yml precedence order, excluding absent environment values. */
+	getProviderConfigApiKeySources(
+		provider: string,
+	): Array<{ kind: "environment"; name: string; provider: string } | { kind: "models-yml"; provider: string }> {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		const configuredProviders = this.#acceptedConfigValue?.providers;
+		const configuredAliases = Object.entries(configuredProviders ?? {}).filter(
+			([configuredProvider]) => resolveOAuthStorageProvider(configuredProvider) === normalizedProvider,
+		);
+		const sources: Array<
+			{ kind: "environment"; name: string; provider: string } | { kind: "models-yml"; provider: string }
+		> = [];
+		const addSource = (
+			configuredProvider: string,
+			apiKey: string | undefined,
+			apiKeyEnv: string | undefined,
+		): void => {
+			if (apiKey) {
+				if (Bun.env[apiKey]) sources.push({ kind: "environment", name: apiKey, provider: configuredProvider });
+				else sources.push({ kind: "models-yml", provider: configuredProvider });
+				return;
+			}
+			if (apiKeyEnv && $rotatingCredentialEnv(apiKeyEnv)) {
+				sources.push({ kind: "environment", name: apiKeyEnv, provider: configuredProvider });
+			}
+		};
+		for (const [configuredProvider, configured] of configuredAliases) {
+			addSource(configuredProvider, configured.apiKey, configured.apiKeyEnv);
+			addSource(configuredProvider, configured.openaiCompat?.apiKey, configured.openaiCompat?.apiKeyEnv);
+		}
+		return sources.filter(
+			(source, index) =>
+				source.kind === "models-yml" ||
+				sources.findIndex(
+					candidate =>
+						candidate.kind === "environment" &&
+						candidate.name === source.name &&
+						candidate.provider === source.provider,
+				) === index,
+		);
+	}
+
+	/** Environment variable name for a provider API key supplied by runtime setup. */
+	getProviderRuntimeApiKeyEnvName(provider: string): string | undefined {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		return (
+			this.#runtimeProviderApiKeyEnvNames.get(provider) ??
+			[...this.#runtimeProviderApiKeyEnvNames].find(
+				([registeredProvider]) => resolveOAuthStorageProvider(registeredProvider) === normalizedProvider,
+			)?.[1]
+		);
+	}
+
+	/** Whether a runtime extension's provider API key is currently installed in AuthStorage. */
+	hasRuntimeProviderApiKey(provider: string): boolean {
+		const normalizedProvider = resolveOAuthStorageProvider(provider);
+		return [...this.#runtimeProviderCredentialInstalled].some(
+			registeredProvider => resolveOAuthStorageProvider(registeredProvider) === normalizedProvider,
+		);
 	}
 
 	/**

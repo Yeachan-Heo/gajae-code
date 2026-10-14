@@ -88,7 +88,9 @@ export function loadFromCandidates<T>(input: LoadFromCandidatesInput<T>): LoadFr
 export interface CachedEmbeddedExtractionIsFreshInput {
 	targetPath: string;
 	embeddedPath: string;
+	expectedDigest: string | null | undefined;
 	sizeOf: (path: string) => number | null;
+	digestOf: (path: string) => string | null;
 }
 
 export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;

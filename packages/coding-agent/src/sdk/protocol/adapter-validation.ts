@@ -1,10 +1,32 @@
 const RELOAD_COMPONENTS = new Set(["config", "models", "skills", "extensions", "tools"]);
-const SERVICE_TIERS = new Set(["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"]);
+const SERVICE_TIERS = new Set([
+	"none",
+	"auto",
+	"default",
+	"flex",
+	"scale",
+	"priority",
+	"ultrafast",
+	"openai-only",
+	"claude-only",
+]);
 
 type Input = Record<string, unknown>;
 
 type SecretInputError = { code: "secret_field_forbidden"; message: string };
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
+
+type UltrafastRestrictionError = { code: "ultrafast_tier_forbidden"; message: string };
+
+function containsUltrafastServiceTier(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(containsUltrafastServiceTier);
+	if (!value || typeof value !== "object") return false;
+	return Object.entries(value as Record<string, unknown>).some(
+		([key, nested]) =>
+			((key === "serviceTier" || key.endsWith(".serviceTier")) && nested === "ultrafast") ||
+			containsUltrafastServiceTier(nested),
+	);
+}
 
 function containsSecretField(value: unknown): boolean {
 	if (Array.isArray(value)) return value.some(containsSecretField);
@@ -12,13 +34,24 @@ function containsSecretField(value: unknown): boolean {
 	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
 }
 
-/** Rejects secret-bearing config patches from model-facing adapter inputs. */
-export function validateAdapterSecretFields(operation: string, input: Input): SecretInputError | undefined {
-	if (operation === "config.patch" && containsSecretField(input)) {
-		return {
-			code: "secret_field_forbidden",
-			message: "config.patch secret fields are not available through this adapter.",
-		};
+/** Rejects secret-bearing and ultrafast-tier config patches from model-facing adapter inputs. */
+export function validateAdapterSecretFields(
+	operation: string,
+	input: Input,
+): SecretInputError | UltrafastRestrictionError | undefined {
+	if (operation === "config.patch") {
+		if (containsSecretField(input)) {
+			return {
+				code: "secret_field_forbidden",
+				message: "config.patch secret fields are not available through this adapter.",
+			};
+		}
+		if (containsUltrafastServiceTier(input)) {
+			return {
+				code: "ultrafast_tier_forbidden",
+				message: "config.patch serviceTier ultrafast is restricted to trusted local sources.",
+			};
+		}
 	}
 	return undefined;
 }
@@ -53,8 +86,12 @@ export function validateRequiredPromptText(operation: string, input: Input): Ada
 	return undefined;
 }
 
-/** Validates controls that adapters must reject before forwarding them to a host. */
-export function validateAdapterControl(operation: string, input: Input): AdapterValidationError | undefined {
+/** Validates controls before forwarding them; adapters reject ultrafast unless explicitly trusted. */
+export function validateAdapterControl(
+	operation: string,
+	input: Input,
+	options: { allowUltrafastTier?: boolean } = {},
+): AdapterValidationError | undefined {
 	const promptError = validateRequiredPromptText(operation, input);
 	if (promptError) return promptError;
 	if (operation === "runtime.reload") {
@@ -68,7 +105,12 @@ export function validateAdapterControl(operation: string, input: Input): Adapter
 			};
 		}
 	}
-	if (operation === "service_tier.set" && (typeof input.tier !== "string" || !SERVICE_TIERS.has(input.tier))) {
+	if (
+		operation === "service_tier.set" &&
+		(typeof input.tier !== "string" ||
+			!SERVICE_TIERS.has(input.tier) ||
+			(input.tier === "ultrafast" && options.allowUltrafastTier !== true))
+	) {
 		return { code: "invalid_input", message: "service_tier.set tier is invalid." };
 	}
 	return undefined;

@@ -230,6 +230,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("TARGET_ARCH: arm64");
 		expect(workflow).toContain("process.platform");
 		expect(workflow).toContain("process.arch");
+		expect(workflow).toContain(
+			'bun test ./packages/natives/test/diagnostic-loader.test.ts --test-name-pattern "verifies a local source addon"',
+		);
+		expect(workflow).toContain(
+			'bun test ./packages/natives/test/diagnostic-loader.test.ts --test-name-pattern "uses the verified local build digest carried by a compiled binary"',
+		);
 		expect(workflow).toContain("Write immutable Darwin smoke receipt");
 		expect(workflow).toContain("dev-affected-darwin-receipt-${{ github.run_id }}");
 		const darwinReceiptUploadStart = workflow.indexOf("      - name: Upload Darwin smoke receipt");

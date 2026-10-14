@@ -17,7 +17,7 @@ import { APP_NAME, adjustHsv, getAgentDir, getProjectDir, logger, postmortem, sa
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import { ConfigHotReloadWatcher } from "../config/config-hot-reload";
-import { isConfigHotReloadTrusted } from "../config/config-hot-reload-trust";
+import { isConfigHotReloadSupported, isConfigHotReloadTrusted } from "../config/config-hot-reload-trust";
 import {
 	type AppKeybinding,
 	defaultMessageQueueKeysForPlatform,
@@ -1699,6 +1699,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #startConfigHotReload(): Promise<void> {
 		const paths = this.session.getConfigurationPaths();
 		if (!paths) return;
+		if (!isConfigHotReloadSupported()) {
+			logger.debug("Configuration hot reload is unsupported on this platform", { platform: process.platform });
+			return;
+		}
 		const trusted = await isConfigHotReloadTrusted(paths);
 		if (this.#stopped || this.#isShuttingDown) return;
 		if (!trusted) {

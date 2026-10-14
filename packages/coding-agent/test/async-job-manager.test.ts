@@ -1,6 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
-import { lookupOwnedRegistration, registerOwnedRegistration } from "../src/session/terminal-abort";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	unregisterOwnedRegistration,
+} from "../src/session/terminal-abort";
 
 describe("AsyncJobManager", () => {
 	test("reentrant cancellation disposal waits for the published runner completion", async () => {
@@ -1303,5 +1307,91 @@ describe("AsyncJobManager", () => {
 
 		expect(AsyncJobManager.instance()).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint("test-session")).toBeUndefined();
+	});
+
+	test("rekeyForEndpoint migrates queued resume registrations from E1 to E2", async () => {
+		// Test that when a manager is rekeyed from E1 to E2, any queued resume
+		// ownership tuple moves to E2 while its admission endpoint remains E1 for
+		// exact lineage lookup. Both endpoint identities are retained so queue
+		// cleanup and resumed-job registration stay aligned after rekey.
+		const endpointE1 = "endpoint-1-rekey-source";
+		const endpointE2 = "endpoint-2-rekey-target";
+		const subagentId = "test-subagent-rekey";
+		const seq = 1;
+		const queuedGeneration = `queued:${subagentId}:${seq}`;
+		const lineageIdHash = "test-lineage-hash";
+		const attemptEpoch = 42;
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		try {
+			// Register the manager at E1
+			expect(AsyncJobManager.registerForEndpoint(endpointE1, manager)).toBe(true);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE1);
+
+			// Register an owned registration at E1 for the queued generation
+			registerOwnedRegistration({
+				endpointId: endpointE1,
+				lineageIdHash,
+				promptAttemptEpoch: attemptEpoch,
+				endpointGeneration: 1,
+				jobId: queuedGeneration,
+				jobGeneration: queuedGeneration,
+			});
+
+			// Verify the registration exists at E1
+			const regAtE1Before = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE1);
+			expect(regAtE1Before).toBeDefined();
+			expect(regAtE1Before?.endpointId).toBe(endpointE1);
+
+			// Manually create a queued resume entry in the manager with the admission endpoint set to E1
+			// This simulates the state after a resume was queued at E1
+			// We create a dummy subagent record with a queued field
+			manager.registerResumeDescriptor(
+				{ subagentId, ownerId: "test-owner", data: { sessionFile: "" } },
+				() => "dummy-job-id",
+			);
+			const subagentRecord = manager.getSubagentRecord(subagentId);
+			if (subagentRecord) {
+				// Simulate the state of a queued resume by manually setting the queued field
+				subagentRecord.status = "queued";
+				subagentRecord.queued = {
+					ownerId: "test-owner",
+					seq,
+					message: "resume message",
+					admissionEndpointId: endpointE1,
+					createdAt: Date.now(),
+				};
+			}
+
+			// Rekey the manager from E1 to E2
+			const rekeySuccess = AsyncJobManager.rekeyForEndpoint(endpointE1, endpointE2, manager);
+			expect(rekeySuccess).toBe(true);
+
+			// Verify the manager is now registered at E2, not E1
+			expect(AsyncJobManager.forEndpoint(endpointE1)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(endpointE2)).toBe(manager);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe(endpointE2);
+
+			// Verify the queued registration was migrated from E1 to E2
+			const regAtE1After = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE1);
+			expect(regAtE1After).toBeUndefined(); // No longer at E1
+
+			const regAtE2After = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointE2);
+			expect(regAtE2After).toBeDefined(); // Now at E2
+			expect(regAtE2After?.endpointId).toBe(endpointE2);
+			expect(regAtE2After?.lineageIdHash).toBe(lineageIdHash);
+			expect(regAtE2After?.promptAttemptEpoch).toBe(attemptEpoch);
+
+			// Preserve lineage admission at E1 while recording the tuple's new E2 key.
+			const updatedRecord = manager.getSubagentRecord(subagentId);
+			expect(updatedRecord?.queued?.admissionEndpointId).toBe(endpointE1);
+			expect(updatedRecord?.queued?.ownedRegistrationEndpointId).toBe(endpointE2);
+		} finally {
+			await manager.dispose({ timeoutMs: 100 });
+			AsyncJobManager.unregisterManager(manager);
+			for (const endpointId of [endpointE1, endpointE2]) {
+				const queuedRegistration = lookupOwnedRegistration(queuedGeneration, queuedGeneration, endpointId);
+				if (queuedRegistration) unregisterOwnedRegistration(queuedRegistration);
+			}
+		}
 	});
 });

@@ -261,6 +261,7 @@ describe("openai-responses encodeResponse", () => {
 				reasoningTokens: 5,
 			},
 			stopReason: "toolUse",
+			serviceTier: "ultrafast",
 			timestamp: 1_700_000_000_000,
 		};
 
@@ -269,6 +270,7 @@ describe("openai-responses encodeResponse", () => {
 		expect(body.object).toBe("response");
 		expect(body.status).toBe("completed");
 		expect(body.model).toBe("gpt-5-requested");
+		expect(body.service_tier).toBe("ultrafast");
 		expect(body.created_at).toBe(1_700_000_000);
 		expect(typeof body.id).toBe("string");
 		expect((body.id as string).startsWith("resp_")).toBe(true);
@@ -391,6 +393,7 @@ describe("openai-responses encodeStream", () => {
 			],
 			usage: { ...zeroUsage(), input: 1, output: 2 },
 			stopReason: "toolUse",
+			serviceTier: "default",
 			timestamp: 1_700_000_000_000,
 		};
 
@@ -510,6 +513,7 @@ describe("openai-responses encodeStream", () => {
 		const response = completed.response as Record<string, unknown>;
 		expect(response.status).toBe("completed");
 		expect(response.model).toBe("gpt-5-requested");
+		expect(response.service_tier).toBe("default");
 		const output = response.output as Array<Record<string, unknown>>;
 		expect(output).toHaveLength(3);
 		expect(output[0]!.type).toBe("reasoning");

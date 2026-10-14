@@ -95,7 +95,7 @@ type SemVer = {
 	patch: number;
 };
 
-type GeminiKind = "pro" | "flash";
+type GeminiKind = "pro" | "flash" | "argon";
 type AnthropicKind = "opus" | "sonnet" | "fable";
 type OpenAIVariant =
 	| "astra"
@@ -328,6 +328,23 @@ export function modelSupportsReasoningControl<TApi extends Api>(
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
 		const source = models[index]!;
+		const inputCost = nonNegativeFinitePrice(source.cost.input);
+		const outputCost = nonNegativeFinitePrice(source.cost.output);
+		const cacheReadCost = nonNegativeFinitePrice(source.cost.cacheRead);
+		const cacheWriteCost = nonNegativeFinitePrice(source.cost.cacheWrite);
+		if (
+			inputCost !== source.cost.input ||
+			outputCost !== source.cost.output ||
+			cacheReadCost !== source.cost.cacheRead ||
+			cacheWriteCost !== source.cost.cacheWrite
+		) {
+			source.cost = {
+				input: inputCost,
+				output: outputCost,
+				cacheRead: cacheReadCost,
+				cacheWrite: cacheWriteCost,
+			};
+		}
 		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
 			source.reasoning = true;
 		}
@@ -357,6 +374,10 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		applyGeneratedModelPolicy(model);
 		models[index] = model;
 	}
+}
+
+function nonNegativeFinitePrice(value: number): number {
+	return Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 /**
@@ -729,6 +750,17 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	) {
 		model.contextWindow = 1_000_000;
 	}
+	// Google Gemini 4 Argon supports up to 65,536 output tokens across provider
+	// aliases. Strip catalog provider prefixes and OpenRouter's batch suffix.
+	// https://ai.google.dev/gemini-api/docs/models/gemini-4-argon
+	const canonicalId = model.id
+		.toLowerCase()
+		.split("/")
+		.at(-1)
+		?.replace(/:batch$/, "");
+	if (canonicalId === "gemini-4-argon") {
+		model.maxTokens = Math.min(model.maxTokens, 65_536);
+	}
 }
 
 function scrubGeneratedModelName(name: string): string {
@@ -979,6 +1011,8 @@ function inferGeminiSupportedEfforts(model: GeminiModel): readonly Effort[] {
 	if (model.kind === "pro") {
 		return GEMINI_3_PRO_EFFORTS;
 	}
+	// Gemini 3.7+ Flash and Gemini 4 Argon accept low/medium/high only.
+	// https://ai.google.dev/gemini-api/docs/models/gemini-4-argon
 	if (semverGte(model.version, "3.7")) {
 		return GEMINI_3_7_FLASH_EFFORTS;
 	}
@@ -1054,11 +1088,7 @@ function inferThinkingControlMode<TApi extends Api>(
 		case "google-generative-ai":
 		case "google-gemini-cli":
 		case "google-vertex":
-			return parsedModel.family === "gemini" &&
-				semverGte(parsedModel.version, "3.0") &&
-				parsedModel.version.major === 3
-				? "google-level"
-				: "budget";
+			return parsedModel.family === "gemini" && semverGte(parsedModel.version, "3.0") ? "google-level" : "budget";
 
 		case "anthropic-messages":
 			if (parsedModel.family === "anthropic") {
@@ -1104,7 +1134,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 	if (modelId.endsWith(GEMINI_SUFFIX)) {
 		modelId = modelId.slice(0, -GEMINI_SUFFIX.length);
 	}
-	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash)\b/.exec(modelId);
+	const match = /gemini-(\d+(?:\.\d+){0,2})-(pro|flash|argon)\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}

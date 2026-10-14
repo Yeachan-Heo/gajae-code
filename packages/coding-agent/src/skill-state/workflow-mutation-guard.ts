@@ -1800,11 +1800,24 @@ function tempEnvNames(): readonly string[] {
 	return process.platform === "win32" ? ["TEMP", "TMP", "TMPDIR"] : ["TMPDIR"];
 }
 
-// The snapshot is the cwd at module import, not a directory created later or a chdir before this module is imported.
-const startupTempSnapshot = projectEnvSnapshot();
+const PROJECT_TEMP_DOTENV_MAX_FILE_BYTES = 64 * 1024;
 
-function projectTempSnapshots(_cwd: string): ProjectEnvSnapshot[] {
-	return [startupTempSnapshot];
+// The snapshot is the cwd at module import, not a directory created later or a chdir before this module is imported.
+const startupTempSnapshot = projectEnvSnapshot(process.cwd(), {
+	maxFileBytes: PROJECT_TEMP_DOTENV_MAX_FILE_BYTES,
+});
+
+function projectTempSnapshots(cwd: string): ProjectEnvSnapshot[] {
+	// Check both the cwd's .env and the startup snapshot (for module-import-time cwd).
+	// The cwd's .env catches project-declared TMPDIR in the current working directory.
+	// The startup snapshot is a fallback for when the cwd's .env is deleted or inaccessible
+	// (e.g., after unlink or chdir), and also handles the case where cwd differs from the
+	// module-import-time cwd. These workspace-controlled files are read as bounded regular files.
+	const snapshots: ProjectEnvSnapshot[] = [
+		projectEnvSnapshot(cwd, { maxFileBytes: PROJECT_TEMP_DOTENV_MAX_FILE_BYTES }),
+		startupTempSnapshot,
+	];
+	return snapshots;
 }
 
 /** macOS account temp directory. `getconf` does not read `TMPDIR`. */
@@ -1845,12 +1858,13 @@ function isPlatformTempPath(resolved: string): boolean {
 	return resolved === resolvedDarwin || isPathWithin(resolvedDarwin, resolved);
 }
 
-/** True when `live` is the temp directory a project dotenv file declares. */
-function projectDeclaresTempPath(cwd: string, live: string): boolean {
+/** True when `live` is declared, or cannot be trusted because a dotenv layer was unsafe to read. */
+function projectDeclaresTempPath(snapshots: readonly ProjectEnvSnapshot[], live: string): boolean {
 	const trimmedLive = live.trim();
 	if (!trimmedLive) return false;
 	const resolvedLive = path.resolve(trimmedLive);
-	for (const snapshot of projectTempSnapshots(cwd)) {
+	for (const snapshot of snapshots) {
+		if (snapshot.incomplete && !isPlatformTempPath(resolvedLive)) return true;
 		for (const name of tempEnvNames()) {
 			const key = canonicalEnvKey(name);
 			const declared = snapshot.values[key];
@@ -1874,8 +1888,9 @@ function neutralTempRoots(cwd: string): string[] {
 	addResolvedTempRoot(roots, darwinUserTempDir());
 	const candidates = [os.tmpdir(), process.env.TMPDIR];
 	if (process.platform === "win32") candidates.push(process.env.TEMP, process.env.TMP);
+	const snapshots = projectTempSnapshots(cwd);
 	for (const candidate of candidates) {
-		if (!candidate || projectDeclaresTempPath(cwd, candidate)) continue;
+		if (!candidate || projectDeclaresTempPath(snapshots, candidate)) continue;
 		addResolvedTempRoot(roots, candidate);
 	}
 	return [...roots];

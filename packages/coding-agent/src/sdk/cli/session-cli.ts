@@ -2209,7 +2209,7 @@ async function runRawControl(
 	input: JsonRecord,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
-	const invalid = validateAdapterControl(operation, input);
+	const invalid = validateAdapterControl(operation, input, { allowUltrafastTier: true });
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
 	await ensureBroker({ agentDir });
 	const operatorRequest = operatorAbortBrokerRequest(sessionId, operation, input, args);

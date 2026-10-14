@@ -1617,4 +1617,44 @@ describe("anthropic SDK request timeout (stalled before headers)", () => {
 		});
 		expect(options.timeout).toBe(500_000);
 	});
+
+	it("uses the configured model idle timeout on Kimi's Anthropic route", async () => {
+		const kimiModel = { ...model, provider: "kimi-code", streamIdleTimeoutMs: 25 };
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			return createAnthropicMockStream({
+				signal: requestOptions?.signal,
+				events: [
+					{
+						type: "message_start",
+						message: {
+							id: "msg_kimi_idle_timeout",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "text", text: "" },
+					},
+				],
+				hangAfterEvents: true,
+			}) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const result = await streamAnthropic(kimiModel, context, {
+			client: { messages: { create } } as Anthropic,
+			streamFirstEventTimeoutMs: 5000,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
+	});
 });

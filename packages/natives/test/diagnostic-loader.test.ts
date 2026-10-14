@@ -18,25 +18,12 @@ const LOADER = path.join(NATIVE_DIR, "diagnostic-loader.js");
 const ARTIFACT = path.join(NATIVE_DIR, "pi_natives.darwin-arm64.node");
 const SUPPORTED_RUNTIME = process.platform === "darwin" && process.arch === "arm64";
 
-/**
- * Whether any component of a path carries an extended ACL, observed independently of
- * the loader (through `ls -lde`) so expectations are never derived from the code
- * under test.
- *
- * The loader refuses every component with an ACL, because an ACE can grant another
- * account write access that `st_mode` never shows. On a host whose home directory
- * carries an ACL -- the macOS default is `group:everyone deny delete` -- no path
- * below it is admissible, so positive expectations must follow this observation
- * instead of assuming one environment. An ACL-free root is the open fixture gate.
- */
-function pathChainHasAcl(target: string): boolean {
-	let current = target;
-	for (;;) {
-		if (aclEntriesOf(current).length > 0) return true;
-		const parent = path.dirname(current);
-		if (parent === current) return false;
-		current = parent;
-	}
+async function writeDiagnosticLoaderFixture(nativeDir: string): Promise<void> {
+	await Bun.write(path.join(nativeDir, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+	await Bun.write(
+		path.join(nativeDir, "diagnostic-artifact-embedded.json"),
+		JSON.stringify({ schema: "gjc.diagnostic-artifact", version: "", artifacts: {} }),
+	);
 }
 
 /** ACE lines for one path, observed independently of the code under test. */
@@ -94,7 +81,7 @@ function stripComments(source: string): string {
 async function fixturePackage(workspace: string): Promise<string> {
 	const nativeDir = path.join(workspace, "native");
 	await fs.mkdir(nativeDir, { recursive: true });
-	await Bun.write(path.join(nativeDir, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+	await writeDiagnosticLoaderFixture(nativeDir);
 	const manifest = (await Bun.file(path.join(NATIVE_DIR, "..", "package.json")).json()) as { version: string };
 	await Bun.write(path.join(workspace, "package.json"), JSON.stringify({ version: manifest.version }));
 	// The loader carries its package-owned trusted digest record in its module graph.
@@ -193,6 +180,7 @@ describe("read-only diagnostic native loader (B3)", () => {
 		expect(manifest.exports["./diagnostic-loader"]).toBeDefined();
 		expect(manifest.files).toContain("native/diagnostic-loader.js");
 		expect(manifest.files).toContain("native/diagnostic-loader.d.ts");
+		expect(manifest.files).toContain("native/diagnostic-artifact-embedded.json");
 	});
 
 	it.skipIf(!SUPPORTED_RUNTIME)("loads the fixed package artifact without any mutation or child process", async () => {
@@ -263,6 +251,7 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 			const entries = await fs.readdir(corruptNative);
 			expect(entries.sort()).toEqual([
 				"diagnostic-artifact.json",
+				"diagnostic-artifact-embedded.json",
 				"diagnostic-loader.js",
 				"pi_natives.darwin-arm64.node",
 			]);
@@ -296,7 +285,11 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 				reason?: string;
 			};
 			expect(parsed).toEqual({ ok: false, reason: "unsupported" });
-			expect((await fs.readdir(emptyNative)).sort()).toEqual(["diagnostic-artifact.json", "diagnostic-loader.js"]);
+			expect((await fs.readdir(emptyNative)).sort()).toEqual([
+				"diagnostic-artifact-embedded.json",
+				"diagnostic-artifact.json",
+				"diagnostic-loader.js",
+			]);
 		} finally {
 			await fs.rm(workspace, { recursive: true, force: true });
 		}
@@ -339,7 +332,7 @@ describe("trusted artifact verification (R1) and package layout resolution (R5)"
 		await fs.mkdir(native, { recursive: true });
 		const version = options.version ?? (await packageVersion());
 		await Bun.write(path.join(root, "package.json"), JSON.stringify({ name: "@gajae-code/natives", version }));
-		await Bun.write(path.join(native, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+		await writeDiagnosticLoaderFixture(native);
 		await Bun.write(
 			path.join(native, "diagnostic-artifact.json"),
 			JSON.stringify({
@@ -372,16 +365,153 @@ console.log(JSON.stringify(loaded.ok ? { ok: true } : { ok: false, reason: loade
 		return JSON.parse(stdout) as { ok: boolean; reason?: string };
 	}
 
-	it.skipIf(!SUPPORTED_RUNTIME)("ships a package-owned trusted digest for the built artifact", async () => {
-		const manifest = (await Bun.file(TRUSTED_MANIFEST).json()) as {
-			version: string;
-			artifacts: Record<string, string>;
-		};
-		expect(manifest.version).toBe(await packageVersion());
-		expect(manifest.artifacts[ADDON_BASENAME]).toBe(await sha256(ARTIFACT));
+	async function verifyInFixture(
+		loader: string,
+		artifact: string,
+		cwd: string,
+	): Promise<{ ok: boolean; reason?: string }> {
+		const harness = path.join(cwd, "verify-local.ts");
+		await Bun.write(
+			harness,
+			`const { verifyDiagnosticArtifact } = await import(${JSON.stringify(loader)});
+const result = verifyDiagnosticArtifact(${JSON.stringify(artifact)});
+console.log(JSON.stringify(result.ok ? { ok: true } : result));`,
+		);
+		const child = Bun.spawnSync({
+			cmd: [process.execPath, harness],
+			cwd,
+			env: { PATH: "/usr/bin:/bin", HOME: cwd, TMPDIR: cwd },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = new TextDecoder().decode(child.stdout ?? new Uint8Array()).trim();
+		return JSON.parse(stdout) as { ok: boolean; reason?: string };
+	}
+
+	it.skipIf(!SUPPORTED_RUNTIME)("ships a trusted digest for the built artifact", async () => {
+		const buildMetadataPath = `${ARTIFACT}.build.json`;
+		const buildMetadata = (await Bun.file(buildMetadataPath).exists())
+			? ((await Bun.file(buildMetadataPath).json()) as { profile?: string })
+			: undefined;
+		if (buildMetadata?.profile === "local") {
+			const manifest = (await Bun.file(path.join(NATIVE_DIR, "diagnostic-artifact.local.json")).json()) as {
+				version: string;
+				artifacts: Record<string, string>;
+			};
+			expect(manifest.version).toBe(await packageVersion());
+			expect(manifest.artifacts[ADDON_BASENAME]).toBe(await sha256(ARTIFACT));
+		} else {
+			const manifest = (await Bun.file(TRUSTED_MANIFEST).json()) as {
+				version: string;
+				artifacts: Record<string, string>;
+			};
+			expect(manifest.version).toBe(await packageVersion());
+			expect(manifest.artifacts[ADDON_BASENAME]).toBe(await sha256(ARTIFACT));
+		}
 		const packed = (await Bun.file(path.join(PACKAGE_ROOT_DIR, "package.json")).json()) as { files: string[] };
 		expect(packed.files).toContain("native/diagnostic-artifact.json");
 	});
+
+	it.skipIf(!SUPPORTED_RUNTIME)(
+		"verifies a local source addon against its gitignored local manifest",
+		async () => {
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-local-source-"));
+			try {
+				const fixture = await fixtureNatives(workspace, { digest: "0".repeat(64) });
+				const localAddon = path.join(fixture.native, ADDON_BASENAME);
+				const localMetadata = `${localAddon}.build.json`;
+				const localManifestPath = path.join(fixture.native, "diagnostic-artifact.local.json");
+				await Bun.write(localAddon, await Bun.file(ARTIFACT).bytes());
+				await Bun.write(localMetadata, JSON.stringify({ profile: "local", version: await packageVersion() }));
+				await Bun.write(
+					localManifestPath,
+					JSON.stringify({
+						schema: "gjc.diagnostic-artifact",
+						version: await packageVersion(),
+						artifacts: { [ADDON_BASENAME]: await sha256(localAddon) },
+					}),
+				);
+				const result = await verifyInFixture(fixture.loader, localAddon, workspace);
+				const admissible = [localAddon, localMetadata, localManifestPath].every(
+					file => expectedLoadOutcome(file).ok,
+				);
+				expect(result).toEqual(admissible ? { ok: true } : { ok: false, reason: "unsupported" });
+			} finally {
+				await fs.rm(workspace, { recursive: true, force: true });
+			}
+		},
+		120_000,
+	);
+
+	it.skipIf(!SUPPORTED_RUNTIME)(
+		"verifies a local source addon requires current-version metadata or an exact trusted legacy digest",
+		async () => {
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-local-version-"));
+			try {
+				const version = await packageVersion();
+				const digest = await fixtureSha256(ARTIFACT);
+
+				const legacy = await fixtureNatives(path.join(workspace, "legacy"), { omitManifest: true });
+				const legacyAddon = path.join(legacy.native, ADDON_BASENAME);
+				await Bun.write(legacyAddon, await Bun.file(ARTIFACT).bytes());
+				await Bun.write(`${legacyAddon}.build.json`, JSON.stringify({ profile: "local" }));
+				await Bun.write(
+					path.join(legacy.native, "diagnostic-artifact.local.json"),
+					JSON.stringify({
+						schema: "gjc.diagnostic-artifact",
+						version,
+						artifacts: { [ADDON_BASENAME]: digest },
+					}),
+				);
+				expect(await verifyInFixture(legacy.loader, legacyAddon, workspace)).toEqual({
+					ok: false,
+					reason: "unsupported",
+				});
+
+				const trustedLegacy = await fixtureNatives(path.join(workspace, "trusted-legacy"));
+				const trustedLegacyAddon = path.join(trustedLegacy.native, ADDON_BASENAME);
+				await Bun.write(trustedLegacyAddon, await Bun.file(ARTIFACT).bytes());
+				await Bun.write(`${trustedLegacyAddon}.build.json`, JSON.stringify({ profile: "local" }));
+				await Bun.write(
+					path.join(trustedLegacy.native, "diagnostic-artifact.local.json"),
+					JSON.stringify({
+						schema: "gjc.diagnostic-artifact",
+						version,
+						artifacts: { [ADDON_BASENAME]: digest },
+					}),
+				);
+				const trustedLegacyResult = await verifyInFixture(trustedLegacy.loader, trustedLegacyAddon, workspace);
+				const trustedLegacyAdmissible = [
+					trustedLegacyAddon,
+					`${trustedLegacyAddon}.build.json`,
+					path.join(trustedLegacy.native, "diagnostic-artifact.local.json"),
+				].every(file => expectedLoadOutcome(file).ok);
+				expect(trustedLegacyResult).toEqual(
+					trustedLegacyAdmissible ? { ok: true } : { ok: false, reason: "unsupported" },
+				);
+
+				const stale = await fixtureNatives(path.join(workspace, "stale"));
+				const staleAddon = path.join(stale.native, ADDON_BASENAME);
+				await Bun.write(staleAddon, await Bun.file(ARTIFACT).bytes());
+				await Bun.write(`${staleAddon}.build.json`, JSON.stringify({ profile: "local", version: "0.0.0-stale" }));
+				await Bun.write(
+					path.join(stale.native, "diagnostic-artifact.local.json"),
+					JSON.stringify({
+						schema: "gjc.diagnostic-artifact",
+						version,
+						artifacts: { [ADDON_BASENAME]: digest },
+					}),
+				);
+				expect(await verifyInFixture(stale.loader, staleAddon, workspace)).toEqual({
+					ok: false,
+					reason: "unsupported",
+				});
+			} finally {
+				await fs.rm(workspace, { recursive: true, force: true });
+			}
+		},
+		120_000,
+	);
 
 	it.skipIf(!SUPPORTED_RUNTIME)(
 		"refuses an artifact whose bytes are not the trusted ones, even when it self-reports the right version",
@@ -526,7 +656,7 @@ describe("artifact activation is pinned to the verified bytes (R1 reopened)", ()
 		await fs.mkdir(native, { recursive: true });
 		const version = await pkgVersion();
 		await Bun.write(path.join(root, "package.json"), JSON.stringify({ name: "@gajae-code/natives", version }));
-		await Bun.write(path.join(native, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+		await writeDiagnosticLoaderFixture(native);
 		await Bun.write(
 			path.join(native, "diagnostic-artifact.json"),
 			JSON.stringify({
@@ -728,7 +858,7 @@ describe("pre-activation namespace authority (C1)", () => {
 		await fs.mkdir(native, { recursive: true });
 		const version = await pkgVersion();
 		await Bun.write(path.join(root, "package.json"), JSON.stringify({ name: "@gajae-code/natives", version }));
-		await Bun.write(path.join(native, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+		await writeDiagnosticLoaderFixture(native);
 		await Bun.write(
 			path.join(native, "diagnostic-artifact.json"),
 			JSON.stringify({
@@ -863,7 +993,7 @@ describe("verified handle lifetime (C3)", () => {
 		const version = ((await Bun.file(path.join(NATIVE_DIR, "..", "package.json")).json()) as { version: string })
 			.version;
 		await Bun.write(path.join(root, "package.json"), JSON.stringify({ name: "@gajae-code/natives", version }));
-		await Bun.write(path.join(native, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+		await writeDiagnosticLoaderFixture(native);
 		await Bun.write(
 			path.join(native, "diagnostic-artifact.json"),
 			JSON.stringify({
@@ -982,22 +1112,6 @@ describe("ACL authority admission (C1 closure)", () => {
 		return /^\s*\d+:\s/m.test(text);
 	}
 
-	/** Every component from the artifact up to the root. */
-	function chainOf(artifact: string): string[] {
-		const components: string[] = [];
-		let current = artifact;
-		for (;;) {
-			components.push(current);
-			const parent = path.dirname(current);
-			if (parent === current) return components;
-			current = parent;
-		}
-	}
-
-	function chainHasAcl(artifact: string): boolean {
-		return chainOf(artifact).some(component => pathHasAcl(component));
-	}
-
 	async function fixture(workspace: string): Promise<{ loader: string; artifact: string; native: string }> {
 		const root = path.join(workspace, "pkg");
 		const native = path.join(root, "native");
@@ -1005,7 +1119,7 @@ describe("ACL authority admission (C1 closure)", () => {
 		const version = ((await Bun.file(path.join(NATIVE_DIR, "..", "package.json")).json()) as { version: string })
 			.version;
 		await Bun.write(path.join(root, "package.json"), JSON.stringify({ name: "@gajae-code/natives", version }));
-		await Bun.write(path.join(native, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+		await writeDiagnosticLoaderFixture(native);
 		await Bun.write(
 			path.join(native, "diagnostic-artifact.json"),
 			JSON.stringify({
@@ -1472,7 +1586,7 @@ describe("artifact namespace anchor policy and real activation (ACL contract)", 
 		await fs.chmod(above, 0o755);
 		const version = await pkgVersion();
 		await Bun.write(path.join(root, "package.json"), JSON.stringify({ name: "@gajae-code/natives", version }));
-		await Bun.write(path.join(anchor, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+		await writeDiagnosticLoaderFixture(anchor);
 		await Bun.write(
 			path.join(anchor, "diagnostic-artifact.json"),
 			JSON.stringify({
@@ -1820,6 +1934,7 @@ try {
 					path.join(workspace, "pkg", "package.json"),
 					JSON.stringify({ name: "@gajae-code/natives", version: manifest.version }),
 				);
+				await writeDiagnosticLoaderFixture(fixtureNative);
 				await Bun.write(
 					path.join(fixtureNative, "diagnostic-artifact.json"),
 					JSON.stringify({
@@ -3050,7 +3165,7 @@ if (!loaded.ok) {
 		const native = path.join(root, "native");
 		await fs.mkdir(native, { recursive: true });
 		await Bun.write(path.join(root, "package.json"), JSON.stringify({ name: "fixture", version }));
-		await Bun.write(path.join(native, "diagnostic-loader.js"), await Bun.file(LOADER).text());
+		await writeDiagnosticLoaderFixture(native);
 		await Bun.write(
 			path.join(native, "diagnostic-artifact.json"),
 			JSON.stringify({
@@ -3088,6 +3203,43 @@ if (!loaded.ok) {
 				} finally {
 					await fs.rm(workspace, { recursive: true, force: true });
 				}
+			}
+		},
+		240_000,
+	);
+
+	it.skipIf(!SUPPORTED_RUNTIME)(
+		"uses the verified local build digest carried by a compiled binary",
+		async () => {
+			const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-diag-compiled-local-"));
+			try {
+				const version = await packageVersion();
+				const root = await fixturePackageRoot(workspace, version);
+				const nativeDir = path.join(root, "native");
+				const addon = "pi_natives.darwin-arm64.node";
+				const digest = await fixtureSha256(ARTIFACT);
+				await Bun.write(
+					path.join(nativeDir, "diagnostic-artifact.json"),
+					JSON.stringify({ schema: "gjc.diagnostic-artifact", version, artifacts: { [addon]: "0".repeat(64) } }),
+				);
+				await Bun.write(
+					path.join(nativeDir, "diagnostic-artifact-embedded.json"),
+					JSON.stringify({ schema: "gjc.diagnostic-artifact", version, artifacts: { [addon]: digest } }),
+				);
+
+				const dir = await cacheDir(workspace, version);
+				const cached = path.join(dir, addon);
+				await fs.copyFile(ARTIFACT, cached);
+				const binary = await buildCompiledProbe(workspace, path.join(nativeDir, "diagnostic-loader.js"));
+				const verified = await runCompiled(binary, workspace);
+				const admissible = expectedLoadOutcome(cached).ok;
+				expect(verified.parsed.ok).toBe(admissible);
+				if (admissible) expect(verified.parsed.leaseReason).toBe("absent");
+
+				await Bun.write(cached, "bytes outside the embedded local digest");
+				expect((await runCompiled(binary, workspace)).parsed).toEqual({ ok: false, reason: "unsupported" });
+			} finally {
+				await fs.rm(workspace, { recursive: true, force: true });
 			}
 		},
 		240_000,

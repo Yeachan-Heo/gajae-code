@@ -1470,19 +1470,30 @@ export const SETTINGS_SCHEMA = {
 
 	serviceTier: {
 		type: "enum",
-		values: ["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"] as const,
+		values: [
+			"none",
+			"auto",
+			"default",
+			"flex",
+			"scale",
+			"priority",
+			"ultrafast",
+			"openai-only",
+			"claude-only",
+		] as const,
 		default: "none",
 		ui: {
 			tab: "model",
 			label: "Service Tier",
 			description:
-				'Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: "fast"` on supported Opus models. Scoped values target one family.',
+				'Processing priority hint (none = omit). OpenAI accepts the tier values directly; ultrafast is a 6x premium tier. Anthropic realizes `priority` as `speed: "fast"` on supported Opus models. Scoped values target one family.',
 			options: [
 				{ value: "none", label: "None", description: "Omit service_tier parameter" },
 				{ value: "auto", label: "Auto", description: "Use provider default tier selection (OpenAI)" },
 				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
 				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
 				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{ value: "ultrafast", label: "Ultrafast", description: "Ultrafast processing at a 6x premium (OpenAI)" },
 				{
 					value: "priority",
 					label: "Priority",
@@ -1512,6 +1523,7 @@ export const SETTINGS_SCHEMA = {
 			"flex",
 			"scale",
 			"priority",
+			"ultrafast",
 			"openai-only",
 			"claude-only",
 		] as const,
@@ -1532,6 +1544,7 @@ export const SETTINGS_SCHEMA = {
 				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
 				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
 				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{ value: "ultrafast", label: "Ultrafast", description: "Ultrafast processing at a 6x premium (OpenAI)" },
 				{
 					value: "priority",
 					label: "Priority",

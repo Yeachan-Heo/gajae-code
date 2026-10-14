@@ -4,13 +4,17 @@ import {
 	Container,
 	Image,
 	ImageProtocol,
+	isCursorNeutralImagePermittedInFallback,
+	isTerminalGraphicsFallbackActive,
 	isViewportAnchorSourceRenderer,
 	Markdown,
+	type MarkdownTheme,
 	Spacer,
 	TERMINAL,
 	Text,
 	type ViewportAnchorSource,
 } from "@gajae-code/tui";
+import { SvgFigure } from "@gajae-code/tui/chat/svg-figure";
 import { formatNumber } from "@gajae-code/utils";
 import { settings } from "../../config/settings";
 import { renderDeepInterviewAssistantText } from "../../deep-interview/render-middleware";
@@ -26,6 +30,44 @@ import { resolveImageOptions } from "../../tools/render-utils";
 const THINKING_REPETITION_ELIDE_MIN_RUN = 24;
 const THINKING_REPETITION_VISIBLE_TOKENS = 3;
 const THINKING_REPETITION_TOKEN_PATTERN = /[\p{L}\p{N}_'-]{1,32}/gu;
+
+let assistantMarkdownThemeBase: MarkdownTheme | undefined;
+let cachedAssistantMarkdownTheme: MarkdownTheme | undefined;
+
+function getAssistantMarkdownTheme(): MarkdownTheme {
+	const base = getMarkdownTheme();
+	if (base === assistantMarkdownThemeBase && cachedAssistantMarkdownTheme) return cachedAssistantMarkdownTheme;
+	assistantMarkdownThemeBase = base;
+	cachedAssistantMarkdownTheme = {
+		...base,
+		resolveSvgFigure: (source, context) => {
+			if (!settings.get("terminal.showImages")) return null;
+			const graphicsSuppressed =
+				isTerminalGraphicsFallbackActive() &&
+				!(TERMINAL.imageProtocol === ImageProtocol.Kitty && isCursorNeutralImagePermittedInFallback());
+			if (!TERMINAL.imageProtocol) return null; // Stable environment: cache the code fallback.
+			if (graphicsSuppressed) return undefined; // The suppression scope can end; retry on repaint.
+			const palette = theme.getSvgPalette();
+			const previous = context.previous instanceof SvgFigure ? context.previous : undefined;
+			const figure =
+				previous ??
+				new SvgFigure({
+					theme: { fallbackColor: (text: string) => theme.fg("toolOutput", text) },
+					palette,
+					onChange: context.onChange,
+				});
+			figure.update(source, context.closed || !context.streaming, context.closed, palette);
+			if (figure.retryable) {
+				// A failed preview remains a code block, but must observe layout changes
+				// so a smaller terminal canvas can retry the same source.
+				figure.render(context.width);
+				return undefined;
+			}
+			return figure.failed ? null : figure;
+		},
+	};
+	return cachedAssistantMarkdownTheme;
+}
 
 interface ThinkingRepetitionToken {
 	text: string;
@@ -92,6 +134,7 @@ export class AssistantMessageComponent extends Container {
 	#convertedKittyImages = new Map<string, ImageContent & { source: string }>();
 	#kittyConversionsInFlight = new Map<string, string>();
 	#toolImageGenerations = new Map<string, number>();
+	#unsubscribeSettings?: () => void;
 
 	#responseHeader = new Text(theme.bold(theme.fg("statusLineModel", "gajae")), 1, 0);
 	#contentBlocksCache = new WeakMap<object, { source: string; component: Component }>();
@@ -133,6 +176,15 @@ export class AssistantMessageComponent extends Container {
 		}
 		this.#visibleSignature = this.#visibleContentSignature();
 		this.#visibleSignatureInitialized = true;
+		this.#unsubscribeSettings = settings.onChanged(path => {
+			if (path !== "terminal.showImages") return;
+			for (const block of this.#lastMessage?.content ?? []) {
+				if (block.type !== "text") continue;
+				const cached = this.#contentBlocksCache.get(block);
+				if (cached?.component instanceof Markdown) cached.component.invalidate();
+			}
+			this.#requestRepaint?.();
+		});
 	}
 
 	#visibleContentSignature(): string {
@@ -339,7 +391,7 @@ export class AssistantMessageComponent extends Container {
 			cached.source = content.text;
 			return cached.component;
 		}
-		const component = deepInterview ?? new Markdown(trimmed, 1, 0, getMarkdownTheme());
+		const component = deepInterview ?? new Markdown(trimmed, 1, 0, getAssistantMarkdownTheme());
 		if (component instanceof Markdown) {
 			component.setOnStaleThrottle(this.#requestRepaint);
 			component.setStreaming(streaming);
@@ -626,6 +678,8 @@ export class AssistantMessageComponent extends Container {
 	override dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#unsubscribeSettings?.();
+		this.#unsubscribeSettings = undefined;
 		this.#toolImageGenerations.clear();
 		this.#kittyConversionsInFlight.clear();
 		this.#convertedKittyImages.clear();

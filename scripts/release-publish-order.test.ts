@@ -280,6 +280,7 @@ describe("unscoped gajae-code package publication", () => {
 			"native/diagnostic-loader.d.ts",
 			"native/diagnostic-loader.js",
 			"native/diagnostic-artifact.json",
+			"native/diagnostic-artifact-embedded.json",
 			"native/embedded-addon.js",
 			"README.md",
 		]);
@@ -433,6 +434,13 @@ describe("immutable stable release contracts", () => {
 		expect(releaseScript).toContain('git(["add", "--update"])');
 		expect(releaseScript).not.toContain('git(["add", "."])');
 
+	});
+	test("rebuilds release native addons with the distribution provenance profile", async () => {
+		const releaseScript = await Bun.file(path.join(repoRoot, "scripts/release.ts")).text();
+
+		expect(releaseScript).toContain(
+			'await $`bun --cwd=packages/natives run build`.env({ ...process.env, PI_NATIVE_PROFILE: "dist" });',
+		);
 	});
 	test("release entrypoints accept only their declared mode-specific arguments", () => {
 		expect(parseReleasePublishCli(["--dry-run"])).toEqual({ mode: "dry-run" });

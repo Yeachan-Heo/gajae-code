@@ -3119,6 +3119,7 @@ dependencies = [
  "clipboard-win",
  "dashmap",
  "find-msvc-tools",
+ "flate2",
  "gjc-sdk",
  "globset",
  "grep-matcher",

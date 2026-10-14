@@ -27,6 +27,7 @@ import {
 } from "../src/sdk/broker/discovery";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
+	BROKER_DISCOVERY_BUDGET,
 	brokerOwnerForTest,
 	brokerSpawnEnvironmentForTest,
 	ensureBroker,
@@ -49,6 +50,7 @@ import {
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
+import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 import * as processIncarnation from "../src/sdk/broker/process-incarnation";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
 import { readBrokerStartupFailureMarker, writeBrokerStartupFailureMarker } from "../src/sdk/broker/startup-failure";
@@ -1820,13 +1822,55 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("refuses concurrent launches when a live lock owner has not published discovery", async () => {
+	it("reclaims a broker lock whose live PID has a different incarnation", async () => {
 		const dir = await temp();
 		const lock = path.join(dir, "sdk", "broker.lock");
+		const hostIdentity = await brokerLockHostIdentity(dir);
+		const currentIncarnation = processIncarnation.processIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Current process incarnation is unavailable");
+		const staleIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
 		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(lock, "owner.json"),
-			JSON.stringify({ version: 1, ownerId: "live-unpublished-owner", pid: process.pid, acquiredAt: Date.now() }),
+			JSON.stringify({
+				version: 1,
+				ownerId: "reused-pid-owner",
+				pid: process.pid,
+				incarnation: staleIncarnation,
+				ownerHostId: hostIdentity.ownerHostId,
+				acquiredAt: Date.now(),
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			const discovery = await broker.start();
+			expect(discovery.pid).toBe(process.pid);
+			expect(discovery.ownerId).not.toBe("reused-pid-owner");
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: discovery.ownerId,
+				pid: process.pid,
+				incarnation: discovery.incarnation,
+			});
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("refuses concurrent launches when a live lock owner has not published discovery", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const { ownerHostId } = await brokerLockHostIdentity(dir);
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "live-unpublished-owner",
+				pid: process.pid,
+				ownerHostId,
+				acquiredAt: Date.now(),
+			}),
 			{ mode: 0o600 },
 		);
 		const contenders = Array.from({ length: 3 }, () => new Broker({ agentDir: dir }));
@@ -1843,6 +1887,98 @@ describe("SDK broker identity and discovery", () => {
 			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
 				ownerId: "live-unpublished-owner",
 				pid: process.pid,
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("keeps a broker lock when its live owner's PID and incarnation match", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const hostIdentity = await brokerLockHostIdentity(dir);
+		const incarnation = processIncarnation.processIncarnation(process.pid);
+		if (!incarnation) throw new Error("Current process incarnation is unavailable");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "matching-live-owner",
+				pid: process.pid,
+				incarnation,
+				ownerHostId: hostIdentity.ownerHostId,
+				acquiredAt: Date.now(),
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: "matching-live-owner",
+				pid: process.pid,
+				incarnation,
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("keeps a broker lock when its owner is on a foreign host with mismatched incarnation", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const currentIncarnation = processIncarnation.processIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Current process incarnation is unavailable");
+		const staleIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "foreign-host-owner",
+				pid: process.pid,
+				incarnation: staleIncarnation,
+				ownerHostId: "some-foreign-host",
+				acquiredAt: Date.now(),
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is attributed to a different host");
+			// Lock should NOT have been reclaimed despite incarnation mismatch
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: "foreign-host-owner",
+				ownerHostId: "some-foreign-host",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
+	it("keeps a broker lock when its owner is legacy (host-unqualified) with mismatched incarnation", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const currentIncarnation = processIncarnation.processIncarnation(process.pid);
+		if (!currentIncarnation) throw new Error("Current process incarnation is unavailable");
+		const staleIncarnation = currentIncarnation.replace(/\d+$/u, currentIncarnation.endsWith(":0") ? "1" : "0");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({
+				version: 1,
+				ownerId: "legacy-unqualified-owner",
+				pid: process.pid,
+				incarnation: staleIncarnation,
+				acquiredAt: Date.now(),
+				// NO ownerHostId field - legacy record
+			}),
+			{ mode: 0o600 },
+		);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is host-unqualified");
+			// Lock should NOT have been reclaimed despite incarnation mismatch
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: "legacy-unqualified-owner",
 			});
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
@@ -1961,47 +2097,51 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("terminates and reaps the spawned broker when discovery times out", async () => {
-		const dir = await temp();
-		// Force ensureBroker's discovery reads to never resolve a live record so the
-		// discovery wait is doomed from the start. The real broker still spawns and
-		// stays alive as a detached daemon, which is exactly the orphan path the reap
-		// must close. Capture its pid from the discovery file (bypassing the spy)
-		// before ensureBroker times out and reaps it.
-		const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
-		try {
-			const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
-			void (async () => {
-				const deadline = Date.now() + 12_000;
-				while (Date.now() < deadline) {
-					try {
-						const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
-							pid?: number;
-						};
-						if (typeof raw.pid === "number") return onPid(raw.pid);
-					} catch {}
-					await sleep(25);
-				}
-				onPid(undefined);
-			})();
-			await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
-				"Timed out waiting for detached SDK broker discovery.",
-			);
-			const brokerPid = await gotPid;
-			// The spawned detached broker must have been terminated, not orphaned. The
-			// trampoline reparents it away from this process, so once killed it may stay
-			// an unreaped zombie of whichever subreaper adopted it; `kill(pid, 0)` still
-			// reports such a zombie as present. Process-identity observation classifies
-			// it as absent, which is the same authority the production reap path uses.
-			expect(typeof brokerPid).toBe("number");
-			expect(processIncarnation.observeProcessIncarnation(brokerPid!).status).toBe("absent");
-			// No owner handle leaked for the failed agent dir.
-			expect(brokerOwnerForTest(dir)).toBeUndefined();
-		} finally {
-			spy.mockRestore();
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-	}, 30_000);
+	it(
+		"terminates and reaps the spawned broker when discovery times out",
+		async () => {
+			const dir = await temp();
+			// Force ensureBroker's discovery reads to never resolve a live record so the
+			// discovery wait is doomed from the start. The real broker still spawns and
+			// stays alive as a detached daemon, which is exactly the orphan path the reap
+			// must close. Capture its pid from the discovery file (bypassing the spy)
+			// before ensureBroker times out and reaps it.
+			const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
+			try {
+				const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
+				void (async () => {
+					const deadline = Date.now() + 12_000;
+					while (Date.now() < deadline) {
+						try {
+							const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
+								pid?: number;
+							};
+							if (typeof raw.pid === "number") return onPid(raw.pid);
+						} catch {}
+						await sleep(25);
+					}
+					onPid(undefined);
+				})();
+				await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
+					"Timed out waiting for detached SDK broker discovery.",
+				);
+				const brokerPid = await gotPid;
+				// The spawned detached broker must have been terminated, not orphaned. The
+				// trampoline reparents it away from this process, so once killed it may stay
+				// an unreaped zombie of whichever subreaper adopted it; `kill(pid, 0)` still
+				// reports such a zombie as present. Process-identity observation classifies
+				// it as absent, which is the same authority the production reap path uses.
+				expect(typeof brokerPid).toBe("number");
+				expect(processIncarnation.observeProcessIncarnation(brokerPid!).status).toBe("absent");
+				// No owner handle leaked for the failed agent dir.
+				expect(brokerOwnerForTest(dir)).toBeUndefined();
+			} finally {
+				spy.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+		BROKER_DISCOVERY_BUDGET.discoveryMs + 5_000,
+	);
 	it("fails fast and reaps the spawned broker when it exits before discovery", async () => {
 		const dir = await temp();
 		// Plant an unsupported session-index snapshot so the spawned broker's start()

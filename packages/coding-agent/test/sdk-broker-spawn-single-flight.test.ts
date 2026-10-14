@@ -5,7 +5,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
-import Sdk from "../src/commands/sdk";
+import Sdk, { consumeBrokerRestartEnvironment } from "../src/commands/sdk";
+import {
+	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
+	FileLockAcquireError,
+	FileLockTestHooks,
+} from "../src/config/file-lock";
+import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerExitRecord, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
 import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
@@ -22,6 +28,7 @@ import {
 	setEnsureBrokerTimingForTest,
 	withBrokerStartupLock,
 } from "../src/sdk/broker/ensure";
+import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
 import { BrokerStartupError } from "../src/sdk/broker/startup-failure";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -694,6 +701,66 @@ it("kills a broker bootstrap that outlives the startup fence deadline", async ()
 	}
 }, 15_000);
 
+it("bounds authorized child fence acquisition by the committed restart expiry", async () => {
+	const dir = await temp();
+	const requestId = "fence-expiry";
+	const expiresAt = Date.now() + 2_000;
+	await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
+	await fs.writeFile(
+		brokerDiscovery.brokerRestartIntentPath(dir),
+		JSON.stringify({ phase: "committed", requestId, expiresAt, lease: "fence-expiry-lease" }),
+	);
+	try {
+		await withBrokerStartupLock(
+			dir,
+			async () => {
+				const child = Bun.spawn([process.execPath, "run", cli, "sdk", "broker-internal", "--agent-dir", dir], {
+					cwd: import.meta.dir,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					env: {
+						...process.env,
+						GJC_BROKER_RESTART_REQUEST: requestId,
+						GJC_BROKER_RESTART_DEADLINE: String(expiresAt),
+					},
+				});
+				const [code] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				expect(code).toBe(1);
+				expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+					mode: "startup",
+					reason: "startup-lock-unavailable",
+					exitCode: 1,
+				});
+			},
+			{ deadlineAt: expiresAt },
+		);
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 5_000);
+
+// Removal-transition adoption is POSIX-only; Windows uses native exact removal.
+it.skipIf(process.platform === "win32")(
+	"startup fence waits long enough to adopt a retained removal transition",
+	async () => {
+		const dir = await temp();
+		const transitionPath = path.join(dir, "sdk", "broker.startup.lock.removing");
+		await fs.mkdir(transitionPath, { recursive: true });
+		const old = new Date(Date.now() - 2_000);
+		await fs.utimes(transitionPath, old, old);
+		try {
+			const result = await withBrokerStartupLock(dir, async () => true);
+			expect(result).toBe(true);
+			expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.startup.lock.removing");
+			expect(Date.now() - old.getTime()).toBeGreaterThanOrEqual(FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	},
+	20_000,
+);
+
 it("records a startup exit when acquisition is blocked by a retained removal transition", async () => {
 	const dir = await temp();
 	const blockingLockPath = path.join(dir, "sdk", "broker.startup.lock.removing");
@@ -702,6 +769,7 @@ it("records a startup exit when acquisition is blocked by a retained removal tra
 	await Bun.write(infoPath, "");
 	const old = new Date(Date.now() - 120_000);
 	await fs.utimes(infoPath, old, old);
+	const sleep = spyOn(Bun, "sleep").mockImplementation(async () => undefined);
 	const stderr: string[] = [];
 	const stderrWrite = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
 		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
@@ -723,9 +791,177 @@ it("records a startup exit when acquisition is blocked by a retained removal tra
 		expect(await readBrokerExitRecord(dir)).toBeUndefined();
 	} finally {
 		stderrWrite.mockRestore();
+		sleep.mockRestore();
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 });
+
+it("retries session-index acquisition timeouts within the startup fence before refusing", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(
+		new FileLockAcquireError(indexFilePath, blockingLockPath, 600, `held by pid ${process.pid}`),
+	);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({
+			code: "acquire_timeout",
+			lockPath: blockingLockPath,
+		});
+		expect(start).toHaveBeenCalledTimes(3);
+		expect(stop).toHaveBeenCalledTimes(3);
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("consumes broker restart authorization before launching descendants", () => {
+	const deadlineAt = Date.now() + 60_000;
+	const environment: NodeJS.ProcessEnv = {
+		GJC_BROKER_RESTART_REQUEST: "single-use-request",
+		GJC_BROKER_RESTART_DEADLINE: String(deadlineAt),
+		KEEP_FOR_CHILDREN: "preserved",
+	};
+
+	expect(consumeBrokerRestartEnvironment(environment)).toEqual({
+		requestIdEnv: "single-use-request",
+		restartDeadlineAt: deadlineAt,
+	});
+	expect(environment).toEqual({ KEEP_FOR_CHILDREN: "preserved" });
+});
+
+it("refuses untagged startup when a restart intent cannot be read", async () => {
+	const dir = await temp();
+	const requestId = "transient-intent-read";
+	const priorRequestId = process.env.GJC_BROKER_RESTART_REQUEST;
+	process.env.GJC_BROKER_RESTART_REQUEST = requestId;
+	const readIntent = spyOn(brokerDiscovery, "readBrokerRestartIntent").mockRejectedValue(
+		new Error("injected transient intent read failure"),
+	);
+	const start = spyOn(Broker.prototype, "start");
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toThrow("refusing untagged startup");
+		expect(readIntent).toHaveBeenCalledTimes(1);
+		expect(start).not.toHaveBeenCalled();
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+	} finally {
+		if (priorRequestId === undefined) delete process.env.GJC_BROKER_RESTART_REQUEST;
+		else process.env.GJC_BROKER_RESTART_REQUEST = priorRequestId;
+		start.mockRestore();
+		readIntent.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("records retained session-index transitions as retryable lock unavailability", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const lockPath = path.join(indexDir, "index.jsonl.lock");
+	const transitionPath = path.join(indexDir, "index.jsonl.lock.removing");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(
+		new FileLockAcquireError(
+			indexFilePath,
+			lockPath,
+			600,
+			`held by pid ${process.pid}`,
+			"orphan_transition",
+			transitionPath,
+		),
+	);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toMatchObject({
+			code: "orphan_transition",
+			orphanPath: transitionPath,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath: transitionPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("retries ordinary broker startup after its session-index lock becomes available", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const spawnLockPath = path.join(dir, "sdk", "broker.spawn.lock");
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	await Bun.write(
+		path.join(blockingLockPath, "info"),
+		JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner_token: "live-index-owner" }),
+	);
+	const lockUnavailable = Promise.withResolvers<void>();
+	void lockUnavailable.promise.catch(() => undefined);
+	let pollInFlight = false;
+	let lockUnavailableCount = 0;
+	let discoveryWhileBlocked: BrokerDiscovery | null | undefined;
+	let spawnLockAcquisitions = 0;
+	let retrySawReleasedSpawnLock = false;
+	FileLockTestHooks.afterParentMkdir = async lockPath => {
+		if (lockPath !== spawnLockPath) return;
+		spawnLockAcquisitions++;
+		if (spawnLockAcquisitions === 2) retrySawReleasedSpawnLock = !(await fs.exists(spawnLockPath));
+	};
+	const poll = setInterval(() => {
+		if (pollInFlight) return;
+		pollInFlight = true;
+		void readBrokerStartupExitRecord(dir)
+			.then(async record => {
+				if (record?.reason !== "startup-lock-unavailable") return;
+				lockUnavailableCount++;
+				discoveryWhileBlocked = await brokerDiscovery.readBrokerDiscovery(dir);
+				clearInterval(poll);
+				await fs.rm(blockingLockPath, { recursive: true, force: true });
+				lockUnavailable.resolve();
+			})
+			.catch(lockUnavailable.reject)
+			.finally(() => {
+				pollInFlight = false;
+			});
+	}, 25);
+	try {
+		const discovery = await ensureBroker({ agentDir: dir });
+		await lockUnavailable.promise;
+		expect(lockUnavailableCount).toBe(1);
+		expect(discoveryWhileBlocked).toBeNull();
+		expect(spawnLockAcquisitions).toBe(2);
+		expect(retrySawReleasedSpawnLock).toBe(true);
+		expect(discovery.pid).toBeGreaterThan(0);
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toMatchObject({ pid: discovery.pid });
+	} finally {
+		clearInterval(poll);
+		FileLockTestHooks.afterParentMkdir = undefined;
+		await fs.rm(blockingLockPath, { recursive: true, force: true });
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 45_000);
 
 it("keeps the deadline reason when SIGTERM arrives during its async record fallback", async () => {
 	if (process.platform === "win32") return;
@@ -1065,7 +1301,7 @@ it("releases the spawn lock when the under-lock discovery read fails so the next
 	}
 }, 30_000);
 
-it("the spawn lock rejects an incomplete published owner instead of acquiring over it", async () => {
+it("the spawn lock rejects an ownerless empty directory instead of acquiring over it", async () => {
 	const dir = await temp();
 	try {
 		await fs.mkdir(path.join(dir, "sdk", "broker.spawn.lock"), { recursive: true });
@@ -1145,10 +1381,17 @@ it("shared agent roots recover dead locks across config profiles despite a retai
 
 		const sdk = path.join(dir, "sdk");
 		const brokerLock = path.join(sdk, "broker.lock");
+		const { ownerHostId } = await brokerLockHostIdentity(dir);
 		await fs.mkdir(brokerLock, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(brokerLock, "owner.json"),
-			JSON.stringify({ version: 1, ownerId: "dead-broker", pid: deadPid, acquiredAt: Date.now() - 60_000 }),
+			JSON.stringify({
+				version: 1,
+				ownerId: "dead-broker",
+				pid: deadPid,
+				ownerHostId,
+				acquiredAt: Date.now() - 60_000,
+			}),
 			{ mode: 0o600 },
 		);
 		const lockStat = await fs.lstat(brokerLock, { bigint: true });

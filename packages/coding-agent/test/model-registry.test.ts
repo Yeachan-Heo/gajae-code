@@ -695,6 +695,31 @@ describe("ModelRegistry", () => {
 			expect(openaiModel?.cacheRetention).toBe("long");
 		});
 
+		test("inherits provider streamIdleTimeoutMs and honors per-model overrides", () => {
+			writeRawModelsJson({
+				openai: {
+					streamIdleTimeoutMs: 240_000,
+					modelOverrides: {
+						"gpt-5-mini": { streamIdleTimeoutMs: 450_000 },
+					},
+				},
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "claude-opus-5-5" }, { id: "deepseek-v4.1-flash", streamIdleTimeoutMs: 450_000 }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("openai", "gpt-5")).toMatchObject({ streamIdleTimeoutMs: 240_000 });
+			expect(registry.find("openai", "gpt-5-mini")).toMatchObject({ streamIdleTimeoutMs: 450_000 });
+			expect(registry.find("proxy", "claude-opus-5-5")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+			expect(registry.find("proxy", "deepseek-v4.1-flash")).toMatchObject({ streamIdleTimeoutMs: 450_000 });
+		});
+
 		test("propagates declared image output capability for custom models", () => {
 			writeRawModelsJson({
 				layofflabs: {
@@ -3476,6 +3501,54 @@ describe("ModelRegistry", () => {
 			const model = registry.find("custom-local", "gpt-5.4");
 			expect(model?.contextWindow).toBe(1_000_000);
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8080");
+		});
+
+		test("does not persist model override idle timeouts in discovery cache", async () => {
+			const provider = "timeout-cache-proxy";
+			const baseUrl = "http://127.0.0.1:8080";
+			const writeConfig = (providerTimeout: number, modelOverride?: number) => {
+				writeRawModelsJson({
+					[provider]: {
+						baseUrl,
+						apiKey: "TEST_KEY",
+						api: "openai-responses",
+						streamIdleTimeoutMs: providerTimeout,
+						discovery: { type: "llama.cpp" },
+						...(modelOverride === undefined
+							? {}
+							: { modelOverrides: { "cached-model": { streamIdleTimeoutMs: modelOverride } } }),
+					},
+				});
+			};
+
+			writeConfig(180_000, 300_000);
+			const settings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, settings, { automaticRefresh: false });
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url !== `${baseUrl}/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+				requests++;
+				return Response.json({ data: [{ id: "cached-model" }] });
+			});
+
+			try {
+				await registry.refreshProvider(provider, "online");
+				expect(registry.find(provider, "cached-model")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+				expect(
+					readModelCache(provider, 86_400_000, Date.now, cacheDbPath)?.models.find(
+						model => model.id === "cached-model",
+					)?.streamIdleTimeoutMs,
+				).toBeUndefined();
+
+				writeConfig(450_000);
+				await registry.refresh("offline");
+
+				expect(registry.find(provider, "cached-model")).toMatchObject({ streamIdleTimeoutMs: 450_000 });
+				expect(requests).toBe(1);
+			} finally {
+				registry.dispose();
+			}
 		});
 
 		test.each([
@@ -6563,6 +6636,524 @@ describe("ModelRegistry", () => {
 		);
 	});
 
+	test("rejects provider stream idle timeouts on non-OpenAI-compatible built-ins", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					streamIdleTimeoutMs: 300_000,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("validates provider stream idle timeouts against bundled APIs before provider API overrides", () => {
+		writeRawModelsConfig({
+			providers: {
+				anthropic: {
+					api: "openai-completions",
+					streamIdleTimeoutMs: 300_000,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("applies provider stream idle timeouts only to OpenAI models in mixed built-ins", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					streamIdleTimeoutMs: 300_000,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("github-copilot", "gpt-4.1")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+		expect(registry.find("github-copilot", "claude-sonnet-4")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("validates provider timeouts against retained bundled models when custom models are Anthropic-only", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					baseUrl: "https://copilot-proxy.example.com/v1",
+					auth: "none",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "custom-claude", api: "anthropic-messages" }],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), { automaticRefresh: false });
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("github-copilot", "gpt-4.1")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+		expect(registry.find("github-copilot", "custom-claude")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("github-copilot", "custom-claude")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("applies provider stream idle timeouts only to OpenAI models in mixed custom lists", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					streamIdleTimeoutMs: 300_000,
+					models: [
+						{ id: "gpt-model", api: "openai-completions" },
+						{ id: "claude-model", api: "anthropic-messages" },
+					],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("proxy", "gpt-model")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+		expect(registry.find("proxy", "claude-model")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("rejects provider stream idle timeouts when custom models have no OpenAI-compatible API", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "claude-model", api: "anthropic-messages" }],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'"streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test.each([
+		["implicit OpenAI discovery", { api: "openai-completions" }],
+		[
+			"explicit OpenAI prefix discovery",
+			{
+				api: "anthropic-messages",
+				discovery: { type: "openai-models-list", apiByModelPrefix: { "gpt-": "openai-completions" } },
+			},
+		],
+	] as const)("validates provider timeouts against %s with Anthropic-only custom models", (_route, routeConfig) => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					auth: "none",
+					streamIdleTimeoutMs: 300_000,
+					models: [{ id: "claude-model", api: "anthropic-messages" }],
+					...routeConfig,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), { automaticRefresh: false });
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("proxy", "claude-model")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("drops inherited provider timeouts when a custom model changes a bundled model API", () => {
+		writeRawModelsConfig({
+			providers: {
+				openai: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					streamIdleTimeoutMs: 300_000,
+					models: [
+						{ id: "gpt-4.1", api: "anthropic-messages" },
+						{ id: "custom-openai-model", api: "openai-completions" },
+					],
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("openai", "gpt-4.1")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("openai", "gpt-4.1")).not.toHaveProperty("streamIdleTimeoutMs");
+		expect(registry.find("openai", "custom-openai-model")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("validates stream idle modelOverrides case-insensitively", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					models: [{ id: "Model-X", api: "openai-responses" }],
+					modelOverrides: { "model-x": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("proxy", "Model-X")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+	});
+
+	test("validates mixed-case stream idle modelOverrides for bundled models", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					modelOverrides: { "GPT-4.1": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		expect(registry.find("github-copilot", "gpt-4.1")).toMatchObject({ streamIdleTimeoutMs: 300_000 });
+	});
+
+	test("validates bundled model API before a provider API override", () => {
+		writeRawModelsConfig({
+			providers: {
+				"github-copilot": {
+					api: "openai-completions",
+					modelOverrides: { "claude-sonnet-4": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("uses bundled model APIs when discovery has no model-specific route", () => {
+		writeRawModelsConfig({
+			providers: {
+				"opencode-go": {
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "minimax-m2.5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("rejects stream idle modelOverrides for explicit Anthropic discovery routes", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list", apiByModelPrefix: { "claude-": "anthropic-messages" } },
+					modelOverrides: { "claude-sonnet-4": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			' modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("defers model timeout overrides for implicit discovery until the catalog is resolved", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+	});
+
+	test("validates discovered idle timeout overrides against the catalog owner", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "claude-opus-5", owned_by: "openai" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "claude-opus-5")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("defers discovered timeout overrides when the provider default conflicts with the catalog owner", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "gpt-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "gpt-5", owned_by: "openai" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "gpt-5")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("does not apply discovered idle timeout overrides when the catalog resolves to Anthropic", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getError()).toBeUndefined();
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "claude-opus-5", owned_by: "anthropic" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+
+		await registry.refreshProvider("proxy", "online");
+		expect(registry.find("proxy", "claude-opus-5")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("proxy", "claude-opus-5")).not.toHaveProperty("streamIdleTimeoutMs");
+	});
+
+	test("hydrates cached Anthropic routes without applying deferred timeout overrides", async () => {
+		const provider = "cached-timeout-proxy";
+		const baseUrl = "https://proxy.example.com/v1";
+		const registrySettings = Settings.isolated();
+		const writeConfig = (includeOverride: boolean) => {
+			writeRawModelsConfig({
+				providers: {
+					[provider]: {
+						baseUrl,
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						discovery: { type: "openai-models-list" },
+						...(includeOverride ? { modelOverrides: { "claude-opus-5": { streamIdleTimeoutMs: 300_000 } } } : {}),
+					},
+				},
+			});
+		};
+		writeConfig(false);
+
+		let requests = 0;
+		using _hook = hookFetch(input => {
+			const url = input instanceof Request ? input.url : String(input);
+			if (url !== `${baseUrl}/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+			requests++;
+			return Response.json({ data: [{ id: "claude-opus-5", owned_by: "anthropic" }] });
+		});
+
+		const discovered = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+		try {
+			await discovered.refreshProvider(provider, "online");
+			expect(discovered.find(provider, "claude-opus-5")).toMatchObject({ api: "anthropic-messages" });
+		} finally {
+			discovered.dispose();
+		}
+
+		writeConfig(true);
+		const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+		try {
+			expect(reloaded.find(provider, "claude-opus-5")).toMatchObject({ api: "anthropic-messages" });
+			expect(reloaded.find(provider, "claude-opus-5")).not.toHaveProperty("streamIdleTimeoutMs");
+			expect(requests).toBe(1);
+		} finally {
+			reloaded.dispose();
+		}
+	});
+
+	test("validates discovery API prefixes case-insensitively for modelOverrides", () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: {
+						type: "openai-models-list",
+						apiByModelPrefix: { "vendor-": "anthropic-messages" },
+					},
+					modelOverrides: { "VENDOR-OPUS": { streamIdleTimeoutMs: 300_000 } },
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain(
+			'modelOverrides "streamIdleTimeoutMs" is only supported with openai-completions or openai-responses APIs',
+		);
+	});
+
+	test("routes discovered model IDs with case-insensitive API prefixes", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					discovery: {
+						type: "openai-models-list",
+						apiByModelPrefix: { "VENDOR-": "anthropic-messages" },
+					},
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [{ id: "vendor-opus" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "vendor-opus")).toMatchObject({ api: "anthropic-messages" });
+	});
+
+	test("does not apply provider stream idle timeouts to discovered Anthropic routes", async () => {
+		writeRawModelsConfig({
+			providers: {
+				proxy: {
+					baseUrl: "https://proxy.example.com/v1",
+					auth: "none",
+					api: "openai-completions",
+					streamIdleTimeoutMs: 300_000,
+					discovery: {
+						type: "openai-models-list",
+						apiByModelPrefix: { "claude-": "anthropic-messages" },
+					},
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		using _hook = hookFetch(
+			() =>
+				new Response(
+					JSON.stringify({
+						data: [{ id: "claude-sonnet-4" }, { id: "gpt-5" }, { id: "opaque-model", owned_by: "anthropic" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+		);
+		await registry.refreshProvider("proxy", "online");
+
+		expect(registry.find("proxy", "claude-sonnet-4")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("proxy", "claude-sonnet-4")).not.toHaveProperty("streamIdleTimeoutMs");
+		expect(registry.find("proxy", "opaque-model")).toMatchObject({ api: "anthropic-messages" });
+		expect(registry.find("proxy", "opaque-model")).not.toHaveProperty("streamIdleTimeoutMs");
+		expect(registry.find("proxy", "gpt-5")).toMatchObject({
+			api: "openai-completions",
+			streamIdleTimeoutMs: 300_000,
+		});
+	});
+
+	test("rejects model-configured stream idle timeouts on pi-native transport", () => {
+		const timeoutConfigs: Array<Record<string, unknown>> = [
+			{ streamIdleTimeoutMs: 300_000 },
+			{ models: [{ id: "upstream/custom-model", streamIdleTimeoutMs: 300_000 }] },
+			{ modelOverrides: { "upstream/custom-model": { streamIdleTimeoutMs: 300_000 } } },
+		];
+
+		for (const timeoutConfig of timeoutConfigs) {
+			writeRawModelsConfig({
+				providers: {
+					gateway: {
+						baseUrl: "http://127.0.0.1:4000",
+						apiKey: "TEST_KEY",
+						api: "openai-completions",
+						transport: "pi-native",
+						models: [{ id: "upstream/custom-model" }],
+						...timeoutConfig,
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(String(registry.getError()?.message)).toContain(
+				'"streamIdleTimeoutMs" is not supported with "transport: pi-native"',
+			);
+		}
+	});
+
+	test("rejects stream idle timeout values above the platform timer range", () => {
+		writeRawModelsConfig({
+			providers: {
+				openai: {
+					streamIdleTimeoutMs: 2 ** 31,
+				},
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(String(registry.getError()?.message)).toContain("2147483647");
+	});
+
 	test("rejects runtime provider-only request shaping without an OpenAI-compatible API", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
@@ -6888,6 +7479,42 @@ describe("ModelRegistry", () => {
 
 			expect(getModelsForProvider(registry, "local")).toHaveLength(0);
 			expect(registry.getProviderBaseUrl("local")).toBeUndefined();
+		});
+
+		test("applies provider and model override idle timeouts to models.yml openaiCompat endpoints", async () => {
+			writeRawModelsConfig({
+				providers: {
+					"local-proxy": {
+						openaiCompat: {
+							baseUrl: "http://127.0.0.1:1234",
+							apiKey: "LOCAL_TEST_KEY",
+						},
+						streamIdleTimeoutMs: 300_000,
+						modelOverrides: { "model-with-override": { streamIdleTimeoutMs: 450_000 } },
+					},
+				},
+			});
+			using _hook = hookFetch((input, init) => {
+				expect(String(input)).toBe("http://127.0.0.1:1234/v1/models");
+				expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer LOCAL_TEST_KEY");
+				return new Response(JSON.stringify({ data: [{ id: "local-model" }, { id: "model-with-override" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+
+			expect(registry.find("local-proxy", "local-model")).toMatchObject({
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:1234/v1",
+				streamIdleTimeoutMs: 300_000,
+			});
+			expect(registry.find("local-proxy", "model-with-override")).toMatchObject({
+				api: "openai-completions",
+				streamIdleTimeoutMs: 450_000,
+			});
 		});
 
 		test("parses providers.local.openaiCompat and discovers OpenAI-compatible models", async () => {

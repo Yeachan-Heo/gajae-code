@@ -1316,6 +1316,31 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 				provider: "kilo",
 				baseUrl,
 				apiKey,
+				// Kilo serves the OpenRouter catalog shape: nested limits/modalities and
+				// per-token USD string prices (GJC costs are per million tokens).
+				mapModel: (entry, defaults) => {
+					const topProvider = isRecord(entry.top_provider) ? entry.top_provider : undefined;
+					const architecture = isRecord(entry.architecture) ? entry.architecture : undefined;
+					const pricing = isRecord(entry.pricing) ? entry.pricing : undefined;
+					const params = Array.isArray(entry.supported_parameters) ? entry.supported_parameters : [];
+					const perMillion = (value: unknown): number => {
+						const perToken = toNumber(value);
+						return perToken !== undefined && perToken >= 0 ? perToken * 1_000_000 : 0;
+					};
+					return {
+						...defaults,
+						reasoning: params.includes("reasoning"),
+						input: toInputCapabilities(architecture?.input_modalities),
+						cost: {
+							input: perMillion(pricing?.prompt),
+							output: perMillion(pricing?.completion),
+							cacheRead: perMillion(pricing?.input_cache_read),
+							cacheWrite: perMillion(pricing?.input_cache_write),
+						},
+						contextWindow: toPositiveNumber(entry.context_length, defaults.contextWindow),
+						maxTokens: toPositiveNumber(topProvider?.max_completion_tokens, defaults.maxTokens),
+					};
+				},
 			}),
 	};
 }
@@ -2125,6 +2150,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 								...(api === "openai-completions"
 									? {
 											compat: {
+												...(reference.compat ?? {}),
 												supportsStore: false,
 												supportsDeveloperRole: false,
 												supportsReasoningEffort: false,

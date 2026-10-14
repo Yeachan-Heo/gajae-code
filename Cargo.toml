@@ -323,6 +323,7 @@ image = { version = "0.25", default-features = false, features = [
    "gif",
    "webp",
 ] }
+flate2 = "1.1"
 png = "0.18"
 resvg = "0.48"
 # Not used directly: activates zune-jpeg's 'log' feature so image's JPEG decoder

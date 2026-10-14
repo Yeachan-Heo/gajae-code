@@ -788,6 +788,11 @@ jobs:
         run: bun run ci:build:native
       - name: Build darwin-arm64 coding-agent binary
         run: bun --cwd=packages/coding-agent run build
+      - name: Verify local diagnostic manifests on Darwin arm64
+        shell: bash
+        run: |
+          bun test ./packages/natives/test/diagnostic-loader.test.ts --test-name-pattern "verifies a local source addon"
+          bun test ./packages/natives/test/diagnostic-loader.test.ts --test-name-pattern "uses the verified local build digest carried by a compiled binary"
       - name: Smoke compiled tab worker with fresh owner directories
         shell: bash
         run: |

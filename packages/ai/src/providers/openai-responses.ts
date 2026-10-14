@@ -15,6 +15,7 @@ import {
 	isKnownProvider,
 	type MessageAttribution,
 	type Model,
+	modelSupportsUltrafastTier,
 	type OpenAICompat,
 	type ProviderSessionState,
 	type ServiceTier,
@@ -394,11 +395,14 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.maxRetryDelayMs,
 				options?.attemptScope,
 				options?.streamFirstEventTimeoutMs,
+				options?.streamIdleTimeoutMs,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			let { params } = buildParams(model, context, options, providerSessionState, cacheRetention, baseUrl);
-			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(model.provider, model.id);
+			const idleTimeoutMs =
+				options?.streamIdleTimeoutMs ??
+				getOpenAIStreamIdleTimeoutMs(model.provider, model.id, model.streamIdleTimeoutMs);
 			const replacementPayload = await options?.onPayload?.(
 				params,
 				undefined,
@@ -491,6 +495,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 					onOutputItemDone: item => {
 						nativeOutputItems.push(structuredCloneJSON<unknown>(item) as unknown as Record<string, unknown>);
 					},
+					serviceTier: (params as unknown as Record<string, unknown>).service_tier as ServiceTier | undefined,
 				},
 			);
 			if (premiumRequestsTotal !== undefined) output.usage.premiumRequests = premiumRequestsTotal;
@@ -588,6 +593,7 @@ function createClient(
 	maxRetryDelayMs?: number,
 	attemptScope?: import("../types.js").AttemptScopeRef,
 	streamFirstEventTimeoutOverride?: number,
+	effectiveIdleTimeoutOverride?: number,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -660,7 +666,13 @@ function createClient(
 	);
 	// Bound HTTP request timeout to the first-event window so a stalled-before-headers
 	// fetch cannot wait the SDK's 10-minute default before the transport watchdog arms.
-	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, streamFirstEventTimeoutOverride, model.id);
+	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(
+		model.provider,
+		streamFirstEventTimeoutOverride,
+		model.id,
+		model.streamIdleTimeoutMs,
+		effectiveIdleTimeoutOverride,
+	);
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -746,7 +758,13 @@ function buildParams(
 		stream_options: model.provider === "openai" ? { include_obfuscation: false } : undefined,
 	};
 
-	applyCommonResponsesSamplingParams(params, options, model.provider, model.compat?.supportsServiceTier === true);
+	applyCommonResponsesSamplingParams(
+		params,
+		options,
+		model.provider,
+		model.compat?.supportsServiceTier === true,
+		modelSupportsUltrafastTier(model),
+	);
 	// TODO: openai responses has no top-level `stop`/`stop_sequences`; surface via reasoning.stop?
 	// `StreamOptions.stopSequences` is intentionally dropped for this provider.
 	// TODO: openai responses has no top-level `frequency_penalty` field as of the current SDK;
