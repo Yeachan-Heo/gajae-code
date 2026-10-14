@@ -3808,7 +3808,7 @@ export class Broker {
 	#removeCreatedLockGeneration(
 		lockIdentity: { dev: string; ino: string },
 		parentIdentity: { dev: bigint; ino: bigint },
-		ownerIdentity?: { dev: string; ino: string; sha256: string },
+		ownerHash?: string,
 	): void {
 		const captured = snapshotDirectoryTree(this.#lock);
 		const snapshot = captured.snapshot;
@@ -3822,19 +3822,13 @@ export class Broker {
 		)
 			return;
 
-		if (ownerIdentity) {
-			const owner = snapshot.entries.find(entry => entry.relativePath === BROKER_LOCK_RECORD);
-			if (
-				snapshot.entries.length !== 2 ||
-				owner?.kind !== "file" ||
-				owner.dev !== ownerIdentity.dev ||
-				owner.ino !== ownerIdentity.ino ||
-				owner.sha256 !== ownerIdentity.sha256
-			)
-				return;
-		} else if (snapshot.entries.length !== 1) {
-			return;
-		}
+		const owner = snapshot.entries.find(entry => entry.relativePath === BROKER_LOCK_RECORD);
+		const exactOwner =
+			ownerHash !== undefined &&
+			snapshot.entries.length === 2 &&
+			owner?.kind === "file" &&
+			owner.sha256 === ownerHash;
+		if (!exactOwner && snapshot.entries.length !== 1) return;
 
 		exactRemoveDirectoryTree(this.#lock, snapshot, parentIdentity);
 	}
@@ -3844,7 +3838,7 @@ export class Broker {
 		const parent = await fs.lstat(path.dirname(this.#lock), { bigint: true });
 		await fs.mkdir(this.#lock, { mode: 0o700 });
 		let createdLockIdentity: { dev: string; ino: string } | undefined;
-		let createdOwnerIdentity: { dev: string; ino: string; sha256: string } | undefined;
+		let createdOwnerHash: string | undefined;
 		try {
 			const lockStat = await fs.lstat(this.#lock, { bigint: true });
 			if (!lockStat.isDirectory()) throw new Error("SDK broker lock is not a directory.");
@@ -3860,18 +3854,8 @@ export class Broker {
 				ownerHostId: hostIdentity.ownerHostId,
 				rootDigest,
 			});
-			const ownerHandle = await fs.open(this.#lockRecordPath(), "wx", 0o600);
-			try {
-				await ownerHandle.writeFile(ownerRecord);
-				const ownerStat = await ownerHandle.stat({ bigint: true });
-				createdOwnerIdentity = {
-					dev: String(ownerStat.dev),
-					ino: String(ownerStat.ino),
-					sha256: createHash("sha256").update(ownerRecord).digest("hex"),
-				};
-			} finally {
-				await ownerHandle.close();
-			}
+			createdOwnerHash = createHash("sha256").update(ownerRecord).digest("hex");
+			await fs.writeFile(this.#lockRecordPath(), ownerRecord, { flag: "wx", mode: 0o600 });
 			const current = await this.#readLock();
 			if (
 				!current ||
@@ -3888,7 +3872,7 @@ export class Broker {
 					this.#removeCreatedLockGeneration(
 						createdLockIdentity,
 						{ dev: parent.dev, ino: parent.ino },
-						createdOwnerIdentity,
+						createdOwnerHash,
 					);
 			} catch {}
 			throw error;
