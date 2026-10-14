@@ -10,5 +10,6 @@ export {
 	type DurableReconciliationRecord,
 	type DurableSteerReconciliationRecord,
 	type ReconciliationStore,
+	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "./bus/reconciliation-store";

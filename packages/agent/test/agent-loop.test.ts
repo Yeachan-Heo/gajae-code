@@ -176,6 +176,39 @@ describe("agentLoop with AgentMessage", () => {
 		expect(agentEnd?.stopReason).toBe("cancelled");
 	});
 
+	it("keeps a pending synthetic recovery from being reported as completed after abort", async () => {
+		const controller = new AbortController();
+		const mock = createMockModel({ responses: [{ content: ["initial answer"] }] });
+		const recoveryMessage = createUserMessage("recover the provider-side tool result");
+		const events: AgentEvent[] = [];
+		let recoveryPolled = 0;
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: [""], messages: [], tools: [] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				getSyntheticRecoveryMessage: async () => {
+					recoveryPolled++;
+					return recoveryMessage;
+				},
+			},
+			controller.signal,
+			mock.stream,
+		);
+
+		for await (const event of stream) {
+			events.push(event);
+			if (event.type === "message_end" && event.message.role === "assistant") controller.abort();
+		}
+
+		const agentEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		expect(recoveryPolled).toBe(1);
+		expect(agentEnd?.stopReason).toBe("cancelled");
+	});
+
 	it("should handle custom message types via convertToLlm", async () => {
 		// Create a custom message type
 		interface CustomNotification {
