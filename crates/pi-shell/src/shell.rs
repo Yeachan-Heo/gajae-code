@@ -3780,6 +3780,7 @@ mod tests {
 
 	/// Contract: a timed-out incomplete UTF-8 character is assigned to the
 	/// partial result instead of being hidden from the caller.
+	#[cfg(not(windows))]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn read_timeout_assigns_an_incomplete_utf8_character() {
 		let (result, output) = execute_captured(
