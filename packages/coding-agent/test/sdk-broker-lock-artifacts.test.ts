@@ -583,7 +583,7 @@ describe("broker lock owner incarnation", () => {
 		const original = await Bun.file(record).text();
 		const broker = new Broker({ agentDir });
 		try {
-			await expect(broker.start()).rejects.toThrow("Broker lock is held by a live owner");
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is attributed to a different host");
 			expect(await Bun.file(record).text()).toBe(original);
 			expect(broker.ownsDiscovery).toBe(false);
 		} finally {
