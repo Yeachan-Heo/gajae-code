@@ -1943,7 +1943,7 @@ describe("SDK broker identity and discovery", () => {
 		);
 		const broker = new Broker({ agentDir: dir });
 		try {
-			await expect(broker.start()).rejects.toThrow(`Broker lock is held by a live owner (pid ${process.pid})`);
+			await expect(broker.start()).rejects.toThrow("Broker lock owner is attributed to a different host");
 			// Lock should NOT have been reclaimed despite incarnation mismatch
 			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
 				ownerId: "foreign-host-owner",
