@@ -611,6 +611,62 @@ describe("broker lock owner incarnation", () => {
 		}
 	});
 
+	it("removes its exact lock when owner read-back fails so startup can retry", async () => {
+		const agentDir = await makeAgentDir();
+		const lock = path.join(agentDir, "sdk", "broker.lock");
+		const lockRecord = path.join(lock, "owner.json");
+		const broker = new Broker({ agentDir });
+		const injectedError = Object.assign(new Error("EIO: injected broker owner read-back failure"), { code: "EIO" });
+		const realReadFile = fs.readFile;
+		let injected = false;
+		vi.spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
+			if (!injected && String(args[0]) === lockRecord) {
+				injected = true;
+				throw injectedError;
+			}
+			return realReadFile(...args);
+		}) as typeof fs.readFile);
+
+		try {
+			await expect(broker.start()).rejects.toBe(injectedError);
+			expect(injected).toBe(true);
+			expect(await exists(lock)).toBe(false);
+
+			const discovery = await broker.start();
+			expect(discovery.pid).toBe(process.pid);
+			expect(broker.ownsDiscovery).toBe(true);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("preserves a successor lock when owner read-back fails", async () => {
+		const agentDir = await makeAgentDir();
+		const lockRecord = path.join(agentDir, "sdk", "broker.lock", "owner.json");
+		const replacementPath = `${lockRecord}.replacement`;
+		const broker = new Broker({ agentDir });
+		const injectedError = Object.assign(new Error("EIO: injected broker owner read-back failure"), { code: "EIO" });
+		const realReadFile = fs.readFile;
+		let injected = false;
+		vi.spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
+			if (!injected && String(args[0]) === lockRecord) {
+				injected = true;
+				await fs.writeFile(replacementPath, JSON.stringify({ ownerId: "successor-owner", pid: 123 }));
+				await fs.rename(replacementPath, lockRecord);
+				throw injectedError;
+			}
+			return realReadFile(...args);
+		}) as typeof fs.readFile);
+
+		try {
+			await expect(broker.start()).rejects.toBe(injectedError);
+			expect(injected).toBe(true);
+			expect(await Bun.file(lockRecord).json()).toMatchObject({ ownerId: "successor-owner", pid: 123 });
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("does not publish when canonical lock ownership changes during startup", async () => {
 		const agentDir = await makeAgentDir();
 		const lockRecord = path.join(agentDir, "sdk", "broker.lock", "owner.json");
