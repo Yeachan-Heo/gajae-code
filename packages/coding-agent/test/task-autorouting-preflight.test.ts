@@ -674,6 +674,34 @@ describe("autorouting preflight contract", () => {
 		expect(result.routing?.terminal).toBe("preflight_exhausted");
 	});
 
+	it("terminalizes credential lookup errors before dispatching a resumed route", async () => {
+		const result = await runSubprocess({
+			cwd: process.cwd(),
+			agent,
+			task: "resume credential lookup error",
+			assignment: "resume credential lookup error",
+			index: 0,
+			id: "resume-credential-lookup-error",
+			runMode: "resume",
+			settings: Settings.isolated(),
+			modelRegistry: {} as never,
+			autoroutingCandidates: ["test/model"],
+			autoroutingPreflightErrors: new Map([["test/model", new Error("keychain access denied")]]),
+			autoroutingSkips: [{ selector: "test/without-credential", code: "credential_unavailable" }],
+			routing: { ...routing, freshOnResume: true },
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.routing).toMatchObject({
+			freshOnResume: true,
+			notExecuted: true,
+			terminal: "preflight_exhausted",
+			skips: [{ selector: "test/without-credential", code: "credential_unavailable" }],
+			attempts: [{ selector: "test/model", phase: "probe", code: "config_invalid_terminal" }],
+		});
+		expect(result.routing?.attempts?.some(attempt => attempt.code === "credential_unavailable")).toBe(false);
+	});
+
 	it("resolves preflight credentials in the parent credential session", async () => {
 		const root = await mkdtemp(path.join(tmpdir(), "gjc-real-preflight-credential-session-"));
 		const model = {

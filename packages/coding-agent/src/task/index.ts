@@ -2108,7 +2108,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: validateAllocatedTaskId(uniqueIds[i] ?? "") }));
 
-			const effectiveAutorouting = session.settings.getEffectiveAutorouting();
+			const isResumedRun = executionOverrides?.runMode === "resume" || executionOverrides?.runMode === "message";
+			const routingSettings = isResumedRun ? this.#ownerSession.settings : session.settings;
+			const effectiveAutorouting = routingSettings.getEffectiveAutorouting();
+			const disabledProviders = new Set(
+				routingSettings.get("disabledProviders").map(provider => provider.toLowerCase()),
+			);
 			const registry = session.modelRegistry as
 				| {
 						getAvailable?: () => Model[];
@@ -2117,16 +2122,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				  }
 				| undefined;
 			const routingSnapshot = registry?.getAll?.() ?? registry?.getAvailable?.();
+			const availableRoutingSnapshot = routingSnapshot?.filter(
+				model => !disabledProviders.has(model.provider.toLowerCase()),
+			);
 			const routingByIndex = new Map<number, RoutingOutcome>();
 			const routingCandidatesByIndex = new Map<number, string[]>();
 			const routingSkipsByIndex = new Map<number, Array<{ selector: string; code: AutoroutingReasonCode }>>();
+			const routingPreflightErrorsByIndex = new Map<number, Map<string, unknown>>();
 			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
 				const task = tasksWithUniqueIds[i];
 				const outcome = routingSnapshot
 					? resolveTaskRouting({
 							effectiveAutorouting,
 							requestedTier: task.tier,
-							availableModels: routingSnapshot,
+							availableModels: availableRoutingSnapshot,
 						})
 					: effectiveAutorouting.active
 						? {
@@ -2148,9 +2157,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const configured = effectiveAutorouting.map[outcome.tier] ?? [];
 				const candidates: string[] = [];
 				const skips: Array<{ selector: string; code: AutoroutingReasonCode }> = [];
-				const disabledProviders = new Set(
-					session.settings.get("disabledProviders").map(provider => provider.toLowerCase()),
-				);
 				for (const selector of configured) {
 					const slash = selector.indexOf("/");
 					const provider = slash > 0 ? selector.slice(0, slash).toLowerCase() : "";
@@ -2175,6 +2181,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			const resolveAutoroutingCandidates = async (
 				index: number,
+				stopAfterFirstAuthenticatedCandidate = false,
 			): Promise<{
 				candidates: string[];
 				skips: Array<{ selector: string; code: AutoroutingReasonCode }>;
@@ -2196,17 +2203,36 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							model,
 							session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 						);
-						if (key) authenticated.push(selector);
-						else skips.push({ selector, code: "credential_unavailable" });
+						if (key) {
+							authenticated.push(selector);
+							if (stopAfterFirstAuthenticatedCandidate) break;
+						} else skips.push({ selector, code: "credential_unavailable" });
 					} catch (error) {
-						// Preserve the candidate for executor preflight, which records the
-						// terminal lookup failure in the routing ledger.
+						// Preserve lookup errors for executor terminalization; only a returned
+						// undefined value means this candidate may be skipped.
 						preflightErrors.set(selector, error);
 						authenticated.push(selector);
+						if (stopAfterFirstAuthenticatedCandidate) break;
 					}
 				}
 				return { candidates: authenticated, skips, preflightErrors };
 			};
+			if (isResumedRun) {
+				for (const [index, outcome] of routingByIndex) {
+					if (outcome.kind !== "routed") continue;
+					const { candidates, skips, preflightErrors } = await resolveAutoroutingCandidates(index, true);
+					routingSkipsByIndex.set(index, skips);
+					const pinnedSelector = candidates[0];
+					if (pinnedSelector) {
+						routingCandidatesByIndex.set(index, [pinnedSelector]);
+						if (preflightErrors.size > 0) routingPreflightErrorsByIndex.set(index, preflightErrors);
+						routingByIndex.set(index, { ...outcome, pinnedSelector });
+						continue;
+					}
+					routingPreflightErrorsByIndex.delete(index);
+					routingCandidatesByIndex.set(index, []);
+				}
+			}
 			const effectivePatterns = (index: number): string | string[] => {
 				const outcome = routingByIndex.get(index);
 				return outcome?.kind === "routed" ? [outcome.pinnedSelector] : modelOverride;
@@ -2347,6 +2373,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const effectiveRunMode = overrides?.runMode ?? executionOverrides?.runMode;
 				const autoroutingInitial =
 					routingOutcome?.kind === "routed" && (effectiveRunMode ?? "initial") === "initial";
+				const includeAutoroutingResolution =
+					autoroutingInitial || effectiveRunMode === "resume" || effectiveRunMode === "message";
 				const autoroutingData =
 					(effectiveRunMode ?? "initial") === "initial" && routingOutcome && routingOutcome.kind !== "disabled"
 						? routingOutcome.kind === "routed"
@@ -2356,7 +2384,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									skips: [...(routingSkipsByIndex.get(index) ?? [])],
 									preflightErrors: new Map(),
 								}
-						: { candidates: undefined, skips: undefined, preflightErrors: new Map() };
+						: {
+								candidates:
+									includeAutoroutingResolution && routingOutcome?.kind === "routed"
+										? [...(routingCandidatesByIndex.get(index) ?? [])]
+										: undefined,
+								skips: [...(routingSkipsByIndex.get(index) ?? [])],
+								preflightErrors: routingPreflightErrorsByIndex.get(index) ?? new Map(),
+							};
 				const routingForRun = routeEvidence(
 					routingOutcome,
 					effectiveRunMode === "resume" || effectiveRunMode === "message",
@@ -2408,9 +2443,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						signal,
 						eventBus: session.eventBus,
 						routing: routingForRun,
-						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
-						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
-						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
+						autoroutingCandidates: includeAutoroutingResolution ? autoroutingData.candidates : undefined,
+						autoroutingSkips: includeAutoroutingResolution ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: includeAutoroutingResolution
+							? autoroutingData.preflightErrors
+							: undefined,
 						autoroutingPreflight: autoroutingInitial,
 
 						onProgress: progress => {
@@ -2496,9 +2533,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						signal,
 						eventBus: session.eventBus,
 						routing: routingForRun,
-						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
-						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
-						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
+						autoroutingCandidates: includeAutoroutingResolution ? autoroutingData.candidates : undefined,
+						autoroutingSkips: includeAutoroutingResolution ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: includeAutoroutingResolution
+							? autoroutingData.preflightErrors
+							: undefined,
 						autoroutingPreflight: autoroutingInitial,
 						onProgress: progress => {
 							progressMap.set(index, {
