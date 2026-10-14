@@ -42,6 +42,20 @@
 				},
 				"credentialPinStoreIdentity": {
 					"type": "string"
+				},
+				"credentialPreferences": {
+					"type": "object",
+					"additionalProperties": {
+						"type": "string",
+						"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+)$"
+					},
+					"default": {}
+				},
+				"credentialPreferenceMaxUsedPercent": {
+					"type": "number",
+					"default": 100,
+					"exclusiveMinimum": 0,
+					"maximum": 100
 				}
 			},
 			"additionalProperties": false

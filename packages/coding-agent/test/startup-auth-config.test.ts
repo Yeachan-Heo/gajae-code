@@ -78,6 +78,7 @@ describe("startup auth config", () => {
 			credentialStoreIdentity: `local:${getAgentDbPath(absentDir)}`,
 			credentialRankingMode: "balanced",
 			credentialPins: {},
+			credentialPreferences: {},
 		});
 
 		const emptyDir = await makeAgentDir("");
@@ -86,6 +87,7 @@ describe("startup auth config", () => {
 			credentialStoreIdentity: `local:${getAgentDbPath(emptyDir)}`,
 			credentialRankingMode: "balanced",
 			credentialPins: {},
+			credentialPreferences: {},
 		});
 	});
 
@@ -163,7 +165,55 @@ describe("startup auth config", () => {
 			credentialPinStoreIdentity: "broker:https://broker.example",
 			credentialRankingMode: "earliest-reset",
 			credentialPins: { anthropic: "email:operator@example.com" },
+			credentialPreferences: {},
 		});
+	});
+
+	it("reads soft credential preferences with the shared usage threshold", async () => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			[
+				"auth:",
+				"  credentialPreferences:",
+				"    anthropic: email:cheap@example.com",
+				"    openai-codex: account:acct-1",
+				"  credentialPreferenceMaxUsedPercent: 90",
+			].join("\n"),
+		);
+
+		await expect(resolveStartupAuthConfig(agentDir)).resolves.toMatchObject({
+			credentialPreferences: {
+				anthropic: { selector: { kind: "email", value: "cheap@example.com" }, maxUsedFraction: 0.9 },
+				"openai-codex": { selector: { kind: "account", value: "acct-1" }, maxUsedFraction: 0.9 },
+			},
+		});
+
+		const noThreshold = await makeAgentDir(
+			"auth:\n  credentialPreferences:\n    anthropic: email:cheap@example.com\n",
+		);
+		const resolved = await resolveStartupAuthConfig(noThreshold);
+		expect(resolved.credentialPreferences).toEqual({
+			anthropic: { selector: { kind: "email", value: "cheap@example.com" } },
+		});
+	});
+
+	it("fails closed for numeric, malformed, or out-of-range credential preferences", async () => {
+		clearAuthEnv();
+		for (const config of [
+			"auth:\n  credentialPreferences:\n    anthropic: id:42\n",
+			"auth:\n  credentialPreferences: preference-section-secret\n",
+			"auth:\n  credentialPreferences:\n    anthropic: cheap@example.com\n",
+			"auth:\n  credentialPreferenceMaxUsedPercent: 0\n",
+			"auth:\n  credentialPreferenceMaxUsedPercent: 101\n",
+			'auth:\n  credentialPreferenceMaxUsedPercent: "90"\n',
+		]) {
+			const agentDir = await makeAgentDir(config);
+			await expectStartupAuthConfigError(
+				resolveStartupAuthConfig(agentDir),
+				"invalid-credential-preferences",
+				"preference-section-secret",
+			);
+		}
 	});
 
 	it("keeps malformed or absent pin-store metadata from authorizing numeric pins", async () => {
@@ -265,5 +315,35 @@ describe("startup auth config", () => {
 		expect(validateSettingPatch({ "auth.credentialPins": { anthropic: "operator@example.com" } })).toEqual([
 			{ path: "auth.credentialPins.anthropic", detail: "Expected credential-selector." },
 		]);
+	});
+
+	it("validates preference records as portable selectors with a bounded threshold", () => {
+		expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: "email:cheap@example.com" } })).toEqual(
+			[],
+		);
+		expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: "id:27" } })).toEqual([
+			{ path: "auth.credentialPreferences.anthropic", detail: "Expected portable-credential-selector." },
+		]);
+		expect(validateSettingPatch({ "auth.credentialPreferenceMaxUsedPercent": 90 })).toEqual([]);
+		expect(validateSettingPatch({ "auth.credentialPreferenceMaxUsedPercent": 0 })).not.toEqual([]);
+		expect(validateSettingPatch({ "auth.credentialPreferenceMaxUsedPercent": 101 })).not.toEqual([]);
+	});
+
+	it("ignores project-scoped credential preferences", async () => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			"auth:\n  credentialPreferences:\n    anthropic: email:global@example.com\n  credentialPreferenceMaxUsedPercent: 80\n",
+		);
+		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-auth-project-"));
+		tempDirs.push(projectDir);
+		await fs.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(projectDir, ".gjc", "config.yml"),
+			"auth:\n  credentialPreferences:\n    anthropic: email:project@example.com\n  credentialPreferenceMaxUsedPercent: 10\n",
+		);
+
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		expect(settings.get("auth.credentialPreferences")).toEqual({ anthropic: "email:global@example.com" });
+		expect(settings.get("auth.credentialPreferenceMaxUsedPercent")).toBe(80);
 	});
 });

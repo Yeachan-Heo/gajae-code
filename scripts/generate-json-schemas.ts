@@ -33,6 +33,7 @@ type SettingDefinition = SettingsSchema[keyof SettingsSchema];
 const DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const PERSISTED_CREDENTIAL_SELECTOR_PATTERN =
 	"^(id:[1-9][0-9]*|email:[^@\\s]+@[^@\\s]+|account:\\S+)$";
+const PORTABLE_CREDENTIAL_SELECTOR_PATTERN = "^(email:[^@\\s]+@[^@\\s]+|account:\\S+)$";
 export const JSON_SCHEMA_OUTPUTS = [
 	{
 		path: "schemas/config.schema.json",
@@ -134,6 +135,10 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.exclusiveMinimum = 0;
 		schema.maximum = 1;
 	}
+	if (settingPath === "auth.credentialPreferenceMaxUsedPercent") {
+		schema.exclusiveMinimum = 0;
+		schema.maximum = 100;
+	}
 	if (settingPath === "sdk.promptDeadlineMs" || settingPath === "sdk.promptMaxRuntimeMs") {
 		schema.type = "integer";
 		schema.minimum = 60_000;
@@ -214,6 +219,7 @@ function recordValueSchema(
 	valueSchema?:
 		| { readonly type: "model-selector-value" }
 		| { readonly type: "credential-selector" }
+		| { readonly type: "portable-credential-selector" }
 		| { readonly type: "string-enum"; readonly values: readonly string[] },
 ): JsonSchema {
 	if (valueSchema?.type === "string-enum") return { type: "string", enum: valueSchema.values };
@@ -221,6 +227,12 @@ function recordValueSchema(
 		return {
 			type: "string",
 			pattern: PERSISTED_CREDENTIAL_SELECTOR_PATTERN,
+		};
+	}
+	if (valueSchema?.type === "portable-credential-selector") {
+		return {
+			type: "string",
+			pattern: PORTABLE_CREDENTIAL_SELECTOR_PATTERN,
 		};
 	}
 	if (valueSchema?.type !== "model-selector-value") return true;

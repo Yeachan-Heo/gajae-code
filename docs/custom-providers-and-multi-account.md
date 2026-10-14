@@ -133,6 +133,9 @@ auth:
     anthropic: id:42
     openai-codex: email:me@example.com
   credentialPinStoreIdentity: broker:https://broker.example.test:8765
+  credentialPreferences:
+    anthropic: email:low-cost-plan@example.com
+  credentialPreferenceMaxUsedPercent: 90
 ```
 
 - `auth.broker.url` and `auth.broker.token` select direct-broker mode. `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN` take precedence over the nested values; nested values may be literal strings or trusted `$ENV_NAME` references. Resolution order remains explicit env → nested value (after indirection) → the owner-only `<config-dir>/auth-broker.token` file, so an unresolved nested token does not displace the token-file authority. A configured URL without a resolvable token is a hard error; GJC does not silently fall back to local SQLite. An absent config file leaves broker mode disabled, while malformed or unreadable global startup-auth config fails closed with a typed `StartupAuthConfigError`.
@@ -140,6 +143,8 @@ auth:
 - `auth.credentialPins` is a global-only record of provider → selector. Project-scoped pins are ignored; do not place this record in project settings.
 - Numeric `id:<positive-row-id>` pins are bound to the credential-store authority fingerprint (`broker:<normalized-url>` or `local:<absolute-agent-db-path>`). Changing broker URL or local database invalidates those numeric pins instead of retargeting a row with the same number; `email:` and `account:` selectors remain portable.
 - `auth.credentialPinStoreIdentity` is managed alongside persistent pins and contains no credential material. Numeric pins are applied only when this value exactly matches the current store authority; missing or mismatched metadata invalidates the numeric pin rather than retargeting a same-number row. Email/account selectors remain portable across store changes.
+- `auth.credentialPreferences` is a global-only record of provider → soft preferred account. Unlike a pin, a preference never blocks the provider: the preferred account is tried first while it is usable, and the provider falls back to normal ranking when the account is blocked by a quota or rate-limit failure, is no longer stored, or has reached the usage threshold. Only portable `email:` and `account:` selectors are accepted; numeric `id:` selectors are rejected because a preference has no store-identity binding.
+- `auth.credentialPreferenceMaxUsedPercent` (greater than 0 and at most 100, default 100) applies to every preference. The preferred account yields to normal ranking once its most-used known usage window (for example Claude 5h or 7d) reaches this percent. Unknown usage never counts as over the threshold. At 100 the account yields only once it is blocked.
 - Literal dotted root keys such as `auth.broker.url: ...`, `auth.credentialRankingMode: ...`, or `auth.credentialPins: ...` are rejected. Startup reports the keys and prints manual rewrite guidance. Rewrite `config.yml` by hand using the nested shape above; there is no automatic migration, and secret values must not be copied into command output.
 
 ### Pin and credential precedence
@@ -150,9 +155,10 @@ API-key overrides are outside OAuth pinning:
 2. A `models.yml` provider `apiKey` config override comes next and beats stored/broker OAuth.
 3. If no API-key override is active, an explicit session selector wins: `--credential ...` or an account selected in `/login <provider>`.
 4. A global `auth.credentialPins` entry seeds that provider's selector when a new session starts. Session **AUTO** masks it for that session.
-5. With no selector, OAuth accounts use automatic ranking (`balanced` or `earliest-reset`).
+5. With no selector, a runtime `--prefer-credential` or, failing that, a global `auth.credentialPreferences` entry moves its account ahead of automatic ranking while that account is usable.
+6. Otherwise OAuth accounts use automatic ranking (`balanced` or `earliest-reset`).
 
-Ranking is performed at session start, or when the session's preferred account is blocked; a running session keeps its selected credential. Blocked/exhausted accounts sort last. Persistent pins and session selectors are valid only for active OAuth credentials. An API-key override (including a configured environment API-key source when creating a pin) makes OAuth pinning unavailable for that provider.
+Ranking is performed at session start, or when the session's preferred account is blocked; a running session keeps its selected credential. The preference usage threshold is therefore evaluated when ranking runs; a session already using the preferred account keeps it until a quota or rate-limit failure rotates it away. Blocked/exhausted accounts sort last. Persistent pins and session selectors are valid only for active OAuth credentials. An API-key override (including a configured environment API-key source when creating a pin) makes OAuth pinning unavailable for that provider.
 
 ## Local, direct-broker, and gateway capabilities
 

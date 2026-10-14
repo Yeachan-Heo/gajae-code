@@ -214,7 +214,8 @@ interface ArrayDef<T> {
 type RecordValueDef =
 	| { type: "model-selector-value" }
 	| { type: "string-enum"; values: readonly string[] }
-	| { type: "credential-selector" };
+	| { type: "credential-selector" }
+	| { type: "portable-credential-selector" };
 
 interface ConstrainedRecordValueDef {
 	type: "autorouting-selector-value";
@@ -452,6 +453,18 @@ export const SETTINGS_SCHEMA = {
 		valueSchema: { type: "credential-selector" } as const,
 	},
 	"auth.credentialPinStoreIdentity": { type: "string", default: undefined },
+	// Soft per-provider OAuth account preference. Global-only, like pins; read at startup.
+	"auth.credentialPreferences": {
+		type: "record",
+		default: {} as Record<string, string>,
+		valueSchema: { type: "portable-credential-selector" } as const,
+	},
+	// Usage percent at which a preferred account yields to the normal ranking; 100 yields only once it is blocked.
+	"auth.credentialPreferenceMaxUsedPercent": {
+		type: "number",
+		default: 100,
+		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 100,
+	},
 	"session.directoryMigration": {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
@@ -4381,6 +4394,9 @@ function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean 
 				/^email:[^@\s]+@[^@\s]+$/.test(value) ||
 				/^account:\S+$/.test(value))
 		);
+	}
+	if (valueSchema.type === "portable-credential-selector") {
+		return typeof value === "string" && (/^email:[^@\s]+@[^@\s]+$/.test(value) || /^account:\S+$/.test(value));
 	}
 	return typeof value === "string" && valueSchema.values.includes(value);
 }
