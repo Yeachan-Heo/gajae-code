@@ -111,6 +111,10 @@ export const PUBLIC_COMMAND_DIAGNOSTICS = {
 	// of them and never implies that another key would be safe.
 	lifecycle_idempotency_conflict:
 		"The broker reported an idempotency conflict. Reconcile existing lifecycle state before deciding whether another request is safe.",
+	// Refusals of the request payload itself: the broker's own text names the missing field
+	// (a required `sessionPath`, for one), and it is never rendered, so the class is named here.
+	lifecycle_input_refused:
+		"The broker refused the request as invalid input. Correct the request payload and reconcile existing lifecycle state before deciding whether another request is safe.",
 	usage_transport_exclusive: "Specify exactly one of --stdio or --socket <path>.",
 	usage_duplicate_option: "Each option on this command may occur at most once.",
 	usage_unknown_argument: "An unrecognized argument was supplied; re-read the command help for its accepted grammar.",

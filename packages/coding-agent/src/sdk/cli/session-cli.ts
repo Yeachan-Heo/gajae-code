@@ -258,17 +258,32 @@ function normalizeSessionFailure(error: unknown, args: SdkSessionCliArgs): Publi
 }
 
 /** Lifecycle terminality/retryability is not, by itself, proof of an effect outcome. */
+/**
+ * Lifecycle codes the broker produces when it refuses the request payload itself. Input shape is
+decided before the request can be dispatched, and an outcome the broker cannot establish comes
+back as `terminal_uncertain` instead, so these codes never stand for an applied operation. They
+still collapse into `operation_failed` below, which cannot say why the request was refused, so
+the refusal class survives as one fixed diagnostic.
+ */
+const LIFECYCLE_INPUT_REFUSAL_CODES = new Set(["invalid_input", "invalid_request"]);
+
 export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, { ok: false }>): PublicCommandFailure {
 	const failure = sdkPublicFailure(outcome.error.code);
 	// The service emits retryable protocol_error only when requestSent is explicitly false.
 	const proof: PublicEffectProof =
 		outcome.certainty === "retryable" && outcome.error.code === "protocol_error" ? "pre-send" : "unknown";
-	// `operation_failed` cannot distinguish a conflict from any other failed operation, so
-	// the conflict survives as one fixed diagnostic. The broker message itself is never
-	// rendered: it may carry request keys, paths, or credentials, and its cause is not
-	// decidable from the code alone.
+	// `operation_failed` cannot distinguish a conflict or an input refusal from any other failed
+	// operation, so each survives as one fixed diagnostic. The broker message itself is never
+	// rendered: it may carry request keys, paths, or credentials, and its cause is not decidable
+	// from the code alone.
+	const diagnostic: PublicCommandDiagnosticCode | undefined =
+		outcome.error.code === "idempotency_conflict"
+			? "lifecycle_idempotency_conflict"
+			: LIFECYCLE_INPUT_REFUSAL_CODES.has(outcome.error.code)
+				? "lifecycle_input_refused"
+				: undefined;
 	const diagnostics: readonly PublicCommandDiagnosticCode[] | undefined =
-		outcome.error.code === "idempotency_conflict" ? ["lifecycle_idempotency_conflict"] : undefined;
+		diagnostic === undefined ? undefined : [diagnostic];
 	return new PublicCommandFailure({
 		...failure.input,
 		...(diagnostics === undefined ? {} : { diagnostics }),
