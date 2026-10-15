@@ -993,6 +993,18 @@ fn retained_replace_error_code(status: i32) -> &'static str {
 }
 
 #[cfg(any(windows, test))]
+/// Exact-replace code for a held-path open that already mapped its NTSTATUS
+/// through [`ntstatus_code`]. A denied open of the staged source or the live
+/// destination is a publication failure, not an owner-identity one (#6760).
+fn exact_replace_open_error_code(code: Option<&str>) -> &str {
+	match code {
+		Some("owner_mismatch") => "access_denied",
+		Some(code) => code,
+		None => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
 /// True only for pre-mutation Windows failures that are transient and safe to
 /// retry at the exact-replace destination open. Sharing violations happen
 /// before anything was renamed or unlinked, so retrying cannot publish twice;
@@ -1076,10 +1088,10 @@ fn native_windows_error_code(status: i32) -> String {
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
 		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, STATUS_ACCESS_DENIED,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_rename_status,
-		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
-		open_with_transient_retry, publication_rename_error_code, rename_with_transient_retry,
-		retained_replace_error_code,
+		STATUS_SHARING_VIOLATION, exact_replace_open_error_code,
+		is_retryable_exact_replace_rename_status, is_retryable_exact_replace_status,
+		native_windows_error_code, ntstatus_code, open_with_transient_retry,
+		publication_rename_error_code, rename_with_transient_retry, retained_replace_error_code,
 	};
 
 	#[test]
@@ -1127,6 +1139,22 @@ mod exact_replace_windows_retry_policy_tests {
 			"access_denied"
 		);
 		assert_eq!(ntstatus_code(STATUS_SHARING_VIOLATION), "sharing_violation");
+	}
+
+	#[test]
+	fn exact_replace_denied_open_is_access_denied_not_owner_mismatch() {
+		// #6760: a denied open of the staged source or the live destination
+		// surfaced as `owner_mismatch` and aborted `gjc update` on Windows.
+		assert_eq!(
+			exact_replace_open_error_code(Some(ntstatus_code(STATUS_ACCESS_DENIED))),
+			"access_denied"
+		);
+		assert_eq!(
+			exact_replace_open_error_code(Some(ntstatus_code(STATUS_SHARING_VIOLATION))),
+			"sharing_violation"
+		);
+		assert_eq!(exact_replace_open_error_code(Some("reparse_point")), "reparse_point");
+		assert_eq!(exact_replace_open_error_code(None), "io_error");
 	}
 
 	#[test]
@@ -10923,9 +10951,10 @@ mod platform {
 		NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
 		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
-		open_with_transient_retry, publication_rename_error_code, rename_with_transient_retry,
-		retained_replace_error_code, sha256, volume_case_sensitivity_from_flags,
+		exact_replace_open_error_code, is_retryable_exact_replace_status, native_windows_error_code,
+		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
+		rename_with_transient_retry, retained_replace_error_code, sha256,
+		volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -11836,7 +11865,9 @@ mod platform {
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -11904,7 +11935,7 @@ mod platform {
 						// log and operator diagnostics can identify a sharing conflict.
 						"sharing_violation"
 					} else {
-						ntstatus_code(status)
+						retained_replace_error_code(status)
 					},
 				)
 				.with_windows_error_code(native_windows_error_code(status));
@@ -12243,7 +12274,9 @@ mod platform {
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
