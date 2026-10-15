@@ -143,6 +143,56 @@ This adds MCP tools alongside the built-in `web_search` tool; it does not select
 gjc mcp remove parallel-search --project
 ```
 
+## Example: local code navigation with Sem
+
+[Sem](https://github.com/Ataraxy-Labs/sem) provides structural code search,
+caller navigation, impact analysis, and diffs through a local stdio MCP server.
+Install Sem separately and confirm `sem --version` (tested with 0.27.0).
+From the Git repository you want GJC to inspect:
+
+```bash
+gjc mcp add sem --project --command sem --arg mcp \
+  --cwd "$PWD" --env "SEM_REPO=$PWD" \
+  --env SEM_NO_NETWORK=1 --env SEM_NO_TELEMETRY=1 --timeout 10000
+gjc mcp list --project
+```
+
+This records an absolute repository path in `./.gjc/mcp.json`; register again
+if you move the checkout. Review the configuration before sharing it. `list`
+checks registration, not connectivity. Start a new `gjc` session to connect.
+No Sem account or API key is required; indexing can create local cache files.
+
+Try asking the agent to find a function with `sem_find`, then request its
+source and surrounding context with the same tool's `mode: "context"`.
+Use a symbol that exists in your repository. Keep normal file tools available
+for unsupported syntax and non-code files.
+
+The server is not a read-only sandbox: for example, `sem_check` can execute
+repository validation commands. Only connect trusted repositories and approve
+operations according to your normal workflow. The repository path and offline
+environment settings do not restrict the process's filesystem permissions.
+
+Remove the registration with `gjc mcp remove sem --project`.
+
+### Optional: preview overlapping branch changes with Weave
+
+[Weave](https://github.com/Ataraxy-Labs/weave) complements navigation with
+structural merging. It is a separate CLI, not a dependency of this MCP setup.
+If installed (`weave --version`, tested with 0.5.4), ask GJC to use its terminal
+tool in the chosen Git repository to inspect status and preview a specific
+existing branch:
+
+```bash
+git status --short
+weave preview feature-branch
+```
+
+Replace `feature-branch` with the branch you actually want compared to HEAD.
+Preview does not apply the merge. Do not automatically run `weave setup`,
+`weave land`, or `git merge` after it succeeds. A clean structural merge is
+not proof of compilation or behavioral correctness; applying changes and
+running the project's checks remain separate, explicitly requested steps.
+
 ## Boundary
 
 Standalone GJC does not inherit user-home MCP configurations from Claude Code, Codex, OpenCode, or other tools (`~/.claude`, `~/.codex`, and similar user-global configs are never read). MCP servers often carry credentials, filesystem reach, browser state, approval semantics, and lifecycle that belong to the configuring host. Claude/Codex MCP files are normalized only through the bounded compatibility layer on explicit import, and the only MCP config read from the user's home directory at session startup is GJC's own `~/.gjc/agent/mcp.json` (or the active agent directory when a profile overrides it).
