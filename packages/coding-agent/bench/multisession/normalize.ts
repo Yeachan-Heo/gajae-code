@@ -6,6 +6,8 @@ import { parseJsonl } from "./jsonl";
 const EVIDENCE_STREAMS = ["transcript.jsonl", "requests.jsonl", "tools.jsonl", "events.jsonl"] as const;
 const NORMALIZED_TIMESTAMP = "<timestamp>";
 const NORMALIZED_PID = "<pid>";
+const VOLATILE_PROJECT_CONTEXT_STATIC_BODY =
+	"Timestamps in files, logs, git history, and API responses are often UTC; convert timestamps that are explicitly UTC to the local timezone above when reporting times to the user. Preserve timestamps that already include an explicit offset or timezone, and do not treat this host wall clock as authenticated event-time evidence. The timezone follows the runtime's process timezone configuration (which may include project environment settings), so treat it as display context rather than trusted location evidence. The full IANA zone may reveal geographic information; do not infer more about the user than the displayed context states.";
 
 /** Explicit volatility rules. Transcript and request payload content stays compared unless a rule below names it. */
 export const NORMALIZATION_ALLOWLIST = [
@@ -14,10 +16,12 @@ export const NORMALIZATION_ALLOWLIST = [
 	{ field: "pid fields", reason: "Operating-system process identifiers differ between runs." },
 	{ field: "*duration* fields", reason: "Elapsed execution time differs between repeated workload runs." },
 	{ field: "promptPrefix.hash", reason: "This hash covers full messages including generated IDs and timestamps; message payloads remain compared separately." },
+	{ field: "promptPrefix message-count fields", reason: "Prefix message/reuse counts shift with the per-turn volatile host context; request messages remain compared after excluding only that host-only context." },
 	{ field: "temporary-root paths, absolute or home-abbreviated (~/…)", reason: "Each isolated run uses a distinct temporary filesystem root; the per-turn reminder renders a root under the home directory as ~/…." },
 	{ field: "task-completion notice duration and job ID tokens", reason: "The system-generated task notice embeds elapsed time and job identity in text; its remaining content is preserved." },
 	{ field: "session transcript filenames beneath the isolated root", reason: "Session files embed a generated timestamp and session UUID in their basename." },
 	{ field: "host date and local clock in the per-turn project-context reminder", reason: "The reminder renders the wall-clock minute, so runs that straddle a minute boundary differ; the surrounding reminder text stays compared." },
+	{ field: "exact date/time/cwd-only reminders in requests.jsonl context.messages", reason: "The per-turn runtime reminder may be injected at different workload turns when isolated runs cross a wall-clock refresh; it carries no tree or task-specific context and is excluded only from that captured request-message array." },
 ] as const;
 
 function idField(key: string, objectType: string | undefined, isSessionEntry: boolean): boolean {
@@ -72,6 +76,31 @@ function normalizeHostWallClock(value: string): string {
 	);
 }
 
+function isVolatileProjectContextMessage(value: unknown): boolean {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const message = value as Record<string, unknown>;
+	if (message.role !== "user" && message.role !== "custom") return false;
+	const content = message.content;
+	let text: string | undefined;
+	if (typeof content === "string") {
+		text = content;
+	} else if (Array.isArray(content) && content.length === 1) {
+		const block = content[0];
+		if (block !== null && typeof block === "object" && !Array.isArray(block)) {
+			const textBlock = block as Record<string, unknown>;
+			if (textBlock.type === "text" && typeof textBlock.text === "string") text = textBlock.text;
+		}
+	}
+	return (
+		typeof text === "string" &&
+		text.startsWith("<system-reminder>\nToday is ") &&
+		!text.includes("<workspace-tree>") &&
+		/^<system-reminder>\nToday is [^,\n]+, the local time is [^,\n]+, and the current working directory is '[^'\n]*'\.\n([\s\S]*)\n<\/system-reminder>$/u.exec(
+			text,
+		)?.[1] === VOLATILE_PROJECT_CONTEXT_STATIC_BODY
+	);
+}
+
 /** The root as it can appear in evidence: absolute, and home-abbreviated when it lies under the home directory. */
 function rootSpellings(tempRoot: string): string[] {
 	const home = os.homedir();
@@ -123,7 +152,13 @@ export function normalizeEvidenceValue(
 ): unknown {
 	if (typeof value === "string")
 		return normalizeHostWallClock(normalizeTaskCompletionNotice(replaceRootPath(value, path.resolve(tempRoot))));
-	if (Array.isArray(value)) return value.map(item => normalizeEvidenceValue(item, tempRoot, parentType, ids));
+	if (Array.isArray(value)) {
+		// Only captured request context.messages is a known host-injected message list.
+		const messages =
+			parentType === "requestContextMessages" ? value.filter(item => !isVolatileProjectContextMessage(item)) : value;
+		const childType = parentType === "requestContextMessages" ? undefined : parentType;
+		return messages.map(item => normalizeEvidenceValue(item, tempRoot, childType, ids));
+	}
 	if (value === null || typeof value !== "object") return value;
 
 	const record = value as Record<string, unknown>;
@@ -135,8 +170,19 @@ export function normalizeEvidenceValue(
 		else if (timestampField(key)) normalized[key] = item === undefined ? item : NORMALIZED_TIMESTAMP;
 		else if (pidField(key)) normalized[key] = item === undefined ? item : NORMALIZED_PID;
 		else if (durationField(key)) normalized[key] = item === undefined ? item : NORMALIZED_TIMESTAMP;
-		else if (key === "hash" && objectType === "promptprefix") normalized[key] = item === undefined ? item : "<hash>";
-		else normalized[key] = normalizeEvidenceValue(item, tempRoot, key === "promptPrefix" ? "promptprefix" : objectType, ids);
+		else if (objectType === "promptprefix" && key === "hash") normalized[key] = item === undefined ? item : "<hash>";
+		else if (
+			objectType === "promptprefix" &&
+			["messages", "previousmessages", "reusedmessages"].includes(key.replaceAll("_", "").toLowerCase())
+		)
+			normalized[key] = item === undefined ? item : "<message-count>";
+		else {
+			let childType = objectType;
+			if (key === "promptPrefix") childType = "promptprefix";
+			else if (objectType === "request" && key === "context") childType = "requestContext";
+			else if (objectType === "requestContext" && key === "messages") childType = "requestContextMessages";
+			normalized[key] = normalizeEvidenceValue(item, tempRoot, childType, ids);
+		}
 	}
 	return normalized;
 }
@@ -151,7 +197,7 @@ async function readNormalizedLines(
 	const contents = await file.text();
 	const tempRoot = await fs.realpath(path.resolve(directory, ".."));
 	return parseJsonl(contents, path.join(directory, stream)).map(value =>
-		normalizeEvidenceValue(value, tempRoot, undefined, ids),
+		normalizeEvidenceValue(value, tempRoot, stream === "requests.jsonl" ? "request" : undefined, ids),
 	);
 }
 

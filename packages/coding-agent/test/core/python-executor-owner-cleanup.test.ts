@@ -905,6 +905,7 @@ if (cleanupFailed) throw cleanupError;
 		let bodyError: unknown;
 		let cleanupFailed = false;
 		let cleanupError: unknown;
+		let restoreSignalHook: (() => void) | undefined;
 		try {
 			execution = executePython(
 				`from pathlib import Path\nimport os, signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nPath(${JSON.stringify(pidFile)}).write_text(str(os.getpid()))\nPath(${JSON.stringify(readyFile)}).touch()\ntime.sleep(60)`,
@@ -919,6 +920,7 @@ if (cleanupFailed) throw cleanupError;
 			pid = await waitForProcessFile(pidFile);
 			const kernel = kernels[0];
 			const originalShutdown = kernel.shutdown.bind(kernel);
+			const originalProcessKill = process.kill.bind(process);
 			kernel.shutdown = async function (this: PythonKernel, options?: Parameters<PythonKernel["shutdown"]>[0]) {
 				const call = ++shutdownCalls;
 				if (call === 2) {
@@ -931,6 +933,16 @@ if (cleanupFailed) throw cleanupError;
 				else secondShutdownResult = result;
 				return result;
 			};
+			// Make the first real shutdown's final SIGKILL miss its zero-length
+			// confirmation window deterministically. Otherwise a fast CI runner can
+			// deliver SIGKILL before the next timer turn and turn this into a successful
+			// shutdown instead of exercising retention of an unconfirmed kernel.
+			const kernelPid = pid;
+			const processKillSpy = vi.spyOn(process, "kill").mockImplementation((targetPid, signal) => {
+				if (targetPid === -kernelPid && signal === "SIGKILL") return true;
+				return originalProcessKill(targetPid, signal);
+			});
+			restoreSignalHook = () => processKillSpy.mockRestore();
 
 			firstCleanup = disposeKernelSessionsByOwner("unconfirmed-owner");
 			await expect(firstCleanup).rejects.toMatchObject({
@@ -943,7 +955,11 @@ if (cleanupFailed) throw cleanupError;
 			expect(firstShutdownResult).toEqual({ confirmed: false });
 			expect(shutdownCalls).toBe(1);
 
-			await waitForProcessGone(pid);
+			expect(isProcessAlive(kernelPid)).toBe(true);
+			restoreSignalHook();
+			restoreSignalHook = undefined;
+			originalProcessKill(-kernelPid, "SIGKILL");
+			await waitForProcessGone(kernelPid);
 			retryCleanup = disposeKernelSessionsByOwner("unconfirmed-owner");
 			const retryStartTimeout = Promise.withResolvers<void>();
 			const retryStartTimer = setTimeout(retryStartTimeout.resolve, 5_000);
@@ -983,6 +999,7 @@ if (cleanupFailed) throw cleanupError;
 			bodyFailed = true;
 			bodyError = error;
 		} finally {
+			restoreSignalHook?.();
 			releaseSecondShutdown.resolve();
 			const settled = await Promise.allSettled([
 				...(retryCleanup ? [retryCleanup] : []),

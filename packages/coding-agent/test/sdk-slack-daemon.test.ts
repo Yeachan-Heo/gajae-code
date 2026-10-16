@@ -611,10 +611,12 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		});
 	});
 
-	it("allows only the durable posting-root owner to publish a concurrent root", async () => {
+	it("waits for the active root publisher beyond the former five-second limit", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-concurrent-"));
 		try {
 			const fake = new FakeSlack();
+			const postGate = Promise.withResolvers<void>();
+			fake.postGate = postGate.promise;
 			const options = {
 				agentDir,
 				repo: agentDir,
@@ -624,16 +626,28 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				randomId: () => "root-client-id",
 				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
-			const [first, second] = await Promise.all([
+			const pending = Promise.all([
 				new SlackNotificationDaemon(options).postRoot("session", "root"),
 				new SlackNotificationDaemon(options).postRoot("session", "root"),
-			]);
+			]).then(
+				roots => ({ fulfilled: true as const, roots }),
+				error => ({ fulfilled: false as const, error }),
+			);
+			try {
+				await fake.waitForPostStartCount(1);
+				await Bun.sleep(5_250);
+			} finally {
+				postGate.resolve();
+			}
+			const outcome = await pending;
+			if (!outcome.fulfilled) throw outcome.error;
+			const [first, second] = outcome.roots;
 			expect(first.rootTs).toBe(second.rootTs);
 			expect(fake.posts).toEqual([expect.objectContaining({ clientMsgId: "root-client-id", text: "root" })]);
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	it("takes over an expired crashed root publisher while retaining its client message identity", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-lease-"));
@@ -747,6 +761,162 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				},
 			});
 		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("stops a root waiter promptly when the daemon shuts down during a renewed peer lease", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-shutdown-waiter-"));
+		const releasePost = Promise.withResolvers<void>();
+		let first: SlackNotificationDaemon | undefined;
+		let second: SlackNotificationDaemon | undefined;
+		let publisher: Promise<SlackConversation> | undefined;
+		let waiter: Promise<{ status: "fulfilled" } | { status: "rejected"; error: unknown }> | undefined;
+		try {
+			const fake = new FakeSlack();
+			fake.postGate = releasePost.promise;
+			const base = {
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
+				publicationLeaseMs: 100,
+			};
+			first = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "first",
+			});
+			second = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "second",
+			});
+			const publisherResult = first.postRoot("session", "root");
+			publisher = publisherResult;
+			await fake.waitForPostStartCount(1);
+			const waiterResult = second.notify("session", "question", "action").then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			waiter = waiterResult;
+			await Bun.sleep(50);
+			const pending = await second.store.read("T1:C1:intent:session");
+			expect(pending).toMatchObject({ state: "posting_root", rootPublicationOwner: "first" });
+			expect(pending?.rootPublicationLeaseExpiresAt).toBeGreaterThan(Date.now());
+			const waiterStillWaiting = await Promise.race([
+				waiterResult.then(() => false),
+				Bun.sleep(25).then(() => true),
+			]);
+			expect(waiterStillWaiting).toBe(true);
+
+			const stopping = second.stop();
+			const outcome = await Promise.race([waiterResult, Bun.sleep(250).then(() => undefined)]);
+			expect(outcome?.status).toBe("rejected");
+			if (outcome?.status !== "rejected") throw new Error("Slack root waiter did not stop with its daemon");
+			if (!(outcome.error instanceof Error)) throw new Error("Slack root waiter shutdown was not an Error");
+			expect(outcome.error.message).toContain("daemon stopped while waiting");
+			const stoppedPromptly = await Promise.race([stopping.then(() => true), Bun.sleep(250).then(() => false)]);
+			expect(stoppedPromptly).toBe(true);
+			await stopping;
+			expect(fake.postStarts).toBe(1);
+
+			releasePost.resolve();
+			await expect(publisherResult).resolves.toMatchObject({ state: "active", rootTs: "1.1" });
+		} finally {
+			releasePost.resolve();
+			await second?.stop();
+			if (waiter) await waiter;
+			if (publisher) await publisher;
+			await first?.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("stops a concurrent root waiter when attachment retirement closes an in-flight post", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-retirement-"));
+		const releasePost = Promise.withResolvers<void>();
+		const key = "T1:C1:intent:session";
+		let endpointCurrent = true;
+		let retiring = false;
+		let retirementNowCalls = 0;
+		let first: SlackNotificationDaemon | undefined;
+		let publisherResult: Promise<{ status: "fulfilled" } | { status: "rejected"; error: unknown }> | undefined;
+		let waiterResult: Promise<{ status: "fulfilled" } | { status: "rejected"; error: unknown }> | undefined;
+		try {
+			const fake = new FakeSlack();
+			fake.postGate = releasePost.promise;
+			const base = {
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async (sessionId: string) => (endpointCurrent ? endpoint(sessionId) : null),
+				publicationLeaseMs: 60_000,
+				now: () => (retiring ? (retirementNowCalls++ === 0 ? 1 : 5_002) : 1),
+			};
+			first = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "first",
+			});
+			const second = new SlackNotificationDaemon({
+				...base,
+				randomId: () => "stable-root-id",
+				publicationOwnerId: "second",
+			});
+			publisherResult = first.postRoot("session", "root").then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await fake.waitForPostStartCount(1);
+			waiterResult = second.postRoot("session", "root").then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			const waiterPending = await Promise.race([waiterResult.then(() => false), Bun.sleep(25).then(() => true)]);
+			expect(waiterPending).toBe(true);
+
+			const pending = await first.store.read(key);
+			expect(pending?.state).toBe("posting_root");
+			endpointCurrent = false;
+			retiring = true;
+			await first.retireAttachment("session", 1);
+			const retired = await first.store.read(key);
+			expect(retired?.state).toBe("closed_marker");
+			expect(retired?.rootPublicationOwner).toBeUndefined();
+			expect(retired?.rootPublicationLeaseExpiresAt).toBeUndefined();
+			expect(retired?.rootPublicationFence).toBeGreaterThan(pending?.rootPublicationFence ?? 0);
+			const waiterOutcome = await Promise.race([waiterResult, Bun.sleep(250).then(() => undefined)]);
+			expect(waiterOutcome?.status).toBe("rejected");
+			if (waiterOutcome?.status !== "rejected") throw new Error("Retired Slack root waiter did not reject");
+			expect(waiterOutcome.error).toBeInstanceOf(SlackEndpointBindingError);
+
+			releasePost.resolve();
+			const publisherOutcome = await publisherResult;
+			expect(publisherOutcome.status).toBe("rejected");
+			expect((await first.store.read(key))?.state).toBe("closed_marker");
+		} finally {
+			endpointCurrent = false;
+			releasePost.resolve();
+			if (first) {
+				await first.store.transact(key, current =>
+					current
+						? {
+								...current,
+								generation: current.generation + 1,
+								state: "error",
+								rootPublicationOwner: undefined,
+								rootPublicationLeaseExpiresAt: undefined,
+							}
+						: current,
+				);
+			}
+			if (publisherResult) await publisherResult;
+			if (waiterResult) await waiterResult;
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});

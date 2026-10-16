@@ -11,6 +11,7 @@ import { createSdkSessionRuntimeExtension, terminalStoppedOutcome } from "../src
 import type { SdkFrame } from "../src/sdk/host/types";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
+import { testBrokerDiscovery } from "./sdk-test-broker-discovery";
 
 /**
  * The SDK-only host publishes the lifecycle boundary that settles an externally
@@ -127,6 +128,7 @@ test("disowned SDK steering cohorts share streams and terminals without adopting
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		settings,
 		createTransport: async ({ sessionId, stateRoot, token }) => ({
 			sessionId,

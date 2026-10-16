@@ -9,6 +9,7 @@
  */
 import { expect } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import packageJson from "../../package.json" with { type: "json" };
@@ -531,6 +532,11 @@ export async function assertMcpRow(operation: Operation, secret: boolean): Promi
 		const expected = expectedOutcome("mcp", operation, secret);
 		const before = host.observed.length;
 		const input = inputFor(operation, secret);
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			await fsPromises.mkdir(target);
+			input.path = target;
+		}
 		mcp = createSdkMcpServer({ agentDir: host.agentDir });
 		const tool =
 			operation.kind === "global"
@@ -595,6 +601,11 @@ export async function assertDaemonCliRow(operation: Operation, secret: boolean):
 		const input =
 			lifecycleInput ??
 			(operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret));
+		if (operation.sdkId === "session.cwd.move") {
+			const target = path.join(host.repo, "cwd-move-target");
+			await fsPromises.mkdir(target);
+			input.path = target;
+		}
 		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
 			action,

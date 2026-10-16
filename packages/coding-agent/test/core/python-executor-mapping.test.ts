@@ -3,6 +3,8 @@ import { executePythonWithKernel, type PythonKernelExecutor } from "@gajae-code/
 import type { KernelExecuteOptions, KernelExecuteResult } from "@gajae-code/coding-agent/eval/py/kernel";
 
 class FakeKernel implements PythonKernelExecutor {
+	#exitCode: number | null = null;
+
 	constructor(
 		private result: KernelExecuteResult,
 		private onExecute: (options?: KernelExecuteOptions) => void = () => {},
@@ -11,6 +13,14 @@ class FakeKernel implements PythonKernelExecutor {
 	async execute(_code: string, options?: KernelExecuteOptions): Promise<KernelExecuteResult> {
 		this.onExecute(options);
 		return this.result;
+	}
+
+	getExitCode(): number | null {
+		return this.#exitCode;
+	}
+
+	setExitCode(code: number | null): void {
+		this.#exitCode = code;
 	}
 }
 

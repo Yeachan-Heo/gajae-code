@@ -5,7 +5,7 @@ import * as path from "node:path";
 
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { type Api, type AssistantMessage, completeSimple, type Model, type Tool } from "@gajae-code/ai/core";
-import { logger, prompt } from "@gajae-code/utils";
+import { logger, prompt, redactCrashSecrets } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -159,7 +159,12 @@ ${truncatedMessage}
 		userMessage,
 		maxTokens,
 	};
-	logger.debug("title-generator: request", request);
+	logger.debug("title-generator: request", {
+		model: request.model,
+		systemPrompt: request.systemPrompt,
+		userMessage: redactCrashSecrets(request.userMessage),
+		maxTokens: request.maxTokens,
+	});
 
 	try {
 		const response = await completeSimple(
@@ -182,7 +187,10 @@ ${truncatedMessage}
 			logger.debug("title-generator: response error", {
 				model: request.model,
 				stopReason: response.stopReason,
-				errorMessage: response.errorMessage,
+				errorMessage:
+					typeof response.errorMessage === "string"
+						? redactCrashSecrets(response.errorMessage)
+						: response.errorMessage,
 			});
 			return null;
 		}
@@ -191,7 +199,7 @@ ${truncatedMessage}
 
 		logger.debug("title-generator: response", {
 			model: request.model,
-			title,
+			title: redactCrashSecrets(title),
 			usage: response.usage,
 			stopReason: response.stopReason,
 		});
@@ -204,7 +212,7 @@ ${truncatedMessage}
 	} catch (err) {
 		logger.debug("title-generator: error", {
 			model: request.model,
-			error: err instanceof Error ? err.message : String(err),
+			error: redactCrashSecrets(err instanceof Error ? err.message : String(err)),
 		});
 		return null;
 	}

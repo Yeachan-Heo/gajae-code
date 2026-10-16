@@ -6,39 +6,10 @@ import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
-import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file";
+import { parseEnvFile, parseEnvFileContent, parseShellEnvFile, projectEnvSnapshot } from "./env-file";
 
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
-
-function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
-	const cwd = process.cwd();
-	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
-	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
-	// NODE_ENV cannot introduce separators or `..` path segments.
-	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const files = [
-		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
-	];
-	const values: Record<string, string> = {};
-	const dynamic = new Set<string>();
-	for (const file of files) {
-		const parsed = parseEnvFile(path.join(cwd, file));
-		for (const [rawKey, value] of Object.entries(parsed)) {
-			// Windows environment names are case-insensitive, so the guard lookups
-			// below must see the same key Bun loaded into `process.env`.
-			const key = canonicalEnvKey(rawKey);
-			values[key] = value;
-			// Track dynamic provenance only for the winning declaration.
-			if (/[$`]/.test(value)) dynamic.add(key);
-			else dynamic.delete(key);
-		}
-	}
-	return { values, dynamic };
-}
 
 function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
 	if (!isSafeEnvName(name)) return undefined;
@@ -101,7 +72,7 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 // Parse the current project's .env first. Bun may have overlaid HOME from it
 // before this module runs, so a declared HOME must never select user credential
 // files for the credential-only snapshot.
-const projectSnapshot = loadProjectEnv();
+const projectSnapshot = projectEnvSnapshot();
 const projectEnv = projectSnapshot.values;
 
 /** Project dotenv as it was when this module loaded, before a later `chdir` or file delete. */

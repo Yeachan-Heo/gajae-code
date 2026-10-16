@@ -100,7 +100,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-runtime-finding-"));
 			const hiddenCauseTail = "CAUSE_TAIL_NOT_DISPLAYED";
 			const primarySecret = "primary-secret-value";
-			const cause = `connection refused \u001b[31munsafe\u001b[0m\t detail\ncontinued ${"cause ".repeat(30)}api_key=${primarySecret} ${hiddenCauseTail}`;
+			const cause = `connection refused \u001b[31munsafe\u001b[0m\t detail\ncontinued ${"cause ".repeat(30)}api_key=${primarySecret} diagnostic=${hiddenCauseTail}`;
 			const failedTool = {
 				name: "mcp__domain_docs_false_success",
 				label: "domain_docs/false_success",

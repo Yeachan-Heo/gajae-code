@@ -227,6 +227,7 @@ interface OwnerSubagentShutdownRecordCapture {
 	readonly record: SubagentRecord;
 	readonly currentJobId: string | null;
 	readonly currentJobGeneration?: string;
+	readonly queuedSeq?: number;
 }
 
 /** Lightweight, manager-owned resume payload. The async layer treats `data` as opaque. */
@@ -1564,6 +1565,7 @@ export class AsyncJobManager {
 				record,
 				currentJobId: record.currentJobId,
 				currentJobGeneration: record.currentJobGeneration,
+				queuedSeq: record.status === "queued" ? record.queued?.seq : undefined,
 			});
 			if (this.#isTerminalSubagentStatus(record.status) && backingExecution?.physicallySettled !== false) continue;
 			targets.set(record.subagentId, {
@@ -1679,7 +1681,8 @@ export class AsyncJobManager {
 				target.source === "record" &&
 				capture &&
 				this.#subagentRecords.get(target.subagentId) === capture.record &&
-				capture.record.status === "queued"
+				capture.record.status === "queued" &&
+				(capture.queuedSeq === undefined || capture.record.queued?.seq === capture.queuedSeq)
 			) {
 				this.cancelSubagent(target.subagentId, { ownerId: lease.ownerId });
 			}
@@ -1741,9 +1744,22 @@ export class AsyncJobManager {
 			!record ||
 			this.#subagentRecords.get(target.subagentId) !== record ||
 			record.ownerId !== ownerId ||
-			record.currentJobId !== capture.currentJobId ||
-			record.currentJobGeneration !== capture.currentJobGeneration ||
 			!this.#isTerminalSubagentStatus(record.status)
+		) {
+			return false;
+		}
+		if (capture.queuedSeq !== undefined) {
+			const queuedGeneration = `queued:${target.subagentId}:${capture.queuedSeq}`;
+			if (
+				record.status !== "cancelled" ||
+				record.terminalQueuedSeq !== capture.queuedSeq ||
+				record.terminalGeneration !== queuedGeneration
+			) {
+				return false;
+			}
+		} else if (
+			record.currentJobId !== capture.currentJobId ||
+			record.currentJobGeneration !== capture.currentJobGeneration
 		) {
 			return false;
 		}

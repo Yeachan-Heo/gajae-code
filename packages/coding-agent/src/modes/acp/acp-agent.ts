@@ -631,6 +631,11 @@ function isAbortNoEffect(value: unknown): boolean {
 	const result = object(candidate?.result) ?? candidate;
 	return result?.turn === "no_active_turn" || result?.turn === "no_effect" || result?.turn === "no_store";
 }
+function isAbortUncertain(value: unknown): boolean {
+	const candidate = object(value);
+	const result = object(candidate?.result) ?? candidate;
+	return result?.turn === "uncertain";
+}
 
 function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefined {
 	const correlation: PromptCorrelation = {};
@@ -3064,12 +3069,16 @@ export class AcpAgent implements Agent {
 			let acknowledgementScope = scope;
 			if (
 				!isAbortAcknowledged(acknowledgement, scope) &&
-				isAbortNoEffect(acknowledgement) &&
+				(isAbortNoEffect(acknowledgement) || isAbortUncertain(acknowledgement)) &&
 				(waiterWasUnacknowledged || waiterWasBeforeActivity) &&
 				waiter &&
 				record.activePrompt === waiter &&
 				!waiter.settled
 			) {
+				// An uncertain replay result is not proof that the worker stopped, but it
+				// also must not erase a cancellation that arrived before prompt admission.
+				// Retain the intent and retry once the prompt acknowledgement/start gives
+				// the abort a concrete active turn to target.
 				waiter.cancelBeforeAdmission = true;
 				waiter.cancelBeforeAdmissionScope =
 					waiter.cancelBeforeAdmissionScope === "owned" || scope === "owned" ? "owned" : "turn";

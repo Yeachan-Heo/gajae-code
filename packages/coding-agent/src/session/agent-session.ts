@@ -4062,6 +4062,9 @@ export class AgentSession {
 	// keep waiting on them; their own finally still runs if the stream ever ends.
 	readonly #abandonedInFlightPrompts = new Set<symbol>();
 	#agentEventHandlersInFlight = 0;
+	#agentEventHandlerAdmissionSequence = 0;
+	readonly #inFlightAgentEventHandlerAdmissions = new Set<number>();
+	readonly #agentEventHandlerAdmissionByEvent = new WeakMap<object, number>();
 	#queuedExtensionEventCount = 0;
 	#extensionTurnGeneration = 0;
 	#closedExtensionTurnGeneration: number | undefined;
@@ -5152,6 +5155,12 @@ export class AgentSession {
 		}
 		if (flushError) throw flushError;
 	}
+	#hasInFlightAgentEventHandlerAtOrBefore(admissionSequence: number): boolean {
+		for (const inFlightAdmission of this.#inFlightAgentEventHandlerAdmissions) {
+			if (inFlightAdmission <= admissionSequence) return true;
+		}
+		return false;
+	}
 
 	#flushPendingPromptMessages(): void {
 		const errors: unknown[] = [];
@@ -5175,23 +5184,41 @@ export class AgentSession {
 	}
 
 	#flushPendingAgentEnd(): void {
+		// SDK terminals are a readiness signal too: publish them only after the
+		// originating prompt finalizer and all event handlers admitted no later than
+		// that terminal have unwound. Later external/background events are unrelated.
+		if (this.#livePromptsInFlight() > 0) return;
+		// Collect SDK agent_ends to publish before modifying the set to avoid iterator issues (PR #6388).
+		// Publish only SDK agent_ends that have been decided by their handler.
+		const sdkPendingsToPublish: Array<[AgentSessionEvent, RunResourceProducerLease | undefined]> = [];
 		for (const sdkPending of this.#pendingSdkAgentEnds) {
+			// Skip if the handler hasn't decided yet (decision is recorded by handler finally block).
 			if (!this.#agentEndContinuationDecisions.has(sdkPending)) continue;
+			const admissionSequence = this.#agentEventHandlerAdmissionByEvent.get(sdkPending);
+			if (
+				admissionSequence === undefined
+					? this.#agentEventHandlersInFlight > 0
+					: this.#hasInFlightAgentEventHandlerAtOrBefore(admissionSequence)
+			)
+				continue;
+			// Also skip if it's being held for a continuation
 			if ([...this.#pendingAgentEndContinuationHolds.values()].includes(sdkPending)) continue;
+			const sdkLease = this.#deferredAgentEndLeases.get(sdkPending);
+			sdkPendingsToPublish.push([sdkPending, sdkLease]);
+		}
+		// Now publish collected items.
+		for (const [sdkPending, sdkLease] of sdkPendingsToPublish) {
 			this.#pendingSdkAgentEnds.delete(sdkPending);
 			if (this.#pendingAgentEndEmit === sdkPending) this.#pendingAgentEndEmit = undefined;
-			const sdkLease = this.#deferredAgentEndLeases.get(sdkPending);
 			this.#deferredAgentEndLeases.delete(sdkPending);
 			this.#startAgentEndPublication(sdkPending, sdkLease);
 		}
 		const pending = this.#pendingAgentEndEmit;
+		// Skip fallback publish if there are still SDK agent_ends pending (they will be handled by the loop above once decided).
 		if (pending && this.#pendingSdkAgentEnds.has(pending)) return;
-		if (
-			this.#livePromptsInFlight() > 0 ||
-			this.#agentEventHandlersInFlight > 0 ||
-			this.#pendingAgentEndContinuationHolds.size > 0
-		)
-			return;
+		if (this.#pendingAgentEndContinuationHolds.size > 0) return;
+		// Non-SDK/fallback terminals retain the session-wide handler barrier.
+		if (pending && this.#agentEventHandlersInFlight > 0) return;
 		if (!pending) {
 			this.#resolveSessionSettlement();
 			return;
@@ -5209,7 +5236,14 @@ export class AgentSession {
 			| AttemptScope
 			| undefined;
 		const sdkTerminal = pendingScope !== undefined && this.#sdkRunTokensByAttemptScope.has(pendingScope);
-		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease, sdkTerminal);
+		// Several SDK terminals can become publishable in one flush after a
+		// continuation finishes. Keep their delivery ordered, and make the newest
+		// promise cover every earlier terminal so prompt preflight/disposal cannot
+		// race a still-running publication.
+		const previousPublication = this.#agentEndPublicationPromise.catch(() => {});
+		this.#agentEndPublicationPromise = previousPublication.then(() =>
+			this.#publishDeferredAgentEnd(pending, lease, sdkTerminal),
+		);
 		void this.#agentEndPublicationPromise.catch(error => {
 			logger.warn("Agent terminal publication failed", { error: sanitizePromptFailure(error) });
 		});
@@ -7097,6 +7131,9 @@ export class AgentSession {
 		// awaited, so a tool-result spill may yield while a later continuation
 		// otherwise overtakes it in persisted/display context.
 		const canonicalAdmission = this.#reserveCanonicalMessageAdmission(event);
+		const handlerAdmissionSequence = ++this.#agentEventHandlerAdmissionSequence;
+		this.#inFlightAgentEventHandlerAdmissions.add(handlerAdmissionSequence);
+		this.#agentEventHandlerAdmissionByEvent.set(event, handlerAdmissionSequence);
 		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
 		const maintenanceCheckpoint =
 			event.type === "agent_end" &&
@@ -7191,6 +7228,7 @@ export class AgentSession {
 						eventLease.closeDiscovery();
 					}
 				}
+				this.#inFlightAgentEventHandlerAdmissions.delete(handlerAdmissionSequence);
 				this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
 				if (event.type === "agent_end") this.#agentEndContinuationDecisions.add(event);
 				this.#flushPendingAgentEnd();
@@ -10457,7 +10495,11 @@ export class AgentSession {
 			const publicationFailure = Object.assign(new Error("Session disposed before SDK terminal publication."), {
 				code: "cancelled",
 			});
-			for (const publication of this.#sdkTerminalPublications.values()) publication.reject(publicationFailure);
+			// An in-flight extension handler may never settle, so disposal must also
+			// reject publication handles whose terminal event is already being delivered.
+			for (const publication of this.#sdkTerminalPublications.values()) {
+				publication.reject(publicationFailure);
+			}
 			this.#sdkTerminalPublications.clear();
 			// Invalidate every coordinator event admitted before disposal. Handlers may
 			// still unwind, but their captured generation can no longer enqueue a write.
@@ -11054,6 +11096,10 @@ export class AgentSession {
 
 	flushParkedAgentEndForCoordinatorPersistForTests(): void {
 		this.#flushPendingAgentEnd();
+	}
+
+	async waitForAgentEndHandlingForTests(): Promise<void> {
+		await this.#agentEndHandlingPromise;
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {

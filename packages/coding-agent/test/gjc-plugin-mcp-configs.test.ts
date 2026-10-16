@@ -102,7 +102,7 @@ afterEach(async () => {
 describe("plugin MCP runtime config conversion", () => {
 	test("bounds and redacts plugin MCP diagnostics", () => {
 		const secret = "plugin-startup-secret-value";
-		const diagnostic = safePluginMcpDiagnostic(`api_key=${secret}\u001b[31m ${"x".repeat(1_200)}`);
+		const diagnostic = safePluginMcpDiagnostic(`api_key=${secret}\u001b[31m diagnostic=${"x".repeat(1_200)}`);
 		expect(diagnostic).toContain("api_key=«redacted»");
 		expect(diagnostic).not.toContain(secret);
 		expect(diagnostic).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);

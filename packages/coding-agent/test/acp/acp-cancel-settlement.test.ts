@@ -780,6 +780,37 @@ test("a pre-admission no_active_turn abort is retried after prompt acknowledgeme
 	}
 });
 
+test("an uncertain pre-admission abort is retried after prompt acknowledgement", async () => {
+	let abortCalls = 0;
+	const admittedAbortIssued = Promise.withResolvers<void>();
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 0,
+		deferPromptAcknowledgement: true,
+		abortAcknowledgement: () => {
+			abortCalls++;
+			if (abortCalls === 1) return { ok: true, selection: "turn", turn: "uncertain" };
+			admittedAbortIssued.resolve();
+			return { ok: true, selection: "turn", turn: "stopped", terminal: "terminal_no_effect" };
+		},
+	});
+	try {
+		const pending = prompt(fixture, "cancel before uncertain prompt acknowledgement");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		expect(fixture.hasPendingPromptAcknowledgement()).toBe(true);
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		expect(abortCalls).toBe(1);
+
+		fixture.acknowledgePendingPrompt();
+		await bounded(admittedAbortIssued.promise, "abort retry after uncertain pre-admission result");
+		expect(abortCalls).toBe(2);
+		expect(await bounded(pending, "settled uncertain cancellation")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("a no_active_turn retry is repeated after the correlated turn starts", async () => {
 	let abortCalls = 0;
 	const preStartRetryFailed = Promise.withResolvers<void>();

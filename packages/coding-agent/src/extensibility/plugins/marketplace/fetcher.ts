@@ -10,7 +10,7 @@ import * as https from "node:https";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isEnoent, logger } from "@gajae-code/utils";
+import { isEnoent, logger, redactCrashSecrets } from "@gajae-code/utils";
 import * as git from "../../../utils/git";
 import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../../../web/insane/url-guard";
 
@@ -461,7 +461,7 @@ async function cloneAndReadCatalog(url: string, cacheDir: string): Promise<Fetch
 	const tmpDir = path.join(cacheDir, `.tmp-clone-${Date.now()}`);
 	await fs.mkdir(cacheDir, { recursive: true });
 
-	logger.debug(`[marketplace] cloning ${url} → ${tmpDir}`);
+	logger.debug(redactCrashSecrets(`[marketplace] cloning ${url} → ${tmpDir}`));
 	await git.clone(url, tmpDir);
 
 	const catalogPath = path.join(tmpDir, CATALOG_RELATIVE_PATH);

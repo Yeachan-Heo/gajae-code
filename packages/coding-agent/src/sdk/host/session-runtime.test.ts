@@ -143,7 +143,11 @@ test("thinking.set uses the control setter and reports the applied session level
 	const transport = memoryTransport(frame => {
 		if (frame.type === "control_response" && frame.id === "thinking-set") response.resolve(frame);
 	});
-	createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
+		createTransport: async () => transport,
+	});
 	const ctx = extensionContext(transport.sessionId, cwd);
 	try {
 		await handlers.get("session_start")?.({}, ctx);
@@ -8726,7 +8730,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "bash",
 				args: {},
 			});
-			const boundaryDeadline = Date.now() + 2_000;
+			// This checks ordering, not prompt latency; allow the scheduler to reach
+			// the boundary when many CI shards are contending for the event loop.
+			const boundaryDeadline = Date.now() + 10_000;
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(10);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(abortCalls).toHaveLength(0);
@@ -8740,7 +8746,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			await Bun.sleep(30);
 			expect(abortCalls).toHaveLength(0);
-			const abortDeadline = Date.now() + 2_000;
+			const abortDeadline = Date.now() + 10_000;
 			while (abortCalls.length === 0 && Date.now() < abortDeadline) await Bun.sleep(10);
 			expect(abortCalls).toEqual([{ handle: "deadline-tool-run", scope: "owned", expectedEpoch: epoch }]);
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
@@ -9003,8 +9009,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(await harness.query("turn.prompt_status", queuedIds)).toMatchObject({ result: { status: "accepted" } });
 			expect(abortCalls).toBe(0);
 			expect(correlatedFrames(harness, queuedIds).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
-			promoted?.({ startsOwnRun: true });
+			// The lease is captured when the follow-up is promoted, not when the
+			// setting later changes. Restore the long deadline first so this run
+			// does not inherit the 100ms queue probe and expire under settledStatus.
 			promptDeadlineMs = 600_000;
+			promoted?.({ startsOwnRun: true });
 			await Bun.sleep(150);
 			expect((await harness.query("turn.prompt_status", queuedIds)).result?.status).toMatch(/accepted|in_flight/);
 			expect(await harness.query("turn.prompt_status", activeIds)).toMatchObject({
@@ -9085,12 +9094,12 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const accepted = await harness.control("turn.prompt", { text: "start while expiring" });
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			const claimDeadline = Date.now() + 2_000;
+			const claimDeadline = Date.now() + 10_000;
 			while (!claimWasEntered && Date.now() < claimDeadline) await Bun.sleep(5);
 			expect(claimWasEntered).toBe(true);
 			await claimEntered.promise;
 			startPromise = harness.emit("agent_start");
-			const captureDeadline = Date.now() + 2_000;
+			const captureDeadline = Date.now() + 10_000;
 			while (handleReads === 0 && Date.now() < captureDeadline) await Bun.sleep(5);
 			expect(handleReads).toBeGreaterThan(0);
 			releaseClaim.resolve();
@@ -9109,7 +9118,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	test("agent_start during an expiry claim keeps the queued correlation owned", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
@@ -11489,6 +11498,7 @@ test.each([
 	let transportCreations = 0;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		createTransport: async () => {
 			transportCreations++;
 			return transport;
@@ -11665,6 +11675,7 @@ test.each([
 			get: (key: string) =>
 				key === "sdk.promptDeadlineMs" ? 1_500 : key === "sdk.promptMaxRuntimeMs" ? 15_000 : undefined,
 		} as unknown as Settings,
+		ensureBrokerImpl: async () => testBrokerDiscovery,
 		createTransport: async () => {
 			creations++;
 			transport = memoryTransport();

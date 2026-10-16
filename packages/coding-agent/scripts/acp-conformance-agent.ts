@@ -102,20 +102,30 @@ server = Bun.serve({
 		if (prompt.includes("sleep")) {
 			const requested = Number(/\bsleep\s+(\d+)/.exec(prompt)?.[1] ?? 0);
 			const delay = Math.min(Math.max(requested, 0), 30_000);
+			let closed = false;
+			let close = (): void => {};
 			const stream = new ReadableStream<Uint8Array>({
 				start(controller) {
-					let closed = false;
-					const close = () => {
+					close = () => {
 						if (closed) return;
 						closed = true;
+						request.signal.removeEventListener("abort", close);
 						controller.close();
 					};
 					request.signal.addEventListener("abort", close, { once: true });
+					// The body parse above may yield long enough for the client to abort before
+					// this response stream installs its listener. Signals do not replay abort
+					// events to late listeners, so close immediately when that already happened.
+					if (request.signal.aborted) close();
 					void Bun.sleep(delay).then(() => {
 						if (closed) return;
 						controller.enqueue(new TextEncoder().encode(textCompletion("slept")));
 						close();
 					});
+				},
+				cancel() {
+					closed = true;
+					request.signal.removeEventListener("abort", close);
 				},
 			});
 			return new Response(stream, { headers: { "content-type": "text/event-stream" } });

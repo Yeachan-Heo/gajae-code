@@ -58,6 +58,7 @@ function slackPublicationClientMsgId(publicationId: string): string {
 
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
+const ROOT_PUBLICATION_POLL_MS = 50;
 const INBOUND_REACTION_DEADLINE_MS = 5_000;
 const RETIREMENT_DRAIN_MS = 5_000;
 const INBOUND_REACTION = "eyes";
@@ -800,6 +801,7 @@ export class SlackNotificationDaemon {
 		endpointGeneration?: number,
 		requestedClientMsgId?: string,
 	): Promise<SlackRootPublication> {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack root publication requires the current session endpoint.");
@@ -859,7 +861,17 @@ export class SlackNotificationDaemon {
 		}
 		if (!pending?.clientMsgId) throw new Error("Unable to persist Slack root post intent");
 		if (!claimed)
-			return { conversation: await this.#waitForRoot(pendingKey, sessionId, body, generation), created: false };
+			return {
+				conversation: await this.#waitForRoot(
+					pendingKey,
+					sessionId,
+					body,
+					generation,
+					lifecycleGeneration,
+					endpoint.authorityId,
+				),
+				created: false,
+			};
 		if (pending.endpointGeneration !== generation) throw new SlackEndpointBindingError();
 		const clientMsgId = pending.clientMsgId;
 		const fence = pending.rootPublicationFence;
@@ -907,7 +919,7 @@ export class SlackNotificationDaemon {
 		// dispatch; resume performs any required replacement after reconciliation.
 		const active = await this.store.transact(pendingKey, current => {
 			if (
-				!current ||
+				current?.state !== "posting_root" ||
 				current.clientMsgId !== clientMsgId ||
 				current.rootPublicationOwner !== this.#publicationOwnerId ||
 				current.rootPublicationFence !== fence
@@ -926,7 +938,17 @@ export class SlackNotificationDaemon {
 		});
 		if (!active) throw new Error("Slack root mapping disappeared");
 		if (active.state !== "active")
-			return { conversation: await this.#waitForRoot(pendingKey, sessionId, body, generation), created: false };
+			return {
+				conversation: await this.#waitForRoot(
+					pendingKey,
+					sessionId,
+					body,
+					generation,
+					lifecycleGeneration,
+					endpoint.authorityId,
+				),
+				created: false,
+			};
 		return { conversation: active, created: createdRootEffect };
 	}
 
@@ -1267,8 +1289,12 @@ export class SlackNotificationDaemon {
 				)
 					return record;
 				inboundDispatches = [...(record.inboundDispatches ?? [])];
+				// Fence the publisher before an abort-ignoring provider can renew or reactivate this mapping.
 				return nextRecord(record, {
 					state: "closed_marker",
+					rootPublicationOwner: undefined,
+					rootPublicationLeaseExpiresAt: undefined,
+					rootPublicationFence: (record.rootPublicationFence ?? 0) + 1,
 					pendingActionId: undefined,
 					cleanupEffectId: undefined,
 					inboundDispatches: [],
@@ -3105,7 +3131,7 @@ export class SlackNotificationDaemon {
 			let renewed = false;
 			await this.store.transact(key, current => {
 				if (
-					!current ||
+					current?.state !== "posting_root" ||
 					current.clientMsgId !== clientMsgId ||
 					current.rootPublicationOwner !== this.#publicationOwnerId ||
 					current.rootPublicationFence !== fence
@@ -3269,18 +3295,82 @@ export class SlackNotificationDaemon {
 		sessionId: string,
 		body: string,
 		endpointGeneration: number,
+		lifecycleGeneration: number,
+		attachmentAuthorityId?: string,
 	): Promise<SlackConversation> {
-		for (let attempt = 0; attempt < 100; attempt++) {
-			await Bun.sleep(10);
+		// Another owner may renew this lease while provider work is active, so wait for the durable transition.
+		while (true) {
+			if (lifecycleGeneration !== this.#lifecycleGeneration)
+				throw new Error("Slack daemon stopped while waiting for root publication");
+			await Bun.sleep(ROOT_PUBLICATION_POLL_MS);
+			if (lifecycleGeneration !== this.#lifecycleGeneration)
+				throw new Error("Slack daemon stopped while waiting for root publication");
 			const current = await this.store.read(key);
+			if (lifecycleGeneration !== this.#lifecycleGeneration)
+				throw new Error("Slack daemon stopped while waiting for root publication");
 			if (current?.state === "active") {
 				const currentGeneration = this.#requireEndpointGeneration(current);
-				if (currentGeneration === endpointGeneration) return current;
+				if (currentGeneration === endpointGeneration) {
+					const endpoint = await this.#resolveAttachment(sessionId);
+					if (lifecycleGeneration !== this.#lifecycleGeneration)
+						throw new Error("Slack daemon stopped while waiting for root publication");
+					if (
+						!endpoint?.isCurrent() ||
+						endpoint.sessionId !== sessionId ||
+						endpoint.generation !== endpointGeneration ||
+						endpoint.authorityId !== attachmentAuthorityId ||
+						current.attachmentAuthorityId !== attachmentAuthorityId
+					)
+						throw new SlackEndpointBindingError("Slack root publication was retired before completion.");
+					return current;
+				}
 				if (currentGeneration > endpointGeneration)
 					throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
 				return await this.resume(sessionId, body, endpointGeneration);
 			}
+			if (current?.state === "closed_marker") {
+				const currentGeneration = this.#requireEndpointGeneration(current);
+				if (currentGeneration > endpointGeneration)
+					throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
+				const endpoint = await this.#resolveAttachment(sessionId);
+				if (lifecycleGeneration !== this.#lifecycleGeneration)
+					throw new Error("Slack daemon stopped while waiting for root publication");
+				if (
+					!endpoint?.isCurrent() ||
+					endpoint.sessionId !== sessionId ||
+					endpoint.generation !== endpointGeneration ||
+					endpoint.authorityId !== attachmentAuthorityId
+				)
+					throw new SlackEndpointBindingError("Slack root publication was retired before completion.");
+				if (currentGeneration === endpointGeneration) {
+					if (!current.rootTs)
+						throw new SlackEndpointBindingError("Slack root publication was retired before completion.");
+					if (
+						current.rootPublicationOwner !== undefined &&
+						!this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())
+					)
+						continue;
+					return await this.postRoot(sessionId, body, endpointGeneration);
+				}
+				if (
+					current.rootPublicationOwner !== undefined &&
+					!this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())
+				)
+					continue;
+				return await this.resume(sessionId, body, endpointGeneration);
+			}
+			if (current?.state === "resumed_root") {
+				const currentGeneration = this.#requireEndpointGeneration(current);
+				if (currentGeneration > endpointGeneration)
+					throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
+				if (
+					current.rootPublicationOwner === undefined ||
+					this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())
+				)
+					return await this.resume(sessionId, body, endpointGeneration);
+			}
 			if (
+				current === undefined ||
 				current?.state === "error" ||
 				(current?.state === "posting_root" &&
 					this.#leaseExpired(current.rootPublicationLeaseExpiresAt, this.#now())) ||
@@ -3291,7 +3381,6 @@ export class SlackNotificationDaemon {
 				return await this.postRoot(sessionId, body, endpointGeneration);
 			}
 		}
-		throw new Error("Slack root post is still pending");
 	}
 
 	async #waitForAction(key: string, sessionId: string, body: string, actionId: string): Promise<SlackConversation> {

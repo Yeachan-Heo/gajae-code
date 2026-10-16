@@ -9,6 +9,7 @@ class FakeKernel {
 	executeCalls = 0;
 	shutdownCalls = 0;
 	alive = true;
+	#exitCode: number | null = null;
 	constructor(
 		private readonly shouldThrow: boolean = false,
 		onExecute?: () => Promise<void>,
@@ -38,6 +39,14 @@ class FakeKernel {
 		this.shutdownCalls += 1;
 		this.alive = false;
 		return { confirmed: true };
+	}
+
+	getExitCode(): number | null {
+		return this.#exitCode;
+	}
+
+	setExitCode(code: number | null): void {
+		this.#exitCode = code;
 	}
 }
 
