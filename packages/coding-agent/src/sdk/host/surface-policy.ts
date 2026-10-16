@@ -57,6 +57,7 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"retry.last": "sdkControl",
 	"retry.now": "sdkControl",
 	"bash.background": "sdkControl",
+	"btw.ask": "sdkControl",
 };
 
 // Resource queries (`artifact.read`, `runtime.jobs.list`) remain dispatchable when their

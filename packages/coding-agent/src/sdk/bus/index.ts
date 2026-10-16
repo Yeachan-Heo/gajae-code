@@ -119,7 +119,14 @@ import {
 	shouldHostSdk,
 	verifyMasterCapabilityFrame,
 } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
+import {
+	type AbortScope,
+	type ControlSurface,
+	createBtwAskHandler,
+	dispatchControl,
+	type EphemeralQuestionRunner,
+	TypedControlError,
+} from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
@@ -2710,6 +2717,9 @@ function sdkControlSurface(
 	// Hands a queued submission's lease handle to the runtime when that
 	// submission is promoted to its own run; the run's agent_start adopts it.
 	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
+	// INTERNAL session-owned ephemeral side-question runner (`/btw`), threaded
+	// from the owning session (NOT on the public extension context).
+	askEphemeralQuestion?: EphemeralQuestionRunner,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -3851,6 +3861,7 @@ function sdkControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
+		askBtw: createBtwAskHandler(askEphemeralQuestion),
 		installedOperations: surfacePolicy.installedControls,
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
@@ -7721,6 +7732,11 @@ export function createNotificationsExtension(
 			trackReconciliationProducer,
 			workLease,
 			promoteWorkLease,
+			// The notification daemon already owns the `/btw` runner for this
+			// session; the SDK control answers through the same ephemeral seam.
+			options.runBtwTurn === undefined
+				? undefined
+				: async question => (await options.runBtwTurn!(question, new AbortController().signal)).replyText,
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {

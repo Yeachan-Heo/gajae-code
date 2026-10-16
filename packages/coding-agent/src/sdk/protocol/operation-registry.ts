@@ -125,6 +125,7 @@ const controls = [
 	["retry.now", "Immediately retry pending backoff."],
 	["bash.background", "Move active managed bash to the background."],
 	["model.profile.set", "Activate a model profile for the current session."],
+	["btw.ask", "Ask an ephemeral side question using the current session context without persisting it."],
 ] as const;
 
 const globals = [
@@ -294,6 +295,11 @@ function controlErrors(id: string): string[] {
 		C50: ["nothing_to_retry", "busy"],
 		C51: ["retry_not_pending"],
 		C52: ["not_foldable", "already_backgrounded", "no_active_bash"],
+		// C54 answers an ephemeral side question through the session-owned runner.
+		// Validation is local, a second concurrent question is refused while the
+		// first is in flight, and a host without the runner seam reports
+		// `unavailable` instead of admitting the ask into turn state.
+		C54: ["invalid_input", "busy", "unavailable"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];
 }
@@ -331,7 +337,10 @@ export const OPERATIONS: readonly Operation[] = [
 			description,
 			idempotency: (["C04", "C24", "C26", "C43", "C51"] as string[]).includes(id)
 				? ("idempotent" as const)
-				: (["C25", "C52"] as string[]).includes(id)
+				: // C54 is fast-lane like the bash controls: it must reach the surface
+					// concurrently so its own single-flight `busy` contract can fire instead
+					// of being queued behind the ordered per-surface chain.
+					(["C25", "C52", "C54"] as string[]).includes(id)
 					? ("fast_lane" as const)
 					: ("ordered" as const),
 			errorCodes: controlErrors(id),

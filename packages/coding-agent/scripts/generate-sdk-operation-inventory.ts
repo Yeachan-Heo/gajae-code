@@ -314,7 +314,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:emitIrcRelayObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:emitSubagentSteerObservation": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:emitSubagentSteerRelayObservation": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:runEphemeralTurn": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:navigateTree": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasCopyCandidateAssistantMessage": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getLastVisibleHandoffText": "internal accessor/plumbing, not a user-facing control seam",
@@ -385,6 +384,9 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:branch": "session.branch",
 	"agent_session:handoff": "session.handoff",
 	"agent_session:exportToHtml": "session.export_html",
+	// The `/btw` ephemeral side question is a public SDK control (`btw.ask`): the
+	// private seam answers from the live session context and persists nothing.
+	"agent_session:runEphemeralTurn": "btw.ask",
 	"agent_session:getAvailableModels": "models.list/current",
 	"agent_session:getSdkConfigItems": "config.list/get",
 	"agent_session:getActiveToolNames": "tools.list",

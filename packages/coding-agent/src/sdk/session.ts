@@ -4195,6 +4195,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									return session.pendingToolExecutions(handle);
 								},
 							},
+							// INTERNAL ephemeral side-question runner (`/btw`), threaded directly
+							// from the owning session (NOT on the public extension context).
+							askEphemeralQuestion: async question => {
+								if (!session) throw new Error("Ephemeral turns are unavailable.");
+								const { replyText } = await session.runEphemeralTurn({
+									purpose: "btw",
+									turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
+								});
+								return replyText;
+							},
 						});
 					}
 				} catch (error) {

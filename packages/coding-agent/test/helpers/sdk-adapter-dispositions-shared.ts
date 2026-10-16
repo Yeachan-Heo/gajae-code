@@ -128,6 +128,10 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"retry.last": "nothing_to_retry",
 	"retry.now": "retry_not_pending",
 	"bash.background": "no_active_bash",
+	// The fixture probe sends `{}` (the default fixture input): a missing question
+	// is refused as invalid input before any provider work, so the parity row
+	// proves adapter forwarding without driving a real modelled side answer.
+	"btw.ask": "invalid_input",
 	"compaction.run": "invalid_request",
 	"session.handoff": "invalid_request",
 	"session.export_html": "invalid_request",
