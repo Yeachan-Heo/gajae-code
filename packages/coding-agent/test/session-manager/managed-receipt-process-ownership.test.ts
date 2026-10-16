@@ -49,10 +49,23 @@ async function ready(lane: string, child: ReceiptWorker): Promise<string> {
 function peerMutation(name: string): void {
 	const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
 	try {
-		store.ensureDirectory(name);
+		store.publishNoReplaceSync(name, Buffer.from("trigger\n"));
 	} finally {
 		store.close();
 	}
+}
+
+function renameWithRenumberedReceiptDevice(pending: string) {
+	const record = JSON.parse(fs.readFileSync(pending, "utf8"));
+	const identity = fs.lstatSync(pending, { bigint: true });
+	const encodedDev = identity.dev + 2n;
+	const receipt = path.join(
+		root,
+		`.gjc-replace-cleanup-${BigInt(record.predecessor.dev).toString(16)}-${BigInt(record.predecessor.ino).toString(16)}-receipt-${encodedDev.toString(16)}-${identity.ino.toString(16)}.json`,
+	);
+	const bytes = fs.readFileSync(pending);
+	fs.renameSync(pending, receipt);
+	return { receipt, identity, bytes };
 }
 
 describe("receipt publisher process ownership", () => {
@@ -114,6 +127,55 @@ describe("receipt publisher process ownership", () => {
 		peerMutation("reused-pid");
 		expect(fs.existsSync(pending)).toBe(false);
 		reuse.mockRestore();
+	}, 30000);
+
+	it("quarantines a dead v3 receipt whose encoded device was renumbered", async () => {
+		const child = spawnWorker("orphan", "orphan");
+		const { pending } = JSON.parse(await ready("orphan", child));
+		fs.writeFileSync(path.join(root, "exit"), "exit\n");
+		expect(await child.exited).toBe(0);
+
+		const { receipt, identity, bytes } = renameWithRenumberedReceiptDevice(pending);
+
+		peerMutation("after-device-renumbering");
+
+		expect(fs.existsSync(path.join(root, "after-device-renumbering"))).toBe(true);
+		expect(fs.existsSync(receipt)).toBe(false);
+		const record = JSON.parse(bytes.toString("utf8"));
+		const quarantinedPath = path.join(
+			root,
+			`.gjc-receipt-remove-${identity.dev.toString(16)}-${identity.ino.toString(16)}-${BigInt(record.predecessor.dev).toString(16)}-${BigInt(record.predecessor.ino).toString(16)}`,
+		);
+		const quarantined = fs.lstatSync(quarantinedPath, { bigint: true });
+		expect(fs.readFileSync(quarantinedPath)).toEqual(bytes);
+		expect(quarantined.dev).toBe(identity.dev);
+		expect(quarantined.ino).toBe(identity.ino);
+		expect(quarantined.size).toBe(identity.size);
+	}, 30000);
+
+	it("keeps live and unknown owners blocking despite a renumbered receipt device", async () => {
+		const child = spawnWorker("orphan", "orphan");
+		const { pending, pid } = JSON.parse(await ready("orphan", child));
+		const { receipt, identity, bytes } = renameWithRenumberedReceiptDevice(pending);
+
+		expect(() => peerMutation("renumbered-live-owner")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.readFileSync(receipt)).toEqual(bytes);
+		expect(fs.lstatSync(receipt, { bigint: true }).ino).toBe(identity.ino);
+		expect(fs.existsSync(path.join(root, "renumbered-live-owner"))).toBe(false);
+
+		fs.writeFileSync(path.join(root, "exit"), "exit\n");
+		expect(await child.exited).toBe(0);
+		const originalObserve = processIdentity.observeProcessIncarnation;
+		const unknown = vi
+			.spyOn(processIdentity, "observeProcessIncarnation")
+			.mockImplementation((target, options) =>
+				target === pid ? { status: "unknown", reasonCode: "permission_denied" } : originalObserve(target, options),
+			);
+		expect(() => peerMutation("renumbered-unknown-owner")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.readFileSync(receipt)).toEqual(bytes);
+		expect(fs.lstatSync(receipt, { bigint: true }).ino).toBe(identity.ino);
+		expect(fs.existsSync(path.join(root, "renumbered-unknown-owner"))).toBe(false);
+		unknown.mockRestore();
 	}, 30000);
 
 	it("does not reclaim remote ownership or accept an unbound attempt", async () => {

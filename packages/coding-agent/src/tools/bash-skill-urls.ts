@@ -1,3 +1,4 @@
+import type * as fsTypes from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
@@ -40,7 +41,7 @@ export interface InternalUrlExpansionOptions {
  * Resolve a single skill:// URL to its absolute filesystem path.
  * Does NOT read file content or verify existence.
  */
-export function resolveSkillUrlToPath(url: string, skills: readonly Skill[]): string {
+export function resolveSkillUrl(url: string, skills: readonly Skill[]): { skill: Skill; lexicalPath: string } {
 	const parsed = /^skill:\/\/([^/?#]+)(\/[^?#]*)?(?:[?#].*)?$/.exec(url);
 	if (!parsed) {
 		throw new ToolError(`Invalid skill:// URL: ${url}`);
@@ -72,7 +73,7 @@ export function resolveSkillUrlToPath(url: string, skills: readonly Skill[]): st
 	const hasRelativePath = rawPath !== "" && rawPath !== "/";
 
 	if (!hasRelativePath) {
-		return path.resolve(skill.filePath);
+		return { skill, lexicalPath: path.resolve(skill.filePath) };
 	}
 
 	let relativePath: string;
@@ -95,7 +96,11 @@ export function resolveSkillUrlToPath(url: string, skills: readonly Skill[]): st
 		throw new ToolError("Path traversal is not allowed in skill:// URLs");
 	}
 
-	return resolvedPath;
+	return { skill, lexicalPath: resolvedPath };
+}
+
+export function resolveSkillUrlToPath(url: string, skills: readonly Skill[]): string {
+	return resolveSkillUrl(url, skills).lexicalPath;
 }
 
 /**
@@ -150,7 +155,7 @@ async function canonicalLocalPath(localRoot: string, lexicalPath: string): Promi
 	const missing: string[] = [];
 	let cursor = lexicalPath;
 	for (;;) {
-		let stat: Awaited<ReturnType<typeof fs.lstat>> | undefined;
+		let stat: fsTypes.Stats | undefined;
 		try {
 			stat = await fs.lstat(cursor);
 		} catch (error) {
@@ -175,6 +180,53 @@ async function canonicalLocalPath(localRoot: string, lexicalPath: string): Promi
 		missing.unshift(path.basename(cursor));
 		cursor = parent;
 	}
+}
+
+const SKILL_ESCAPE = "Path traversal is not allowed in skill:// URLs";
+
+/** Real path of `target`, or the real ancestor plus the missing suffix. */
+async function canonicalPathOrAncestor(target: string, escapeMessage: string): Promise<string> {
+	try {
+		return await fs.realpath(target);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+
+	const missing: string[] = [];
+	let cursor = target;
+	for (;;) {
+		let stat: fsTypes.Stats | undefined;
+		try {
+			stat = await fs.lstat(cursor);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		if (stat) {
+			try {
+				return path.join(await fs.realpath(cursor), ...missing);
+			} catch (error) {
+				if (isEnoent(error)) throw new ToolError(escapeMessage);
+				throw error;
+			}
+		}
+		const parent = path.dirname(cursor);
+		if (parent === cursor) throw new ToolError(escapeMessage);
+		missing.unshift(path.basename(cursor));
+		cursor = parent;
+	}
+}
+
+/**
+ * Keep the lexical skill path, then bind the shell to the real path inside the skill directory.
+ * A missing file under a real in-skill ancestor still expands.
+ */
+async function canonicalSkillExpansionPath(baseDir: string, lexicalPath: string): Promise<string> {
+	const realBase = await canonicalPathOrAncestor(baseDir, SKILL_ESCAPE);
+	const realTarget = await canonicalPathOrAncestor(lexicalPath, SKILL_ESCAPE);
+	if (localPathEscapes(realBase, realTarget)) {
+		throw new ToolError(SKILL_ESCAPE);
+	}
+	return realTarget;
 }
 
 function extractScheme(url: string): SupportedInternalScheme | undefined {
@@ -211,7 +263,8 @@ async function resolveInternalUrlToPath(
 	}
 
 	if (scheme === "skill") {
-		return resolveSkillUrlToPath(url, skills);
+		const { skill, lexicalPath } = resolveSkillUrl(url, skills);
+		return canonicalSkillExpansionPath(skill.baseDir, lexicalPath);
 	}
 
 	// Managed artifact and agent resources carry session authority. Expanding

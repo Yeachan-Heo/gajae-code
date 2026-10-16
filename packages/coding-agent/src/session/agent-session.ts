@@ -2012,10 +2012,11 @@ const PERMISSION_REQUIRED_TOOLS = new Set([
 	"computer",
 	"python",
 	"recipe",
+	"ssh",
 ]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
-	return toolName === "bash" || toolName === "monitor";
+	return toolName === "bash" || toolName === "monitor" || toolName === "ssh";
 }
 
 function isExecutionPermissionTool(toolName: string): boolean {
