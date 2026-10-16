@@ -322,6 +322,15 @@ export type ManagedScopeResolution =
 const managedScopeIdentityFailureCodes = new Set(["identity_mismatch", "reparse_point", "not_directory", "not_file"]);
 
 /**
+ * Fixed, path-free tokens from the replacement-cleanup receipt preflight that
+ * runs before every no-replace publish. A stale receipt the preflight refuses
+ * (for example one whose filename encodes a device number that changed after a
+ * reboot, #6820) blocks an otherwise healthy binding publish; reporting it as
+ * `binding_invalid` sends operators to the binding instead of the receipt.
+ */
+const managedScopeReceiptFailureCodes = new Set(["managed_replace_cleanup_receipt_invalid"]);
+
+/**
  * Fixed, path-free errno tokens. A managed scope that fails to prepare because
  * another process holds the object (AV scanners, indexers, cloud-sync agents)
  * is operationally distinct from a corrupted binding, and only the errno
@@ -376,6 +385,7 @@ function isManagedScopeCapacityMessage(message: string): boolean {
 function managedScopeResidualClassification(error: unknown): string | undefined {
 	if (!(error instanceof Error)) return undefined;
 	if (managedScopeIdentityFailureCodes.has(error.message)) return error.message;
+	if (managedScopeReceiptFailureCodes.has(error.message)) return error.message;
 	const errno = (error as NodeJS.ErrnoException).code;
 	return errno !== undefined && managedScopeErrnoFailureCodes.has(errno) ? errno : undefined;
 }
