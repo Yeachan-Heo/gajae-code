@@ -5090,7 +5090,11 @@ export function createNotificationsExtension(
 		};
 
 		type HostConnectionIncarnation = { generation: number; closed: boolean };
-		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
+		type HostCapabilityCacheEntry = {
+			generation: number;
+			capabilities: ReadonlySet<string>;
+			nativeConfirmed: ReadonlySet<string>;
+		};
 		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
 		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
 		const hostAttachedConnections = new Set<string>();
@@ -5104,16 +5108,28 @@ export function createNotificationsExtension(
 			hostConnectionIncarnations.set(connectionId, incarnation);
 			return incarnation;
 		};
-		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
+		const rememberHostCapabilities = (
+			connectionId: string,
+			capabilities: readonly string[],
+			source: "replay" | "native",
+		): void => {
 			const incarnation = liveHostConnection(connectionId);
 			if (!incarnation) return;
 			const previous = hostCapCache.get(connectionId);
 			const merged =
 				previous?.generation === incarnation.generation ? new Set(previous.capabilities) : new Set<string>();
+			const nativeConfirmed =
+				previous?.generation === incarnation.generation ? new Set(previous.nativeConfirmed) : new Set<string>();
 			for (const capability of capabilities) merged.add(capability);
+			// Replay claims enable stream routing immediately, but only native snapshots
+			// can remove a socket from host demand. Merge delayed snapshots monotonically.
+			if (source === "native") {
+				for (const capability of capabilities) nativeConfirmed.add(capability);
+			}
 			hostCapCache.set(connectionId, {
 				generation: incarnation.generation,
 				capabilities: merged,
+				nativeConfirmed,
 			});
 		};
 		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
@@ -8478,7 +8494,7 @@ export function createNotificationsExtension(
 							Array.isArray(capabilities) &&
 							capabilities.every((capability: unknown) => typeof capability === "string")
 						) {
-							rememberHostCapabilities(inbound.connectionId, capabilities as string[]);
+							rememberHostCapabilities(inbound.connectionId, capabilities as string[], "replay");
 						}
 						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
@@ -8524,7 +8540,7 @@ export function createNotificationsExtension(
 				const negotiated = tuple?.[1] ?? capabilities;
 				if (typeof id !== "string" || !Array.isArray(negotiated)) return;
 				const normalized = negotiated.filter((capability): capability is string => typeof capability === "string");
-				rememberHostCapabilities(id, normalized);
+				rememberHostCapabilities(id, normalized, "native");
 				if (liveHostCapabilities(id) === undefined) return;
 				hostAttachedConnections.add(id);
 				negotiatedCapabilitiesHandler?.(id, normalized);
@@ -9067,8 +9083,10 @@ export function createNotificationsExtension(
 				attachedClients: () => server.clientCount(),
 				observerClients: () => {
 					if (workLease.isHeld()) return 0;
-					const observers = [...hostCapCache.keys()].filter(connectionId =>
-						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					const observers = [...hostCapCache.entries()].filter(
+						([connectionId, entry]) =>
+							liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY) &&
+							entry.nativeConfirmed.has(SESSION_HOST_OBSERVER_CAPABILITY),
 					).length;
 					return Math.min(server.clientCount(), observers);
 				},

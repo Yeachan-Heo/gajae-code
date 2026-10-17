@@ -1303,6 +1303,75 @@ test("replay capability claims cannot turn a demanding connection into an observ
 	}
 }, 60_000);
 
+for (const confirmNative of [false, true]) {
+	test(`replay observer demand waits for native confirmation: ${confirmNative ? "confirmed" : "forged"}`, async () => {
+		const delayedCallbacks: Array<() => void> = [];
+		const registerCapabilities = NotificationServer.prototype.onNegotiatedCapabilities;
+		const capabilitySpy = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(
+			function (this: NotificationServer, callback) {
+				return registerCapabilities.call(this, (error, connectionId, capabilities) => {
+					delayedCallbacks.push(() => callback(error, connectionId, capabilities));
+				});
+			},
+		);
+		let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+		const registerFrame = NotificationServer.prototype.onSdkFrame;
+		const frameSpy = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+			this: NotificationServer,
+			callback,
+		) {
+			sdkFrame = callback;
+			return registerFrame.call(this, callback);
+		});
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-observer-demand-"));
+		dirs.push(cwd);
+		try {
+			const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+			try {
+				const baseDemand = sessionHostAttachedClients() ?? 0;
+				const frames: Record<string, unknown>[] = [];
+				const socket = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+				sockets.push(socket);
+				socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+				await waitFor(() => frames.some(frame => frame.type === "hello"), "client hello");
+				await waitFor(() => sessionHostAttachedClients() === baseDemand + 1, "client demand");
+				const connectionId = frames.find(frame => frame.type === "hello")?.connectionId;
+				if (typeof connectionId !== "string" || !sdkFrame) throw new Error("Missing SDK callback wiring");
+				const replay = {
+					type: "event_replay",
+					id: "native-observer-demand",
+					capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+				};
+				if (confirmNative) {
+					// Exercise real native replay negotiation, but withhold its callback.
+					socket.send(JSON.stringify(replay));
+					await waitFor(() => delayedCallbacks.length > 0, "native replay snapshot");
+				} else {
+					// A forged bus frame never reaches native negotiation.
+					sdkFrame(null, { connectionId, json: JSON.stringify(replay) });
+				}
+				await waitFor(
+					() => frames.some(frame => frame.type === "event_replay_result" && frame.id === replay.id),
+					"replay processed before native confirmation",
+				);
+				expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+				expect(delayedCallbacks.length > 0).toBe(confirmNative);
+				for (const deliver of delayedCallbacks.splice(0)) deliver();
+				if (confirmNative) {
+					await waitFor(() => sessionHostAttachedClients() === baseDemand, "native-confirmed observer");
+				} else {
+					expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+				}
+			} finally {
+				await host.stop();
+			}
+		} finally {
+			capabilitySpy.mockRestore();
+			frameSpy.mockRestore();
+		}
+	}, 60_000);
+}
+
 test("a default ACP-shaped SessionRouter client remains demanding", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
 	dirs.push(cwd);
