@@ -231,7 +231,7 @@ not evidence that a running tool produced no output.
 - A replayed frame may describe a job that has since finished. `runtime.jobs.list` is the source of truth: each running/recent job carries `metadata.backgrounded` and, whenever it is `true` because of a fold, `metadata.foldReason` with the same values. The `bash.background` control (C52) returns `{ backgrounded: true, jobId }` on a fresh fold, `already_backgrounded` when no wait is foldable but a running job of this session was already folded (by steer, chord, timer, or a prior control call), `no_active_bash` when nothing is running or foldable, and `not_foldable` when a live wait refused the fold.
 - A `turn.steer` that folds a running bash behaves exactly like a TUI steer: the steer is consumed by the same turn at the tool boundary immediately after the fold result; `turn.steer_status` is unchanged.
 
-The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
+The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), `awaiting_input` (a foreground `bash` command printed a browser sign-in or device-code prompt and went quiet; carries only `toolCallId`, `toolName`, and `kind` — `browser_auth` or `device_code` — never the URL, code, command, or output; delivered live only to clients that advertise the `awaiting_input_v1` capability and never retained for `event_replay`; a notice detected while notification policy is provisional is held and delivered on activation if the command is still running), and `pong`.
 
 ### Internal inbound frames
 
@@ -1047,8 +1047,9 @@ or gateway details outside logged payloads.
 answer remotely, so its `question` and `options` are always sent unredacted
 (otherwise it would be unanswerable). When redaction is enabled, `idle`
 summaries are removed and streamed content frames (`turn_stream`,
-`context_update`, `image_attachment`) are suppressed at their emit sites. When
-redaction is disabled, all content is delivered unchanged.
+`context_update`, `image_attachment`) are suppressed at their emit sites. The
+content-free `awaiting_input` notice is still delivered. When redaction is
+disabled, all content is delivered unchanged.
 
 ### Local `/notify`
 

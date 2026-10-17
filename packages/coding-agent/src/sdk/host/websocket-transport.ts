@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { exactUnlink, type NativeExactFileIdentity } from "@gajae-code/natives";
 import {
+	AWAITING_INPUT_CAPABILITY,
 	canDeliverSdkEvent,
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	TOOL_ACTIVITY_CAPABILITY,
@@ -203,6 +204,7 @@ export async function createSdkWebSocketTransport(
 										protocolVersion: 3,
 										connectionId: socket.data.connectionId,
 										capabilities: [
+											AWAITING_INPUT_CAPABILITY,
 											TOOL_ACTIVITY_CAPABILITY,
 											TURN_STREAM_CAPABILITY,
 											SESSION_HOST_OBSERVER_CAPABILITY,

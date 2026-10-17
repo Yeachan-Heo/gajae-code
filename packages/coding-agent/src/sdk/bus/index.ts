@@ -102,6 +102,7 @@ import {
 	registerAskAnswerSource,
 	registerWorkflowGateEmitterListener,
 } from "../../tools/ask-answer-registry";
+import type { AwaitingInputKind } from "../../tools/awaiting-input";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
@@ -1422,6 +1423,12 @@ interface SessionRuntime {
 		string,
 		{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 	>;
+	/**
+	 * Running tool calls that reported an awaiting-input signal, keyed by tool call
+	 * id. An entry stays undelivered while notifications are inactive or policy is
+	 * provisional, and is dropped when the call ends; one notification per call.
+	 */
+	awaitingInput: Map<string, { toolName: string; kind: AwaitingInputKind; delivered: boolean }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
@@ -1431,6 +1438,48 @@ interface SessionRuntime {
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
 const TOOL_SUMMARY_MAX = 280;
+
+/** The `awaitingInput` signal a running bash update carries, validated at the extension boundary. */
+function readAwaitingInput(partialResult: unknown): { kind: AwaitingInputKind } | undefined {
+	if (!partialResult || typeof partialResult !== "object") return undefined;
+	const details = (partialResult as { details?: unknown }).details;
+	if (!details || typeof details !== "object") return undefined;
+	const signal = (details as { awaitingInput?: unknown }).awaitingInput;
+	if (!signal || typeof signal !== "object") return undefined;
+	const kind = (signal as { kind?: unknown }).kind;
+	return kind === "browser_auth" || kind === "device_code" ? { kind } : undefined;
+}
+
+/**
+ * Deliver every undelivered awaiting-input notice once stable policy admits it.
+ * The notice describes the present ("a command is waiting now"), so it goes out
+ * on the live native leg only and never enters the replay ring: a client that
+ * reconnects after the command exited must not receive it. The native server
+ * still withholds it from connections without `awaiting_input_v1`.
+ */
+function deliverAwaitingInput(
+	runtime: Pick<SessionRuntime, "server" | "awaitingInput" | "notificationsActive" | "policySuspended">,
+	sessionId: string,
+): void {
+	if (!runtime.notificationsActive || runtime.policySuspended) return;
+	for (const [toolCallId, entry] of runtime.awaitingInput) {
+		if (entry.delivered) continue;
+		entry.delivered = true;
+		try {
+			runtime.server.pushFrame(
+				JSON.stringify({
+					type: "awaiting_input",
+					sessionId,
+					toolCallId,
+					toolName: entry.toolName,
+					kind: entry.kind,
+				}),
+			);
+		} catch (e) {
+			logger.warn(`notifications: awaiting_input failed: ${String(e)}`);
+		}
+	}
+}
 
 /** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
 type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
@@ -8353,6 +8402,7 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
+			awaitingInput: new Map(),
 			deferredInboundControls: [],
 		};
 		const initializedRuntime = runtime;
@@ -9523,6 +9573,7 @@ export function createNotificationsExtension(
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
 			flushPendingSettled(runtime, runtime.id);
+			deliverAwaitingInput(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		reproveOwnership: async binding => {
@@ -10424,8 +10475,18 @@ export function createNotificationsExtension(
 	});
 
 	api.on("tool_execution_update", (event, ctx) => {
-		const rt = runtimes.get(sessionId(ctx));
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
+		if (!rt) return;
+		const awaitingInput = readAwaitingInput(event.partialResult);
+		if (!awaitingInput || rt.awaitingInput.has(event.toolCallId)) return;
+		// Notify-only and content-free (prompt kind only, never the URL or code), so
+		// it is delivered under redaction exactly like the idle marker. While policy
+		// is provisional it stays pending; activation delivers it if the call is
+		// still running.
+		rt.awaitingInput.set(event.toolCallId, { toolName: event.toolName, kind: awaitingInput.kind, delivered: false });
+		deliverAwaitingInput(rt, id);
 	});
 
 	api.on("tool_execution_end", (event, ctx) => {
@@ -10433,6 +10494,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.emitPromptEvent(event);
+		rt.awaitingInput.delete(event.toolCallId);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!inFlight) return;
 		if (!rt.notificationsActive) {

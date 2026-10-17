@@ -103,6 +103,7 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
  *  must see the same capability-gated event kinds on both legs, or live and
  *  replay delivery diverge for the same subscriber. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+export const AWAITING_INPUT_CAPABILITY = "awaiting_input_v1";
 /** Capability for non-replayable streamed turn content. */
 export const TURN_STREAM_CAPABILITY = "turn_stream";
 /** Capability used by notification adapters that observe a host without owning its work. */
@@ -113,12 +114,17 @@ export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
  * of every frame its positioned envelope already reached.
  */
 export const POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY = "positioned_notification_effects_v1";
-export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);
+export const CAP_GATED_FRAME_KINDS: ReadonlyMap<string, string> = new Map([
+	["tool_activity", TOOL_ACTIVITY_CAPABILITY],
+	["reasoning_summary", TOOL_ACTIVITY_CAPABILITY],
+	["awaiting_input", AWAITING_INPUT_CAPABILITY],
+]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 
 /** Keep live delivery and replay on one capability gate. */
 export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<string> | undefined): boolean {
-	return !CAP_GATED_FRAME_KINDS.has(kind) || capabilities?.has(TOOL_ACTIVITY_CAPABILITY) === true;
+	const requiredCapability = CAP_GATED_FRAME_KINDS.get(kind);
+	return requiredCapability === undefined || capabilities?.has(requiredCapability) === true;
 }
 
 /** Safe, identifier-free explanations for every refused activation status. */

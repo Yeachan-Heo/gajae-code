@@ -64,6 +64,7 @@ import { CachedOutputBlock, getOutputBlockContentWidth } from "../tui/output-blo
 import { truncateToWidth } from "../tui/utils";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
+import { AwaitingInputDetector, type AwaitingInputSignal } from "./awaiting-input";
 import { checkBashAllowedPrefixes, normalizeReadOnlyBashCommand } from "./bash-allowed-prefixes";
 import { applyBashFixups } from "./bash-command-fixup";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
@@ -578,6 +579,12 @@ export interface BashToolDetails {
 	foldReason?: FoldReason;
 	/** The accepted model-declared activity declaration, when the call carried one. */
 	activity?: BashActivityDeclaration;
+	/**
+	 * Set on a running (partial) update when the foreground command printed an
+	 * interactive auth prompt and then went quiet. Carries only the prompt kind,
+	 * never the URL or code.
+	 */
+	awaitingInput?: AwaitingInputSignal;
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -1125,6 +1132,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 				const tailBuffer = new TailBuffer(spillThreshold);
+				// Only a foreground wait blocks the turn; once folded or started in the
+				// background the agent is free and this tool call has already settled.
+				const awaitingInput = new AwaitingInputDetector({
+					onDetect: signal => {
+						if (backgrounded) return;
+						void options.onUpdate?.({
+							content: [{ type: "text", text: latestText }],
+							details: { ...activityDetails, awaitingInput: signal },
+						});
+					},
+				});
 
 				let executionResult: BashResult | BashInteractiveResult | undefined;
 				try {
@@ -1155,11 +1173,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									latestText = tailBuffer.text();
 									void reportProgress(latestText, runningDetails(jobId));
 								},
-								onRawChunk: chunk => manager.appendOutput(jobId, chunk),
+								// onChunk is throttled and drops chunks inside the window; the
+								// detector must see every chunk, so it reads the raw stream.
+								onRawChunk: chunk => {
+									manager.appendOutput(jobId, chunk);
+									awaitingInput.push(chunk);
+								},
 								onMinimizedSave: async originalText =>
 									saveBashOriginalArtifact(options.artifactPublication, originalText),
 							});
 					executionResult = result;
+					awaitingInput.dispose();
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
 						notices: options.notices,
@@ -1173,6 +1197,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					await reportProgress(finalText, completedDetails(jobId));
 					return finalText;
 				} catch (error) {
+					awaitingInput.dispose();
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
 					options.onCompletion?.();
@@ -2651,6 +2676,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		// Track output for streaming updates (tail only)
 		const tailBuffer = new TailBuffer(spillThreshold);
+		const awaitingInput = new AwaitingInputDetector({
+			onDetect: signal => {
+				void onUpdate?.({
+					content: [{ type: "text", text: tailBuffer.text() }],
+					details: { ...(activity === undefined ? {} : { activity }), awaitingInput: signal },
+				});
+			},
+		});
 
 		const artifactPublisher = createBashArtifactPublisher(artifactPublication);
 
@@ -2833,11 +2866,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					onOutput: chunk => {
 						ptyOutputSeen = true;
 						if (ptyJobId) ownedManager?.appendOutput(ptyJobId, chunk);
+						awaitingInput.push(chunk);
 					},
-				}).catch(error => {
-					if (ptyAdmission) ownedManager?.releaseCapacity(ptyAdmission);
-					throw error;
 				})
+					.catch(error => {
+						if (ptyAdmission) ownedManager?.releaseCapacity(ptyAdmission);
+						throw error;
+					})
+					// Completion, error, and a fold all settle this foreground wait.
+					.finally(() => awaitingInput.dispose())
 			: await executeBash(command, {
 					cwd: commandCwd,
 					settings: this.session.settings,
@@ -2851,10 +2888,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					spillThreshold,
 					headBytes,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
+					// onChunk is throttled and drops chunks; the detector needs all of them.
+					onRawChunk: chunk => awaitingInput.push(chunk),
 					onMinimizedSave: async originalText => saveBashOriginalArtifact(artifactPublication, originalText),
 					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
 					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
-				});
+				}).finally(() => awaitingInput.dispose());
 		ptyFoldUnregister?.();
 		// Folded: the foreground was settled by the fold, so return the background
 		// -start result verbatim instead of presenting a half-finished command.

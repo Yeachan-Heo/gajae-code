@@ -1960,3 +1960,110 @@ test("strict replay admits only capability-bearing identity frames", async () =>
 		}
 	}
 });
+
+test("awaiting input sends once to a topic under redact without buttons and is not re-sent from replay", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const { bot, calls } = topicAdmissionBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot,
+		});
+		await daemon.loadTopics();
+		const routing = daemon.attachmentRoutingHarnessForTest();
+		const attachment = notificationSubscription("awaiting-session");
+		routing.attach(attachment);
+		const session = daemon.sessions.get(attachment.sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ seq: 1, payload: { type: "identity_header", sessionId: attachment.sessionId } }],
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "config_update",
+			sessionId: attachment.sessionId,
+			redact: true,
+		});
+		calls.length = 0;
+		const awaiting = {
+			type: "awaiting_input",
+			sessionId: attachment.sessionId,
+			toolCallId: "call-1",
+			toolName: "bash",
+			kind: "browser_auth",
+		};
+		await daemon.handleSessionMessage(session, awaiting);
+		const messages = calls.filter(call => call.method === "sendMessage");
+		expect(messages).toHaveLength(1);
+		expect(messages[0]?.body).toMatchObject({
+			message_thread_id: 555,
+			text: "⏳ A running command is waiting for browser sign-in. Finish it on the host; the agent continues when the command does.",
+		});
+		expect(messages[0]?.body).not.toHaveProperty("reply_markup");
+		calls.length = 0;
+		const replacement = notificationSubscription(attachment.sessionId, 2);
+		routing.attach(replacement);
+		const resumed = daemon.sessions.get(replacement.sessionId);
+		if (!resumed) throw new Error("Expected resumed attachment session.");
+		// A reconnect replays the host event ring; the already-delivered notice
+		// must not be rendered a second time.
+		await daemon.handleSessionMessage(resumed, {
+			type: "event_replay_result",
+			id: resumed.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 2,
+			events: [
+				{ seq: 1, payload: { type: "identity_header", sessionId: attachment.sessionId } },
+				{ seq: 2, payload: awaiting },
+			],
+		});
+		expect(calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("awaiting input refuses flat fallback into a non-private chat", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const calls: string[] = [];
+		const botApi: BotApi = {
+			call: async method => {
+				calls.push(method);
+				if (method === "getChat") return { ok: true, result: { id: 42, type: "supergroup" } };
+				return { ok: true, result: true };
+			},
+		};
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi,
+		});
+		const routing = daemon.attachmentRoutingHarnessForTest();
+		const attachment = notificationSubscription("awaiting-flat-session");
+		routing.attach(attachment);
+		const session = daemon.sessions.get(attachment.sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		session.replayPending = false;
+		await daemon.handleSessionMessage(session, {
+			type: "awaiting_input",
+			sessionId: attachment.sessionId,
+			toolCallId: "call-1",
+			toolName: "bash",
+			kind: "device_code",
+		});
+		expect(calls).not.toContain("sendMessage");
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
