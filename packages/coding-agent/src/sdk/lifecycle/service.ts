@@ -701,6 +701,7 @@ const savedSessionCandidateDetailCodes = new Set([
 	"cwd_not_utf8",
 	"cwd_network_unsupported",
 	"cwd_identity_unavailable",
+	"permission_denied",
 	"cwd_io_error",
 ]);
 

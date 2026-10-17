@@ -518,6 +518,7 @@ type NativeIdentity =
 type CanonicalNativeIdentity = Extract<NativeIdentity, { ok: true }>;
 
 type NativeIdentityFailureCode =
+	| "access_denied"
 	| "not_found"
 	| "not_directory"
 	| "not_utf8"
@@ -628,6 +629,12 @@ function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution 
 		return { kind: "error", code: "cwd_missing", message: "The workspace directory does not exist." };
 	if (code === "not_directory")
 		return { kind: "error", code: "cwd_not_directory", message: "The workspace path is not a directory." };
+	if (code === "access_denied")
+		return {
+			kind: "error",
+			code: "permission_denied",
+			message: "Permission was denied while identifying the workspace directory.",
+		};
 	if (code === "network_unsupported") {
 		return {
 			kind: "error",
@@ -636,6 +643,10 @@ function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution 
 		};
 	}
 	return { kind: "error", code: "identity_unavailable", message: "Workspace directory identity is unavailable." };
+}
+
+function nativeIdentityDiagnosticCode(code: NativeIdentityFailureCode): string {
+	return code === "access_denied" ? "permission_denied" : `cwd_${code}`;
 }
 
 function bindingFor(scope: ManagedScope): Binding {
@@ -1117,7 +1128,7 @@ function inspectCandidate(
 		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
 			return { code: "invalid_header" };
 		const cwdIdentity = identityFor(header.cwd);
-		if (!cwdIdentity.ok) return { code: `cwd_${cwdIdentity.code}` };
+		if (!cwdIdentity.ok) return { code: nativeIdentityDiagnosticCode(cwdIdentity.code) };
 		const named = fs.lstatSync(filePath, { bigint: true });
 		if (
 			!named.isFile() ||
@@ -1964,7 +1975,7 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 				const candidateIdentity = identityFor(candidate.cwd);
 				if (!candidateIdentity.ok) {
 					invalid.push({
-						code: `cwd_${candidateIdentity.code}`,
+						code: nativeIdentityDiagnosticCode(candidateIdentity.code),
 						...(safeManagedCandidateSessionId(candidate.sessionId) === undefined
 							? {}
 							: { sessionId: candidate.sessionId }),

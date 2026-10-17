@@ -39,6 +39,28 @@ describe("SessionLease", () => {
 		});
 	});
 
+	it("preserves access-denied publication failures instead of mapping them to lease timeout", async () => {
+		const filePath = sessionPaths(root, SID).lease;
+		const error = new FileLockAcquireError(
+			filePath,
+			`${filePath}.lock`,
+			3,
+			"publication failed with access_denied",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+		);
+		FileLockTestHooks.afterParentMkdir = () => {
+			throw error;
+		};
+		try {
+			await expect(releaseLease(root, SID, "owner-a")).rejects.toBe(error);
+		} finally {
+			FileLockTestHooks.afterParentMkdir = undefined;
+		}
+	});
+
 	it("heals a scrubbed dead-owner removal transition through the lease lock", async () => {
 		const filePath = sessionPaths(root, SID).lease;
 		const orphanPath = `${filePath}.lock.removing`;

@@ -65,6 +65,7 @@ export const exactSwapManagedLink = nativeBindings.exactSwapManagedLink;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const exactUnlinkDirect = nativeBindings.exactUnlinkDirect;
 export const exactUnlinkDirectDetached = nativeBindings.exactUnlinkDirectDetached;
+export const exactUnlinkOpenFile = nativeBindings.exactUnlinkOpenFile;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;

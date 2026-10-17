@@ -829,6 +829,44 @@ it("retries session-index acquisition timeouts within the startup fence before r
 	}
 });
 
+it("does not retry an unproven access-denied session-index publication failure", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const indexFilePath = path.join(indexDir, "index.jsonl");
+	const failure = new FileLockAcquireError(
+		indexFilePath,
+		blockingLockPath,
+		1,
+		"unproven lock holder",
+		"acquire_timeout",
+		undefined,
+		undefined,
+		"access_denied",
+		false,
+	);
+	const start = spyOn(Broker.prototype, "start").mockRejectedValue(failure);
+	const stop = spyOn(Broker.prototype, "stop").mockImplementation(async () => undefined);
+	try {
+		const command = new Sdk(["broker-internal", "--agent-dir", dir], {} as never);
+		await expect(command.run()).rejects.toBe(failure);
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(stop).toHaveBeenCalledTimes(1);
+		expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+			mode: "startup",
+			reason: "startup-lock-unavailable",
+			blockingLockPath,
+			timeoutMs: null,
+			exitCode: 1,
+			signal: null,
+		});
+	} finally {
+		stop.mockRestore();
+		start.mockRestore();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
 it("consumes broker restart authorization before launching descendants", () => {
 	const deadlineAt = Date.now() + 60_000;
 	const environment: NodeJS.ProcessEnv = {

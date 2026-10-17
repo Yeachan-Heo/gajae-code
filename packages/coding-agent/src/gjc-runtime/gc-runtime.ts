@@ -2299,7 +2299,10 @@ async function removeGcDiskEntry(
 		return { removed: false, reason: "entry_changed" };
 	}
 	const retainedAtOriginal = !removal.detachedPath || path.resolve(removal.detachedPath) === path.resolve(target);
-	if ((removal.code === "permission_denied" || removal.code === "io_error") && retainedAtOriginal) {
+	if (
+		(removal.code === "permission_denied" || removal.code === "access_denied" || removal.code === "io_error") &&
+		retainedAtOriginal
+	) {
 		return { removed: false, reason: "withheld_evidence_incomplete: tree_unreadable", withheld: true };
 	}
 	return {

@@ -2664,6 +2664,33 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "cleanup-io-error-retry"))).toBe(true);
 	});
 
+	it("retries a retained canonical receipt after a transient access-denied failure", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const realExactUnlink = native.exactUnlink;
+		let firstAttempt = true;
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			if (pathname === receipt && firstAttempt) {
+				firstAttempt = false;
+				return { ok: false, code: "access_denied" };
+			}
+			return realExactUnlink(pathname, expected);
+		});
+		replay("cleanup-access-denied-first-attempt");
+		expect(fs.existsSync(receipt)).toBe(true);
+
+		replay("cleanup-access-denied-retry");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "cleanup-access-denied-retry"))).toBe(true);
+	});
+
 	it("keeps canonical receipt identity failures fail-closed", () => {
 		const predecessorPath = path.join(root, "predecessor");
 		fs.writeFileSync(predecessorPath, "predecessor\n");

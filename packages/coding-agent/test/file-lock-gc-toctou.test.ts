@@ -88,7 +88,7 @@ test("exhaustion reports a valid owner published after parsing a null owner obse
 		return parsed;
 	});
 
-	const attempt = withFileLock(filePath, contender, { retries: 1, retryDelayMs: 1 });
+	const attempt = withFileLock(filePath, contender, { retries: 2, retryDelayMs: 1 });
 	await expect(attempt).rejects.toBeInstanceOf(FileLockAcquireError);
 	await expect(attempt).rejects.toMatchObject({
 		holder:
@@ -2440,33 +2440,31 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		const infoPath = path.join(lockDir, "info");
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
 		const legacyInfoBytes = await fs.readFile(infoPath, "utf8");
-		const retries = 3;
+		let replaced = false;
 		FileLockTestHooks.nativeExactRemovalProbe = () => true;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
-			exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+			exactRemoveDirectoryTree: () => {
+				if (!replaced) {
+					renameSync(lockDir, `${lockDir}.previous`);
+					mkdirSync(lockDir);
+					writeFileSync(infoPath, legacyInfoBytes);
+					replaced = true;
+				}
+				return { ok: false, code: "identity_mismatch" };
+			},
 		});
-		const realSleep = Bun.sleep;
-		let sleeps = 0;
-		vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
-			sleeps++;
-			if (sleeps === retries) {
-				renameSync(lockDir, `${lockDir}.previous`);
-				mkdirSync(lockDir);
-				writeFileSync(infoPath, legacyInfoBytes);
-			}
-			return await realSleep(ms ?? 0);
-		}) as typeof Bun.sleep);
 
 		let observed: unknown;
 		try {
-			await withFileLock(file, async () => undefined, { retries, retryDelayMs: 1 });
+			await withFileLock(file, async () => undefined, { retries: 1, retryDelayMs: 1 });
 		} catch (error) {
 			observed = error;
 		}
 		expect(observed).toBeInstanceOf(FileLockAcquireError);
 		const lockError = observed as FileLockAcquireError;
 		expect(lockError.code).toBe("acquire_timeout");
+		expect(replaced).toBe(true);
 		expect(lockError.removalFailure).toBeUndefined();
 		expect(lockError.message).not.toContain("could not be reaped on this host");
 		expect(lockError.message).not.toContain("rm -rf");
@@ -2533,6 +2531,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 						JSON.stringify({
 							pid: process.pid,
 							start_time: processStartTime(process.pid),
+							start_time_format: "utc-v1",
 							timestamp: Date.now(),
 						}),
 					);
@@ -2559,46 +2558,43 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).pid).toBe(process.pid);
 	});
 
-	test("drops a recorded refusal when a live successor takes over during the final retry sleep", async () => {
+	test("drops a recorded refusal when a live successor replaces the lock after the removal snapshot", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "index.jsonl");
 		const lockDir = `${file}.lock`;
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
-		const retries = 3;
+		let replaced = false;
 		FileLockTestHooks.nativeExactRemovalProbe = () => false;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
-			exactRemoveDirectoryTree: () => ({ ok: false, code: "sharing_violation" }),
+			exactRemoveDirectoryTree: () => {
+				if (!replaced) {
+					renameSync(lockDir, `${lockDir}.previous`);
+					mkdirSync(lockDir);
+					writeFileSync(
+						path.join(lockDir, "info"),
+						JSON.stringify({
+							pid: process.pid,
+							start_time: processStartTime(process.pid),
+							start_time_format: "utc-v1",
+							timestamp: Date.now(),
+						}),
+					);
+					replaced = true;
+				}
+				return { ok: false, code: "identity_mismatch" };
+			},
 		});
-		// Publish a live successor after the loop's final snapshot, so only the
-		// exhaustion-time generation re-read can keep the refusal off the message.
-		const realSleep = Bun.sleep;
-		let sleeps = 0;
-		vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
-			sleeps++;
-			if (sleeps === retries) {
-				rmSync(lockDir, { recursive: true, force: true });
-				mkdirSync(lockDir);
-				writeFileSync(
-					path.join(lockDir, "info"),
-					JSON.stringify({
-						pid: process.pid,
-						start_time: processStartTime(process.pid),
-						timestamp: Date.now(),
-					}),
-				);
-			}
-			return await realSleep(ms ?? 0);
-		}) as typeof Bun.sleep);
 
 		let observed: unknown;
 		try {
-			await withFileLock(file, async () => undefined, { retries, retryDelayMs: 1 });
+			await withFileLock(file, async () => undefined, { retries: 1, retryDelayMs: 1 });
 		} catch (error) {
 			observed = error;
 		}
 		expect(observed).toBeInstanceOf(FileLockAcquireError);
 		const lockError = observed as FileLockAcquireError;
+		expect(replaced).toBe(true);
 		expect(lockError.holder).toContain("(live)");
 		expect(lockError.removalFailure).toBeUndefined();
 		expect(lockError.message).not.toContain("could not be reaped");

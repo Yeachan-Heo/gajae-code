@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { FileLockAcquireError, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
+import { FileLockAcquireError, FileLockTestHooks, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
 
 const tempDirs: string[] = [];
 let originalPlatform: PropertyDescriptor | undefined;
@@ -11,9 +11,11 @@ beforeEach(() => {
 	originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 	if (!originalPlatform?.configurable) throw new Error("process.platform descriptor is not configurable");
 	Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+	FileLockTestHooks.cleanupPendingStaging = async stagingPath => fs.rm(stagingPath, { recursive: true, force: true });
 });
 
 afterEach(async () => {
+	FileLockTestHooks.cleanupPendingStaging = undefined;
 	if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 	for (const dir of tempDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });

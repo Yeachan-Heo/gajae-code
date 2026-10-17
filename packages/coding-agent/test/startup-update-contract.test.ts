@@ -1,8 +1,15 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { closeModelCache, getBundledModel, type Model } from "@gajae-code/ai";
+import { exactRemoveDirectoryTree, snapshotDirectoryTree } from "@gajae-code/natives";
 import { getAgentDir, hookFetch, postmortem, setAgentDir, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
+import {
+	FileLockAcquireError,
+	FileLockStagingCleanupError,
+	FileLockTestHooks,
+	withFileLock,
+} from "../src/config/file-lock";
 import { ModelRegistry, ModelsConfigFile } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
@@ -21,6 +28,7 @@ import type { InteractiveMode } from "../src/modes/interactive-mode";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
+import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 
 const alternateRoutes: Array<{
@@ -618,6 +626,253 @@ describe("startup update contract", () => {
 			else Bun.env.PI_NO_TITLE = originalNoTitle;
 		}
 	});
+	it("reports an exhausted direct session-index lock without an uncaught startup failure", async () => {
+		using tempDir = TempDir.createSync("@gjc-session-index-startup-lock-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
+		const lockPath = `${filePath}.lock`;
+		const lockError = new FileLockAcquireError(
+			filePath,
+			lockPath,
+			2,
+			`held by pid 123 (live) since ${new Date().toISOString()}`,
+			"acquire_timeout",
+			undefined,
+			undefined,
+			undefined,
+			true,
+		);
+		const stderr: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		const originalExitCode = process.exitCode;
+		let createAgentSessionCalls = 0;
+		try {
+			process.exitCode = 0;
+			await runRootCommand(rootArgs({ mode: "text", noSession: false }), [], {
+				createAgentSession: async () => {
+					createAgentSessionCalls++;
+					return fakeSessionResult();
+				},
+				createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
+				registerDirectSession: async () => {
+					throw lockError;
+				},
+				discoverAuthStorage: async () => authStorage,
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				initTheme: async () => {},
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				suppressProcessExit: false,
+			});
+
+			expect(stderr.join("")).toContain("Session index is busy");
+			expect(stderr.join("")).toContain(`Lock: ${lockPath}`);
+			expect(stderr.join("")).toContain("Code: acquire_timeout");
+			expect(stderr.join("")).toContain("Retry in a few seconds");
+			expect(process.exitCode).toBe(1);
+			expect(createAgentSessionCalls).toBe(0);
+			expect(cleanupSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.restoreAllMocks();
+			process.exitCode = originalExitCode ?? 0;
+			authStorage.close();
+		}
+	});
+	it("does not label unproven session-index failures as broker contention", async () => {
+		const originalExitCode = process.exitCode;
+		const stderr: string[] = [];
+		vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		const scenarios = [
+			{
+				kind: "access_denied",
+				code: "access_denied",
+				holder: "held by an unrecognized owner record",
+				message: "Session index lock acquisition failed",
+				busy: false,
+			},
+			{
+				kind: "sharing_violation",
+				code: "sharing_violation",
+				holder: "publication failed without an observed holder",
+				message: "Session index is busy (validated lock-publication contention)",
+				busy: true,
+			},
+			{
+				kind: "dead_holder",
+				code: "acquire_timeout",
+				holder: "held by pid 123 (dead but not reaped) since 2026-10-13T00:00:00.000Z",
+				message: "Session index lock acquisition failed",
+				busy: false,
+			},
+			{
+				kind: "unknown_holder",
+				code: "acquire_timeout",
+				holder: "held by pid 123 (liveness unknown) since 2026-10-13T00:00:00.000Z",
+				message: "Session index lock acquisition failed",
+				busy: false,
+			},
+			{
+				kind: "malformed_holder",
+				code: "acquire_timeout",
+				holder: "held by an owner record that never became readable",
+				message: "Session index lock acquisition failed",
+				busy: false,
+			},
+			{
+				kind: "io_error",
+				code: "io_error",
+				holder: "",
+				message: "Session index lock publication failed",
+				busy: false,
+			},
+			{
+				kind: "raw_sharing_violation",
+				code: "sharing_violation",
+				holder: "",
+				message: "Session index lock publication failed",
+				busy: false,
+			},
+			{
+				kind: "cleanup_denied",
+				code: "EACCES",
+				holder: "",
+				message: "Session index lock staging cleanup failed",
+				busy: false,
+			},
+		] as const;
+
+		try {
+			for (const scenario of scenarios) {
+				using tempDir = TempDir.createSync("@gjc-session-index-publication-failure-");
+				const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+				const filePath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
+				const lockPath = `${filePath}.lock`;
+				const error =
+					scenario.kind === "io_error" || scenario.kind === "raw_sharing_violation"
+						? Object.assign(new Error(`Failed to publish file lock: ${scenario.code}.`), {
+								code: scenario.code,
+							})
+						: scenario.kind === "cleanup_denied"
+							? new FileLockStagingCleanupError(
+									lockPath,
+									`${lockPath}.pending.test`,
+									Object.assign(new Error("staging cleanup denied"), { code: "EACCES" }),
+								)
+							: new FileLockAcquireError(
+									filePath,
+									lockPath,
+									2,
+									scenario.holder,
+									"acquire_timeout",
+									undefined,
+									undefined,
+									scenario.kind === "access_denied"
+										? "access_denied"
+										: scenario.kind === "sharing_violation"
+											? "sharing_violation"
+											: undefined,
+								);
+				process.exitCode = 0;
+				stderr.length = 0;
+				try {
+					await runRootCommand(rootArgs({ mode: "text", noSession: false }), [], {
+						createAgentSession: async () => fakeSessionResult(),
+						createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
+						registerDirectSession: async () => {
+							throw error;
+						},
+						discoverAuthStorage: async () => authStorage,
+						settings: Settings.isolated({
+							"marketplace.autoUpdate": "off",
+							"startup.checkUpdate": false,
+						}),
+						initTheme: async () => {},
+						runStartupCredentialAutoImportIfNeeded: async () => undefined,
+						suppressProcessExit: false,
+					});
+					const output = stderr.join("");
+					expect(output).toContain(scenario.message);
+					const reportedLockPath =
+						scenario.kind === "io_error" || scenario.kind === "raw_sharing_violation"
+							? path.join(getAgentDir(), "sdk", "sessions", "index.jsonl.lock")
+							: lockPath;
+					expect(output).toContain(`Lock: ${reportedLockPath}`);
+					expect(output).toContain(`Code: ${scenario.code}`);
+					if (scenario.busy) {
+						expect(output).toContain("Retry in a few seconds");
+					} else {
+						expect(output).not.toContain("Session index is busy");
+						expect(output).not.toContain("Retry in a few seconds");
+						expect(output).not.toContain("SDK broker");
+					}
+					expect(process.exitCode).toBe(1);
+				} finally {
+					authStorage.close();
+				}
+			}
+			expect(cleanupSpy).toHaveBeenCalledTimes(scenarios.length);
+		} finally {
+			vi.restoreAllMocks();
+			process.exitCode = originalExitCode ?? 0;
+		}
+	}, 15_000);
+	it("propagates a session-index lock release failure after registration commits", async () => {
+		using tempDir = TempDir.createSync("@gjc-session-index-release-failure-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const originalAgentDir = getAgentDir();
+		const originalLifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+		const originalExitCode = process.exitCode;
+		const sessionManager = SessionManager.create(
+			tempDir.path(),
+			SessionManager.explicitDestination(path.join(tempDir.path(), "sessions")),
+		);
+		const indexPath = path.join(tempDir.path(), "sdk", "sessions", "index.jsonl");
+		let failNextRemoval = true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: (lockPath, snapshot, parentIdentity, detachOnly) => {
+				if (failNextRemoval) {
+					failNextRemoval = false;
+					return { ok: false, code: "identity_mismatch" };
+				}
+				return exactRemoveDirectoryTree(lockPath, snapshot, parentIdentity, detachOnly);
+			},
+		});
+		try {
+			setAgentDir(tempDir.path());
+			delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+			process.exitCode = 0;
+			await expect(
+				runRootCommand(rootArgs({ mode: "text", noSession: false }), [], {
+					createSessionManager: async () => sessionManager,
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					initTheme: async () => {},
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					suppressProcessExit: true,
+				}),
+			).rejects.toThrow("Failed to release file lock:");
+			expect(await Bun.file(indexPath).text()).toContain('"type":"host_registered"');
+			expect(await Bun.file(indexPath).text()).toContain(sessionManager.getSessionId());
+			expect(process.exitCode).toBe(0);
+			await withFileLock(indexPath, async () => undefined, { retries: 2, retryDelayMs: 1 });
+		} finally {
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			setAgentDir(originalAgentDir);
+			if (originalLifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+			else process.env.GJC_LIFECYCLE_REQUEST_ID = originalLifecycleRequestId;
+			vi.restoreAllMocks();
+			process.exitCode = originalExitCode ?? 0;
+			authStorage.close();
+		}
+	});
 	it("cleans up noninteractive owners when print mode rejects", async () => {
 		using tempDir = TempDir.createSync("@gjc-print-failure-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
@@ -921,6 +1176,7 @@ describe("startup update contract", () => {
 			await expect(
 				runRootCommand(parsed, [], {
 					createAgentSession: async () => fakeSessionResult(),
+					createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
 					discoverAuthStorage: async () => authStorage,
 					settings,
 					initTheme: async () => {},
@@ -981,6 +1237,7 @@ describe("startup update contract", () => {
 			await expect(
 				runRootCommand(parsed, [], {
 					createAgentSession: async () => fakeSessionResult(),
+					createSessionManager: async () => SessionManager.inMemory(tempDir.path()),
 					discoverAuthStorage: async () => authStorage,
 					settings,
 					initTheme: async () => {},

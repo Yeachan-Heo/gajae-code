@@ -458,6 +458,11 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		);
 	});
 
+	it("accepts Windows access-denied owner-only security results", () => {
+		const failure = { ok: false, code: "access_denied" } as const;
+		expect(validateNativeSecurityResult(failure, "verify", "directory")).toEqual(failure);
+	});
+
 	it("does not re-adopt a replaced managed leaf or write into its external replacement", async () => {
 		const { agentDir, cwd, sessionsRoot } = await sharedStickyFixture();
 		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });

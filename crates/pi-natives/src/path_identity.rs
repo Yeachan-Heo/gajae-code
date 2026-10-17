@@ -965,6 +965,25 @@ const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 
 #[cfg(any(windows, test))]
+const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_PATH_NOT_FOUND: u32 = 3;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_ACCESS_DENIED: u32 = 5;
+#[cfg(any(windows, test))]
+const WIN32_ERROR_SHARING_VIOLATION: u32 = 32;
+
+#[cfg(any(windows, test))]
+fn windows_error_code(error: u32) -> &'static str {
+	match error {
+		WIN32_ERROR_FILE_NOT_FOUND | WIN32_ERROR_PATH_NOT_FOUND => "not_found",
+		WIN32_ERROR_ACCESS_DENIED => "access_denied",
+		WIN32_ERROR_SHARING_VIOLATION => "sharing_violation",
+		_ => "io_error",
+	}
+}
+
+#[cfg(any(windows, test))]
 fn ntstatus_code(status: i32) -> &'static str {
 	match status as u32 {
 		0xc000_0034 | 0xc000_003a => "not_found",
@@ -1092,6 +1111,7 @@ mod exact_replace_windows_retry_policy_tests {
 		is_retryable_exact_replace_rename_status, is_retryable_exact_replace_status,
 		native_windows_error_code, ntstatus_code, open_with_transient_retry,
 		publication_rename_error_code, rename_with_transient_retry, retained_replace_error_code,
+		windows_error_code,
 	};
 
 	#[test]
@@ -1132,6 +1152,19 @@ mod exact_replace_windows_retry_policy_tests {
 	#[test]
 	fn windows_error_code_is_hex_and_path_free() {
 		assert_eq!(native_windows_error_code(STATUS_SHARING_VIOLATION), "0xC0000043");
+		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED as i32), "0xC0000022");
+	}
+
+	#[test]
+	fn win32_access_denied_stays_distinct_for_exact_cleanup() {
+		assert_eq!(windows_error_code(5), "access_denied");
+		assert_eq!(windows_error_code(32), "sharing_violation");
+		assert_eq!(windows_error_code(2), "not_found");
+		assert_eq!(windows_error_code(5_000), "io_error");
+	}
+
+	#[test]
+	fn status_access_denied_is_distinct_from_owner_mismatch() {
 		assert_eq!(native_windows_error_code(STATUS_ACCESS_DENIED), "0xC0000022");
 		assert_eq!(ntstatus_code(STATUS_ACCESS_DENIED), "owner_mismatch");
 		assert_eq!(
@@ -1753,6 +1786,25 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 		return NativeExactUnlinkResult::failure("identity_mismatch");
 	};
 	platform::exact_unlink(Path::new(&path), &identity)
+}
+
+/// Delete only the empty regular file opened by the caller's retained
+/// descriptor.
+///
+/// This is used when a newly created staging file cannot be statted through the
+/// host API. Native code derives identity from the open descriptor and verifies
+/// the public entry still names that object before using the platform's exact
+/// unlink protocol.
+#[napi]
+pub fn exact_unlink_open_file(
+	path: String,
+	caller_fd: i32,
+	quarantine_name: String,
+) -> NativeExactUnlinkResult {
+	if path.contains('\0') || quarantine_name.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	platform::exact_unlink_open_file(Path::new(&path), caller_fd, &quarantine_name)
 }
 
 /// Delete only the regular file that still has the supplied platform identity,
@@ -2616,7 +2668,7 @@ pub(crate) mod platform {
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader, io_code,
-		security_io_code, sha256,
+		security_io_code, sha256, validate_retained_backup_name,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -5402,6 +5454,62 @@ pub(crate) mod platform {
 		} else {
 			close_parent(NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path))
 		}
+	}
+
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		if caller_fd < 0 || validate_retained_backup_name(quarantine_name).is_none() {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		// SAFETY: zero is valid initialized storage for fstat output; caller_fd is
+		// retained by the host FileHandle for the duration of this synchronous call.
+		let mut file_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: caller_fd remains live through this synchronous call and file_stat is
+		// writable.
+		if unsafe { libc::fstat(caller_fd, &mut file_stat) } != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		if file_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+			|| file_stat.st_size != 0
+			|| file_stat.st_nlink != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let (parent_fd, _) = match open_parent_no_follow(path) {
+			Ok(parent) => parent,
+			Err(result) => return *result,
+		};
+		// SAFETY: zero is valid initialized storage for fstat output.
+		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd is live and parent_stat is writable initialized output.
+		let parent_stat_result = unsafe { libc::fstat(parent_fd, &mut parent_stat) };
+		// SAFETY: open_parent_no_follow returned ownership of this descriptor.
+		unsafe { libc::close(parent_fd) };
+		if parent_stat_result != 0 {
+			return NativeExactUnlinkResult::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		let Ok(mtime_ns) = i64::try_from(stat_mtime_ns(&file_stat)) else {
+			return NativeExactUnlinkResult::failure("identity_unavailable");
+		};
+		let identity = ExactFileIdentity {
+			dev: file_stat.st_dev as u64,
+			ino: file_stat.st_ino as u64,
+			nlink: Some(file_stat.st_nlink as u64),
+			parent_dev: Some(parent_stat.st_dev as u64),
+			parent_ino: Some(parent_stat.st_ino as u64),
+			size: 0,
+			mtime_ns,
+			directory: false,
+			detach_only: false,
+			quarantine_name: Some(quarantine_name.to_owned()),
+			sha256: Some(sha256(&[])),
+			allow_hard_link: false,
+			require_hard_link: false,
+		};
+		exact_unlink_direct(path, &identity)
 	}
 
 	fn exact_unlink_at(
@@ -10922,8 +11030,7 @@ mod platform {
 	use windows_sys::Win32::{
 		Foundation::{
 			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
-			ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, GENERIC_ALL, GetLastError, HANDLE,
-			INVALID_HANDLE_VALUE, LocalFree,
+			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -11056,11 +11163,7 @@ mod platform {
 	}
 
 	fn last_error_code() -> &'static str {
-		match unsafe { GetLastError() } {
-			ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "not_found",
-			ERROR_SHARING_VIOLATION => "sharing_violation",
-			_ => "io_error",
-		}
+		super::windows_error_code(unsafe { GetLastError() })
 	}
 
 	fn open_path(path: &Path, reparse: bool, desired_access: u32) -> Result<HANDLE, &'static str> {
@@ -12803,6 +12906,78 @@ mod platform {
 		exact_unlink(path, identity)
 	}
 
+	pub(super) fn exact_unlink_open_file(
+		path: &Path,
+		caller_fd: i32,
+		_quarantine_name: &str,
+	) -> NativeExactUnlinkResult {
+		let caller = match retained_caller_handle(caller_fd) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		let attributes = match handle_attributes(caller.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(caller.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| size != 0
+			|| information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let path_handle = match open_exact_with_share(
+			path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		};
+		match same_file_identity(path_handle.target, caller.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeExactUnlinkResult::failure("identity_mismatch"),
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(
+					result.code.as_deref().unwrap_or("identity_unavailable"),
+				);
+			},
+		}
+		let attributes = match handle_attributes(path_handle.target) {
+			Ok(attributes) => attributes,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut path_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(path_handle.target, &mut path_information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		let path_size = (u64::from(path_information.nFileSizeHigh) << 32)
+			| u64::from(path_information.nFileSizeLow);
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+			|| path_size != 0
+			|| path_information.nNumberOfLinks != 1
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		match delete_handle(path_handle.target) {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			Err(code) => NativeExactUnlinkResult::failure(code),
+		}
+	}
+
 	pub(super) fn exact_restore(
 		detached_path: &Path,
 		original_path: &Path,
@@ -14395,6 +14570,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_unlink_direct(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("identity_unavailable")
+	}
+	pub(super) fn exact_unlink_open_file(_: &Path, _: i32, _: &str) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_restore(

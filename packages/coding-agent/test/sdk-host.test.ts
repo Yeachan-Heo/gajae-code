@@ -305,6 +305,67 @@ describe("SessionSdkHost", () => {
 		expect(host.started).toBe(false);
 	});
 
+	test("does not suppress access-denied publication failures as lock contention", async () => {
+		const error = new FileLockAcquireError(
+			"/tmp/index.jsonl",
+			"/tmp/index.jsonl.lock",
+			3,
+			"publication failed with access_denied",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+		);
+		const host = new SessionSdkHost({
+			sessionId: "access-denied-stop",
+			stateRoot: "/tmp/access-denied-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw error;
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).rejects.toBe(error);
+		expect(host.started).toBe(true);
+	});
+
+	test("allows access-denied lock contention during shutdown when a holder is proven live", async () => {
+		const error = new FileLockAcquireError(
+			"/tmp/index.jsonl",
+			"/tmp/index.jsonl.lock",
+			3,
+			"held by pid 123 (live)",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+			true,
+		);
+		const host = new SessionSdkHost({
+			sessionId: "live-access-denied-stop",
+			stateRoot: "/tmp/live-access-denied-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw error;
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).resolves.toBe("stopped");
+		expect(host.started).toBe(false);
+	});
+
 	test("does not swallow orphan transition errors as allowed lock contention", async () => {
 		const host = new SessionSdkHost({
 			sessionId: "orphan-stop",

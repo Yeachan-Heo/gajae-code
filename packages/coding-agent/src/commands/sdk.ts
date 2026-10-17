@@ -16,7 +16,7 @@ import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
-import { FileLockAcquireError } from "../config/file-lock";
+import { FileLockAcquireError, isFileLockAcquireTimeout } from "../config/file-lock";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
@@ -1990,9 +1990,8 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 					return await singleStartupAttempt(deadline);
 				} catch (error) {
 					if (
-						!(error instanceof FileLockAcquireError) ||
+						!isFileLockAcquireTimeout(error) ||
 						!startupFenceAcquired ||
-						error.code !== "acquire_timeout" ||
 						path.resolve(error.filePath) !==
 							path.resolve(path.join(agentDir, "sdk", "sessions", "index.jsonl")) ||
 						sessionIndexTimeoutRetries >= MAX_SESSION_INDEX_TIMEOUT_RETRIES
