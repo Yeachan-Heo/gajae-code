@@ -78,6 +78,24 @@ export const CURATED_TIER_LABELS = {
 
 /** Generated from packages/ai/src/models.json at feature land: 3936 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
+	"amazon-bedrock/anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/au.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/eu.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/global.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/jp.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/us.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
 	"amazon-bedrock/au.anthropic.claude-sonnet-5-5": {
 		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
 	},

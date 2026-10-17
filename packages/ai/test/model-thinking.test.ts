@@ -455,6 +455,11 @@ describe("model thinking metadata", () => {
 
 	it("resolves Claude Haiku 5.x as adaptive with a medium default while Haiku 4.5 keeps the generic ladder", () => {
 		const haiku55 = createModel({ id: "claude-haiku-5-5", api: "anthropic-messages", provider: "anthropic" });
+		const haiku55Bedrock = createModel({
+			id: "us.anthropic.claude-haiku-5-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
 		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
 
 		expect(haiku55.thinking).toEqual({
@@ -463,6 +468,15 @@ describe("model thinking metadata", () => {
 			maxLevel: Effort.Max,
 			defaultLevel: Effort.Medium,
 		});
+		// AWS documents the same effort range and medium default for Converse.
+		expect(haiku55Bedrock.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.Max)).toBe("max");
 		// Haiku 4.5 predates the policy: unchanged budget ladder, no default.
 		expect(haiku45.thinking?.mode).toBe("budget");
 		expect(haiku45.thinking?.defaultLevel).toBeUndefined();
@@ -471,11 +485,24 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Max)).toBe("max");
 	});
 
-	it("keeps the bundled Haiku 5.5 row aligned with the thinking policy", () => {
+	it("keeps the bundled Haiku 5.5 rows aligned with the thinking policy", () => {
 		const direct = getBundledModel("anthropic", "claude-haiku-5-5");
 		expect(direct.thinking?.mode).toBe("anthropic-adaptive");
 		expect(direct.thinking?.maxLevel).toBe(Effort.Max);
 		expect(direct.thinking?.defaultLevel).toBe(Effort.Medium);
+		for (const id of [
+			"anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"us.anthropic.claude-haiku-5-5",
+		]) {
+			const bedrock = getBundledModel("amazon-bedrock", id as never);
+			expect(bedrock.thinking?.mode).toBe("anthropic-adaptive");
+			expect(bedrock.thinking?.maxLevel).toBe(Effort.Max);
+			expect(bedrock.thinking?.defaultLevel).toBe(Effort.Medium);
+		}
 	});
 
 	it("holds seeded Haiku parser and policy properties for catalog IDs (seed 0x5eed5505)", () => {

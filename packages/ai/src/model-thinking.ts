@@ -916,9 +916,12 @@ function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel
 	if (
 		parsedModel.family === "anthropic" &&
 		parsedModel.kind === "haiku" &&
-		model.provider === "anthropic" &&
-		model.api === "anthropic-messages" &&
-		semverGte(parsedModel.version, "5.0")
+		((model.provider === "anthropic" &&
+			model.api === "anthropic-messages" &&
+			semverGte(parsedModel.version, "5.0")) ||
+			(model.provider === "amazon-bedrock" &&
+				model.api === "bedrock-converse-stream" &&
+				semverGte(parsedModel.version, "5.5")))
 	) {
 		// Haiku 5.5 defaults to medium adaptive effort instead of the global high.
 		return Effort.Medium;
@@ -1152,7 +1155,7 @@ function inferThinkingControlMode<TApi extends Api>(
 			if (parsedModel.family === "anthropic") {
 				if (
 					semverGte(parsedModel.version, "4.6") &&
-					(parsedModel.kind === "opus" || parsedModel.kind === "fable")
+					(parsedModel.kind === "opus" || parsedModel.kind === "fable" || parsedModel.kind === "haiku")
 				) {
 					return "anthropic-adaptive";
 				}

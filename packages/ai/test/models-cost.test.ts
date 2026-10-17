@@ -139,6 +139,45 @@ describe("calculateCost", () => {
 		expect(model.longContextPricing).toEqual(expected);
 	});
 
+	it("bundles a Bedrock Haiku 5.5 long-context tier at 5x each profile's own rates", () => {
+		for (const id of [
+			"anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"us.anthropic.claude-haiku-5-5",
+		]) {
+			const model = getBundledModel("amazon-bedrock", id as never);
+			expect(model.longContextPricing?.threshold).toBe(100_000);
+			for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+				expect(model.longContextPricing?.cost[key]).toBeCloseTo(model.cost[key] * 5, 9);
+			}
+		}
+	});
+
+	it("bills Bedrock Haiku 5.5 at long-context rates only above 100K total prompt tokens", () => {
+		const model = getBundledModel("amazon-bedrock", "us.anthropic.claude-haiku-5-5" as never);
+		const usage = (input: number, cacheRead: number): Usage => ({
+			input,
+			output: 1_000,
+			cacheRead,
+			cacheWrite: 0,
+			totalTokens: input + cacheRead + 1_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const atThreshold = usage(100_000, 0);
+		const aboveThreshold = usage(80_000, 20_001);
+
+		calculateCost(model, atThreshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(atThreshold.cost.input).toBeCloseTo(0.011, 9);
+		expect(aboveThreshold.cost.input).toBeCloseTo(0.044, 9);
+		expect(aboveThreshold.cost.output).toBeCloseTo(0.00275, 9);
+		expect(aboveThreshold.cost.cacheRead).toBeCloseTo(0.001100055, 9);
+	});
+
 	it("applies Haiku 5.5 long-context rates only above 100K total prompt tokens", () => {
 		const model = getBundledModel("anthropic", "claude-haiku-5-5");
 		const usage = (input: number, cacheRead: number, cacheWrite: number): Usage => ({

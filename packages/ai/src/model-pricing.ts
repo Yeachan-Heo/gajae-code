@@ -102,29 +102,53 @@ export function getOpenAIModelCost<TApi extends Api>(model: Model<TApi>, inputTo
 	return inputTokens > pricing.longContextPricing.threshold ? pricing.longContextPricing.cost : pricing.cost;
 }
 
+const BEDROCK_HAIKU_5_5_ID = /^(?:(?:au|eu|global|jp|us).)?anthropic.claude-haiku-5-5$/;
+// Bedrock bills Haiku 5.5 prompts above 100K tokens at higher "Long Context" rates.
+// AWS documents the threshold but the per-token rates only on its pricing page,
+// which is not machine-readable; mirror Anthropic's published 5x multiplier on each
+// inference profile's own base rates.
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html#model-card-anthropic-claude-haiku-5-5-pricing
+const BEDROCK_HAIKU_5_5_LONG_CONTEXT_MULTIPLIER = 5;
+
+function getAnthropicLongContextPricing<TApi extends Api>(model: Model<TApi>): LongContextPricing | undefined {
+	if (model.provider === "anthropic" && model.api === "anthropic-messages" && model.id === "claude-haiku-5-5") {
+		return {
+			threshold: ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold,
+			cost: { ...ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.cost },
+		};
+	}
+	if (
+		model.provider === "amazon-bedrock" &&
+		model.api === "bedrock-converse-stream" &&
+		BEDROCK_HAIKU_5_5_ID.test(model.id)
+	) {
+		const m = BEDROCK_HAIKU_5_5_LONG_CONTEXT_MULTIPLIER;
+		const scale = (rate: number): number => Math.round(rate * m * 1e9) / 1e9;
+		return {
+			threshold: ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold,
+			cost: {
+				input: scale(model.cost.input),
+				output: scale(model.cost.output),
+				cacheRead: scale(model.cost.cacheRead),
+				cacheWrite: scale(model.cost.cacheWrite),
+			},
+		};
+	}
+	return undefined;
+}
+
 export function getAnthropicModelCost<TApi extends Api>(
 	model: Model<TApi>,
 	inputTokens: number,
 ): ModelCost | undefined {
-	if (
-		model.provider !== "anthropic" ||
-		model.api !== "anthropic-messages" ||
-		model.id !== "claude-haiku-5-5" ||
-		inputTokens <= ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold
-	) {
-		return undefined;
-	}
-	return ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.cost;
+	const pricing = getAnthropicLongContextPricing(model);
+	if (!pricing || inputTokens <= pricing.threshold) return undefined;
+	return pricing.cost;
 }
 
 export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>): void {
-	if (model.provider !== "anthropic" || model.api !== "anthropic-messages" || model.id !== "claude-haiku-5-5") {
-		return;
-	}
-	model.longContextPricing = {
-		threshold: ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold,
-		cost: { ...ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.cost },
-	};
+	const pricing = getAnthropicLongContextPricing(model);
+	if (pricing) model.longContextPricing = pricing;
 }
 
 export function applyOpenAIModelPricing<TApi extends Api>(model: Model<TApi>): void {
