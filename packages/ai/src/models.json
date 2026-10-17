@@ -5782,6 +5782,41 @@
         "mode": "budget"
       }
     },
+    "claude-haiku-5-5": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "input": 0.1,
+        "output": 0.5
+      },
+      "id": "claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "longContextPricing": {
+        "cost": {
+          "cacheRead": 0.05,
+          "cacheWrite": 0.625,
+          "input": 0.5,
+          "output": 2.5
+        },
+        "threshold": 100000
+      },
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5",
+      "provider": "anthropic",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "max",
+        "minLevel": "low",
+        "mode": "anthropic-adaptive"
+      }
+    },
     "claude-opus-4-0": {
       "api": "anthropic-messages",
       "baseUrl": "https://api.anthropic.com",

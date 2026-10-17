@@ -6,6 +6,13 @@ interface TieredPricing {
 }
 
 const LONG_CONTEXT_THRESHOLD = 272_000;
+// Anthropic Haiku 5.5's direct Messages API charges five times the base rates
+// when prompt input exceeds 100K tokens, including cached input.
+// https://platform.claude.com/docs/en/models/haiku-5-5/overview#pricing
+const ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING: LongContextPricing = {
+	threshold: 100_000,
+	cost: { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 },
+};
 
 const GPT_5_6_SOL_PRICING: TieredPricing = {
 	cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
@@ -93,6 +100,31 @@ export function getOpenAIModelCost<TApi extends Api>(model: Model<TApi>, inputTo
 		return undefined;
 	}
 	return inputTokens > pricing.longContextPricing.threshold ? pricing.longContextPricing.cost : pricing.cost;
+}
+
+export function getAnthropicModelCost<TApi extends Api>(
+	model: Model<TApi>,
+	inputTokens: number,
+): ModelCost | undefined {
+	if (
+		model.provider !== "anthropic" ||
+		model.api !== "anthropic-messages" ||
+		model.id !== "claude-haiku-5-5" ||
+		inputTokens <= ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold
+	) {
+		return undefined;
+	}
+	return ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.cost;
+}
+
+export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>): void {
+	if (model.provider !== "anthropic" || model.api !== "anthropic-messages" || model.id !== "claude-haiku-5-5") {
+		return;
+	}
+	model.longContextPricing = {
+		threshold: ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold,
+		cost: { ...ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.cost },
+	};
 }
 
 export function applyOpenAIModelPricing<TApi extends Api>(model: Model<TApi>): void {
