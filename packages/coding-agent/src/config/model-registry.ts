@@ -7115,6 +7115,35 @@ export class ModelRegistry {
 		return apiKey;
 	}
 
+	/** Get a model API key together with the stored row that resolved it, when any. */
+	async getApiKeyWithCredentialRowId(
+		model: Model<Api>,
+		sessionId?: string,
+		options: {
+			credentialSelector?: AuthCredentialSelector;
+			preferredCredentialSelector?: AuthCredentialSelector;
+			signal?: AbortSignal;
+		} = {},
+	): Promise<{ apiKey: string | undefined; credentialRowId: number | undefined }> {
+		this.#refreshRotatingConfigApiKey(model.provider);
+		let credentialRowId: number | undefined;
+		const apiKey = await this.#getApiKeyOrNoAuth(model.provider, async () => {
+			const resolved = await this.authStorage.getApiKeyWithCredentialRowId(model.provider, sessionId, {
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				credentialSelector: options.credentialSelector,
+				preferredCredentialSelector: options.preferredCredentialSelector,
+				owner: this.#authStorageConfigOwner,
+				signal: options.signal,
+			});
+			credentialRowId = isVllmNoAuthToken(model.provider, resolved.apiKey) ? undefined : resolved.credentialRowId;
+			return resolved.apiKey;
+		});
+		if (apiKey === kNoAuth) credentialRowId = undefined;
+		this.#applyEffectiveAuthHeader(model, apiKey);
+		return { apiKey, credentialRowId };
+	}
+
 	/**
 	 * Get API key for a provider (e.g., "openai").
 	 */
