@@ -116,6 +116,11 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<
 	return cmd;
 });
 
+export function getBuiltinSlashCommandsForSession(hasExactMcpControls: boolean): typeof BUILTIN_SLASH_COMMANDS {
+	if (hasExactMcpControls) return BUILTIN_SLASH_COMMANDS;
+	return BUILTIN_SLASH_COMMANDS.filter(command => command.name !== "mcp");
+}
+
 /**
  * Represents a custom slash command loaded from a file
  */
