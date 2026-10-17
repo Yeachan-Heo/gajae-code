@@ -779,6 +779,31 @@
         "mode": "anthropic-adaptive"
       }
     },
+    "anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "input": 0.1,
+        "output": 0.5
+      },
+      "id": "anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "anthropic-budget-effort"
+      }
+    },
     "anthropic.claude-opus-4-6-v1": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -1096,6 +1121,31 @@
         "maxLevel": "high",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "au.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "au.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (AU)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "anthropic-budget-effort"
       }
     },
     "au.anthropic.claude-opus-4-6-v1": {
@@ -1787,6 +1837,31 @@
         "mode": "budget"
       }
     },
+    "eu.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "eu.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (EU)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "anthropic-budget-effort"
+      }
+    },
     "eu.anthropic.claude-opus-4-1-20250805-v1:0": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -2265,6 +2340,31 @@
         "maxLevel": "high",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "global.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "input": 0.1,
+        "output": 0.5
+      },
+      "id": "global.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (Global)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "anthropic-budget-effort"
       }
     },
     "global.anthropic.claude-opus-4-5-20251101-v1:0": {
@@ -3122,6 +3222,31 @@
         "maxLevel": "high",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "jp.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "jp.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (JP)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "anthropic-budget-effort"
       }
     },
     "jp.anthropic.claude-opus-4-7": {
@@ -4573,6 +4698,31 @@
         "mode": "budget"
       }
     },
+    "us.anthropic.claude-haiku-5-5": {
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.011,
+        "cacheWrite": 0.1375,
+        "input": 0.11,
+        "output": 0.55
+      },
+      "id": "us.anthropic.claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5 (US)",
+      "provider": "amazon-bedrock",
+      "reasoning": true,
+      "thinking": {
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "anthropic-budget-effort"
+      }
+    },
     "us.anthropic.claude-opus-4-1-20250805-v1:0": {
       "api": "bedrock-converse-stream",
       "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
@@ -5780,6 +5930,32 @@
         "maxLevel": "xhigh",
         "minLevel": "minimal",
         "mode": "budget"
+      }
+    },
+    "claude-haiku-5-5": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "contextWindow": 1000000,
+      "cost": {
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
+        "input": 0.1,
+        "output": 0.5
+      },
+      "id": "claude-haiku-5-5",
+      "input": [
+        "text",
+        "image"
+      ],
+      "maxTokens": 128000,
+      "name": "Anthropic Haiku 5.5",
+      "provider": "anthropic",
+      "reasoning": true,
+      "thinking": {
+        "defaultLevel": "medium",
+        "maxLevel": "high",
+        "minLevel": "minimal",
+        "mode": "anthropic-adaptive"
       }
     },
     "claude-opus-4-0": {

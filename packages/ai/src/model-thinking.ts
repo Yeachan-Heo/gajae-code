@@ -96,7 +96,7 @@ type SemVer = {
 };
 
 type GeminiKind = "pro" | "flash" | "argon";
-type AnthropicKind = "opus" | "sonnet" | "fable";
+type AnthropicKind = "opus" | "sonnet" | "fable" | "haiku";
 type OpenAIVariant =
 	| "astra"
 	| "base"
@@ -879,6 +879,15 @@ function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel
 	if (model.provider === "omlx") {
 		return Effort.Medium;
 	}
+	if (
+		model.provider === "anthropic" &&
+		parsedModel.family === "anthropic" &&
+		parsedModel.kind === "haiku" &&
+		semverGte(parsedModel.version, "5.0")
+	) {
+		// Haiku 5.x defaults to medium adaptive effort instead of the global high.
+		return Effort.Medium;
+	}
 	return undefined;
 }
 
@@ -1146,12 +1155,17 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 }
 
 function parseAnthropicModel(modelId: string): AnthropicModel | null {
-	const match = /claude-(opus|sonnet|fable)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
+	const match = /claude-(opus|sonnet|fable|haiku)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}
 	const version = parseSemVer(match[2]);
 	if (!version) {
+		return null;
+	}
+	// Haiku is recognized from generation 5 only. Haiku 4.5 predates the
+	// adaptive-thinking policy and keeps the generic (unparsed) budget ladder.
+	if (match[1] === "haiku" && !semverGte(version, "5.0")) {
 		return null;
 	}
 	return { family: "anthropic", kind: match[1] as AnthropicKind, version };

@@ -442,6 +442,47 @@ describe("model thinking metadata", () => {
 		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.High)).toBe("high");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.XHigh)).toThrow(/not supported/);
 	});
+
+	it("resolves Claude Haiku 5.x as adaptive with a medium default while Haiku 4.5 keeps the generic ladder", () => {
+		const haiku55 = createModel({ id: "claude-haiku-5-5", api: "anthropic-messages", provider: "anthropic" });
+		const haiku55Bedrock = createModel({
+			id: "us.anthropic.claude-haiku-5-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
+		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
+
+		expect(haiku55.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.High,
+			defaultLevel: Effort.Medium,
+		});
+		// Bedrock keeps its separate budget-effort behavior and no model default.
+		expect(haiku55Bedrock.thinking?.mode).toBe("anthropic-budget-effort");
+		expect(haiku55Bedrock.thinking?.defaultLevel).toBeUndefined();
+		// Haiku 4.5 predates the policy: unchanged budget ladder, no default.
+		expect(haiku45.thinking?.mode).toBe("budget");
+		expect(haiku45.thinking?.defaultLevel).toBeUndefined();
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Medium)).toBe("medium");
+		expect(() => mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.XHigh)).toThrow(/not supported/);
+	});
+
+	it("keeps the bundled Haiku 5.5 rows aligned with the thinking policy", () => {
+		const direct = getBundledModel("anthropic", "claude-haiku-5-5");
+		expect(direct.thinking?.mode).toBe("anthropic-adaptive");
+		expect(direct.thinking?.defaultLevel).toBe(Effort.Medium);
+		for (const id of [
+			"anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"us.anthropic.claude-haiku-5-5",
+		]) {
+			expect(getBundledModel("amazon-bedrock", id as never).thinking?.mode).toBe("anthropic-budget-effort");
+		}
+	});
 });
 
 describe("generated model policies", () => {
