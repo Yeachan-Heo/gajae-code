@@ -63,6 +63,38 @@ interface PKCE {
 	challenge: string;
 }
 
+/**
+ * Extract a readable error message from OpenAI OAuth error response.
+ * Handles both string errors (error + error_description) and object errors (code/type + message).
+ */
+function extractOpenAIErrorMessage(body: unknown): string {
+	if (typeof body !== "object" || body === null) return "";
+
+	const obj = body as Record<string, unknown>;
+	const error = obj.error;
+
+	if (typeof error === "string") {
+		// String error: "invalid_grant"
+		const desc = obj.error_description;
+		const description = typeof desc === "string" && desc.length > 0 ? `: ${desc}` : "";
+		return `${error}${description}`;
+	}
+
+	if (typeof error === "object" && error !== null) {
+		// Object error: {message, type, code}
+		const err = error as Record<string, unknown>;
+		const code = err.code || err.type;
+		const msg = err.message;
+
+		const parts: string[] = [];
+		if (code && typeof code === "string") parts.push(code);
+		if (msg && typeof msg === "string") parts.push(msg);
+		return parts.join(": ");
+	}
+
+	return "";
+}
+
 class OpenAICodexOAuthFlow extends OAuthCallbackFlow {
 	constructor(
 		ctrl: OAuthController,
@@ -120,9 +152,9 @@ async function exchangeCodeForToken(code: string, verifier: string, redirectUri:
 	if (!tokenResponse.ok) {
 		let detail = `${tokenResponse.status}`;
 		try {
-			const body = (await tokenResponse.json()) as { error?: string; error_description?: string };
-			if (body.error)
-				detail = `${tokenResponse.status} ${body.error}${body.error_description ? `: ${body.error_description}` : ""}`;
+			const body = await tokenResponse.json();
+			const errorMsg = extractOpenAIErrorMessage(body);
+			if (errorMsg) detail = `${tokenResponse.status} ${errorMsg}`;
 		} catch {}
 		throw new Error(`Token exchange failed: ${detail}`);
 	}
@@ -272,9 +304,9 @@ export async function refreshOpenAICodexToken(refreshToken: string): Promise<OAu
 	if (!response.ok) {
 		let detail = `${response.status}`;
 		try {
-			const body = (await response.json()) as { error?: string; error_description?: string };
-			if (body.error)
-				detail = `${response.status} ${body.error}${body.error_description ? `: ${body.error_description}` : ""}`;
+			const body = await response.json();
+			const errorMsg = extractOpenAIErrorMessage(body);
+			if (errorMsg) detail = `${response.status} ${errorMsg}`;
 		} catch {}
 		throw new Error(`OpenAI Codex token refresh failed: ${detail}`);
 	}
