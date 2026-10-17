@@ -1447,19 +1447,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...internalUrlOptions,
 			ensureLocalParentDirs: this.session.bashRestrictionProfile !== "read-only",
 		});
-		// Issue #5039: refuse tmux write verbs whose target resolves to this
-		// agent's own tmux pane — such bytes forge a human `user` turn in the
-		// transcript. This is after command expansion but before any spawn, so
-		// blocked attempts inject no bytes and create no transcript turn.
-		if (this.session.bashRestrictionProfile !== "read-only") {
-			const injection = await checkTmuxSelfInjection(command, {
-				env: process.env,
-				cwd: this.session.cwd,
-			});
-			if (injection.block) {
-				throw new ToolError(injection.reason ?? "Blocked: tmux self-pane injection.");
-			}
-		}
 		const expandedEnv = env
 			? Object.fromEntries(
 					await Promise.all(
@@ -1540,6 +1527,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes?.length ?? 0) > 0) {
 			await assertCwdInsideWorkspace(this.session.cwd, commandCwd);
+		}
+		// Issue #5039: refuse tmux write verbs whose target resolves to this
+		// agent's own tmux pane — such bytes forge a human `user` turn in the
+		// transcript. This is after command/env/cwd preparation but before any
+		// spawn, so guard discovery matches execution without trusting caller env
+		// for the agent's tmux identity.
+		if (this.session.bashRestrictionProfile !== "read-only") {
+			const shellConfigEnv = this.session.settings.getShellConfig().env;
+			const injection = await checkTmuxSelfInjection(command, {
+				env: process.env,
+				cwd: commandCwd,
+				executionEnv: { ...process.env, ...shellConfigEnv, ...resolvedEnv },
+			});
+			if (injection.block) {
+				throw new ToolError(injection.reason ?? "Blocked: tmux self-pane injection.");
+			}
 		}
 
 		const requestedTimeoutSec = input.timeout ?? 300;
