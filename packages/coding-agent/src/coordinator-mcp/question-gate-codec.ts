@@ -121,8 +121,8 @@ export interface PrivateAskGateCodecV1 {
 	recommended_index: number | null;
 	multi: boolean;
 	allow_empty: boolean;
-	other_allowed: true;
-	clarification_allowed: true;
+	other_allowed: boolean;
+	clarification_allowed: boolean;
 }
 
 const MAX_TEXT = 4096;
@@ -146,8 +146,14 @@ function validStageState(value: unknown, labels: string[]): value is Record<stri
 		state.options.every((item, index) => item === labels[index])
 	);
 }
-function askSchema(labels: string[], multi: boolean, allowEmpty: boolean): JsonSchema {
-	return buildAskGateAnswerSchema({ multi, allowEmpty }, labels);
+function askSchema(
+	labels: string[],
+	multi: boolean,
+	allowEmpty: boolean,
+	allowOther = true,
+	allowClarification = true,
+): JsonSchema {
+	return buildAskGateAnswerSchema({ multi, allowEmpty, allowOther, allowClarification }, labels);
 }
 
 /**
@@ -160,6 +166,8 @@ export function buildCoordinatorAskAnswerSchema(
 	optionIds: readonly string[] | undefined = undefined,
 	multi = true,
 	allowEmpty = true,
+	allowOther = true,
+	allowClarification = true,
 ): JsonSchema {
 	const selectedItems: JsonSchema =
 		optionIds !== undefined
@@ -181,6 +189,59 @@ export function buildCoordinatorAskAnswerSchema(
 			description,
 			"x-maxUtf8Bytes": MAX_TEXT,
 		}) as JsonSchema;
+	const properties: Record<string, JsonSchema> = {
+		selected: selectedBase,
+		other: allowOther
+			? { type: "boolean", description: "set true to provide a free-text answer in `custom`" }
+			: { const: false },
+		...(allowOther ? { custom: boundedAnswerText("free-text answer; required when `other` is true") } : {}),
+		action: allowClarification
+			? {
+					type: "string",
+					enum: ["answer", "clarify"],
+					description: "set to `clarify` to ask about the choices without answering the round",
+				}
+			: { const: "answer" },
+		...(allowClarification
+			? { question: boundedAnswerText("clarification question; required when action is `clarify`") }
+			: {}),
+	};
+	const oneOf: JsonSchema[] = [
+		{
+			type: "object",
+			properties: { selected: selectedOnly, other: { const: false }, action: { const: "answer" } },
+			required: ["selected"],
+			additionalProperties: false,
+		},
+	];
+	if (allowOther) {
+		oneOf.push({
+			type: "object",
+			properties: {
+				selected: selectedWithOther,
+				other: { const: true },
+				custom: boundedAnswerText(
+					"At least one non-whitespace character; maxLength counts Unicode code points and x-maxUtf8Bytes counts UTF-8 bytes.",
+				),
+				action: { const: "answer" },
+			},
+			required: ["selected", "other", "custom"],
+			additionalProperties: false,
+		});
+	}
+	if (allowClarification) {
+		oneOf.push({
+			type: "object",
+			properties: {
+				action: { const: "clarify" },
+				question: boundedAnswerText(
+					"At least one non-whitespace character; maxLength counts Unicode code points and x-maxUtf8Bytes counts UTF-8 bytes.",
+				),
+			},
+			required: ["action", "question"],
+			additionalProperties: false,
+		});
+	}
 	return {
 		title: "CoordinatorQuestionAnswerV1",
 		type: "object",
@@ -190,50 +251,9 @@ export function buildCoordinatorAskAnswerSchema(
 		// so selection, custom-answer, and clarification payloads were all rejected
 		// client-side before the server saw them (#5801). Each branch stays closed too,
 		// so the union still rejects field combinations this map alone would allow.
-		properties: {
-			selected: selectedBase,
-			other: { type: "boolean", description: "set true to provide a free-text answer in `custom`" },
-			custom: boundedAnswerText("free-text answer; required when `other` is true"),
-			action: {
-				type: "string",
-				enum: ["answer", "clarify"],
-				description: "set to `clarify` to ask about the choices without answering the round",
-			},
-			question: boundedAnswerText("clarification question; required when action is `clarify`"),
-		},
+		properties,
 		additionalProperties: false,
-		oneOf: [
-			{
-				type: "object",
-				properties: { selected: selectedOnly, other: { const: false }, action: { const: "answer" } },
-				required: ["selected"],
-				additionalProperties: false,
-			},
-			{
-				type: "object",
-				properties: {
-					selected: selectedWithOther,
-					other: { const: true },
-					custom: boundedAnswerText(
-						"At least one non-whitespace character; maxLength counts Unicode code points and x-maxUtf8Bytes counts UTF-8 bytes.",
-					),
-					action: { const: "answer" },
-				},
-				required: ["selected", "other", "custom"],
-				additionalProperties: false,
-			},
-			{
-				type: "object",
-				properties: {
-					action: { const: "clarify" },
-					question: boundedAnswerText(
-						"At least one non-whitespace character; maxLength counts Unicode code points and x-maxUtf8Bytes counts UTF-8 bytes.",
-					),
-				},
-				required: ["action", "question"],
-				additionalProperties: false,
-			},
-		],
+		oneOf,
 	};
 }
 
@@ -273,15 +293,19 @@ export function decodeAskGateV1(gate: WorkflowGate): PrivateAskGateCodecV1 | nul
 	if (!validStageState(gate.context.stage_state, labels)) return null;
 	const multi = gate.context.stage_state.multi as boolean;
 	const allowEmpty = gate.context.stage_state.allow_empty as boolean;
-	if (gate.schema_hash !== schemaHash(askSchema(labels, multi, allowEmpty))) return null;
+	const approvalGate = gate.stage === "ralplan" && gate.kind === "approval";
+	const otherAllowed = !approvalGate;
+	const clarificationAllowed = !approvalGate;
+	if (gate.schema_hash !== schemaHash(askSchema(labels, multi, allowEmpty, otherAllowed, clarificationAllowed)))
+		return null;
 	return {
 		schema_version: 1,
 		labels,
 		recommended_index: recommendedIndex,
 		multi,
 		allow_empty: allowEmpty,
-		other_allowed: true,
-		clarification_allowed: true,
+		other_allowed: otherAllowed,
+		clarification_allowed: clarificationAllowed,
 	};
 }
 export function projectAskGateQuestion(input: {
@@ -315,12 +339,14 @@ export function projectAskGateQuestion(input: {
 			label,
 			recommended: input.codec.recommended_index === index,
 		})),
-		other_allowed: true,
-		clarification_allowed: true,
+		other_allowed: input.codec.other_allowed,
+		clarification_allowed: input.codec.clarification_allowed,
 		answer_schema: buildCoordinatorAskAnswerSchema(
 			input.codec.labels.map((_label, index) => `opt_${index}`),
 			input.codec.multi,
 			input.codec.allow_empty,
+			input.codec.other_allowed,
+			input.codec.clarification_allowed,
 		),
 		created_at: input.created_at,
 		updated_at: input.updated_at,
@@ -335,7 +361,9 @@ export function validateCoordinatorAskAnswer(
 ): CoordinatorAskAnswerV1 | null {
 	if (!isRecord(answer)) return null;
 	if (answer.action === "clarify")
-		return sameKeys(answer, ["action", "question"]) && boundedText(answer.question, MAX_TEXT)
+		return codec.clarification_allowed &&
+			sameKeys(answer, ["action", "question"]) &&
+			boundedText(answer.question, MAX_TEXT)
 			? { action: "clarify", question: answer.question }
 			: null;
 	if (
@@ -352,7 +380,7 @@ export function validateCoordinatorAskAnswer(
 	)
 		return null;
 	if (answer.other === true)
-		return answer.selected.length === 0 && boundedText(answer.custom, MAX_TEXT)
+		return codec.other_allowed && answer.selected.length === 0 && boundedText(answer.custom, MAX_TEXT)
 			? { selected: [], other: true, custom: answer.custom }
 			: null;
 	if (

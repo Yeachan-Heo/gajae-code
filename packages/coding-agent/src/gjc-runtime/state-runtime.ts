@@ -46,6 +46,7 @@ import {
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
+import { verifyRalplanReviewAttestation } from "./ralplan-reviewer-capability";
 import {
 	activeSnapshotPath,
 	auditPath,
@@ -2188,6 +2189,7 @@ interface NonCrystalExecutionApprovalRecord {
 	transcript_path: string;
 	transcript_sha256: string;
 	transcript_boundary: ExecutionApprovalTranscriptBoundary;
+	review_index_sha256?: string;
 	created_at: string;
 	expires_at: string;
 }
@@ -2198,6 +2200,7 @@ export interface ExecutionApprovalPresentation {
 	artifact_path: string;
 	artifact_sha256: string;
 	run_id: string | null;
+	review_index_sha256?: string;
 }
 
 export function nonCrystalExecutionApprovalRecordPath(
@@ -2208,24 +2211,48 @@ export function nonCrystalExecutionApprovalRecordPath(
 	return path.join(sessionStateDir(cwd, sessionId), `${stage}-ordinary-execution-approval.json`);
 }
 
-async function nonCrystalApprovalPublication(cwd: string, sessionId: string, stage: ExecutionApprovalStage) {
+async function nonCrystalApprovalPublication(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+	allowHandoff = false,
+	expectedReviewIndexSha256?: string,
+) {
 	if ((await executionApprovalLineage(cwd, sessionId, stage)) !== "ordinary")
 		throw new StateCommandError(2, "ordinary execution approval cannot authorize Crystal lineage");
 	const statePath = modeStateFile(cwd, stage, sessionId);
 	const read = await readExistingStateForMutation(statePath);
 	if (read.kind !== "valid") throw new StateCommandError(2, "execution approval state is unavailable");
 	const state = read.value;
-	if (state.active !== true || !["final", "handoff"].includes(String(state.current_phase)))
+	const phaseIsAllowed =
+		stage === "deep-interview"
+			? ["final", "handoff"].includes(String(state.current_phase))
+			: state.current_phase === "final" || (allowHandoff && state.current_phase === "handoff");
+	if (state.active !== true || !phaseIsAllowed)
 		throw new StateCommandError(2, "execution approval requires an active final publication");
 	if (stage === "ralplan") {
 		const final = await verifiedRalplanFinalEvidence(cwd, sessionId, state);
 		if (!final) throw new StateCommandError(2, "execution approval requires verified Ralplan final evidence");
+		let reviewIndexSha256: string;
+		if (expectedReviewIndexSha256 !== undefined) {
+			const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
+			reviewIndexSha256 = (await currentRalplanReviewIndexSha256(cwd, sessionId, final.runId)) ?? "";
+			if (
+				admission?.effectiveTarget !== "off" ||
+				!isSha256(expectedReviewIndexSha256) ||
+				reviewIndexSha256 !== expectedReviewIndexSha256
+			)
+				throw new StateCommandError(2, "Ralplan execution approval review ledger is stale or no longer matches");
+		} else {
+			reviewIndexSha256 = await assertRalplanManualApprovalReadiness(cwd, sessionId, state, final);
+		}
 		return {
 			state_path: final.statePath,
 			state_revision: final.stateRevision,
 			artifact_path: final.finalPath,
 			artifact_sha256: final.finalSha256,
 			run_id: final.runId,
+			review_index_sha256: reviewIndexSha256,
 		};
 	}
 	await assertDeepInterviewHandoffReady(state, { cwd, sessionId, statePath });
@@ -2274,14 +2301,18 @@ export async function captureExecutionApprovalPresentation(
 		const ralplanRead = await readExistingStateForMutation(modeStateFile(cwd, "ralplan", sessionId));
 		if (ralplanRead.kind !== "valid")
 			throw new StateCommandError(2, "Ralplan execution approval requires valid final state");
+		if (ralplanRead.value.active !== true || ralplanRead.value.current_phase !== "final")
+			throw new StateCommandError(2, "Ralplan execution approval requires current final plan");
 		const final = await verifiedRalplanFinalEvidence(cwd, sessionId, ralplanRead.value);
 		if (!final) throw new StateCommandError(2, "execution approval requires verified Ralplan final evidence");
+		const reviewIndexSha256 = await assertRalplanManualApprovalReadiness(cwd, sessionId, ralplanRead.value, final);
 		return {
 			state_path: path.resolve(statePath),
 			state_revision: existingStateRevision(envelope)!,
 			artifact_path: final.finalPath,
 			artifact_sha256: final.finalSha256,
 			run_id: final.runId,
+			review_index_sha256: reviewIndexSha256,
 		};
 	}
 	if (typeof envelope.spec_path !== "string" || !isSha256(envelope.spec_sha256))
@@ -2382,6 +2413,7 @@ async function readNonCrystalApproval(
 		typeof value.transcript_path !== "string" ||
 		!path.isAbsolute(value.transcript_path) ||
 		!isSha256(value.transcript_sha256) ||
+		(stage === "ralplan" ? !isSha256(value.review_index_sha256) : value.review_index_sha256 !== undefined) ||
 		!isExecutionApprovalTranscriptBoundary(value.transcript_boundary) ||
 		typeof value.expires_at !== "string" ||
 		!Number.isFinite(Date.parse(value.expires_at))
@@ -2477,8 +2509,8 @@ async function assertNonCrystalApprovalCurrent(
 	const record = await readNonCrystalApproval(cwd, sessionId, stage);
 	if (!record || record.status !== status || (status === "pending" && Date.parse(record.expires_at) <= Date.now()))
 		throw new StateCommandError(2, "ordinary execution approval is missing, expired or consumed");
-	const publication = await nonCrystalApprovalPublication(cwd, sessionId, stage);
-	for (const key of ["state_path", "artifact_path", "artifact_sha256", "run_id"] as const)
+	const publication = await nonCrystalApprovalPublication(cwd, sessionId, stage, true, record.review_index_sha256);
+	for (const key of ["state_path", "artifact_path", "artifact_sha256", "run_id", "review_index_sha256"] as const)
 		if (record[key] !== publication[key])
 			throw new StateCommandError(2, "ordinary execution approval publication is stale");
 	if (record.state_revision !== publication.state_revision) {
@@ -2557,6 +2589,7 @@ export interface DeepInterviewExecutionApprovalRecord {
 	ralplan_run_id?: string;
 	ralplan_final_path?: string;
 	ralplan_final_sha256?: string;
+	ralplan_review_index_sha256?: string;
 	created_at: string;
 	expires_at: string;
 	consumed_at?: string;
@@ -2605,6 +2638,7 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 		"ralplan_run_id",
 		"ralplan_final_path",
 		"ralplan_final_sha256",
+		"ralplan_review_index_sha256",
 		"created_at",
 		"expires_at",
 		"consumed_at",
@@ -2673,7 +2707,8 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 			!isExecutionApprovalId(value.ralplan_run_id) ||
 			typeof value.ralplan_final_path !== "string" ||
 			!path.isAbsolute(value.ralplan_final_path) ||
-			!isSha256(value.ralplan_final_sha256))
+			!isSha256(value.ralplan_final_sha256) ||
+			!isSha256(value.ralplan_review_index_sha256))
 	)
 		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
 	if (
@@ -2684,6 +2719,7 @@ function assertExecutionApprovalRecordShape(value: unknown): asserts value is De
 			value.ralplan_run_id,
 			value.ralplan_final_path,
 			value.ralplan_final_sha256,
+			value.ralplan_review_index_sha256,
 		].some(field => field !== undefined)
 	)
 		throw new StateCommandError(2, "deep-interview execution approval record is invalid");
@@ -2832,6 +2868,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 					handoffAt: envelope.handoff_at,
 				}));
 			let ralplanFinal: VerifiedRalplanFinalEvidence | undefined;
+			let ralplanReviewIndexSha256: string | undefined;
 			if (ralplanApproval) {
 				const ralplanPath = modeStateFile(options.cwd, "ralplan", options.sessionId);
 				const ralplanRead = await readExistingStateForMutation(ralplanPath);
@@ -2843,6 +2880,12 @@ export async function recordDeepInterviewExecutionApproval(options: {
 				ralplanFinal = await verifiedRalplanFinalEvidence(options.cwd, options.sessionId, ralplanState);
 				if (!ralplanFinal)
 					throw new StateCommandError(2, "Ralplan execution approval requires verified final plan evidence");
+				ralplanReviewIndexSha256 = await assertRalplanManualApprovalReadiness(
+					options.cwd,
+					options.sessionId,
+					ralplanState,
+					ralplanFinal,
+				);
 			}
 			if (
 				envelope.version !== WORKFLOW_STATE_VERSION ||
@@ -2896,6 +2939,8 @@ export async function recordDeepInterviewExecutionApproval(options: {
 			const currentRevision = existingStateRevision(envelope);
 			if (typeof currentRevision !== "number" || !Number.isSafeInteger(currentRevision) || currentRevision < 0)
 				throw new StateCommandError(2, "deep-interview execution approval requires a valid state revision");
+			if (ralplanFinal && !ralplanReviewIndexSha256)
+				throw new StateCommandError(2, "Ralplan execution approval requires a verified review-index digest");
 			const currentPresentation: ExecutionApprovalPresentation = ralplanFinal
 				? {
 						state_path: path.resolve(statePath),
@@ -2903,6 +2948,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 						artifact_path: ralplanFinal.finalPath,
 						artifact_sha256: ralplanFinal.finalSha256,
 						run_id: ralplanFinal.runId,
+						review_index_sha256: ralplanReviewIndexSha256,
 					}
 				: {
 						state_path: path.resolve(statePath),
@@ -2952,6 +2998,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 							ralplan_run_id: ralplanFinal.runId,
 							ralplan_final_path: ralplanFinal.finalPath,
 							ralplan_final_sha256: ralplanFinal.finalSha256,
+							ralplan_review_index_sha256: ralplanReviewIndexSha256,
 						}
 					: {}),
 				created_at: now,
@@ -3323,9 +3370,9 @@ async function assertSanctionedExecutionApprovalAudit(
 		try {
 			parsed = JSON.parse(line);
 		} catch {
-			return false;
+			return undefined;
 		}
-		if (!isPlainObject(parsed)) return false;
+		if (!isPlainObject(parsed)) return undefined;
 		const paths = Array.isArray(parsed.paths)
 			? parsed.paths.filter((value): value is string => typeof value === "string")
 			: [];
@@ -3656,6 +3703,244 @@ interface VerifiedRalplanFinalEvidence {
 	finalSha256: string;
 }
 
+interface RalplanPlannerReference {
+	stage_n: number;
+	path: string;
+	sha256: string;
+}
+
+interface RalplanReviewReceipt {
+	valid: boolean;
+	verdict: string | undefined;
+	decision: string | undefined;
+}
+
+function parseRalplanPlannerReference(value: unknown): RalplanPlannerReference | undefined {
+	if (!isPlainObject(value)) return undefined;
+	if (
+		typeof value.stage_n !== "number" ||
+		!Number.isSafeInteger(value.stage_n) ||
+		value.stage_n < 1 ||
+		value.stage_n > 999 ||
+		typeof value.path !== "string" ||
+		!path.isAbsolute(value.path) ||
+		typeof value.sha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(value.sha256)
+	)
+		return undefined;
+	return { stage_n: value.stage_n, path: path.resolve(value.path), sha256: value.sha256 };
+}
+
+function sameRalplanPlannerReference(value: unknown, expected: RalplanPlannerReference): boolean {
+	const reference = parseRalplanPlannerReference(value);
+	return (
+		reference !== undefined &&
+		reference.stage_n === expected.stage_n &&
+		reference.path === expected.path &&
+		reference.sha256 === expected.sha256
+	);
+}
+
+async function verifiedRalplanStageReference(
+	runDir: string,
+	row: Record<string, unknown>,
+): Promise<RalplanPlannerReference | undefined> {
+	const stage = row.stage;
+	const reference = parseRalplanPlannerReference({ stage_n: row.stage_n, path: row.path, sha256: row.sha256 });
+	if (!reference || typeof stage !== "string") return undefined;
+	const relative = path.relative(path.resolve(runDir), reference.path);
+	if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+		return undefined;
+	const canonicalPath = path.resolve(runDir, `stage-${String(reference.stage_n).padStart(2, "0")}-${stage}.md`);
+	if (reference.path !== canonicalPath) return undefined;
+	try {
+		return (await hashIdentityFile(reference.path, "ralplan review artifact")) === reference.sha256
+			? reference
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function hasVerifiedRalplanApprovalReviewJoin(
+	cwd: string,
+	sessionId: string,
+	finalEvidence: VerifiedRalplanFinalEvidence,
+): Promise<string | undefined> {
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", finalEvidence.runId);
+	const indexPath = path.join(runDir, "index.jsonl");
+	let indexText: string | undefined;
+	try {
+		indexText = await readBoundedIdentityText(indexPath, 1024 * 1024, "ralplan approval review index");
+	} catch {
+		return undefined;
+	}
+	if (indexText === undefined) return undefined;
+
+	let planner: RalplanPlannerReference | undefined;
+	let architect: RalplanReviewReceipt | undefined;
+	let critic: RalplanReviewReceipt | undefined;
+	type ReviewRowFingerprint = {
+		path?: string;
+		sha256?: string;
+		reviewed_planner?: string;
+		lane_verdict?: string;
+		architect_decision?: string;
+		reviewer_identity?: string;
+	};
+	const reviewRowFingerprints = new Map<string, ReviewRowFingerprint>();
+	let finalJoin:
+		| {
+				stageN: number;
+				planner: RalplanPlannerReference | undefined;
+				finalPlanner: RalplanPlannerReference | undefined;
+				architect: RalplanReviewReceipt | undefined;
+				critic: RalplanReviewReceipt | undefined;
+		  }
+		| undefined;
+	for (const line of indexText.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			return undefined;
+		}
+		if (!isPlainObject(parsed)) return undefined;
+		const row = parsed;
+		if (row.stage === "planner" || row.stage === "revision") {
+			planner = await verifiedRalplanStageReference(runDir, row);
+			architect = undefined;
+			critic = undefined;
+			reviewRowFingerprints.clear();
+			finalJoin = undefined;
+			continue;
+		}
+		if ((row.stage === "architect" || row.stage === "critic") && planner && row.stage_n === planner.stage_n) {
+			const reviewKey = `${row.stage}\u0000${row.stage_n}`;
+			const reviewedPlanner = parseRalplanPlannerReference(row.reviewed_planner);
+			const reviewerAttestation = isPlainObject(row.reviewer_attestation) ? row.reviewer_attestation : undefined;
+			const fingerprint: ReviewRowFingerprint = {
+				...(typeof row.path === "string" ? { path: path.resolve(row.path) } : {}),
+				...(typeof row.sha256 === "string" ? { sha256: row.sha256 } : {}),
+				...(reviewedPlanner ? { reviewed_planner: JSON.stringify(reviewedPlanner) } : {}),
+				...(typeof row.lane_verdict === "string" ? { lane_verdict: row.lane_verdict } : {}),
+				...(typeof row.architect_decision === "string" ? { architect_decision: row.architect_decision } : {}),
+				...(typeof reviewerAttestation?.role === "string" && typeof reviewerAttestation.agent_id === "string"
+					? { reviewer_identity: `${reviewerAttestation.role}\u0000${reviewerAttestation.agent_id}` }
+					: {}),
+			};
+			const previousFingerprint = reviewRowFingerprints.get(reviewKey);
+			if (
+				previousFingerprint &&
+				((previousFingerprint.path !== undefined &&
+					fingerprint.path !== undefined &&
+					previousFingerprint.path !== fingerprint.path) ||
+					(previousFingerprint.sha256 !== undefined &&
+						fingerprint.sha256 !== undefined &&
+						previousFingerprint.sha256 !== fingerprint.sha256) ||
+					(previousFingerprint.reviewed_planner !== undefined &&
+						fingerprint.reviewed_planner !== undefined &&
+						previousFingerprint.reviewed_planner !== fingerprint.reviewed_planner) ||
+					(previousFingerprint.lane_verdict !== undefined &&
+						fingerprint.lane_verdict !== undefined &&
+						previousFingerprint.lane_verdict !== fingerprint.lane_verdict) ||
+					(previousFingerprint.architect_decision !== undefined &&
+						fingerprint.architect_decision !== undefined &&
+						previousFingerprint.architect_decision !== fingerprint.architect_decision) ||
+					(previousFingerprint.reviewer_identity !== undefined &&
+						fingerprint.reviewer_identity !== undefined &&
+						previousFingerprint.reviewer_identity !== fingerprint.reviewer_identity))
+			)
+				return undefined;
+			reviewRowFingerprints.set(reviewKey, { ...previousFingerprint, ...fingerprint });
+			const receipt: RalplanReviewReceipt = {
+				valid:
+					sameRalplanPlannerReference(row.reviewed_planner, planner) &&
+					(await verifiedRalplanStageReference(runDir, row)) !== undefined &&
+					verifyRalplanReviewAttestation(
+						{
+							sessionId,
+							runId: finalEvidence.runId,
+							stage: row.stage,
+							stageN: typeof row.stage_n === "number" ? row.stage_n : -1,
+							artifactPath: typeof row.path === "string" ? path.resolve(row.path) : "",
+							artifactSha256: typeof row.sha256 === "string" ? row.sha256 : "",
+							reviewedPlanner,
+							laneVerdict: typeof row.lane_verdict === "string" ? row.lane_verdict : "",
+							architectDecision: typeof row.architect_decision === "string" ? row.architect_decision : undefined,
+						},
+						row.reviewer_attestation,
+					),
+				verdict: typeof row.lane_verdict === "string" ? row.lane_verdict : undefined,
+				decision: typeof row.architect_decision === "string" ? row.architect_decision : undefined,
+			};
+			if (row.stage === "architect") {
+				architect = receipt;
+				if (
+					finalJoin?.stageN === row.stage_n &&
+					finalJoin.planner &&
+					sameRalplanPlannerReference(finalJoin.planner, planner) &&
+					sameRalplanPlannerReference(finalJoin.finalPlanner, planner)
+				)
+					finalJoin = { ...finalJoin, architect: receipt };
+			} else {
+				critic = receipt;
+				if (
+					finalJoin?.stageN === row.stage_n &&
+					finalJoin.planner &&
+					sameRalplanPlannerReference(finalJoin.planner, planner) &&
+					sameRalplanPlannerReference(finalJoin.finalPlanner, planner)
+				)
+					finalJoin = { ...finalJoin, critic: receipt };
+			}
+			continue;
+		}
+		if (row.stage === "final") {
+			const finalPath = typeof row.path === "string" ? path.resolve(row.path) : undefined;
+			const finalSha = typeof row.sha256 === "string" ? row.sha256 : undefined;
+			if (finalPath === finalEvidence.finalPath && finalSha === finalEvidence.finalSha256) {
+				finalJoin = {
+					stageN: typeof row.stage_n === "number" ? row.stage_n : -1,
+					planner,
+					finalPlanner: parseRalplanPlannerReference(row.reviewed_planner),
+					architect,
+					critic,
+				};
+			}
+		}
+	}
+	const validJoin = Boolean(
+		finalJoin?.planner &&
+			finalJoin.stageN === finalJoin.planner.stage_n &&
+			sameRalplanPlannerReference(finalJoin.finalPlanner, finalJoin.planner) &&
+			finalJoin.architect?.valid === true &&
+			finalJoin.architect.verdict === "CLEAR" &&
+			finalJoin.architect.decision === "APPROVE" &&
+			finalJoin.critic?.valid === true &&
+			finalJoin.critic?.verdict === "OKAY",
+	);
+	return validJoin ? createHash("sha256").update(indexText).digest("hex") : undefined;
+}
+
+async function assertRalplanManualApprovalReadiness(
+	cwd: string,
+	sessionId: string,
+	state: Record<string, unknown>,
+	finalEvidence: VerifiedRalplanFinalEvidence,
+): Promise<string> {
+	const admission = isPlainObject(state.auto_handoff) ? state.auto_handoff : undefined;
+	if (admission?.effectiveTarget !== "off")
+		throw new StateCommandError(2, "manual Ralplan execution approval requires effectiveTarget off");
+	const reviewIndexSha256 = await hasVerifiedRalplanApprovalReviewJoin(cwd, sessionId, finalEvidence);
+	if (!reviewIndexSha256)
+		throw new StateCommandError(
+			2,
+			"Ralplan execution approval requires a verified same-pass Architect/Critic review join",
+		);
+	return reviewIndexSha256;
+}
+
 async function hasDurableRalplanPlanningStuck(
 	cwd: string,
 	sessionId: string,
@@ -3710,6 +3995,17 @@ async function verifiedRalplanFinalEvidence(
 	const ralplanPath = modeStateFile(cwd, "ralplan", sessionId);
 	const receipt = persistedWorkflowReceipt(state.receipt, "ralplan");
 	const checksum = receipt?.content_sha256;
+	// Duplicate review artifacts may enrich legacy lane metadata after publication.
+	// These run-bound writers preserve the admission fields while refreshing the
+	// envelope checksum, so their receipts remain valid provenance for the final.
+	const reviewMetadataReceipt =
+		receipt?.owner === "gjc-runtime" &&
+		[
+			"gjc ralplan planner-state",
+			"gjc ralplan architect-state",
+			"gjc ralplan critic-state",
+			"gjc ralplan lane-verdict",
+		].includes(receipt.command ?? "");
 	const phaseMarker = isPlainObject(state.final_admission_phase_transition)
 		? state.final_admission_phase_transition
 		: undefined;
@@ -3720,6 +4016,7 @@ async function verifiedRalplanFinalEvidence(
 		(receipt.command === "gjc state ralplan write" || receipt.command === "gjc state ralplan handoff --to ultragoal");
 	if (
 		(!phaseTransitionReceipt &&
+			!reviewMetadataReceipt &&
 			(receipt?.owner !== "gjc-runtime" || receipt.command !== "gjc ralplan final-admission")) ||
 		checksum?.algorithm !== "sha256" ||
 		typeof checksum.value !== "string" ||
@@ -3743,6 +4040,7 @@ async function verifiedRalplanFinalEvidence(
 		return undefined;
 	}
 	let finalRow: Record<string, unknown> | undefined;
+	let planningReopenedAfterFinal = false;
 	let planningStuck = false;
 	for (const line of indexText.split(/\r?\n/)) {
 		if (!line.trim()) continue;
@@ -3753,10 +4051,15 @@ async function verifiedRalplanFinalEvidence(
 			return undefined;
 		}
 		if (!isPlainObject(parsed)) return undefined;
-		if (parsed.stage === "final") finalRow = parsed;
+		if (parsed.stage === "planner" || parsed.stage === "revision") {
+			if (finalRow) planningReopenedAfterFinal = true;
+		} else if (parsed.stage === "final") {
+			finalRow = parsed;
+			planningReopenedAfterFinal = false;
+		}
 		if (parsed.planning_stuck === true || parsed.event === "planning_stuck") planningStuck = true;
 	}
-	if (planningStuck || isPlainObject(state.planning_stuck)) return undefined;
+	if (planningStuck || planningReopenedAfterFinal || isPlainObject(state.planning_stuck)) return undefined;
 	const indexedAdmission = isPlainObject(finalRow?.auto_handoff) ? finalRow.auto_handoff : undefined;
 	if (
 		!finalRow ||
@@ -3805,6 +4108,21 @@ async function hasSanctionedRalplanFinalAdmission(
 	);
 }
 
+async function currentRalplanReviewIndexSha256(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+): Promise<string | undefined> {
+	try {
+		assertSafePathComponent(runId, "ralplan run-id");
+		const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
+		const text = await readBoundedIdentityText(indexPath, 1024 * 1024, "ralplan approval review index");
+		return text === undefined ? undefined : createHash("sha256").update(text).digest("hex");
+	} catch {
+		return undefined;
+	}
+}
+
 /** Whether a verified automatic Ultragoal admission already authorizes handoff. */
 export async function hasSanctionedRalplanFinalAdmissionForHandoff(cwd: string, sessionId: string): Promise<boolean> {
 	const read = await readExistingStateForMutation(modeStateFile(cwd, "ralplan", sessionId));
@@ -3827,6 +4145,14 @@ async function assertRalplanApprovalRecordCurrent(
 	}
 	const evidence = await verifiedRalplanFinalEvidence(cwd, sessionId, ralplanState);
 	if (!evidence) throw new StateCommandError(2, "Ralplan execution approval final evidence is unavailable");
+	const admission = isPlainObject(ralplanState.auto_handoff) ? ralplanState.auto_handoff : undefined;
+	const reviewIndexSha256 = await currentRalplanReviewIndexSha256(cwd, sessionId, evidence.runId);
+	if (
+		admission?.effectiveTarget !== "off" ||
+		!reviewIndexSha256 ||
+		reviewIndexSha256 !== record.ralplan_review_index_sha256
+	)
+		throw new StateCommandError(2, "Ralplan execution approval review ledger is stale or no longer matches");
 	if (
 		record.ralplan_state_path !== evidence.statePath ||
 		record.ralplan_run_id !== evidence.runId ||

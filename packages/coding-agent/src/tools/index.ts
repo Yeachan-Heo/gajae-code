@@ -41,6 +41,7 @@ import {
 import { resolveEvalBackends } from "./eval-backends";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import type { TodoPhase } from "./todo-write";
+import { markBuiltinAskTool } from "./ultragoal-ask-guard";
 
 export type { LspStartupServerInfo } from "../lsp";
 export type { BashToolDetails, BashToolInput } from "./bash";
@@ -136,6 +137,7 @@ export type AskSettlement =
 				| "invalid_option"
 				| "invalid_control"
 				| "invalid_structured_answer"
+				| "invalid_workflow_gate_answer"
 				| "empty_custom"
 				| "empty_clarification";
 	  };
@@ -232,6 +234,8 @@ export interface ToolSession {
 	taskDepth?: number;
 	/** Current role-agent type/name for nested task sessions. */
 	currentAgentType?: string;
+	/** @internal Opaque capability passed only to trusted Ralplan review-lane Bash children. */
+	ralplanReviewerCapability?: string;
 	/** Get session file */
 	getSessionFile: () => string | null;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
@@ -666,14 +670,15 @@ export async function createTools(
 			descriptor.metadata.loadMode === "discoverable" &&
 			!selectedDiscoveredNames.has(name.toLowerCase());
 		if (defer) {
-			return wrapToolWithMetaNotice(
-				new LazyAgentTool(descriptor, undefined, () => descriptor.load(session), session),
-			);
+			const lazyTool = new LazyAgentTool(descriptor, undefined, () => descriptor.load(session), session);
+			if (descriptor === BUILTIN_TOOL_DESCRIPTORS.ask) markBuiltinAskTool(lazyTool);
+			return wrapToolWithMetaNotice(lazyTool);
 		}
 		const materialized = await logger.time(`createTools:${name}`, descriptor.load, session);
-		return materialized
-			? wrapToolWithMetaNotice(new LazyAgentTool(descriptor, materialized, undefined, session))
-			: null;
+		if (!materialized) return null;
+		const lazyTool = new LazyAgentTool(descriptor, materialized, undefined, session);
+		if (descriptor === BUILTIN_TOOL_DESCRIPTORS.ask) markBuiltinAskTool(lazyTool);
+		return wrapToolWithMetaNotice(lazyTool);
 	};
 	const tools: LazyAgentTool[] = [];
 	for (const entry of baseEntries) {

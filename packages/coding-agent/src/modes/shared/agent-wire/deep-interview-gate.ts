@@ -139,10 +139,13 @@ export function buildAskGateStageState(question: AskGateQuestion, labels: string
 /** Build the `workflow_gate` open-input for one ask question. */
 export function questionToGate(question: AskGateQuestion): OpenGateInput {
 	const labels = question.options.map(o => o.label);
+	const isRalplanApproval = question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval";
 	const schema = buildAskGateAnswerSchema(
 		{
 			multi: question.multi,
 			allowEmpty: question.allowEmpty,
+			allowOther: !isRalplanApproval,
+			allowClarification: !isRalplanApproval,
 			customMaxLength:
 				question.deepInterview || isDeepInterviewAskQuestion(question.question)
 					? MAX_USER_RESPONSE_LENGTH

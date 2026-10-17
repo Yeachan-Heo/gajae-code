@@ -615,6 +615,8 @@ export interface CreateAgentSessionOptions {
 	taskDepth?: number;
 	/** Current role-agent type/name for nested task sessions. */
 	currentAgentType?: string;
+	/** @internal Opaque capability used only by trusted Architect/Critic Ralplan subprocesses. */
+	ralplanReviewerCapability?: string;
 	/** Parent Hindsight state to alias for subagent private memory backend compatibility. */
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Pre-allocated agent identity for IRC routing. Default: "0-Main" for top-level, parentTaskPrefix-derived for sub. */
@@ -3293,6 +3295,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			isFastForSubagentProvider: (provider, supportsServiceTier) =>
 				session?.isFastForSubagentProvider(provider, supportsServiceTier) ?? false,
 			getAgentId: () => resolvedAgentId,
+			ralplanReviewerCapability: options.ralplanReviewerCapability,
 			bashAllowedPrefixes: options.bashAllowedPrefixes,
 			bashRestrictionProfile: options.bashRestrictionProfile,
 			goalToolAllowedOps: options.goalToolAllowedOps,
@@ -5172,6 +5175,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					() => sessionManager.getCwd(),
 					() => ({ sessionId: sessionManager.getSessionId?.() ?? null }),
 					() => session?.getSessionAgentDir(),
+					builtinToolIdentities.has(tool),
 				),
 			);
 

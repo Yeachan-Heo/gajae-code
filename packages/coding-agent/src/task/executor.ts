@@ -268,6 +268,8 @@ export interface ExecutorOptions {
 	/** Parent session's model profile ownership marker for propagating to subagent sessions. */
 	parentModelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
 	parentSessionId?: string;
+	/** Opaque dispatcher-minted capability for a trusted Architect/Critic Ralplan lane. */
+	ralplanReviewerCapability?: string;
 	parentCredentialSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
@@ -2117,6 +2119,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
 					currentAgentType: agent.name,
+					ralplanReviewerCapability: options.preflightProbe ? undefined : options.ralplanReviewerCapability,
 					gjcSubskillToolContext: {
 						cwd,
 						sessionId: options.parentSessionId,

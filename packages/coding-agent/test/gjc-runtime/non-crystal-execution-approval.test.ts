@@ -1,9 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolContext } from "@gajae-code/agent-core";
+import type { AgentTool, AgentToolContext } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai/types";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
@@ -11,8 +11,22 @@ import {
 	authoritativeConversationSnapshot,
 	runNativeDeepInterviewCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import {
+	clearRalplanReviewerCapabilities,
+	GJC_RALPLAN_REVIEWER_CAPABILITY_ENV,
+	GJC_RALPLAN_REVIEWER_ID_ENV,
+	GJC_RALPLAN_REVIEWER_ROLE_ENV,
+	getOrCreateRalplanReviewerCapability,
+	type RalplanReviewerRole,
+} from "@gajae-code/coding-agent/gjc-runtime/ralplan-reviewer-capability";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
-import { auditPath, modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "@gajae-code/coding-agent/gjc-runtime/restricted-role-agent-bash";
+import {
+	auditPath,
+	modeStatePath,
+	sessionPlansDir,
+	sessionStateDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	captureExecutionApprovalPresentation,
 	DEEP_INTERVIEW_EXECUTION_APPROVAL_MAX_AGE_MS,
@@ -24,9 +38,17 @@ import {
 	recordNonCrystalExecutionApproval,
 	runNativeStateCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { isUltragoalAskBlocked } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
+import { createUltragoalPlan, getUltragoalPaths } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
+import {
+	formatRalplanUltragoalApprovalQuestion,
+	guardToolForUltragoalAsk,
+} from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
+import { ExtensionToolWrapper } from "../../src/extensibility/extensions/wrapper";
 
 let askInvocationCounter = 0;
 
@@ -50,6 +72,34 @@ function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	};
 }
 
+async function withRalplanReviewer<T>(
+	sessionId: string,
+	role: RalplanReviewerRole,
+	agentId: string,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const names = [
+		GJC_RESTRICTED_ROLE_AGENT_BASH_ENV,
+		GJC_RALPLAN_REVIEWER_ROLE_ENV,
+		GJC_RALPLAN_REVIEWER_ID_ENV,
+		GJC_RALPLAN_REVIEWER_CAPABILITY_ENV,
+	] as const;
+	const previous = new Map(names.map(name => [name, process.env[name]]));
+	process.env[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV] = "1";
+	process.env[GJC_RALPLAN_REVIEWER_ROLE_ENV] = role;
+	process.env[GJC_RALPLAN_REVIEWER_ID_ENV] = agentId;
+	process.env[GJC_RALPLAN_REVIEWER_CAPABILITY_ENV] = getOrCreateRalplanReviewerCapability(sessionId, role, agentId);
+	try {
+		return await operation();
+	} finally {
+		for (const name of names) {
+			const value = previous.get(name);
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+}
+
 async function withSession(fn: (cwd: string, manager: SessionManager, sessionId: string) => Promise<void>) {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-execution-approval-"));
 	const oldId = process.env.GJC_SESSION_ID;
@@ -66,6 +116,7 @@ async function withSession(fn: (cwd: string, manager: SessionManager, sessionId:
 		await fn(cwd, manager, manager.getSessionId());
 	} finally {
 		await manager.close();
+		clearRalplanReviewerCapabilities(manager.getSessionId());
 		if (oldId === undefined) delete process.env.GJC_SESSION_ID;
 		else process.env.GJC_SESSION_ID = oldId;
 		if (oldFile === undefined) delete process.env.GJC_SESSION_FILE;
@@ -75,42 +126,108 @@ async function withSession(fn: (cwd: string, manager: SessionManager, sessionId:
 }
 
 async function publish(cwd: string, sessionId: string, stage: ExecutionApprovalStage, version = 1) {
-	const result =
-		stage === "deep-interview"
-			? await runNativeDeepInterviewCommand(
-					[
-						"--write",
-						"--stage",
-						"final",
-						"--slug",
-						`ordinary-${version}`,
-						"--spec",
-						`# Report specification ${version}\n\nBuild a report.`,
-						"--session-id",
-						sessionId,
-						"--json",
-					],
-					cwd,
-				)
-			: await runNativeRalplanCommand(
-					[
-						"--write",
-						"--stage",
-						"final",
-						"--stage_n",
-						String(version),
-						"--artifact",
-						`# Report plan ${version}\n\nImplement and test the report.`,
-						"--run-id",
-						"ordinary-plan",
-						"--session-id",
-						sessionId,
-						"--json",
-					],
-					cwd,
-				);
+	if (stage === "ralplan") {
+		await publishReviewedRalplanFinal(cwd, sessionId, "ordinary-plan", version);
+		return JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, stage), "utf8"));
+	}
+	const result = await runNativeDeepInterviewCommand(
+		[
+			"--write",
+			"--stage",
+			"final",
+			"--slug",
+			`ordinary-${version}`,
+			"--spec",
+			`# Report specification ${version}\n\nBuild a report.`,
+			"--session-id",
+			sessionId,
+			"--json",
+		],
+		cwd,
+	);
 	expect(result.status, result.stderr).toBe(0);
 	return JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, stage), "utf8"));
+}
+
+async function publishReviewedRalplanFinal(
+	cwd: string,
+	sessionId: string,
+	runId = "reviewed-current-final",
+	stageN = 1,
+) {
+	const stages = [
+		{
+			stage: "planner",
+			artifact: "# Planner\n\nImplement and test the approved repair.",
+			extra: ["--planner-id", "1-Planner"],
+		},
+		{
+			stage: "architect",
+			artifact: "## Architectural Status\nCLEAR\n\n## Code Review Recommendation\nAPPROVE\n",
+			extra: ["--architect-id", "2-Architect", "--lane-verdict", "CLEAR", "--architect-decision", "APPROVE"],
+		},
+		{
+			stage: "critic",
+			artifact: "## Verdict\n**OKAY**\n",
+			extra: ["--critic-id", "3-Critic", "--lane-verdict", "OKAY"],
+		},
+		{
+			stage: "final",
+			artifact: `# Approved final plan ${stageN}\n\nImplement and test the approved repair.`,
+			extra: [],
+		},
+	] as const;
+	for (const row of stages) {
+		await writeRalplanStage(cwd, sessionId, runId, row.stage, stageN, row.artifact, row.extra);
+	}
+	return JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ralplan"), "utf8"));
+}
+
+async function writeRalplanStage(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	stage: string,
+	stageN: number,
+	artifact: string,
+	extra: readonly string[] = [],
+) {
+	const reviewerRole =
+		(stage === "architect" || stage === "critic") && extra.includes("--lane-verdict") ? stage : undefined;
+	const idFlag =
+		reviewerRole === "architect" ? "--architect-id" : reviewerRole === "critic" ? "--critic-id" : undefined;
+	const writeExtra = [...extra];
+	if (idFlag && !writeExtra.includes(idFlag)) writeExtra.push(idFlag, `${reviewerRole}-test-agent`);
+	const write = () =>
+		runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				stage,
+				"--stage_n",
+				String(stageN),
+				"--artifact",
+				artifact,
+				"--run-id",
+				runId,
+				"--session-id",
+				sessionId,
+				...writeExtra,
+				"--json",
+			],
+			cwd,
+		);
+	const result = await (async () => {
+		if (reviewerRole && idFlag) {
+			const idIndex = writeExtra.indexOf(idFlag);
+			const agentId = idIndex >= 0 ? writeExtra[idIndex + 1] : undefined;
+			if (!agentId) throw new Error(`Ralplan ${stage} test write requires ${idFlag}`);
+			return await withRalplanReviewer(sessionId, reviewerRole, agentId, write);
+		}
+		return await write();
+	})();
+	expect(result.status, result.stderr).toBe(0);
+	return JSON.parse(result.stdout ?? "{}");
 }
 
 async function ask(
@@ -119,9 +236,20 @@ async function ask(
 	stage: ExecutionApprovalStage,
 	id = "approve-report",
 	consumeRalplan = true,
+	guarded = false,
 ) {
 	const label = "Approve execution via ultragoal";
 	const toolCallId = `provider-${id}-${++askInvocationCounter}`;
+	let question = "Approve this published artifact for execution?";
+	if (stage === "ralplan") {
+		try {
+			const presentation = await captureExecutionApprovalPresentation(cwd, manager.getSessionId(), "ralplan");
+			const formattedQuestion = formatRalplanUltragoalApprovalQuestion(presentation);
+			if (formattedQuestion) question = formattedQuestion;
+		} catch {
+			// Forged and tampered approval cases must reach the guard to prove it fails closed.
+		}
+	}
 	const workflowGate =
 		stage === "deep-interview"
 			? { stage: "deep-interview" as const, kind: "execution" as const }
@@ -130,8 +258,10 @@ async function ask(
 		questions: [
 			{
 				id,
-				question: "Approve this published artifact for execution?",
-				options: [{ label }, { label: "Keep planning" }],
+				question,
+				options: [{ label: "Refine further" }, { label }, { label: "Stop here" }],
+				recommended: 1,
+				multi: false,
 				workflowGate,
 			},
 		],
@@ -147,7 +277,14 @@ async function ask(
 		getSessionSpawns: () => "*",
 	});
 	const context = { hasUI: true, ui: { select: async () => label }, abort: () => {} } as unknown as AgentToolContext;
-	const result = await tool.execute(toolCallId, args, undefined, undefined, context);
+	const executable = guarded
+		? (guardToolForUltragoalAsk(
+				tool as AgentTool,
+				() => cwd,
+				() => ({ sessionId: manager.getSessionId() }),
+			) as AskTool)
+		: tool;
+	const result = await executable.execute(toolCallId, args, undefined, undefined, context);
 	manager.appendMessage({
 		role: "toolResult",
 		toolCallId,
@@ -231,6 +368,658 @@ async function publishCrystal(cwd: string, sessionId: string) {
 }
 
 describe("non-Crystal user-gated execution approval", () => {
+	it("allows a same-session current-final Ralplan approval during an incomplete Ultragoal", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const presentation = await captureExecutionApprovalPresentation(cwd, sessionId, "ralplan");
+			const paths = getUltragoalPaths(cwd, sessionId);
+			const goalsBefore = await fs.readFile(paths.goalsPath, "utf8");
+			const ledgerBefore = await fs.readFile(paths.ledgerPath, "utf8");
+
+			expect(presentation.artifact_path).toContain("stage-01-final.md");
+			await expect(ask(cwd, manager, "ralplan", "ultragoal-current-final", true, true)).resolves.toBeUndefined();
+
+			const recordedApproval = await approval(cwd, sessionId, "ralplan");
+			expect(recordedApproval).toMatchObject({
+				status: "consumed",
+				artifact_path: presentation.artifact_path,
+				artifact_sha256: presentation.artifact_sha256,
+			});
+			expect(await isUltragoalAskBlocked(cwd, { sessionId })).toMatchObject({ active: true });
+			expect(await fs.readFile(paths.goalsPath, "utf8")).toBe(goalsBefore);
+			expect(await fs.readFile(paths.ledgerPath, "utf8")).toBe(ledgerBefore);
+		});
+	});
+
+	it("consumes a Ralplan approval after reviewer capabilities are cleared", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			await ask(cwd, manager, "ralplan", "approval-after-restart", false, true);
+			clearRalplanReviewerCapabilities(sessionId);
+
+			const result = await handoff(cwd, sessionId, "ralplan");
+			expect(result.status, result.stderr).toBe(0);
+			expect(JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8")).active).toBe(true);
+		});
+	});
+
+	it("keeps built-in Ask approval through SDK extension-wrapper preflight", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const presentation = await captureExecutionApprovalPresentation(cwd, sessionId, "ralplan");
+			const question = formatRalplanUltragoalApprovalQuestion(presentation);
+			if (!question) throw new Error("expected canonical Ralplan approval question");
+			const session = {
+				cwd,
+				hasUI: true,
+				settings: Settings.isolated(),
+				getSessionId: () => sessionId,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			} as unknown as ToolSession;
+			const askFacade = (await createTools(session, ["ask"])).find(tool => tool.name === "ask");
+			if (!askFacade) throw new Error("built-in Ask LazyAgentTool was not created");
+			const extensionWrappedAsk = new ExtensionToolWrapper(
+				askFacade as AgentTool,
+				{
+					hasHandlers: () => false,
+					hasToolResultMediation: () => false,
+				} as never,
+			);
+			const guarded = guardToolForUltragoalAsk(
+				extensionWrappedAsk,
+				() => cwd,
+				() => ({ sessionId }),
+				() => undefined,
+				true,
+			);
+			const context = {
+				hasUI: true,
+				ui: { select: async () => "Stop here", editor: async () => undefined },
+				abort: () => {},
+			} as unknown as AgentToolContext;
+
+			const result = await guarded.execute(
+				"production-ask-facade",
+				{
+					questions: [
+						{
+							id: "ralplan-approval",
+							question,
+							options: [
+								{ label: "Refine further" },
+								{ label: "Approve execution via ultragoal" },
+								{ label: "Stop here" },
+							],
+							recommended: 1,
+							multi: false,
+							workflowGate: { stage: "ralplan", kind: "approval" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+			expect(result.details?.question).toBe(question);
+			expect(result.details?.selectedOptions).toEqual(["Stop here"]);
+		});
+	});
+
+	it("does not present a second Ralplan approval after handoff begins", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const handoffReady = await runNativeStateCommand(
+				["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+				cwd,
+			);
+			expect(handoffReady.status, handoffReady.stderr).toBe(0);
+
+			await expect(captureExecutionApprovalPresentation(cwd, sessionId, "ralplan")).rejects.toThrow(
+				/execution approval requires an active final publication/,
+			);
+		});
+	});
+
+	it("requires runtime-recorded same-pass accepted reviews and an off admission target", async () => {
+		for (const invalidJoin of ["missing", "rejected", "mismatched", "unapproved-architect"] as const) {
+			await withSession(async (cwd, manager, sessionId) => {
+				await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+				const runId = `invalid-review-join-${invalidJoin}`;
+				if (invalidJoin !== "missing") {
+					await writeRalplanStage(cwd, sessionId, runId, "planner", 1, "# Planner\n\nPlan the repair.");
+					await writeRalplanStage(
+						cwd,
+						sessionId,
+						runId,
+						"architect",
+						invalidJoin === "mismatched" ? 2 : 1,
+						`## Architectural Status\nCLEAR\n\n## Code Review Recommendation\n${invalidJoin === "unapproved-architect" ? "COMMENT" : "APPROVE"}\n`,
+						[
+							"--lane-verdict",
+							"CLEAR",
+							"--architect-decision",
+							invalidJoin === "unapproved-architect" ? "COMMENT" : "APPROVE",
+						],
+					);
+					await writeRalplanStage(
+						cwd,
+						sessionId,
+						runId,
+						"critic",
+						invalidJoin === "mismatched" ? 2 : 1,
+						"## Verdict\n**OKAY**\n",
+						["--lane-verdict", invalidJoin === "rejected" ? "ITERATE" : "OKAY"],
+					);
+				}
+				await writeRalplanStage(cwd, sessionId, runId, "final", 1, "# Final plan\n\nPlan the repair.");
+
+				await expect(ask(cwd, manager, "ralplan", `invalid-${invalidJoin}`, false, true)).rejects.toThrow(
+					/Ultragoal try-harder nudge/,
+				);
+				expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(
+					false,
+				);
+			});
+		}
+	});
+
+	it("refuses conflicting duplicate review decisions and enriches legacy review rows", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			const runId = "duplicate-review-provenance";
+			await writeRalplanStage(cwd, sessionId, runId, "planner", 1, "# Planner\n\nPlan the repair.");
+			const architectArtifact = "## Architectural Status\nCLEAR\n\n## Code Review Recommendation\nAPPROVE\n";
+			await writeRalplanStage(cwd, sessionId, runId, "architect", 1, architectArtifact, [
+				"--lane-verdict",
+				"CLEAR",
+				"--architect-decision",
+				"APPROVE",
+			]);
+			const conflictingRetry = await withRalplanReviewer(
+				sessionId,
+				"architect",
+				"architect-test-agent",
+				async () =>
+					await runNativeRalplanCommand(
+						[
+							"--write",
+							"--stage",
+							"architect",
+							"--stage_n",
+							"1",
+							"--artifact",
+							architectArtifact,
+							"--run-id",
+							"duplicate-review-provenance",
+							"--session-id",
+							sessionId,
+							"--architect-id",
+							"architect-test-agent",
+							"--lane-verdict",
+							"CLEAR",
+							"--architect-decision",
+							"REQUEST_CHANGES",
+							"--json",
+						],
+						cwd,
+					),
+			);
+			expect(conflictingRetry.status).toBe(2);
+			expect(conflictingRetry.stderr).toContain("conflicting Architect decision");
+
+			await writeRalplanStage(cwd, sessionId, runId, "critic", 1, "## Verdict\n**OKAY**\n", [
+				"--lane-verdict",
+				"OKAY",
+			]);
+			await writeRalplanStage(cwd, sessionId, runId, "final", 1, "# Final plan\n\nPlan the repair.");
+			await expect(captureExecutionApprovalPresentation(cwd, sessionId, "ralplan")).resolves.toMatchObject({
+				run_id: runId,
+			});
+
+			const legacyRunId = "legacy-review-provenance";
+			await writeRalplanStage(cwd, sessionId, legacyRunId, "planner", 1, "# Planner\n\nPlan the repair.");
+			await writeRalplanStage(cwd, sessionId, legacyRunId, "architect", 1, architectArtifact);
+			await writeRalplanStage(cwd, sessionId, legacyRunId, "architect", 1, architectArtifact, [
+				"--lane-verdict",
+				"CLEAR",
+				"--architect-decision",
+				"APPROVE",
+			]);
+			await writeRalplanStage(cwd, sessionId, legacyRunId, "critic", 1, "## Verdict\n**OKAY**\n", [
+				"--lane-verdict",
+				"OKAY",
+			]);
+			await writeRalplanStage(cwd, sessionId, legacyRunId, "final", 1, "# Final plan\n\nPlan the repair.");
+			const legacyIndexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", legacyRunId, "index.jsonl");
+			const legacyRows = (await fs.readFile(legacyIndexPath, "utf8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			expect(legacyRows.filter(row => row.stage === "architect")).toHaveLength(2);
+			expect(legacyRows.findLast(row => row.stage === "architect")).toMatchObject({
+				lane_verdict: "CLEAR",
+				architect_decision: "APPROVE",
+				reviewed_planner: { stage_n: 1 },
+			});
+			await expect(captureExecutionApprovalPresentation(cwd, sessionId, "ralplan")).resolves.toMatchObject({
+				run_id: legacyRunId,
+			});
+		});
+	});
+
+	it("refreshes the final review join after post-publication metadata enrichment", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			const runId = "late-review-metadata-enrichment";
+			const architectArtifact = "## Architectural Status\nCLEAR\n\n## Code Review Recommendation\nAPPROVE\n";
+			await writeRalplanStage(cwd, sessionId, runId, "planner", 1, "# Planner\n\nPlan the repair.");
+			await writeRalplanStage(cwd, sessionId, runId, "architect", 1, architectArtifact);
+			await writeRalplanStage(cwd, sessionId, runId, "critic", 1, "## Verdict\n**OKAY**\n", [
+				"--lane-verdict",
+				"OKAY",
+			]);
+			await writeRalplanStage(cwd, sessionId, runId, "final", 1, "# Final plan\n\nPlan the repair.");
+			await expect(captureExecutionApprovalPresentation(cwd, sessionId, "ralplan")).rejects.toThrow(
+				/verified same-pass Architect\/Critic review join/,
+			);
+
+			await writeRalplanStage(cwd, sessionId, runId, "architect", 1, architectArtifact, [
+				"--lane-verdict",
+				"CLEAR",
+				"--architect-decision",
+				"APPROVE",
+			]);
+
+			const presentation = await captureExecutionApprovalPresentation(cwd, sessionId, "ralplan");
+			expect(presentation).toMatchObject({ run_id: runId });
+		});
+	});
+
+	it("requires the exact current-final Ralplan approval prompt outside the Ultragoal guard", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const presentation = await captureExecutionApprovalPresentation(cwd, sessionId, "ralplan");
+			const question = formatRalplanUltragoalApprovalQuestion(presentation);
+			if (!question) throw new Error("expected canonical Ralplan approval question");
+			const select = vi.fn(async () => "Approve execution via ultragoal");
+			const tool = new AskTool({
+				cwd,
+				hasUI: true,
+				settings: Settings.isolated(),
+				getSessionId: () => sessionId,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			});
+			const context = {
+				hasUI: true,
+				ui: { select, editor: async () => undefined },
+				abort: () => {},
+			} as unknown as AgentToolContext;
+			const options = [
+				{ label: "Refine further" },
+				{ label: "Approve execution via ultragoal" },
+				{ label: "Stop here" },
+			];
+
+			await expect(
+				tool.execute(
+					"generic-ralplan-approval-question",
+					{
+						questions: [
+							{
+								id: "ralplan-approval",
+								question: "Approve this plan?",
+								options,
+								recommended: 1,
+								multi: false,
+								workflowGate: { stage: "ralplan", kind: "approval" },
+							},
+						],
+					},
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/exact question and options for the current final publication/);
+
+			await expect(
+				tool.execute(
+					"extra-question-ralplan-approval",
+					{
+						questions: [
+							{
+								id: "ralplan-approval",
+								question,
+								options,
+								recommended: 1,
+								multi: false,
+								workflowGate: { stage: "ralplan", kind: "approval" },
+							},
+							{ id: "unrelated", question: "Continue?", options: [{ label: "Yes" }] },
+						],
+					},
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/must be the only question/);
+			expect(select).not.toHaveBeenCalled();
+			expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(false);
+		});
+	});
+
+	it("invalidates an earlier final review join when a Planner revision reopens planning", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			await writeRalplanStage(
+				cwd,
+				sessionId,
+				"reviewed-current-final",
+				"revision",
+				2,
+				"# Revised plan\n\nChange the repair.",
+			);
+			await writeRalplanStage(
+				cwd,
+				sessionId,
+				"reviewed-current-final",
+				"final",
+				2,
+				"# Revised final plan\n\nChange the repair.",
+			);
+
+			await expect(captureExecutionApprovalPresentation(cwd, sessionId, "ralplan")).rejects.toThrow(
+				/verified same-pass Architect\/Critic review join/,
+			);
+		});
+	});
+
+	it("does not offer manual approval for a Ralplan autoresearch admission", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: autoresearch\n");
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			const finalState = await publishReviewedRalplanFinal(cwd, sessionId);
+			expect(finalState.auto_handoff).toMatchObject({ effectiveTarget: "autoresearch" });
+
+			await expect(ask(cwd, manager, "ralplan", "autoresearch-is-not-manual-approval", false, true)).rejects.toThrow(
+				/Ultragoal try-harder nudge/,
+			);
+			expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(false);
+		});
+	});
+
+	it("reserves the approval exception for the built-in Ask tool", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const presentation = await captureExecutionApprovalPresentation(cwd, sessionId, "ralplan");
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "asked" }] }));
+			const customAsk = {
+				name: "ask",
+				description: "Extension Ask tool",
+				parameters: {},
+				execute,
+			} as unknown as AgentTool;
+			const guarded = guardToolForUltragoalAsk(
+				customAsk,
+				() => cwd,
+				() => ({ sessionId }),
+			);
+			const approvalQuestion = formatRalplanUltragoalApprovalQuestion(presentation);
+			if (!approvalQuestion) throw new Error("expected canonical Ralplan approval question");
+			const params = {
+				questions: [
+					{
+						id: "custom-ask-approval",
+						question: approvalQuestion,
+						options: [
+							{ label: "Refine further" },
+							{ label: "Approve execution via ultragoal" },
+							{ label: "Stop here" },
+						],
+						recommended: 1,
+						multi: false,
+						workflowGate: { stage: "ralplan", kind: "approval" },
+					},
+				],
+			};
+
+			await expect(guarded.execute("custom-ask-call", params)).rejects.toThrow(/Ultragoal try-harder nudge/);
+			expect(execute).not.toHaveBeenCalled();
+		});
+	});
+
+	it("does not return free-text Other answers through the Ultragoal approval exception", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const presentation = await captureExecutionApprovalPresentation(cwd, sessionId, "ralplan");
+			const question = formatRalplanUltragoalApprovalQuestion(presentation);
+			if (!question) throw new Error("expected canonical Ralplan approval question");
+			const tool = new AskTool({
+				cwd,
+				hasUI: true,
+				settings: Settings.isolated(),
+				getSessionId: () => sessionId,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			});
+			const guarded = guardToolForUltragoalAsk(
+				tool as AgentTool,
+				() => cwd,
+				() => ({ sessionId }),
+			) as AskTool;
+			const select = vi.fn(async () => "Other (type your own)");
+			const editor = vi.fn(async () => "Postgres");
+			const context = {
+				hasUI: true,
+				ui: { select, editor },
+				abort: () => {},
+			} as unknown as AgentToolContext;
+
+			await expect(
+				guarded.execute(
+					"free-text-approval-call",
+					{
+						questions: [
+							{
+								id: "approval",
+								question,
+								options: [
+									{ label: "Refine further" },
+									{ label: "Approve execution via ultragoal" },
+									{ label: "Stop here" },
+								],
+								recommended: 1,
+								multi: false,
+								workflowGate: { stage: "ralplan", kind: "approval" },
+							},
+						],
+					},
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/accepts only the listed choices, not free text/);
+			expect(select).toHaveBeenCalledTimes(1);
+			expect(editor).toHaveBeenCalledTimes(1);
+			expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(false);
+		});
+	});
+
+	it("does not let Ralplan approval labels bypass the guard without a current final", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+
+			await expect(ask(cwd, manager, "ralplan", "forged-current-final", false, true)).rejects.toThrow(
+				/Ultragoal try-harder nudge/,
+			);
+			expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(false);
+		});
+	});
+
+	it("blocks ordinary Ask when a current Ralplan final exists during Ultragoal", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const select = vi.fn(async () => "Continue");
+			const tool = new AskTool({
+				cwd,
+				hasUI: true,
+				settings: Settings.isolated(),
+				getSessionId: () => sessionId,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			});
+			const guarded = guardToolForUltragoalAsk(
+				tool as AgentTool,
+				() => cwd,
+				() => ({ sessionId }),
+			) as AskTool;
+			const context = {
+				hasUI: true,
+				ui: { select, editor: async () => undefined },
+				abort: () => {},
+			} as unknown as AgentToolContext;
+
+			await expect(
+				guarded.execute(
+					"ordinary-ask",
+					{ questions: [{ id: "ordinary", question: "Continue?", options: [{ label: "Continue" }] }] },
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/try-harder nudge/);
+			expect(select).not.toHaveBeenCalled();
+		});
+	});
+
+	it("blocks mixed-purpose options even when a current Ralplan final exists", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const select = vi.fn(async () => "Postgres");
+			const tool = new AskTool({
+				cwd,
+				hasUI: true,
+				settings: Settings.isolated(),
+				getSessionId: () => sessionId,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			});
+			const guarded = guardToolForUltragoalAsk(
+				tool as AgentTool,
+				() => cwd,
+				() => ({ sessionId }),
+			) as AskTool;
+			const context = {
+				hasUI: true,
+				ui: { select, editor: async () => undefined },
+				abort: () => {},
+			} as unknown as AgentToolContext;
+
+			await expect(
+				guarded.execute(
+					"mixed-purpose-ask",
+					{
+						questions: [
+							{
+								id: "database-choice",
+								question: "Which database should we use?",
+								options: [
+									{ label: "Postgres" },
+									{ label: "SQLite" },
+									{ label: "Approve execution via ultragoal" },
+								],
+								recommended: 1,
+								multi: false,
+								workflowGate: { stage: "ralplan", kind: "approval" },
+							},
+						],
+					},
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/Ultragoal try-harder nudge/);
+			expect(select).not.toHaveBeenCalled();
+			expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(false);
+		});
+	});
+
+	it("blocks an unrelated prompt even with canonical approval options", async () => {
+		await withSession(async (cwd, _manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const select = vi.fn(async () => "Postgres");
+			const tool = new AskTool({
+				cwd,
+				hasUI: true,
+				settings: Settings.isolated(),
+				getSessionId: () => sessionId,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			});
+			const guarded = guardToolForUltragoalAsk(
+				tool as AgentTool,
+				() => cwd,
+				() => ({ sessionId }),
+			) as AskTool;
+			const context = {
+				hasUI: true,
+				ui: { select, editor: async () => undefined },
+				abort: () => {},
+			} as unknown as AgentToolContext;
+
+			await expect(
+				guarded.execute(
+					"unrelated-approval-prompt",
+					{
+						questions: [
+							{
+								id: "database-choice",
+								question: "Which database should we use?",
+								options: [
+									{ label: "Refine further" },
+									{ label: "Approve execution via ultragoal" },
+									{ label: "Stop here" },
+								],
+								recommended: 1,
+								multi: false,
+								workflowGate: { stage: "ralplan", kind: "approval" },
+							},
+						],
+					},
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/Ultragoal try-harder nudge/);
+			expect(select).not.toHaveBeenCalled();
+			expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(false);
+		});
+	});
+
+	it("blocks a tampered Ralplan final before presenting Ultragoal approval", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await createUltragoalPlan({ cwd, brief: "Implement the approved repair" });
+			await publishReviewedRalplanFinal(cwd, sessionId);
+			const presentation = await captureExecutionApprovalPresentation(cwd, sessionId, "ralplan");
+			await fs.writeFile(presentation.artifact_path, "# Substituted plan\n");
+
+			await expect(ask(cwd, manager, "ralplan", "tampered-current-final", false, true)).rejects.toThrow(
+				/Ultragoal try-harder nudge/,
+			);
+			expect(await Bun.file(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "ralplan")).exists()).toBe(false);
+		});
+	});
+
 	for (const stage of ["deep-interview", "ralplan"] as const) {
 		it(`${stage}: real Ask and persistent continuation approve the published artifact before handoff`, async () => {
 			await withSession(async (cwd, manager, sessionId) => {
@@ -543,24 +1332,7 @@ describe("non-Crystal user-gated execution approval", () => {
 			const indexPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-handoff-ralplan-audit.json");
 			const oldIndex = await fs.readFile(indexPath, "utf8");
 			const oldAudit = await fs.readFile(auditPath(cwd, sessionId), "utf8");
-			const replacement = await runNativeRalplanCommand(
-				[
-					"--write",
-					"--stage",
-					"final",
-					"--stage_n",
-					"1",
-					"--artifact",
-					"# Independent replacement plan",
-					"--run-id",
-					"replacement-plan",
-					"--session-id",
-					sessionId,
-					"--json",
-				],
-				cwd,
-			);
-			expect(replacement.status, replacement.stderr).toBe(0);
+			await publishReviewedRalplanFinal(cwd, sessionId, "replacement-plan");
 			expect(await executionApprovalLineage(cwd, sessionId, "ralplan")).toBe("ordinary");
 			expect((await handoff(cwd, sessionId, "ralplan")).status).toBe(2);
 			await ask(cwd, manager, "ralplan", "approve-independent-plan");

@@ -26,6 +26,11 @@ import {
 	MANAGED_OWNER_STATE_DIR_ENV,
 } from "../gjc-runtime/managed-owner-supervisor";
 import {
+	GJC_RALPLAN_REVIEWER_CAPABILITY_ENV,
+	GJC_RALPLAN_REVIEWER_ID_ENV,
+	GJC_RALPLAN_REVIEWER_ROLE_ENV,
+} from "../gjc-runtime/ralplan-reviewer-capability";
+import {
 	GJC_RALPLAN_ARTIFACT_ENV,
 	GJC_RESTRICTED_ROLE_AGENT_BASH_ENV,
 } from "../gjc-runtime/restricted-role-agent-bash";
@@ -1501,6 +1506,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// under its own variable on every bash env so a master-owned child can
 		// still read its OWN id from GJC_SESSION_ID (issue #5374).
 		const masterOwnerSessionId = this.session.getMasterOwnerSessionId?.();
+		const ralplanReviewerRole = this.session.currentAgentType;
+		const ralplanReviewerId = this.session.getAgentId?.();
+		const ralplanReviewerCapability = this.session.ralplanReviewerCapability;
 		const commandEnvOverrides = masterCommandEnvOverrides(expandedEnv, directMasterSpawn);
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
@@ -1516,6 +1524,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...(masterOwnerSessionId ? { [MASTER_OWNER_SESSION_ENV]: masterOwnerSessionId } : {}),
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
+			...(this.session.bashAllowedPrefixes &&
+			this.session.bashAllowedPrefixes.length > 0 &&
+			(ralplanReviewerRole === "architect" || ralplanReviewerRole === "critic") &&
+			ralplanReviewerId &&
+			ralplanReviewerCapability
+				? {
+						[GJC_RALPLAN_REVIEWER_ROLE_ENV]: ralplanReviewerRole,
+						[GJC_RALPLAN_REVIEWER_ID_ENV]: ralplanReviewerId,
+						[GJC_RALPLAN_REVIEWER_CAPABILITY_ENV]: ralplanReviewerCapability,
+					}
+				: {}),
 		};
 		const unsetEnv = COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(expandedEnv ?? {}, name));
 

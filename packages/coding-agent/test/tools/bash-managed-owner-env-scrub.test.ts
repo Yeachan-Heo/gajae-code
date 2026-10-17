@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { disposeAllShellSessions, setShellFactoryForTests } from "../../src/exec/bash-executor";
 // Unused: MANAGED_OWNER_PREDECESSOR_* env vars are not needed in this test
 import {
@@ -18,11 +21,18 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 });
 
-function createSession(sessionId: string): ToolSession {
+function createSession(
+	sessionId: string,
+	reviewer?: { role: "architect" | "critic"; agentId: string; capability: string },
+): ToolSession {
 	return {
 		cwd: process.cwd(),
 		getSessionFile: () => null,
 		getSessionId: () => sessionId,
+		getAgentId: () => reviewer?.agentId,
+		currentAgentType: reviewer?.role,
+		ralplanReviewerCapability: reviewer?.capability,
+		bashAllowedPrefixes: reviewer ? ["gjc ralplan --write", "gjc state"] : undefined,
 		getMasterBashCapability: () => "master-capability-fixture",
 		getMasterOwnerSessionId: () => undefined,
 		settings: {
@@ -42,6 +52,42 @@ function textOf(result: unknown): string {
 
 // Use the exported list from bash.ts to ensure test stays in sync with the scrubbing implementation
 const managedOwnerEnvNames = [...MANAGED_OWNER_BASH_ENV];
+
+describe("dispatcher-authenticated Ralplan reviewer Bash context", () => {
+	it("injects reviewer credentials only into restricted Architect/Critic subprocesses", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-ralplan-reviewer-env-"));
+		const executable = path.join(directory, "gjc");
+		const previousPath = process.env.PATH;
+		const shellValue = (name: string) => `"\${${name}-<unset>}"`;
+		const fakeCli = `#!/bin/sh\nprintf "role=%s id=%s capability=%s restricted=%s\\n" ${shellValue("GJC_RALPLAN_REVIEWER_ROLE")} ${shellValue("GJC_RALPLAN_REVIEWER_ID")} ${shellValue("GJC_RALPLAN_REVIEWER_CAPABILITY")} ${shellValue("GJC_RESTRICTED_ROLE_AGENT_BASH")}\n`;
+		await fs.writeFile(executable, fakeCli);
+		await fs.chmod(executable, 0o755);
+		process.env.PATH = `${directory}${path.delimiter}${previousPath ?? ""}`;
+		try {
+			const reviewerResult = await new BashTool(
+				createSession("reviewer-session", {
+					role: "architect",
+					agentId: "2-Architect",
+					capability: "a".repeat(43),
+				}),
+			).execute("reviewer-call", {
+				command: "gjc ralplan --write --stage architect --stage_n 1 --artifact fixture",
+			});
+			expect(textOf(reviewerResult)).toContain(
+				`role=architect id=2-Architect capability=${"a".repeat(43)} restricted=1`,
+			);
+
+			const ordinaryResult = await new BashTool(createSession("ordinary-session")).execute("ordinary-call", {
+				command: "gjc ralplan --write --stage architect --stage_n 1 --artifact fixture",
+			});
+			expect(textOf(ordinaryResult)).toContain("role=<unset> id=<unset> capability=<unset> restricted=<unset>");
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("issue #6140: managed-owner env scrub at the bash boundary", () => {
 	it("covers the full tmux-owner tuple, not a subset", () => {

@@ -29,7 +29,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@gajae-code/tui";
-import { logger, prompt, untilAborted } from "@gajae-code/utils";
+import { logger, prompt, sanitizeDisplayLine, untilAborted } from "@gajae-code/utils";
 import {
 	formatDeepInterviewSelectorPrompt,
 	isDeepInterviewAskQuestion,
@@ -88,9 +88,22 @@ import {
 
 export { askSchema } from "./ask-contract";
 
-import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
+import {
+	formatErrorMessage,
+	formatMeta,
+	formatTitle,
+	replaceTabs,
+	shortenPath,
+	TRUNCATE_LENGTHS,
+	truncateToWidth,
+} from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
-import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
+import {
+	assertUltragoalAskAllowed,
+	isAcceptedRalplanApprovalResponse,
+	isCanonicalRalplanUltragoalApproval,
+	markBuiltinAskTool,
+} from "./ultragoal-ask-guard";
 
 // =============================================================================
 // Types
@@ -163,6 +176,8 @@ const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
 export const MAX_EMPTY_CUSTOM_ATTEMPTS = 3;
 const EMPTY_CUSTOM_RETRY_MESSAGE = "Custom input cannot be empty. Enter text or cancel the ask.";
+const INVALID_RALPLAN_APPROVAL_RETRY_MESSAGE =
+	"Choose one of the listed Ralplan approval options; custom input and clarifications are not accepted.";
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -824,6 +839,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(askDescription);
+		markBuiltinAskTool(this);
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
@@ -949,10 +965,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
-		await assertUltragoalAskAllowed(
+		let verifiedRalplanApprovalPresentation = await assertUltragoalAskAllowed(
 			this.session.cwd,
 			{ sessionId: this.session.getSessionId?.() ?? null },
 			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
+			params,
+			true,
 		);
 		assertDeepInterviewStructuredResponseWithinLimit(params);
 		// Recheck at execution time as well: direct SDK callers and a phase change
@@ -969,6 +987,41 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				{ type: "toolCall", id: _toolCallId, name: this.name, arguments: params },
 			),
 		);
+		const executionGateCount = params.questions.filter(
+			question =>
+				(question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution") ||
+				(question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval"),
+		).length;
+		if (executionGateCount > 1)
+			throw new ToolError("Ask accepts at most one execution-authorizing workflow gate per invocation");
+		const hasRalplanApproval = params.questions.some(
+			question => question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval",
+		);
+		if (hasRalplanApproval) {
+			if (params.questions.length !== 1)
+				throw new ToolError("Ralplan approval must be the only question in its Ask invocation");
+			const sessionId = this.session.getSessionId?.();
+			if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
+			if (!verifiedRalplanApprovalPresentation) {
+				try {
+					verifiedRalplanApprovalPresentation = await captureExecutionApprovalPresentation(
+						this.session.cwd,
+						sessionId,
+						"ralplan",
+					);
+				} catch (error) {
+					throw new ToolAbortError(
+						error instanceof Error
+							? `Execution approval publication could not be authenticated: ${error.message}`
+							: "Execution approval publication could not be authenticated",
+					);
+				}
+			}
+			if (!isCanonicalRalplanUltragoalApproval(params, verifiedRalplanApprovalPresentation))
+				throw new ToolError(
+					"Ralplan approval must use the exact question and options for the current final publication",
+				);
+		}
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;
 		let remoteGeneration = 0;
@@ -1289,30 +1342,49 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const timeoutSeconds = this.session.settings.get("ask.timeout");
 		const settingsTimeout = timeoutSeconds === 0 ? null : timeoutSeconds * 1000;
 		const timeout = planModeEnabled ? null : settingsTimeout;
+		const captureQuestionExecutionPresentation = async (
+			question: AskParams["questions"][number],
+		): Promise<ExecutionApprovalPresentation> => {
+			const sessionId = this.session.getSessionId?.();
+			if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
+			try {
+				if (
+					question.workflowGate?.stage === "ralplan" &&
+					question.workflowGate.kind === "approval" &&
+					verifiedRalplanApprovalPresentation
+				)
+					return verifiedRalplanApprovalPresentation;
+				return await captureExecutionApprovalPresentation(
+					this.session.cwd,
+					sessionId,
+					question.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
+				);
+			} catch (error) {
+				throw new ToolAbortError(
+					error instanceof Error
+						? `Execution approval publication could not be authenticated: ${error.message}`
+						: "Execution approval publication could not be authenticated",
+				);
+			}
+		};
 
 		// Send notification if waiting and not suppressed
 		this.#sendAskNotification();
 
-		if (
-			params.questions.filter(
-				question =>
-					(question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution") ||
-					(question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval"),
-			).length > 1
-		)
-			throw new ToolError("Ask accepts at most one execution-authorizing workflow gate per invocation");
 		const askQuestion = async (
 			q: AskParams["questions"][number],
 			options?: {
 				previous?: QuestionResult;
 				navigation?: NavigationControls;
 				emptyCustomAttempt?: number;
+				invalidRetryMessage?: string;
 			},
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
 			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 			const questionIndex = params.questions.indexOf(q);
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
+			const invalidRetryMessage = options?.invalidRetryMessage ?? EMPTY_CUSTOM_RETRY_MESSAGE;
 			const isExecutionApprovalQuestion =
 				(q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution") ||
 				(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval");
@@ -1334,23 +1406,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					? `interactive-${randomUUID()}`
 					: undefined;
 				let executionPresentation: ExecutionApprovalPresentation | undefined;
-				if (isExecutionApprovalQuestion) {
-					const sessionId = this.session.getSessionId?.();
-					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
-					try {
-						executionPresentation = await captureExecutionApprovalPresentation(
-							this.session.cwd,
-							sessionId,
-							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
-						);
-					} catch (error) {
-						throw new ToolAbortError(
-							error instanceof Error
-								? `Execution approval publication could not be authenticated: ${error.message}`
-								: "Execution approval publication could not be authenticated",
-						);
-					}
-				}
+				if (isExecutionApprovalQuestion) executionPresentation = await captureQuestionExecutionPresentation(q);
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
 					const stageState = gate.context?.stage_state;
 					if (
@@ -1383,32 +1439,20 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			}
 			try {
 				let executionPresentation: ExecutionApprovalPresentation | undefined;
-				if (isExecutionApprovalQuestion) {
-					const sessionId = this.session.getSessionId?.();
-					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
-					try {
-						executionPresentation = await captureExecutionApprovalPresentation(
-							this.session.cwd,
-							sessionId,
-							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
-						);
-					} catch (error) {
-						throw new ToolAbortError(
-							error instanceof Error
-								? `Execution approval publication could not be authenticated: ${error.message}`
-								: "Execution approval publication could not be authenticated",
-						);
-					}
-				}
+				if (isExecutionApprovalQuestion) executionPresentation = await captureQuestionExecutionPresentation(q);
 				const executionGateId: string | undefined = isExecutionApprovalQuestion
 					? `interactive-${randomUUID()}`
 					: undefined;
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
-				const baseDisplayQuestion = deepInterviewPrompt ?? q.question;
+				const baseDisplayQuestion =
+					deepInterviewPrompt ??
+					(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval"
+						? displayRalplanApprovalQuestion(q.question)
+						: q.question);
 				const displayQuestion =
 					emptyCustomAttempt > 0
-						? `${baseDisplayQuestion}\n\n${EMPTY_CUSTOM_RETRY_MESSAGE} (attempt ${emptyCustomAttempt + 1} of ${MAX_EMPTY_CUSTOM_ATTEMPTS})`
+						? `${baseDisplayQuestion}\n\n${invalidRetryMessage} (attempt ${emptyCustomAttempt + 1} of ${MAX_EMPTY_CUSTOM_ATTEMPTS})`
 						: baseDisplayQuestion;
 				const shouldNumberOptions = isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question);
 				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
@@ -1512,15 +1556,21 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				if ((isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question)) && customInput !== undefined)
 					assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 				if (activeRemoteReceipt) {
-					const settlement: AskSettlement =
-						clarificationQuestion !== undefined
-							? { kind: "resolve_without_commit", reason: "clarification_submitted" }
+					const invalidRalplanApprovalAnswer =
+						q.workflowGate?.stage === "ralplan" &&
+						q.workflowGate.kind === "approval" &&
+						(selectedOptions.length > 0 || customInput !== undefined || clarificationQuestion !== undefined) &&
+						!isAcceptedRalplanApprovalResponse(selectedOptions, customInput, clarificationQuestion, timedOut);
+					const settlement: AskSettlement = cancelled
+						? { kind: "resolve_without_commit", reason: "cancelled" }
+						: timedOut
+							? { kind: "resolve_without_commit", reason: "timed_out" }
 							: customInput !== undefined && customInput.trim().length === 0
 								? { kind: "invalid", reason: "empty_custom" }
-								: cancelled
-									? { kind: "resolve_without_commit", reason: "cancelled" }
-									: timedOut
-										? { kind: "resolve_without_commit", reason: "timed_out" }
+								: invalidRalplanApprovalAnswer
+									? { kind: "invalid", reason: "invalid_workflow_gate_answer" }
+									: clarificationQuestion !== undefined
+										? { kind: "resolve_without_commit", reason: "clarification_submitted" }
 										: navigation === "back"
 											? { kind: "resolve_without_commit", reason: "back_navigation" }
 											: navigation === "forward" &&
@@ -1551,6 +1601,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						return askQuestion(q, {
 							...options,
 							emptyCustomAttempt: emptyCustomAttempt + 1,
+							invalidRetryMessage:
+								settlement.reason === "invalid_workflow_gate_answer"
+									? INVALID_RALPLAN_APPROVAL_RETRY_MESSAGE
+									: options?.invalidRetryMessage,
 						});
 					}
 				}
@@ -1585,7 +1639,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		if (params.questions.length === 1) {
 			const [q] = params.questions;
-			const {
+			let {
 				optionLabels,
 				selectedOptions,
 				customInput,
@@ -1595,6 +1649,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q);
+			if (timedOut && q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval") {
+				selectedOptions = [];
+				customInput = undefined;
+				clarificationQuestion = undefined;
+			}
 
 			if (
 				!timedOut &&
@@ -1605,19 +1664,26 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
 			if (
+				verifiedRalplanApprovalPresentation &&
+				!timedOut &&
+				!isAcceptedRalplanApprovalResponse(selectedOptions, customInput, clarificationQuestion, timedOut)
+			)
+				throw new ToolError("Ralplan approval accepts only the listed choices, not free text.");
+			if (
 				clarificationQuestion === undefined &&
 				!(timedOut && (intentContract(q.deepInterview) || intentReview(q.deepInterview)))
 			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
-			await this.#recordDeepInterviewExecutionApproval(
-				q,
-				selectedOptions,
-				customInput,
-				_toolCallId,
-				executionGateId,
-				executionPresentation,
-			);
+			if (!(timedOut && q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval"))
+				await this.#recordDeepInterviewExecutionApproval(
+					q,
+					selectedOptions,
+					customInput,
+					_toolCallId,
+					executionGateId,
+					executionPresentation,
+				);
 			const details: AskToolDetails = {
 				question: q.question,
 				options: optionLabels,
@@ -1672,7 +1738,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				allowForward: true,
 				progressText: `${questionIndex + 1}/${params.questions.length}`,
 			};
-			const {
+			let {
 				optionLabels,
 				selectedOptions,
 				customInput,
@@ -1683,11 +1749,22 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				cancelled,
 				timedOut,
 			} = await askQuestion(q, { previous, navigation });
+			if (timedOut && q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval") {
+				selectedOptions = [];
+				customInput = undefined;
+				clarificationQuestion = undefined;
+			}
 
 			if (cancelled && !timedOut) {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
+			if (
+				verifiedRalplanApprovalPresentation &&
+				!timedOut &&
+				!isAcceptedRalplanApprovalResponse(selectedOptions, customInput, clarificationQuestion, timedOut)
+			)
+				throw new ToolError("Ralplan approval accepts only the listed choices, not free text.");
 
 			resultsByIndex[questionIndex] = {
 				id: q.id,
@@ -1752,12 +1829,64 @@ interface AskRenderArgs {
 	question?: string;
 	options?: Array<{ label: string }>;
 	multi?: boolean;
+	workflowGate?: { stage: string; kind: string };
 	questions?: Array<{
 		id: string;
 		question: string;
 		options: Array<{ label: string }>;
 		multi?: boolean;
+		workflowGate?: { stage: string; kind: string };
 	}>;
+}
+
+function markdownCodeSpan(value: string): string {
+	let longestBacktickRun = 0;
+	for (const match of value.matchAll(/`+/g)) longestBacktickRun = Math.max(longestBacktickRun, match[0].length);
+	const delimiter = "`".repeat(longestBacktickRun + 1);
+	const padding = value.startsWith(" ") || value.endsWith(" ") ? " " : "";
+	return `${delimiter}${padding}${value}${padding}${delimiter}`;
+}
+
+function isRalplanApprovalGate(gate: AskRenderArgs["workflowGate"]): boolean {
+	return gate?.stage === "ralplan" && gate.kind === "approval";
+}
+
+function isRalplanApprovalQuestion(question: string): boolean {
+	return question.startsWith("Approve execution via ultragoal for the current Ralplan final at ");
+}
+
+function displayRalplanApprovalQuestion(question: string): string {
+	const prefix = "Approve execution via ultragoal for the current Ralplan final at ";
+	const safeQuestion = sanitizeDisplayLine(question);
+	if (!safeQuestion.startsWith(prefix)) return safeQuestion;
+	const pathStart = prefix.length;
+	if (safeQuestion[pathStart] !== '"') return truncateToWidth(replaceTabs(safeQuestion), TRUNCATE_LENGTHS.LINE);
+	let pathEnd = pathStart + 1;
+	for (; pathEnd < safeQuestion.length; pathEnd++) {
+		if (safeQuestion[pathEnd] === "\\") {
+			pathEnd++;
+			continue;
+		}
+		if (safeQuestion[pathEnd] === '"') break;
+	}
+	if (pathEnd >= safeQuestion.length) return truncateToWidth(replaceTabs(safeQuestion), TRUNCATE_LENGTHS.LINE);
+	let artifactPath: unknown;
+	try {
+		artifactPath = JSON.parse(safeQuestion.slice(pathStart, pathEnd + 1));
+	} catch {
+		return truncateToWidth(replaceTabs(safeQuestion), TRUNCATE_LENGTHS.LINE);
+	}
+	if (typeof artifactPath !== "string") return truncateToWidth(replaceTabs(safeQuestion), TRUNCATE_LENGTHS.LINE);
+	const displayPath = truncateToWidth(
+		replaceTabs(shortenPath(sanitizeDisplayLine(artifactPath))),
+		TRUNCATE_LENGTHS.CONTENT,
+	);
+	return truncateToWidth(
+		replaceTabs(
+			`${safeQuestion.slice(0, pathStart)}${JSON.stringify(displayPath)}${safeQuestion.slice(pathEnd + 1)}`,
+		),
+		TRUNCATE_LENGTHS.LINE,
+	);
 }
 
 /** Render custom input as a single block with continuation lines (not one entry per line) */
@@ -1830,7 +1959,11 @@ export const askToolRenderer = {
 					new Text(` ${uiTheme.fg("dim", qBranch)} ${uiTheme.fg("dim", `[${q.id}]`)}${metaStr}`, 0, 0),
 				);
 				const deepInterviewQuestion = renderDeepInterviewAskQuestion(q.question, uiTheme);
-				container.addChild(deepInterviewQuestion ?? new Markdown(q.question, 3, 0, mdTheme, accentStyle));
+				const markdownQuestion =
+					isRalplanApprovalGate(q.workflowGate) || isRalplanApprovalQuestion(q.question)
+						? markdownCodeSpan(displayRalplanApprovalQuestion(q.question))
+						: q.question;
+				container.addChild(deepInterviewQuestion ?? new Markdown(markdownQuestion, 3, 0, mdTheme, accentStyle));
 
 				const qOptions = q.options;
 				if (qOptions?.length) {
@@ -1863,7 +1996,11 @@ export const askToolRenderer = {
 		if (args.options?.length) meta.push(`options:${args.options.length}`);
 		container.addChild(new Text(`${label}${formatMeta(meta, uiTheme)}`, 0, 0));
 		const deepInterviewQuestion = renderDeepInterviewAskQuestion(question, uiTheme);
-		container.addChild(deepInterviewQuestion ?? new Markdown(question, 1, 0, mdTheme, accentStyle));
+		const markdownQuestion =
+			isRalplanApprovalGate(args.workflowGate) || isRalplanApprovalQuestion(question)
+				? markdownCodeSpan(displayRalplanApprovalQuestion(question))
+				: question;
+		container.addChild(deepInterviewQuestion ?? new Markdown(markdownQuestion, 1, 0, mdTheme, accentStyle));
 
 		const options = args.options;
 		if (options?.length) {
@@ -1935,7 +2072,15 @@ export const askToolRenderer = {
 				);
 				container.addChild(
 					renderDeepInterviewAskQuestion(r.question, uiTheme) ??
-						new Markdown(r.question, 3, 0, mdTheme, accentStyle),
+						new Markdown(
+							isRalplanApprovalQuestion(r.question)
+								? markdownCodeSpan(displayRalplanApprovalQuestion(r.question))
+								: r.question,
+							3,
+							0,
+							mdTheme,
+							accentStyle,
+						),
 				);
 
 				const answerLines: string[] = [];
@@ -1992,9 +2137,12 @@ export const askToolRenderer = {
 		const header = renderStatusLine({ icon: hasSelection ? "success" : "warning", title: "Ask" }, uiTheme);
 		const container = new Container();
 		container.addChild(new Text(header, 0, 0));
+		const markdownQuestion = isRalplanApprovalQuestion(details.question)
+			? markdownCodeSpan(displayRalplanApprovalQuestion(details.question))
+			: details.question;
 		container.addChild(
 			renderDeepInterviewAskQuestion(details.question, uiTheme) ??
-				new Markdown(details.question, 1, 0, mdTheme, accentStyle),
+				new Markdown(markdownQuestion, 1, 0, mdTheme, accentStyle),
 		);
 
 		const answerLines: string[] = [];

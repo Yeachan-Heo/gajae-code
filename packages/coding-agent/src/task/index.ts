@@ -30,6 +30,7 @@ import { normalizeTierSelector, type RoutingOutcome, resolveTaskRouting } from "
 import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { getOrCreateRalplanReviewerCapability } from "../gjc-runtime/ralplan-reviewer-capability";
 import type { Theme } from "../modes/theme/theme";
 import type { PlanModeState } from "../plan-mode/state";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -2460,6 +2461,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					? null
 					: (overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null);
 				const taskRepositoryBinding = repositoryBindingFromTask(task) ?? this.#sessionRepositoryBinding;
+				const parentSessionId = session.getSessionId?.() ?? undefined;
+				const ralplanReviewerCapability =
+					parentSessionId && (effectiveAgent.name === "architect" || effectiveAgent.name === "critic")
+						? getOrCreateRalplanReviewerCapability(parentSessionId, effectiveAgent.name, task.id)
+						: undefined;
 				// Declared paths (relativeSubdir) must stay under the bound root before spawn.
 				if (taskRepositoryBinding.relativeSubdir) {
 					assertPathUnderRepositoryBinding(taskRepositoryBinding, ".");
@@ -2486,7 +2492,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
 						parentModelProfileOwnershipMarker: parentModelProfileOwnershipMarker as any,
-						parentSessionId: session.getSessionId?.() ?? undefined,
+						parentSessionId,
+						ralplanReviewerCapability,
 						parentCredentialSessionId:
 							session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
@@ -2578,7 +2585,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
 						parentModelProfileOwnershipMarker: parentModelProfileOwnershipMarker as any,
-						parentSessionId: session.getSessionId?.() ?? undefined,
+						parentSessionId,
+						ralplanReviewerCapability,
 						parentCredentialSessionId:
 							session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,

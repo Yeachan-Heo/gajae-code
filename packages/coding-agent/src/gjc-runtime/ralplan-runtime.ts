@@ -22,6 +22,12 @@ import {
 	serializeReviewConflictDocument,
 } from "./ralplan-review-conflicts";
 import {
+	createRalplanReviewAttestation,
+	type RalplanReviewAttestation,
+	type RalplanReviewerIdentity,
+	readRalplanReviewerIdentity,
+} from "./ralplan-reviewer-capability";
+import {
 	assertCwdMatchesRepositoryBinding,
 	assertPathUnderRepositoryBinding,
 	captureRepositoryBinding,
@@ -68,8 +74,9 @@ import {
  *
  * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N>
  *    (--artifact <path-or-string> | --artifact-env GJC_RALPLAN_ARTIFACT)
- *    [--run-id <id>] [--session-id <id>] [--lane-verdict <token>] [--json]` persists Planner / Architect
- *    / Critic / intent / disposition / revision / post-interview / ADR / final artifacts under
+ *    [--run-id <id>] [--session-id <id>] [--lane-verdict <token>]
+ *    [--architect-decision <APPROVE|COMMENT|REQUEST_CHANGES>] [--json]` persists Planner / Architect / Critic
+ *    / intent / disposition / revision / post-interview / ADR / final artifacts under
  *    `.gjc/plans/ralplan/<run-id>/`, maintains an `index.jsonl` audit log, copies `final`
  *    stages to `pending-approval.md`, and advances the HUD chip to reflect the latest
  *    persisted stage. Disposition stage artifacts are fail-closed JSON documents that
@@ -704,6 +711,7 @@ const VALUE_FLAGS = new Set([
 	"--fallback-stage-n",
 	"--fallback-receipt-path",
 	"--lane-verdict",
+	"--architect-decision",
 	"--worktree-root",
 ]);
 
@@ -1115,6 +1123,8 @@ interface LaneVerdictUpdate {
 	lane: RalplanReviewLane;
 	verdict: string;
 	stageN: number;
+	architectDecision?: string;
+	reviewer: RalplanReviewerIdentity;
 }
 
 const PERSISTED_ROLES = ["planner", "architect", "critic"] as const;
@@ -1129,6 +1139,8 @@ const LANE_VERDICTS: Record<RalplanReviewLane, ReadonlySet<string>> = {
 	architect: new Set(["CLEAR", "WATCH", "BLOCK"]),
 	critic: new Set(["OKAY", "ITERATE", "REJECT"]),
 };
+
+const ARCHITECT_REVIEW_DECISIONS = new Set(["APPROVE", "COMMENT", "REQUEST_CHANGES"]);
 
 function parseBooleanFlag(raw: string, flag: string): boolean {
 	if (raw === "true") return true;
@@ -1272,11 +1284,36 @@ function parseLaneVerdictArgs(
 	stageN: number,
 ): LaneVerdictUpdate | undefined {
 	const rawVerdict = roleStateFlagValue(args, "--lane-verdict");
-	if (rawVerdict === undefined) return undefined;
+	const rawArchitectDecision = roleStateFlagValue(args, "--architect-decision");
+	if (rawArchitectDecision !== undefined && stage !== "architect") {
+		throw new RalplanCommandError(
+			2,
+			`--architect-decision is only valid with --stage architect (received ${stage}).`,
+		);
+	}
+	if (rawVerdict === undefined) {
+		if (rawArchitectDecision !== undefined)
+			throw new RalplanCommandError(2, "--architect-decision requires --lane-verdict on the same write.");
+		return undefined;
+	}
 	if (stage !== "architect" && stage !== "critic") {
 		throw new RalplanCommandError(
 			2,
 			`--lane-verdict is only valid with --stage architect or critic (received ${stage}).`,
+		);
+	}
+	const reviewer = readRalplanReviewerIdentity();
+	if (!reviewer || reviewer.role !== stage) {
+		throw new RalplanCommandError(
+			2,
+			`--lane-verdict for ${stage} requires a dispatcher-authenticated ${stage} role-agent write.`,
+		);
+	}
+	const reviewerIdFlag = PERSISTED_ROLE_FLAGS[reviewer.role].id;
+	if (roleStateFlagValue(args, reviewerIdFlag) !== reviewer.agentId) {
+		throw new RalplanCommandError(
+			2,
+			`${reviewerIdFlag} must match the dispatcher-authenticated ${stage} agent identity.`,
 		);
 	}
 	const verdict = rawVerdict.trim().toUpperCase();
@@ -1286,7 +1323,20 @@ function parseLaneVerdictArgs(
 			`invalid --lane-verdict for ${stage}: ${rawVerdict}. Expected one of: ${[...LANE_VERDICTS[stage]].join(", ")}.`,
 		);
 	}
-	return { lane: stage, verdict, stageN };
+	const architectDecision = rawArchitectDecision?.trim().toUpperCase();
+	if (architectDecision !== undefined && !ARCHITECT_REVIEW_DECISIONS.has(architectDecision)) {
+		throw new RalplanCommandError(
+			2,
+			`invalid --architect-decision: ${rawArchitectDecision}. Expected one of: ${[...ARCHITECT_REVIEW_DECISIONS].join(", ")}.`,
+		);
+	}
+	return {
+		lane: stage,
+		verdict,
+		stageN,
+		reviewer,
+		...(architectDecision === undefined ? {} : { architectDecision }),
+	};
 }
 
 /**
@@ -1807,29 +1857,158 @@ function ralplanIndexKey(entry: unknown): string | undefined {
 	return `${stage}\u0000${stage_n}\u0000${sha256}`;
 }
 
+function ralplanIndexKeyWithReviewMetadata(entry: unknown): string | undefined {
+	const key = ralplanIndexKey(entry);
+	if (!key || !entry || typeof entry !== "object" || Array.isArray(entry)) return key;
+	const record = entry as Record<string, unknown>;
+	return `${key}\u0000${JSON.stringify({
+		reviewed_planner: record.reviewed_planner ?? null,
+		lane_verdict: record.lane_verdict ?? null,
+		architect_decision: record.architect_decision ?? null,
+		reviewer_attestation: record.reviewer_attestation ?? null,
+	})}`;
+}
+
+interface RalplanPlannerReference {
+	stage_n: number;
+	path: string;
+	sha256: string;
+}
+
+function parseRalplanPlannerReference(value: unknown): RalplanPlannerReference | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (
+		!Number.isSafeInteger(record.stage_n) ||
+		(typeof record.stage_n === "number" && (record.stage_n < 1 || record.stage_n > 999)) ||
+		typeof record.path !== "string" ||
+		!path.isAbsolute(record.path) ||
+		typeof record.sha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(record.sha256)
+	)
+		return undefined;
+	return { stage_n: record.stage_n as number, path: path.resolve(record.path), sha256: record.sha256 };
+}
+
+function sameRalplanPlannerReference(left: unknown, right: RalplanPlannerReference): boolean {
+	const parsed = parseRalplanPlannerReference(left);
+	return (
+		parsed !== undefined &&
+		parsed.stage_n === right.stage_n &&
+		parsed.path === right.path &&
+		parsed.sha256 === right.sha256
+	);
+}
+
+/** Resolve the latest Planner/revision receipt for the exact review pass. */
+function latestRalplanPlannerReference(
+	indexText: string | undefined,
+	runDir: string,
+	stageN: number,
+): RalplanPlannerReference | undefined {
+	if (indexText === undefined) return undefined;
+	let latest: RalplanPlannerReference | undefined;
+	for (const line of indexText.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			return undefined;
+		}
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const record = parsed as Record<string, unknown>;
+		if (record.stage !== "planner" && record.stage !== "revision") continue;
+		const reference = parseRalplanPlannerReference({
+			stage_n: record.stage_n,
+			path: record.path,
+			sha256: record.sha256,
+		});
+		if (!reference) {
+			latest = undefined;
+			continue;
+		}
+		const relative = path.relative(path.resolve(runDir), reference.path);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			latest = undefined;
+			continue;
+		}
+		latest = reference;
+	}
+	return latest?.stage_n === stageN ? latest : undefined;
+}
+
 function serializeRalplanIndexEntries(entries: readonly unknown[]): string {
 	return entries.map(entry => `${JSON.stringify(entry)}\n`).join("");
 }
 
+function protectRalplanPlannerJoin(
+	entries: readonly unknown[],
+	reference: RalplanPlannerReference,
+	protectedIndices: Set<number>,
+): void {
+	for (const [index, entry] of entries.entries()) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const record = entry as Record<string, unknown>;
+		if (
+			(record.stage === "planner" || record.stage === "revision") &&
+			sameRalplanPlannerReference({ stage_n: record.stage_n, path: record.path, sha256: record.sha256 }, reference)
+		) {
+			protectedIndices.add(index);
+		}
+		if (
+			(record.stage === "architect" || record.stage === "critic") &&
+			sameRalplanPlannerReference(record.reviewed_planner, reference)
+		) {
+			protectedIndices.add(index);
+		}
+	}
+}
+
 /**
  * Compact the append-only ralplan ledger without dropping the current final receipt.
- * The newest row and newest planning-stuck marker are also retained so a write can
- * never report success while silently losing the receipt it just persisted.
+ * Retain both the latest final's joined review evidence and the active pass receipts,
+ * alongside the newest row/stuck marker, so compaction cannot invalidate approval.
  */
 function compactRalplanIndexEntries(entries: readonly unknown[]): unknown[] {
 	let latestFinal = -1;
 	let latestPlanningStuck = -1;
+	let latestPlanner = -1;
 	for (const [index, entry] of entries.entries()) {
 		if (entry && typeof entry === "object" && !Array.isArray(entry)) {
 			const record = entry as Record<string, unknown>;
 			if (record.stage === "final") latestFinal = index;
 			if (record.planning_stuck === true) latestPlanningStuck = index;
+			if (record.stage === "planner" || record.stage === "revision") latestPlanner = index;
 		}
+	}
+	const protectedIndices = new Set([entries.length - 1, latestFinal, latestPlanningStuck]);
+	if (latestPlanner >= 0) {
+		const plannerRow = entries[latestPlanner];
+		const plannerRecord =
+			plannerRow && typeof plannerRow === "object" && !Array.isArray(plannerRow)
+				? (plannerRow as Record<string, unknown>)
+				: undefined;
+		const currentPlanner = parseRalplanPlannerReference({
+			stage_n: plannerRecord?.stage_n,
+			path: plannerRecord?.path,
+			sha256: plannerRecord?.sha256,
+		});
+		if (currentPlanner) protectRalplanPlannerJoin(entries, currentPlanner, protectedIndices);
+	}
+	if (latestFinal >= 0) {
+		const finalRow = entries[latestFinal];
+		const finalRecord =
+			finalRow && typeof finalRow === "object" && !Array.isArray(finalRow)
+				? (finalRow as Record<string, unknown>)
+				: undefined;
+		const finalPlanner = parseRalplanPlannerReference(finalRecord?.reviewed_planner);
+		if (finalPlanner) protectRalplanPlannerJoin(entries, finalPlanner, protectedIndices);
 	}
 	const retained = entries.map((entry, index) => ({
 		entry,
 		bytes: Buffer.byteLength(`${JSON.stringify(entry)}\n`, "utf8"),
-		protected: index === entries.length - 1 || index === latestFinal || index === latestPlanningStuck,
+		protected: protectedIndices.has(index),
 	}));
 	let totalBytes = retained.reduce((total, item) => total + item.bytes, 0);
 	while (totalBytes > RALPLAN_MAX_INDEX_BYTES) {
@@ -1843,11 +2022,68 @@ function compactRalplanIndexEntries(entries: readonly unknown[]): unknown[] {
 	return retained.map(item => item.entry);
 }
 
+function assertRalplanIndexReviewMetadataWriteSafe(
+	existing: readonly unknown[],
+	candidateValue: unknown,
+	runDir: string,
+): void {
+	if (!candidateValue || typeof candidateValue !== "object" || Array.isArray(candidateValue)) return;
+	const candidate = candidateValue as Record<string, unknown>;
+	const { stage, stage_n: stageN, sha256 } = candidate;
+	if (typeof stage !== "string" || typeof stageN !== "number" || typeof sha256 !== "string") return;
+	const matchingRows: Record<string, unknown>[] = [];
+	for (const row of existing) {
+		if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+		const record = row as Record<string, unknown>;
+		if (record.stage === stage && record.stage_n === stageN && typeof record.sha256 === "string")
+			matchingRows.push(record);
+	}
+	const rejectConflict = (): never => {
+		throw new RalplanCommandError(
+			2,
+			`refusing to append contradictory ralplan ${stage} stage ${stageN} review metadata; the index changed during this write`,
+		);
+	};
+	const metadataFields = ["reviewed_planner", "lane_verdict", "architect_decision"] as const;
+	const metadataValue = (field: (typeof metadataFields)[number], value: unknown): string | undefined => {
+		if (value === undefined) return undefined;
+		if (field === "reviewed_planner") {
+			const reference = parseRalplanPlannerReference(value);
+			if (!reference) return rejectConflict();
+			return JSON.stringify(reference);
+		}
+		if (typeof value !== "string") return rejectConflict();
+		return value;
+	};
+	const priorMetadata = new Map<(typeof metadataFields)[number], string>();
+	for (const row of matchingRows) {
+		if (row.sha256 !== sha256) return rejectConflict();
+		for (const field of metadataFields) {
+			const value = metadataValue(field, row[field]);
+			if (value === undefined) continue;
+			const prior = priorMetadata.get(field);
+			if (prior !== undefined && prior !== value) return rejectConflict();
+			priorMetadata.set(field, value);
+		}
+	}
+	for (const field of metadataFields) {
+		const value = metadataValue(field, candidate[field]);
+		const prior = priorMetadata.get(field);
+		if (prior !== undefined && value !== prior) return rejectConflict();
+	}
+	const reviewedPlanner = metadataValue("reviewed_planner", candidate.reviewed_planner);
+	if (reviewedPlanner !== undefined) {
+		const latest = latestRalplanPlannerReference(serializeRalplanIndexEntries(existing), runDir, stageN);
+		if (!latest || JSON.stringify(latest) !== reviewedPlanner) return rejectConflict();
+	}
+}
+
 /** Append a ralplan index row under the ledger lock, compacting before the write. */
 async function appendRalplanIndexIdempotent(
 	targetPath: string,
 	entry: unknown,
 	options: AppendJsonlIdempotentOptions,
+	guard?: (existing: readonly unknown[], candidate: unknown) => void,
 ): Promise<AppendJsonlIdempotentResult> {
 	const { key, equals, ...writeOptions } = options;
 	const resolvedTargetPath = path.resolve(options.cwd ?? process.cwd(), targetPath);
@@ -1866,6 +2102,7 @@ async function appendRalplanIndexIdempotent(
 					malformed = true;
 				}
 			}
+			guard?.(existing, entry);
 			const candidateKey = key ? key(entry) : undefined;
 			const duplicate = equals
 				? existing.find(item => equals(entry, item))
@@ -1900,6 +2137,9 @@ async function persistArtifact(
 	content: string,
 	sha256: string,
 	finalAdmission?: RalplanAutoHandoffResolution,
+	reviewedPlanner?: RalplanPlannerReference,
+	laneVerdict?: LaneVerdictUpdate,
+	reviewerAttestation?: RalplanReviewAttestation,
 ): Promise<PersistedArtifact> {
 	const runDir = path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId);
 
@@ -1923,19 +2163,28 @@ async function persistArtifact(
 		path: filePath,
 		created_at: createdAt,
 		sha256,
+		...(reviewedPlanner ? { reviewed_planner: reviewedPlanner } : {}),
+		...(laneVerdict ? { lane_verdict: laneVerdict.verdict } : {}),
+		...(laneVerdict?.architectDecision ? { architect_decision: laneVerdict.architectDecision } : {}),
+		...(reviewerAttestation ? { reviewer_attestation: reviewerAttestation } : {}),
 		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
-	await appendRalplanIndexIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
-		cwd,
-		audit: {
-			category: "ledger",
-			verb: "append",
-			owner: "gjc-runtime",
-			skill: "ralplan",
-			sessionId: resolved.sessionId,
+	await appendRalplanIndexIdempotent(
+		path.join(runDir, "index.jsonl"),
+		indexEntry,
+		{
+			cwd,
+			audit: {
+				category: "ledger",
+				verb: "append",
+				owner: "gjc-runtime",
+				skill: "ralplan",
+				sessionId: resolved.sessionId,
+			},
+			key: ralplanIndexKeyWithReviewMetadata,
 		},
-		key: ralplanIndexKey,
-	});
+		(existing, candidate) => assertRalplanIndexReviewMetadataWriteSafe(existing, candidate, runDir),
+	);
 
 	let pendingApprovalPath: string | undefined;
 	if (resolved.stage === "final") {
@@ -1968,6 +2217,12 @@ interface ExistingStageArtifact {
 	path: string;
 	sha256: string;
 	createdAt: string;
+	stage?: RalplanStage;
+	stageN?: number;
+	reviewedPlanner?: RalplanPlannerReference;
+	laneVerdict?: string;
+	architectDecision?: string;
+	reviewerAttestation?: unknown;
 	autoHandoff?: RalplanAutoHandoffResolution;
 }
 
@@ -2029,10 +2284,58 @@ function findExistingStageArtifact(
 			path: record.path,
 			sha256: record.sha256,
 			createdAt: typeof record.created_at === "string" ? record.created_at : "",
+			stage,
+			stageN,
+			...(parseRalplanPlannerReference(record.reviewed_planner)
+				? { reviewedPlanner: parseRalplanPlannerReference(record.reviewed_planner) }
+				: {}),
+			...(typeof record.lane_verdict === "string" ? { laneVerdict: record.lane_verdict } : {}),
+			...(typeof record.architect_decision === "string" ? { architectDecision: record.architect_decision } : {}),
+			...(record.reviewer_attestation !== undefined ? { reviewerAttestation: record.reviewer_attestation } : {}),
 			...(stage === "final" ? { autoHandoff: parseRalplanFinalAdmission(record.auto_handoff) } : {}),
 		};
 	}
 	return match;
+}
+
+function assertDuplicateReviewMetadataMatches(
+	existing: ExistingStageArtifact,
+	stage: RalplanStage,
+	reviewedPlanner: RalplanPlannerReference | undefined,
+	laneVerdict: LaneVerdictUpdate | undefined,
+): void {
+	if (existing.reviewedPlanner && !reviewedPlanner) {
+		throw new RalplanCommandError(
+			2,
+			`refusing to deduplicate ralplan ${stage} stage ${existing.stageN}: its reviewed Planner pass is no longer current.`,
+		);
+	}
+	if (
+		existing.reviewedPlanner &&
+		reviewedPlanner &&
+		!sameRalplanPlannerReference(existing.reviewedPlanner, reviewedPlanner)
+	) {
+		throw new RalplanCommandError(
+			2,
+			`refusing to deduplicate ralplan ${stage} stage ${existing.stageN} with different Planner provenance.`,
+		);
+	}
+	if (laneVerdict && existing.laneVerdict !== undefined && existing.laneVerdict !== laneVerdict.verdict) {
+		throw new RalplanCommandError(
+			2,
+			`refusing to deduplicate ralplan ${stage} stage ${existing.stageN} with a conflicting lane verdict.`,
+		);
+	}
+	if (
+		laneVerdict?.architectDecision &&
+		existing.architectDecision !== undefined &&
+		existing.architectDecision !== laneVerdict.architectDecision
+	) {
+		throw new RalplanCommandError(
+			2,
+			`refusing to deduplicate ralplan architect stage ${existing.stageN} with a conflicting Architect decision.`,
+		);
+	}
 }
 
 interface OnDiskStageArtifact {
@@ -2116,6 +2419,9 @@ async function repairMissingStageArtifactLedger(
 	resolved: Pick<ResolvedArtifactArgs, "sessionId" | "runId" | "stage" | "stageN">,
 	onDisk: OnDiskStageArtifact,
 	finalAdmission?: RalplanAutoHandoffResolution,
+	reviewedPlanner?: RalplanPlannerReference,
+	laneVerdict?: LaneVerdictUpdate,
+	reviewerAttestation?: RalplanReviewAttestation,
 ): Promise<ExistingStageArtifact> {
 	const createdAt = new Date().toISOString();
 	const indexEntry = {
@@ -2124,6 +2430,10 @@ async function repairMissingStageArtifactLedger(
 		path: onDisk.path,
 		created_at: createdAt,
 		sha256: onDisk.sha256,
+		...(reviewedPlanner ? { reviewed_planner: reviewedPlanner } : {}),
+		...(laneVerdict ? { lane_verdict: laneVerdict.verdict } : {}),
+		...(laneVerdict?.architectDecision ? { architect_decision: laneVerdict.architectDecision } : {}),
+		...(reviewerAttestation ? { reviewer_attestation: reviewerAttestation } : {}),
 		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
 	const result = await appendRalplanIndexIdempotent(
@@ -2138,8 +2448,14 @@ async function repairMissingStageArtifactLedger(
 				skill: "ralplan",
 				sessionId: resolved.sessionId,
 			},
-			key: ralplanIndexKey,
+			key: ralplanIndexKeyWithReviewMetadata,
 		},
+		(existing, candidate) =>
+			assertRalplanIndexReviewMetadataWriteSafe(
+				existing,
+				candidate,
+				path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId),
+			),
 	);
 	const duplicate = result.duplicate;
 	if (duplicate && typeof duplicate === "object" && !Array.isArray(duplicate)) {
@@ -2323,6 +2639,7 @@ async function handleArtifactWrite(
 	args: readonly string[],
 	cwd: string,
 	agentDir?: string,
+	stageWriteLockHeld = false,
 	finalPublicationLockHeld = false,
 ): Promise<RalplanCommandResult> {
 	// #4693: explicit --worktree-root binds every persistence root to the selected
@@ -2334,20 +2651,10 @@ async function handleArtifactWrite(
 	const resolved = await resolveArtifactArgs(args, persistCwd, cwd, {
 		confineArtifactRoot: target.explicit ? cwd : undefined,
 	});
-	if (resolved.stage === "final" && !finalPublicationLockHeld) {
-		const publicationLockPath = path.join(
-			sessionPlansDir(persistCwd, resolved.sessionId),
-			"ralplan",
-			resolved.runId,
-			"final-publication",
-		);
-		return await withWorkflowStateLock(publicationLockPath, () => handleArtifactWrite(args, cwd, agentDir, true), {
-			cwd: persistCwd,
-		});
-	}
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
-	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
+	// Validate repository ownership and reviewer authority before lock acquisition:
+	// creating a stage-lock path must not mutate an unseeded linked worktree.
 	const repositoryBinding = await enforceRalplanRepositoryBinding(persistCwd, resolved.sessionId, {
 		exactWorktreeRoot: target.explicit,
 	});
@@ -2369,7 +2676,36 @@ async function handleArtifactWrite(
 			// Non-file / missing path is inline content; resolveArtifactContent already handled it.
 		}
 	}
-
+	if (!stageWriteLockHeld) {
+		// Duplicate lookup, deterministic stage-file publication, and index append
+		// are one cross-process transaction for this exact stage identity.
+		const stageWriteLockPath = path.join(
+			sessionPlansDir(persistCwd, resolved.sessionId),
+			"ralplan",
+			resolved.runId,
+			`stage-${pad2(resolved.stageN)}-${resolved.stage}-write`,
+		);
+		return await withWorkflowStateLock(
+			stageWriteLockPath,
+			() => handleArtifactWrite(args, cwd, agentDir, true, false),
+			{ cwd: persistCwd },
+		);
+	}
+	if (resolved.stage === "final" && !finalPublicationLockHeld) {
+		const publicationLockPath = path.join(
+			sessionPlansDir(persistCwd, resolved.sessionId),
+			"ralplan",
+			resolved.runId,
+			"final-publication",
+		);
+		return await withWorkflowStateLock(
+			publicationLockPath,
+			() => handleArtifactWrite(args, cwd, agentDir, true, true),
+			{
+				cwd: persistCwd,
+			},
+		);
+	}
 	// Read the ledger once before persistence. The dedupe guard, both gates, and
 	// disposition provenance consume this same snapshot so no additional ledger
 	// read can slip between gate evaluation and persistence.
@@ -2382,7 +2718,28 @@ async function handleArtifactWrite(
 			: resolved.artifact;
 	const content = normalizedArtifact.endsWith("\n") ? normalizedArtifact : `${normalizedArtifact}\n`;
 	const sha256 = createHash("sha256").update(content).digest("hex");
-
+	const runDir = path.join(sessionPlansDir(persistCwd, resolved.sessionId), "ralplan", resolved.runId);
+	const reviewedPlanner =
+		resolved.stage === "architect" || resolved.stage === "critic" || resolved.stage === "final"
+			? latestRalplanPlannerReference(indexLoad.rawText, runDir, resolved.stageN)
+			: undefined;
+	const reviewerAttestation =
+		laneVerdict === undefined
+			? undefined
+			: createRalplanReviewAttestation(
+					{
+						sessionId: resolved.sessionId,
+						runId: resolved.runId,
+						stage: laneVerdict.lane,
+						stageN: laneVerdict.stageN,
+						artifactPath: path.join(runDir, `stage-${pad2(resolved.stageN)}-${resolved.stage}.md`),
+						artifactSha256: sha256,
+						reviewedPlanner,
+						laneVerdict: laneVerdict.verdict,
+						architectDecision: laneVerdict.architectDecision,
+					},
+					laneVerdict.reviewer,
+				);
 	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not
 	// silently clobber the artifact or append a duplicate ledger row. Classify before any
 	// state mutation so a conflict never regresses run-state phase.
@@ -2392,6 +2749,46 @@ async function handleArtifactWrite(
 			throw new RalplanCommandError(
 				2,
 				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
+			);
+		}
+		assertDuplicateReviewMetadataMatches(existingArtifact, resolved.stage, reviewedPlanner, laneVerdict);
+		const mergedReviewedPlanner = reviewedPlanner ?? existingArtifact.reviewedPlanner;
+		const mergedLaneVerdict = laneVerdict?.verdict ?? existingArtifact.laneVerdict;
+		const mergedArchitectDecision = laneVerdict?.architectDecision ?? existingArtifact.architectDecision;
+		if (
+			(resolved.stage === "architect" || resolved.stage === "critic" || resolved.stage === "final") &&
+			(mergedReviewedPlanner || mergedLaneVerdict || mergedArchitectDecision)
+		) {
+			await appendRalplanIndexIdempotent(
+				path.join(sessionPlansDir(persistCwd, resolved.sessionId), "ralplan", resolved.runId, "index.jsonl"),
+				{
+					stage: resolved.stage,
+					stage_n: resolved.stageN,
+					path: existingArtifact.path,
+					created_at: existingArtifact.createdAt,
+					sha256: existingArtifact.sha256,
+					...(mergedReviewedPlanner ? { reviewed_planner: mergedReviewedPlanner } : {}),
+					...(mergedLaneVerdict ? { lane_verdict: mergedLaneVerdict } : {}),
+					...(mergedArchitectDecision ? { architect_decision: mergedArchitectDecision } : {}),
+					...(reviewerAttestation
+						? { reviewer_attestation: reviewerAttestation }
+						: existingArtifact.reviewerAttestation !== undefined
+							? { reviewer_attestation: existingArtifact.reviewerAttestation }
+							: {}),
+					...(existingArtifact.autoHandoff ? { auto_handoff: existingArtifact.autoHandoff } : {}),
+				},
+				{
+					cwd: persistCwd,
+					key: ralplanIndexKeyWithReviewMetadata,
+					audit: {
+						category: "ledger",
+						verb: "append",
+						owner: "gjc-runtime",
+						skill: "ralplan",
+						sessionId: resolved.sessionId,
+					},
+				},
+				(existing, candidate) => assertRalplanIndexReviewMetadataWriteSafe(existing, candidate, runDir),
 			);
 		}
 		if (resolved.stage === "final") {
@@ -2404,11 +2801,19 @@ async function handleArtifactWrite(
 					path: existingArtifact.path,
 					created_at: existingArtifact.createdAt,
 					sha256: existingArtifact.sha256,
+					...(mergedReviewedPlanner ? { reviewed_planner: mergedReviewedPlanner } : {}),
+					...(mergedLaneVerdict ? { lane_verdict: mergedLaneVerdict } : {}),
+					...(mergedArchitectDecision ? { architect_decision: mergedArchitectDecision } : {}),
+					...(reviewerAttestation
+						? { reviewer_attestation: reviewerAttestation }
+						: existingArtifact.reviewerAttestation !== undefined
+							? { reviewer_attestation: existingArtifact.reviewerAttestation }
+							: {}),
 					...(existingArtifact.autoHandoff ? { auto_handoff: existingArtifact.autoHandoff } : {}),
 				},
 				{
 					cwd: persistCwd,
-					key: ralplanIndexKey,
+					key: ralplanIndexKeyWithReviewMetadata,
 					audit: {
 						category: "ledger",
 						verb: "append",
@@ -2417,6 +2822,7 @@ async function handleArtifactWrite(
 						sessionId: resolved.sessionId,
 					},
 				},
+				(existing, candidate) => assertRalplanIndexReviewMetadataWriteSafe(existing, candidate, runDir),
 			);
 			// The artifact and its authenticated ledger receipt are durable before the
 			// current-session admission projection. Repair that projection after a
@@ -2443,7 +2849,26 @@ async function handleArtifactWrite(
 				}
 			}
 		}
-		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, persistCwd, repositoryBinding);
+		let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
+		if (
+			persistedRoleState &&
+			(await applyPersistedRoleStateUpdate(persistCwd, resolved.sessionId, persistedRoleState, resolved.runId))
+		) {
+			appliedPersistedRoleState = persistedRoleState;
+		}
+		let appliedLaneVerdict: LaneVerdictUpdate | undefined;
+		if (laneVerdict && (await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict, resolved.runId))) {
+			appliedLaneVerdict = laneVerdict;
+		}
+		return await buildDeduplicatedResult(
+			resolved,
+			existingArtifact,
+			sha256,
+			persistCwd,
+			repositoryBinding,
+			appliedLaneVerdict,
+			appliedPersistedRoleState,
+		);
 	}
 
 	// `persistArtifact` writes the artifact before its ledger row. If a process crashed
@@ -2463,6 +2888,9 @@ async function handleArtifactWrite(
 			resolved,
 			onDiskArtifact,
 			resolved.stage === "final" ? unavailableRalplanFinalAdmission() : undefined,
+			reviewedPlanner,
+			laneVerdict,
+			reviewerAttestation,
 		);
 		if (resolved.stage === "final") {
 			const recoveryPublication = { id: randomUUID(), sha256 };
@@ -2572,7 +3000,16 @@ async function handleArtifactWrite(
 	}
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
-	const persisted = await persistArtifact(resolved, persistCwd, content, sha256, autoHandoff);
+	const persisted = await persistArtifact(
+		resolved,
+		persistCwd,
+		content,
+		sha256,
+		autoHandoff,
+		reviewedPlanner,
+		laneVerdict,
+		reviewerAttestation,
+	);
 	if (persistedRoleState) {
 		await applyPersistedRoleStateUpdate(persistCwd, resolved.sessionId, persistedRoleState);
 	}
@@ -2625,6 +3062,7 @@ async function handleArtifactWrite(
 	if (persistedRoleState) payload[`${persistedRoleState.role}_state`] = persistedRoleStatePayload(persistedRoleState);
 	if (reviewBudgetWarning) payload.review_budget_warning = reviewBudgetWarning;
 	if (laneVerdict) payload.lane_verdict = { lane: laneVerdict.lane, verdict: laneVerdict.verdict };
+	if (laneVerdict?.architectDecision) payload.architect_decision = laneVerdict.architectDecision;
 	if (autoHandoff) payload.auto_handoff = autoHandoff;
 
 	const stdout = resolved.json
@@ -2666,6 +3104,7 @@ async function buildDeduplicatedResult(
 		deduplicated: true,
 	};
 	if (laneVerdict) payload.lane_verdict = { lane: laneVerdict.lane, verdict: laneVerdict.verdict };
+	if (laneVerdict?.architectDecision) payload.architect_decision = laneVerdict.architectDecision;
 	if (persistedRoleState) {
 		payload[`${persistedRoleState.role}_state`] = persistedRoleStatePayload(persistedRoleState);
 	}
@@ -2724,6 +3163,9 @@ function extractPositionalTask(args: readonly string[]): string {
 function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHandoffArgs {
 	if (hasFlag(args, "--lane-verdict")) {
 		throw new RalplanCommandError(2, "--lane-verdict is only supported with gjc ralplan --write.");
+	}
+	if (hasFlag(args, "--architect-decision")) {
+		throw new RalplanCommandError(2, "--architect-decision is only supported with gjc ralplan --write.");
 	}
 	const architectKind = flagValue(args, "--architect")?.trim() || undefined;
 	if (architectKind && !KNOWN_ARCHITECT_KINDS.has(architectKind)) {

@@ -134,7 +134,8 @@ const ralplanReReviewContractPatterns = [
 	/A rule-2-justified blocker routes through a Planner `revision` opener \(new iteration, fresh lane budget\), never a second same-iteration review pass\./u,
 	/gjc:\n\s+ralplan:\n\s+maxIterations: 3\n\s+maxReviewPassesPerLane: 2/u,
 	/--lane-verdict <token>/u,
-	/Architect passes its Architectural Status token \(`CLEAR`\/`WATCH`\/`BLOCK`\), and Critic passes its verdict token \(`OKAY`\/`ITERATE`\/`REJECT`\)/u,
+	/Architect passes its Architectural Status token \(`CLEAR`\/`WATCH`\/`BLOCK`\) and `--architect-decision <APPROVE\|COMMENT\|REQUEST_CHANGES>` for its recommendation/u,
+	/Critic passes its verdict token \(`OKAY`\/`ITERATE`\/`REJECT`\)/u,
 ] as const;
 
 const staleRalplanReReviewContractPatterns = [/within the current consensus iteration/u] as const;

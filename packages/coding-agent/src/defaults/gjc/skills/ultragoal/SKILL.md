@@ -149,7 +149,7 @@ gjc ultragoal record-critic-verdict --terminus pause --classification-event-id <
 goal({"op":"pause"})
 ```
 
-Recording `--classification resolvable` is an audit note only; it never authorizes a pause. The `ask` tool stays blocked during active runs regardless of classification — record unresolved decisions as durable blockers instead of prompting.
+Recording `--classification resolvable` is an audit note only; it never authorizes a pause. While an Ultragoal run is active, `ask` remains blocked for blocker triage and every ordinary question. The sole exception is the canonical Ralplan execution-approval question when runtime verifies the current final, its trusted same-pass Architect/Critic review join, and `effectiveTarget: off`; use durable blockers for every other unresolved decision.
 
 ## Dynamic steering
 

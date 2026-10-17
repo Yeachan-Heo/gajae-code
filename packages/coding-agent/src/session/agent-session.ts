@@ -478,6 +478,7 @@ import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/pa
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
+import { clearRalplanReviewerCapabilities } from "../gjc-runtime/ralplan-reviewer-capability";
 import { clampTimeout } from "../tools/tool-timeouts";
 import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { parseCommandArgs } from "../utils/command-args";
@@ -11013,6 +11014,7 @@ export class AgentSession {
 
 	async #dispose(): Promise<void> {
 		const disposeFailures: Array<{ label: string; error: unknown; critical: boolean }> = [];
+		clearRalplanReviewerCapabilities(this.sessionManager.getSessionId());
 		this.#restoreManagedFallbackGetApiKey?.();
 		this.#restoreManagedFallbackGetApiKey = undefined;
 		this.#managedFallbackNextCredentialOverride = undefined;
@@ -12470,6 +12472,7 @@ export class AgentSession {
 						() => this.sessionManager.getCwd(),
 						() => ({ sessionId: this.sessionManager.getSessionId() }),
 						() => this.getSessionAgentDir(),
+						this.#builtinToolIdentities.has(tool),
 					),
 				),
 			),

@@ -52,6 +52,8 @@ export interface AskGateStageStateInput {
 export interface AskGateSchemaInput {
 	multi?: boolean;
 	allowEmpty?: boolean;
+	allowOther?: boolean;
+	allowClarification?: boolean;
 	customMaxLength?: number;
 }
 
@@ -205,6 +207,8 @@ export function validateAskGateStageState(value: unknown): asserts value is Reco
 /** Builds the canonical generic ask answer schema. */
 export function buildAskGateAnswerSchema(question: AskGateSchemaInput, labels: string[]): JsonSchema {
 	const multi = question.multi ?? false;
+	const allowOther = question.allowOther !== false;
+	const allowClarification = question.allowClarification !== false;
 	const selectedItems: JsonSchema = { type: "string", enum: labels };
 	const selectedBase: JsonSchema = { type: "array", items: selectedItems, uniqueItems: true };
 	const selectedOnly: JsonSchema = {
@@ -213,61 +217,79 @@ export function buildAskGateAnswerSchema(question: AskGateSchemaInput, labels: s
 		...(multi ? {} : { maxItems: 1 }),
 	};
 	const selectedWithOther: JsonSchema = { ...selectedBase, ...(multi ? {} : { maxItems: 0 }) };
-	return {
-		type: "object",
-		properties: {
-			selected: selectedBase,
-			other: { type: "boolean", description: "set true to provide a free-text answer in `custom`" },
-			custom: {
-				type: "string",
-				minLength: 1,
-				...(question.customMaxLength === undefined ? {} : { maxLength: question.customMaxLength }),
-				pattern: "\\S",
-				description: "free-text answer; required when `other` is true",
-			},
-			action: {
-				type: "string",
-				enum: ["answer", "clarify"],
-				description: "set to `clarify` to ask about the choices without answering the round",
-			},
-			question: {
-				type: "string",
-				minLength: 1,
-				pattern: "\\S",
-				description: "clarification question; required when action is `clarify`",
-			},
-		},
-		additionalProperties: false,
-		anyOf: [
-			{
-				type: "object",
-				properties: { selected: selectedOnly, other: { const: false }, action: { const: "answer" } },
-				required: ["selected"],
-				additionalProperties: false,
-			},
-			{
-				type: "object",
-				properties: {
-					selected: selectedWithOther,
-					other: { const: true },
+	const properties: Record<string, JsonSchema> = {
+		selected: selectedBase,
+		other: allowOther
+			? { type: "boolean", description: "set true to provide a free-text answer in `custom`" }
+			: { const: false },
+		...(allowOther
+			? {
 					custom: {
-						type: "string",
+						type: "string" as const,
 						minLength: 1,
 						...(question.customMaxLength === undefined ? {} : { maxLength: question.customMaxLength }),
 						pattern: "\\S",
+						description: "free-text answer; required when `other` is true",
 					},
-					action: { const: "answer" },
+				}
+			: {}),
+		action: allowClarification
+			? {
+					type: "string",
+					enum: ["answer", "clarify"],
+					description: "set to `clarify` to ask about the choices without answering the round",
+				}
+			: { const: "answer" },
+		...(allowClarification
+			? {
+					question: {
+						type: "string" as const,
+						minLength: 1,
+						pattern: "\\S",
+						description: "clarification question; required when action is `clarify`",
+					},
+				}
+			: {}),
+	};
+	const anyOf: JsonSchema[] = [
+		{
+			type: "object",
+			properties: { selected: selectedOnly, other: { const: false }, action: { const: "answer" } },
+			required: ["selected"],
+			additionalProperties: false,
+		},
+	];
+	if (allowOther) {
+		anyOf.push({
+			type: "object",
+			properties: {
+				selected: selectedWithOther,
+				other: { const: true },
+				custom: {
+					type: "string",
+					minLength: 1,
+					...(question.customMaxLength === undefined ? {} : { maxLength: question.customMaxLength }),
+					pattern: "\\S",
 				},
-				required: ["selected", "other", "custom"],
-				additionalProperties: false,
+				action: { const: "answer" },
 			},
-			{
-				type: "object",
-				properties: { action: { const: "clarify" }, question: { type: "string", minLength: 1, pattern: "\\S" } },
-				required: ["action", "question"],
-				additionalProperties: false,
-			},
-		],
+			required: ["selected", "other", "custom"],
+			additionalProperties: false,
+		});
+	}
+	if (allowClarification) {
+		anyOf.push({
+			type: "object",
+			properties: { action: { const: "clarify" }, question: { type: "string", minLength: 1, pattern: "\\S" } },
+			required: ["action", "question"],
+			additionalProperties: false,
+		});
+	}
+	return {
+		type: "object",
+		properties,
+		additionalProperties: false,
+		anyOf,
 	};
 }
 

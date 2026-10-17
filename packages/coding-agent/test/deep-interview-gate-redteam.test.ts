@@ -203,6 +203,39 @@ describe("deep-interview question gates red-team", () => {
 		expect(gate.context?.stage_state).toMatchObject({ other_option: "Other (type your own)" });
 	});
 
+	it("rejects custom Ralplan approval responses before accepting the gate", async () => {
+		const question: AskGateQuestion = {
+			id: "ralplan-final-approval",
+			question: "Approve the current Ralplan final?",
+			options: [{ label: "Refine further" }, { label: "Approve execution via ultragoal" }, { label: "Stop here" }],
+			recommended: 1,
+			workflowGate: { stage: "ralplan", kind: "approval" },
+		};
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-ralplan-approval", new MemoryGateStore(), {
+			advance: (_gate, acceptedAnswer) => {
+				advanced.push(acceptedAnswer);
+			},
+		});
+		const gate = broker.openGate(questionToGate(question), activeContinuation());
+		expect(gate.schema.properties?.custom).toBeUndefined();
+		expect(gate.schema.properties?.question).toBeUndefined();
+
+		const invalid = await broker.resolve({
+			gate_id: gate.gate_id,
+			answer: { selected: [], other: true, custom: "Postgres" },
+		});
+		expect(invalid.status).toBe("rejected");
+		expect(advanced).toEqual([]);
+
+		const accepted = await broker.resolve({
+			gate_id: gate.gate_id,
+			answer: { selected: ["Approve execution via ultragoal"] },
+		});
+		expect(accepted.status).toBe("accepted");
+		expect(advanced).toEqual([{ selected: ["Approve execution via ultragoal"] }]);
+	});
+
 	it("supports zero-option questions as free-text gates without advertising Other as a selectable option", async () => {
 		const zeroQ: AskGateQuestion = {
 			id: "zero-options",

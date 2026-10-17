@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -31,6 +31,15 @@ import {
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { CURRENT_SESSION_VERSION, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
+import { formatRalplanUltragoalApprovalQuestion } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
+import {
+	clearRalplanReviewerCapabilities,
+	GJC_RALPLAN_REVIEWER_CAPABILITY_ENV,
+	GJC_RALPLAN_REVIEWER_ID_ENV,
+	GJC_RALPLAN_REVIEWER_ROLE_ENV,
+	getOrCreateRalplanReviewerCapability,
+} from "../../src/gjc-runtime/ralplan-reviewer-capability";
+import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "../../src/gjc-runtime/restricted-role-agent-bash";
 import { migrateAndPersistLegacyState } from "../../src/gjc-runtime/state-migrations";
 import {
 	assertExecutionApprovalTranscriptBoundary,
@@ -52,6 +61,11 @@ import {
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 const TEST_SESSION_ID = "test-session";
+const reviewerSessionIds = new Set<string>([TEST_SESSION_ID]);
+
+afterAll(() => {
+	for (const sessionId of reviewerSessionIds) clearRalplanReviewerCapabilities(sessionId);
+});
 
 function readyCrystal(): DeepInterviewCrystal {
 	const messages = [{ index: 0, role: "user" as const, content: "Build the approved feature." }];
@@ -123,6 +137,50 @@ async function writePublishedReadyCrystal(
 	return { callerPath, specPath };
 }
 
+async function writeReviewedRalplanFinal(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	stageN: number,
+	finalArtifact: string,
+): Promise<void> {
+	const stages = [
+		{ stage: "planner", artifact: "# Planner\n\nImplement the reviewed change.", extra: [] },
+		{
+			stage: "architect",
+			artifact: "## Architectural Status\nCLEAR\n\n## Code Review Recommendation\nAPPROVE\n",
+			extra: ["--lane-verdict", "CLEAR", "--architect-decision", "APPROVE"],
+		},
+		{ stage: "critic", artifact: "## Verdict\n**OKAY**\n", extra: ["--lane-verdict", "OKAY"] },
+		{ stage: "final", artifact: finalArtifact, extra: [] },
+	] as const;
+	for (const row of stages) {
+		const reviewerRole = row.stage === "architect" || row.stage === "critic" ? row.stage : undefined;
+		const write = (reviewerId?: string) =>
+			runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					row.stage,
+					"--stage_n",
+					String(stageN),
+					"--artifact",
+					row.artifact,
+					"--run-id",
+					runId,
+					"--session-id",
+					sessionId,
+					...row.extra,
+					...(reviewerRole && reviewerId ? [`--${reviewerRole}-id`, reviewerId] : []),
+					"--json",
+				],
+				cwd,
+			);
+		const result = reviewerRole ? await withRalplanReviewer(sessionId, reviewerRole, write) : await write();
+		expect(result.status, result.stderr).toBe(0);
+	}
+}
+
 async function writeLegacyApprovedCrystal(cwd: string): Promise<string> {
 	const crystal = readyCrystal();
 	const content = crystalMarkdown(crystal);
@@ -171,6 +229,29 @@ function restoreSessionId(sessionId: string | undefined): void {
 function restoreEnvironmentValue(name: string, value: string | undefined): void {
 	if (value === undefined) delete process.env[name];
 	else process.env[name] = value;
+}
+
+async function withRalplanReviewer<T>(
+	sessionId: string,
+	role: "architect" | "critic",
+	run: (agentId: string) => Promise<T>,
+): Promise<T> {
+	const agentId = `state-handoff-${role}`;
+	const capability = getOrCreateRalplanReviewerCapability(sessionId, role, agentId);
+	reviewerSessionIds.add(sessionId);
+	const environment = {
+		[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1",
+		[GJC_RALPLAN_REVIEWER_ROLE_ENV]: role,
+		[GJC_RALPLAN_REVIEWER_ID_ENV]: agentId,
+		[GJC_RALPLAN_REVIEWER_CAPABILITY_ENV]: capability,
+	};
+	const previous = Object.keys(environment).map(name => [name, process.env[name]] as const);
+	for (const [name, value] of Object.entries(environment)) process.env[name] = value;
+	try {
+		return await run(agentId);
+	} finally {
+		for (const [name, value] of previous) restoreEnvironmentValue(name, value);
+	}
 }
 
 function parseRequiredJson(text: string | undefined, source: string): Record<string, unknown> {
@@ -394,12 +475,23 @@ async function askAndPersistExecutionApproval(
 ): Promise<void> {
 	const label = "Approve execution via ultragoal";
 	const toolCallId = `provider-${questionId}`;
+	let question = "Approve this published specification for execution?";
+	if (stage === "ralplan") {
+		const presentation = await captureExecutionApprovalPresentation(cwd, manager.getSessionId(), "ralplan");
+		const canonicalQuestion = formatRalplanUltragoalApprovalQuestion(presentation);
+		if (!canonicalQuestion) throw new Error("expected canonical Ralplan approval question");
+		question = canonicalQuestion;
+	}
 	const args = {
 		questions: [
 			{
 				id: questionId,
-				question: "Approve this published specification for execution?",
-				options: [{ label }, { label: "Keep planning" }],
+				question,
+				options:
+					stage === "ralplan"
+						? [{ label: "Refine further" }, { label }, { label: "Stop here" }]
+						: [{ label }, { label: "Keep planning" }],
+				...(stage === "ralplan" ? { recommended: 1, multi: false } : {}),
 				workflowGate:
 					stage === "ralplan"
 						? { stage: "ralplan" as const, kind: "approval" as const }
@@ -691,11 +783,7 @@ describe("gjc state handoff", () => {
 			const runId = parseRequiredJson(seed.stdout, "ralplan seed stdout").run_id as string;
 			const artifactPath = path.join(cwd, "renewal-final.md");
 			await fs.writeFile(artifactPath, `# Final\n${"계획".repeat(60_000)}`);
-			const final = await runNativeRalplanCommand(
-				["--write", "--stage", "final", "--stage_n", "1", "--artifact", artifactPath, "--run-id", runId, "--json"],
-				cwd,
-			);
-			expect(final.status, final.stderr).toBe(0);
+			await writeReviewedRalplanFinal(cwd, sessionId, runId, 1, artifactPath);
 			const handoff = () =>
 				runNativeStateCommand(
 					["handoff", "--mode", "ralplan", "--to", "ultragoal", "--session-id", sessionId, "--json"],
@@ -1845,6 +1933,52 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("rejects sanctioned Ralplan admission after a later Planner reopens the plan", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+					.status,
+			).toBe(0);
+			await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: ultragoal\n");
+			const seed = await runNativeRalplanCommand(["--json", "reopen the auto-admitted plan"], cwd);
+			expect(seed.status, seed.stderr).toBe(0);
+			const runId = parseRequiredJson(seed.stdout, "ralplan seed stdout").run_id as string;
+			await writeReviewedRalplanFinal(cwd, TEST_SESSION_ID, runId, 1, "# Final\n\nApproved plan.");
+
+			const reopen = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"planner",
+					"--stage_n",
+					"2",
+					"--artifact",
+					"# Revised plan\n\nPlanning has reopened.",
+					"--run-id",
+					runId,
+					"--session-id",
+					TEST_SESSION_ID,
+					"--json",
+				],
+				cwd,
+			);
+			expect(reopen.status, reopen.stderr).toBe(0);
+			expect(await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"))).toMatchObject({
+				current_phase: "final",
+				auto_handoff: { effectiveTarget: "ultragoal" },
+			});
+
+			const handoff = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(handoff.status).toBe(2);
+			expect(handoff.stderr).toContain("Ralplan execution handoff requires non-stuck verified final plan evidence");
+			expect(await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).toBeNull();
+		});
+	});
+
 	it("rejects Ralplan execution from an ordinary off receipt without user approval evidence", async () => {
 		await withTempCwd(async cwd => {
 			await writePublishedReadyCrystal(cwd);
@@ -1857,11 +1991,7 @@ describe("gjc state handoff", () => {
 			const runId = parseRequiredJson(seed.stdout, "ralplan seed stdout").run_id as string;
 			const artifactPath = path.join(cwd, "large-final.md");
 			await fs.writeFile(artifactPath, `# Final\n${"계획".repeat(60_000)}`);
-			const final = await runNativeRalplanCommand(
-				["--write", "--stage", "final", "--stage_n", "1", "--artifact", artifactPath, "--run-id", runId, "--json"],
-				cwd,
-			);
-			expect(final.status, final.stderr).toBe(0);
+			await writeReviewedRalplanFinal(cwd, TEST_SESSION_ID, runId, 1, artifactPath);
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
 				cwd,

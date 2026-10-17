@@ -4,9 +4,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { runRalplanCliCommand } from "../../src/commands/ralplan";
+import {
+	clearRalplanReviewerCapabilities,
+	GJC_RALPLAN_REVIEWER_CAPABILITY_ENV,
+	GJC_RALPLAN_REVIEWER_ID_ENV,
+	GJC_RALPLAN_REVIEWER_ROLE_ENV,
+	getOrCreateRalplanReviewerCapability,
+} from "../../src/gjc-runtime/ralplan-reviewer-capability";
+import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "../../src/gjc-runtime/restricted-role-agent-bash";
 import ralplanPersistenceTemplate from "../../src/prompts/agent-fragments/ralplan-persistence.md" with { type: "text" };
 
 const tempRoots: string[] = [];
+const reviewerSessionIds = new Set<string>();
 const recursiveForce = { recursive: true, force: true } as const;
 
 let priorSessionId: string | undefined;
@@ -17,6 +26,7 @@ afterAll(async () => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
 	else delete process.env.GJC_SESSION_ID;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, recursiveForce)));
+	for (const sessionId of reviewerSessionIds) clearRalplanReviewerCapabilities(sessionId);
 });
 
 async function tempDir(prefix = "gjc-ralplan-wt-"): Promise<string> {
@@ -120,6 +130,39 @@ function explicitWriteArgs(input: {
 		input.artifact,
 		...(input.extra ?? []),
 	];
+}
+
+async function withRalplanReviewer<T>(
+	sessionId: string,
+	role: "architect" | "critic",
+	run: (agentId: string) => Promise<T>,
+): Promise<T> {
+	const agentId = `ralplan-worktree-${role}`;
+	const capability = getOrCreateRalplanReviewerCapability(sessionId, role, agentId);
+	reviewerSessionIds.add(sessionId);
+	const environment = {
+		[GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1",
+		[GJC_RALPLAN_REVIEWER_ROLE_ENV]: role,
+		[GJC_RALPLAN_REVIEWER_ID_ENV]: agentId,
+		[GJC_RALPLAN_REVIEWER_CAPABILITY_ENV]: capability,
+	};
+	const previous = Object.keys(environment).map(name => [name, process.env[name]] as const);
+	for (const [name, value] of Object.entries(environment)) process.env[name] = value;
+	try {
+		return await run(agentId);
+	} finally {
+		for (const [name, value] of previous) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+}
+
+async function runRalplanLaneWrite(args: string[], cwd: string, sessionId: string, role: "architect" | "critic") {
+	const reviewerIdFlag = role === "architect" ? "--architect-id" : "--critic-id";
+	return await withRalplanReviewer(sessionId, role, agentId =>
+		runNativeRalplanCommand([...args, reviewerIdFlag, agentId], cwd),
+	);
 }
 
 async function readState(root: string, sessionId: string): Promise<Record<string, unknown>> {
@@ -321,7 +364,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(legacyWrite.status).toBe(0);
 		// A later explicit write from the dispatcher lands in the same single tree.
-		const explicitWrite = await runNativeRalplanCommand(
+		const explicitWrite = await runRalplanLaneWrite(
 			[
 				"--write",
 				"--worktree-root",
@@ -340,6 +383,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 				"OKAY",
 			],
 			dispatcher,
+			session,
+			"critic",
 		);
 		expect(explicitWrite.status).toBe(0);
 		const dir = runDir(target, session, session);
@@ -441,26 +486,27 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		await fs.mkdir(path.join(target, ".gjc"), { recursive: true });
 		await fs.writeFile(path.join(target, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    maxReviewPassesPerLane: 1\n");
 
-		const writeStage = (stage: string, stageN: number, artifact: string, extra: string[] = []) =>
-			runNativeRalplanCommand(
-				[
-					"--write",
-					"--worktree-root",
-					target,
-					"--stage",
-					stage,
-					"--stage_n",
-					String(stageN),
-					"--session-id",
-					session,
-					"--run-id",
-					session,
-					"--artifact",
-					artifact,
-					...extra,
-				],
-				dispatcher,
-			);
+		const writeStage = (stage: string, stageN: number, artifact: string, extra: string[] = []) => {
+			const args = [
+				"--write",
+				"--worktree-root",
+				target,
+				"--stage",
+				stage,
+				"--stage_n",
+				String(stageN),
+				"--session-id",
+				session,
+				"--run-id",
+				session,
+				"--artifact",
+				artifact,
+				...extra,
+			];
+			if (!extra.includes("--lane-verdict")) return runNativeRalplanCommand(args, dispatcher);
+			if (stage !== "architect" && stage !== "critic") throw new Error(`unexpected lane verdict stage: ${stage}`);
+			return runRalplanLaneWrite(args, dispatcher, session, stage);
+		};
 
 		expect(
 			(
@@ -732,7 +778,7 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		).toBe(0);
 		expect(
 			(
-				await runNativeRalplanCommand(
+				await runRalplanLaneWrite(
 					explicitWriteArgs({
 						worktreeRoot: target,
 						stage: "architect",
@@ -742,10 +788,12 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 						extra: ["--lane-verdict", "CLEAR"],
 					}),
 					dispatcher,
+					session,
+					"architect",
 				)
 			).status,
 		).toBe(0);
-		const stuck = await runNativeRalplanCommand(
+		const stuck = await runRalplanLaneWrite(
 			explicitWriteArgs({
 				worktreeRoot: target,
 				stage: "architect",
@@ -755,6 +803,8 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 				extra: ["--lane-verdict", "CLEAR"],
 			}),
 			dispatcher,
+			session,
+			"architect",
 		);
 		expect(stuck.status).toBe(3);
 		expect(stuck.stderr ?? "").toMatch(/PLANNING-STUCK/);
