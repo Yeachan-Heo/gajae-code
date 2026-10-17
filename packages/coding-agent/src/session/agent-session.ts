@@ -28717,18 +28717,33 @@ export class AgentSession {
 			// before fallible post-commit integrations. A cleanup or MCP failure must
 			// not leave the next turn running with the parent's messages/session id.
 			this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
-			await this.#runToolSessionTransitionCleanups();
-			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-			// session_branch is the post-commit identity signal. Publish it only after
-			// the successor's messages and MCP selections are restored.
-			if (this.#extensionRunner) {
+			// session_branch is the post-commit identity signal. Publish it after the
+			// successor's messages and MCP selections are restored, and also when those
+			// fallible integrations fail: the identity is committed either way, and a
+			// missing signal leaves the broker index advertising the parent session until
+			// some later turn or teardown. A handler failure is logged, never thrown in
+			// place of the integration failure or as a veto of the committed branch.
+			const publishCommittedBranchIdentity = async (): Promise<void> => {
+				if (!this.#extensionRunner) return;
 				await this.#runCommittedSuccessorHook(() =>
 					this.#extensionRunner!.emit({
 						type: "session_branch",
 						previousSessionFile,
 					}),
 				);
+			};
+			try {
+				await this.#runToolSessionTransitionCleanups();
+				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
+			} catch (error) {
+				await publishCommittedBranchIdentity().catch((hookError: unknown) => {
+					logger.warn("Failed to publish the committed branch identity after a transition failure", {
+						error: hookError instanceof Error ? hookError.message : String(hookError),
+					});
+				});
+				throw error;
 			}
+			await publishCommittedBranchIdentity();
 
 			return { selectedText, cancelled: false };
 		} finally {
