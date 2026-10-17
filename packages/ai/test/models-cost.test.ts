@@ -127,6 +127,87 @@ describe("calculateCost", () => {
 		expect(usage.cost.total).toBeCloseTo(2.18, 8);
 	});
 
+	it("bundles the direct Haiku 5.5 long-context price tier", () => {
+		const rawCatalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		const expected = {
+			threshold: 100_000,
+			cost: { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 },
+		};
+		const model = getBundledModel("anthropic", "claude-haiku-5-5");
+
+		expect(rawCatalog.anthropic?.["claude-haiku-5-5"]?.longContextPricing).toEqual(expected);
+		expect(model.longContextPricing).toEqual(expected);
+	});
+
+	it("bundles a Bedrock Haiku 5.5 long-context tier at 5x each profile's own rates", () => {
+		for (const id of [
+			"anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"us.anthropic.claude-haiku-5-5",
+		]) {
+			const model = getBundledModel("amazon-bedrock", id as never);
+			expect(model.longContextPricing?.threshold).toBe(100_000);
+			for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+				expect(model.longContextPricing?.cost[key]).toBeCloseTo(model.cost[key] * 5, 9);
+			}
+		}
+	});
+
+	it("bills Bedrock Haiku 5.5 at long-context rates only above 100K total prompt tokens", () => {
+		const model = getBundledModel("amazon-bedrock", "us.anthropic.claude-haiku-5-5" as never);
+		const usage = (input: number, cacheRead: number): Usage => ({
+			input,
+			output: 1_000,
+			cacheRead,
+			cacheWrite: 0,
+			totalTokens: input + cacheRead + 1_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const atThreshold = usage(100_000, 0);
+		const aboveThreshold = usage(80_000, 20_001);
+
+		calculateCost(model, atThreshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(atThreshold.cost.input).toBeCloseTo(0.011, 9);
+		expect(aboveThreshold.cost.input).toBeCloseTo(0.044, 9);
+		expect(aboveThreshold.cost.output).toBeCloseTo(0.00275, 9);
+		expect(aboveThreshold.cost.cacheRead).toBeCloseTo(0.001100055, 9);
+	});
+
+	it("applies Haiku 5.5 long-context rates only above 100K total prompt tokens", () => {
+		const model = getBundledModel("anthropic", "claude-haiku-5-5");
+		const usage = (input: number, cacheRead: number, cacheWrite: number): Usage => ({
+			input,
+			output: 1_000,
+			cacheRead,
+			cacheWrite,
+			totalTokens: input + cacheRead + cacheWrite + 1_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const atThreshold = usage(100_000, 0, 0);
+		const aboveThreshold = usage(80_000, 20_000, 1);
+
+		calculateCost(model, atThreshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(atThreshold.cost).toEqual({
+			input: 0.01,
+			output: 0.0005,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0.0105,
+		});
+		expect(aboveThreshold.cost.input).toBeCloseTo(0.04, 12);
+		expect(aboveThreshold.cost.output).toBeCloseTo(0.0025, 12);
+		expect(aboveThreshold.cost.cacheRead).toBeCloseTo(0.001, 12);
+		expect(aboveThreshold.cost.cacheWrite).toBeCloseTo(0.000000625, 12);
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.043500625, 12);
+	});
+
 	it("prices OpenAI Codex GPT models from the matching OpenAI catalog entry", () => {
 		const openAIModel = getBundledModel("openai", "gpt-5.4");
 		const codexModel = getBundledModel("openai-codex", "gpt-5.4");

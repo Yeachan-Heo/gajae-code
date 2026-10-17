@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel, THINKING_CONTROL_MODES } from "@gajae-code/ai";
+import { getBundledModel, getBundledModels, THINKING_CONTROL_MODES } from "@gajae-code/ai";
 import {
 	applyGeneratedModelPolicies,
 	clampThinkingLevelForModel,
@@ -11,6 +11,8 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	modelSupportsReasoningControl,
 	requireSupportedEffort,
+	requiresAnthropicThinkingDisableWhenOff,
+	supportsAnthropicAdaptiveThinkingDisplay,
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Context, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 import { hookFetch } from "@gajae-code/utils";
@@ -29,6 +31,14 @@ const TEST_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
 	xai: "https://api.x.ai/v1",
 	zai: "https://api.z.ai/v1",
 };
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
@@ -441,6 +451,117 @@ describe("model thinking metadata", () => {
 		expect(fableBedrock.thinking?.maxLevel).toBe(Effort.High);
 		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.High)).toBe("high");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.XHigh)).toThrow(/not supported/);
+	});
+
+	it("resolves Claude Haiku 5.x as adaptive with a medium default while Haiku 4.5 keeps the generic ladder", () => {
+		const haiku55 = createModel({ id: "claude-haiku-5-5", api: "anthropic-messages", provider: "anthropic" });
+		const haiku55Bedrock = createModel({
+			id: "us.anthropic.claude-haiku-5-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
+		const haiku45 = createModel({ id: "claude-haiku-4-5", api: "anthropic-messages", provider: "anthropic" });
+
+		expect(haiku55.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		// AWS documents the same effort range and medium default for Converse.
+		expect(haiku55Bedrock.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.Max)).toBe("max");
+		// Haiku 4.5 predates the policy: unchanged budget ladder, no default.
+		expect(haiku45.thinking?.mode).toBe("budget");
+		expect(haiku45.thinking?.defaultLevel).toBeUndefined();
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Medium)).toBe("medium");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Max)).toBe("max");
+	});
+
+	it("keeps the bundled Haiku 5.5 rows aligned with the thinking policy", () => {
+		const direct = getBundledModel("anthropic", "claude-haiku-5-5");
+		expect(direct.thinking?.mode).toBe("anthropic-adaptive");
+		expect(direct.thinking?.maxLevel).toBe(Effort.Max);
+		expect(direct.thinking?.defaultLevel).toBe(Effort.Medium);
+		for (const id of [
+			"anthropic.claude-haiku-5-5",
+			"au.anthropic.claude-haiku-5-5",
+			"eu.anthropic.claude-haiku-5-5",
+			"global.anthropic.claude-haiku-5-5",
+			"jp.anthropic.claude-haiku-5-5",
+			"us.anthropic.claude-haiku-5-5",
+		]) {
+			const bedrock = getBundledModel("amazon-bedrock", id as never);
+			expect(bedrock.thinking?.mode).toBe("anthropic-adaptive");
+			expect(bedrock.thinking?.maxLevel).toBe(Effort.Max);
+			expect(bedrock.thinking?.defaultLevel).toBe(Effort.Medium);
+		}
+	});
+
+	it("holds seeded Haiku parser and policy properties for catalog IDs (seed 0x5eed5505)", () => {
+		const haikuVersionPattern = /claude-haiku-(\d{1,2})-(\d{1,2})\b/;
+		const directCatalogCases = getBundledModels("anthropic").flatMap(model => {
+			if (model.api !== "anthropic-messages") return [];
+			const match = haikuVersionPattern.exec(model.id);
+			if (!match) return [];
+			return [
+				{
+					id: model.id,
+					api: "anthropic-messages" as const,
+					provider: "anthropic" as const,
+					major: Number(match[1]),
+					minor: Number(match[2]),
+				},
+			];
+		});
+		const catalogCases = directCatalogCases;
+		const versions = Array.from(new Set(catalogCases.map(({ major, minor }) => `${major}.${minor}`))).sort();
+		const random = seededRandom(0x5eed_5505);
+		const randomInt = (max: number): number => Math.floor(random() * max);
+
+		expect(versions).toContain("4.5");
+		expect(versions).toContain("5.5");
+		for (const version of versions) {
+			const [major, minor] = version.split(".").map(Number);
+			if (major === undefined || minor === undefined) throw new Error(`Invalid catalog version ${version}`);
+			const isHaiku55OrLater = major > 5 || (major === 5 && minor >= 5);
+			for (const api of ["anthropic-messages"] as const) {
+				const candidates = catalogCases.filter(
+					model => model.major === major && model.minor === minor && model.api === api,
+				);
+				expect(candidates.length).toBeGreaterThan(0);
+
+				for (let caseIndex = 0; caseIndex < 32; caseIndex++) {
+					const catalogCase = candidates[randomInt(candidates.length)];
+					if (!catalogCase) throw new Error("Expected a generated Haiku catalog case");
+
+					const model = createModel(catalogCase);
+					const isGeneration5OrLater = major >= 5;
+					const expectedMode = isGeneration5OrLater ? "anthropic-adaptive" : "budget";
+					const expectedDefault = isGeneration5OrLater ? Effort.Medium : undefined;
+					const defaultLevel = model.thinking?.defaultLevel;
+					const supportedEfforts = getSupportedEfforts(model);
+
+					expect(model.thinking?.mode).toBe(expectedMode);
+					expect(defaultLevel).toBe(expectedDefault);
+					if (isHaiku55OrLater) {
+						expect(supportedEfforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+					}
+					if (defaultLevel !== undefined) {
+						expect(supportedEfforts).toContain(defaultLevel);
+					}
+					expect(requiresAnthropicThinkingDisableWhenOff(catalogCase.id)).toBe(isGeneration5OrLater);
+					expect(supportsAnthropicAdaptiveThinkingDisplay(catalogCase.id)).toBe(isGeneration5OrLater);
+				}
+			}
+		}
 	});
 });
 
