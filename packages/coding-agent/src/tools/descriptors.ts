@@ -432,6 +432,8 @@ const loaders: Record<string, Loader> = {
 		cached("move_session", () => import("./move-session")).then(module => new module.MoveSessionTool(session)),
 	report_issue: session =>
 		cached("report_issue", () => import("./report-issue")).then(module => new module.ReportIssueTool(session)),
+	diff_comment: session =>
+		cached("diff_comment", () => import("./diff-comment")).then(module => new module.DiffCommentTool(session)),
 	yield: session => cached("yield", () => import("./yield")).then(module => new module.YieldTool(session)),
 	report_finding: _session => cached("review", () => import("./review")).then(module => module.reportFindingTool),
 	resolve: session => cached("resolve", () => import("./resolve")).then(module => new module.ResolveTool(session)),
@@ -494,6 +496,7 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 			"discoverable",
 		],
 		["calc", "Calc", "Evaluate a mathematical expression", "discoverable"],
+		["diff_comment", "Diff Comment", "Add comments to specific lines in the current diff", "discoverable"],
 		["ssh", "SSH", "Execute a command on a remote host over SSH", "discoverable"],
 		["github", "GitHub", "Interact with GitHub issues, pull requests, and repositories", "discoverable"],
 		["find", "Find", "Find files and directories matching a glob pattern", "discoverable"],
