@@ -464,18 +464,25 @@ describe("model thinking metadata", () => {
 
 		expect(haiku55.thinking).toEqual({
 			mode: "anthropic-adaptive",
-			minLevel: Effort.Minimal,
-			maxLevel: Effort.High,
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
 			defaultLevel: Effort.Medium,
 		});
-		// Bedrock keeps its separate budget-effort behavior and no model default.
-		expect(haiku55Bedrock.thinking?.mode).toBe("anthropic-budget-effort");
-		expect(haiku55Bedrock.thinking?.defaultLevel).toBeUndefined();
+		// AWS documents the same effort range and medium default for Converse.
+		expect(haiku55Bedrock.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Medium,
+		});
 		// Haiku 4.5 predates the policy: unchanged budget ladder, no default.
 		expect(haiku45.thinking?.mode).toBe("budget");
 		expect(haiku45.thinking?.defaultLevel).toBeUndefined();
 		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Medium)).toBe("medium");
-		expect(() => mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.XHigh)).toThrow(/not supported/);
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55, Effort.Max)).toBe("max");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(haiku55Bedrock, Effort.Max)).toBe("max");
 	});
 
 	it("keeps the bundled Haiku 5.5 rows aligned with the thinking policy", () => {
@@ -490,7 +497,10 @@ describe("model thinking metadata", () => {
 			"jp.anthropic.claude-haiku-5-5",
 			"us.anthropic.claude-haiku-5-5",
 		]) {
-			expect(getBundledModel("amazon-bedrock", id as never).thinking?.mode).toBe("anthropic-budget-effort");
+			const bedrock = getBundledModel("amazon-bedrock", id as never);
+			expect(bedrock.thinking?.mode).toBe("anthropic-adaptive");
+			expect(bedrock.thinking?.maxLevel).toBe(Effort.Max);
+			expect(bedrock.thinking?.defaultLevel).toBe(Effort.Medium);
 		}
 	});
 
@@ -534,6 +544,7 @@ describe("model thinking metadata", () => {
 		for (const version of versions) {
 			const [major, minor] = version.split(".").map(Number);
 			if (major === undefined || minor === undefined) throw new Error(`Invalid catalog version ${version}`);
+			const isHaiku55OrLater = major > 5 || (major === 5 && minor >= 5);
 			for (const api of ["anthropic-messages", "bedrock-converse-stream"] as const) {
 				const candidates = catalogCases.filter(
 					model => model.major === major && model.minor === minor && model.api === api,
@@ -546,18 +557,22 @@ describe("model thinking metadata", () => {
 
 					const model = createModel(catalogCase);
 					const isGeneration5OrLater = major >= 5;
-					const expectedMode = isGeneration5OrLater
-						? api === "anthropic-messages"
-							? "anthropic-adaptive"
-							: "anthropic-budget-effort"
-						: "budget";
-					const expectedDefault = isGeneration5OrLater && api === "anthropic-messages" ? Effort.Medium : undefined;
+					const expectedMode = isGeneration5OrLater ? "anthropic-adaptive" : "budget";
+					const expectedDefault =
+						(isGeneration5OrLater && api === "anthropic-messages") ||
+						(isHaiku55OrLater && api === "bedrock-converse-stream")
+							? Effort.Medium
+							: undefined;
 					const defaultLevel = model.thinking?.defaultLevel;
+					const supportedEfforts = getSupportedEfforts(model);
 
 					expect(model.thinking?.mode).toBe(expectedMode);
 					expect(defaultLevel).toBe(expectedDefault);
+					if (isHaiku55OrLater) {
+						expect(supportedEfforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+					}
 					if (defaultLevel !== undefined) {
-						expect(getSupportedEfforts(model)).toContain(defaultLevel);
+						expect(supportedEfforts).toContain(defaultLevel);
 					}
 					expect(requiresAnthropicThinkingDisableWhenOff(catalogCase.id)).toBe(isGeneration5OrLater);
 					expect(supportsAnthropicAdaptiveThinkingDisplay(catalogCase.id)).toBe(isGeneration5OrLater);

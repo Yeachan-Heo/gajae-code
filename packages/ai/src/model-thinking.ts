@@ -5,7 +5,7 @@ import {
 	isCodexGpt56Tier,
 	isCodexProductTransport,
 } from "./context-cap-policy";
-import { applyOpenAIModelPricing } from "./model-pricing";
+import { applyAnthropicModelPricing, applyOpenAIModelPricing } from "./model-pricing";
 import {
 	isAuditedOpenAIReasoningTransport,
 	parseDirectXaiReasoningEffortGeneration,
@@ -50,6 +50,17 @@ const DEFAULT_REASONING_EFFORTS_WITH_MAX: readonly Effort[] = [
 ];
 const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 	Effort.Minimal,
+	Effort.Low,
+	Effort.Medium,
+	Effort.High,
+	Effort.XHigh,
+	Effort.Max,
+];
+// Haiku 5.5 supports low, medium, high, xhigh, and max on both Anthropic
+// Messages and Bedrock Converse; neither contract lists minimal.
+// https://platform.claude.com/docs/en/build-with-claude/effort#effort-levels
+// https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html
+const ANTHROPIC_HAIKU_5_5_EFFORTS: readonly Effort[] = [
 	Effort.Low,
 	Effort.Medium,
 	Effort.High,
@@ -552,6 +563,14 @@ export function requiresAnthropicThinkingDisableWhenOff(modelId: string): boolea
 }
 
 /**
+ * Haiku 5+ and Opus 4.7+ reject sampling parameters on the Anthropic Messages API.
+ * https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide#remove-sampling-parameters
+ */
+export function hasAnthropicModelSamplingRestrictions(modelId: string): boolean {
+	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId);
+}
+
+/**
  * Adaptive thinking `display` is supported starting with Anthropic Opus 4.7.
  * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
  * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
@@ -590,6 +609,7 @@ function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi
 
 function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	applyOpenAIModelPricing(model);
+	applyAnthropicModelPricing(model);
 	const copilotLimits = model.provider === "github-copilot" ? COPILOT_GENERATED_LIMITS[model.id] : undefined;
 	if (copilotLimits) {
 		model.contextWindow = copilotLimits.contextWindow;
@@ -894,12 +914,16 @@ function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel
 		return Effort.Medium;
 	}
 	if (
-		model.provider === "anthropic" &&
 		parsedModel.family === "anthropic" &&
 		parsedModel.kind === "haiku" &&
-		semverGte(parsedModel.version, "5.0")
+		((model.provider === "anthropic" &&
+			model.api === "anthropic-messages" &&
+			semverGte(parsedModel.version, "5.0")) ||
+			(model.provider === "amazon-bedrock" &&
+				model.api === "bedrock-converse-stream" &&
+				semverGte(parsedModel.version, "5.5")))
 	) {
-		// Haiku 5.x defaults to medium adaptive effort instead of the global high.
+		// Haiku 5.5 defaults to medium adaptive effort instead of the global high.
 		return Effort.Medium;
 	}
 	return undefined;
@@ -1050,6 +1074,9 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
+		if (parsedModel.kind === "haiku" && semverGte(parsedModel.version, "5.5")) {
+			return ANTHROPIC_HAIKU_5_5_EFFORTS;
+		}
 		if (parsedModel.kind === "fable") {
 			// Fable exposes Anthropic's Messages-only xhigh preset; Bedrock
 			// Converse lacks it (same split as Opus 4.7+ below).
@@ -1128,7 +1155,7 @@ function inferThinkingControlMode<TApi extends Api>(
 			if (parsedModel.family === "anthropic") {
 				if (
 					semverGte(parsedModel.version, "4.6") &&
-					(parsedModel.kind === "opus" || parsedModel.kind === "fable")
+					(parsedModel.kind === "opus" || parsedModel.kind === "fable" || parsedModel.kind === "haiku")
 				) {
 					return "anthropic-adaptive";
 				}

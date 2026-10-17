@@ -14,6 +14,7 @@ import type { Effort } from "../model-thinking";
 import {
 	mapEffortToAnthropicAdaptiveEffort,
 	requireSupportedEffort,
+	requiresAnthropicThinkingDisableWhenOff,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
 import { calculateCost } from "../models";
@@ -888,6 +889,9 @@ function buildAdditionalModelRequestFields(
 	options: BedrockOptions,
 ): Record<string, unknown> | undefined {
 	const reasoning = options.reasoning;
+	if (requiresAnthropicThinkingDisableWhenOff(model.id) && (!reasoning || !model.reasoning)) {
+		return { thinking: { type: "disabled" } };
+	}
 	if (!reasoning || !model.reasoning) return undefined;
 
 	const mode = model.thinking?.mode;

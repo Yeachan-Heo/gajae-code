@@ -328,16 +328,24 @@ describe("anthropic stream envelope handling", () => {
 			]) as never;
 		});
 
-		for (const modelId of ["claude-haiku-5-5", "claude-haiku-4-5"]) {
-			const bundled = getBundledModel<"anthropic-messages">("anthropic", modelId);
-			if (!bundled) throw new Error(`Expected bundled Anthropic model ${modelId}`);
-			const stream = streamSimple(bundled, context, { apiKey: "sk-ant-test" });
+		const haiku55 = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		const haiku45 = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-4-5");
+		if (!haiku55 || !haiku45) throw new Error("Expected bundled Anthropic Haiku models");
+		for (const options of [
+			{ apiKey: "sk-ant-test" },
+			{ apiKey: "sk-ant-test", reasoning: Effort.High, disableReasoning: true },
+		] as const) {
+			const stream = streamSimple(haiku55, context, options);
 			for await (const _ of stream) {
 				// Drain the provider stream to inspect its request payload.
 			}
 		}
+		const legacyStream = streamSimple(haiku45, context, { apiKey: "sk-ant-test" });
+		for await (const _ of legacyStream) {
+			// Drain the provider stream to inspect its request payload.
+		}
 
-		expect(requestedThinking).toEqual([{ type: "disabled" }, undefined]);
+		expect(requestedThinking).toEqual([{ type: "disabled" }, { type: "disabled" }, undefined]);
 	});
 
 	it("requests summarized Haiku 5.5 thinking by default and preserves explicit omission", async () => {
