@@ -5,6 +5,7 @@
  * multiple leases and roots/resource subscriptions are connection-global unions.
  */
 import { logger } from "@gajae-code/utils";
+import type { SessionLaunchEnvironment } from "../sdk/session-environment";
 import { connectToServer, MCPConnectionCleanupFailure, subscribeToResources, unsubscribeFromResources } from "./client";
 import {
 	buildMCPPoolKeyIdentity,
@@ -141,6 +142,7 @@ export interface MCPConnectionPoolOptions {
 		options: {
 			signal?: AbortSignal;
 			advertiseRoots?: boolean;
+			sessionEnvironment?: SessionLaunchEnvironment;
 			onNotification?: (method: string, params: unknown) => void;
 			onRequest?: (method: string, params: unknown) => Promise<unknown>;
 		},
@@ -786,6 +788,7 @@ export class MCPConnectionPool {
 			connection = await this.#connect(name, config, {
 				signal: openSignal,
 				advertiseRoots: options.advertiseRoots,
+				sessionEnvironment: options.sessionEnvironment,
 				onNotification: options.onNotification,
 				onRequest: options.onRequest,
 			});
@@ -1094,6 +1097,7 @@ export class MCPConnectionPool {
 			const connection = await this.#connect(name, config, {
 				signal: openSignal,
 				advertiseRoots: options.advertiseRoots,
+				sessionEnvironment: options.sessionEnvironment,
 				onNotification: options.onNotification,
 				onRequest: options.onRequest,
 			});

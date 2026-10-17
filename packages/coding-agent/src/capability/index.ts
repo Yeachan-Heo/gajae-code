@@ -442,6 +442,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		repoRoot,
 		isolatedHome: false,
 		settings: ordinaryOptions.settings,
+		environment: ordinaryOptions.environment,
 		allowExternalUserSkillSymlinks: resolveExternalUserSkillSymlinkTrust(activeSettings),
 		bypassCache: ordinaryOptions.bypassCache,
 	};
@@ -535,6 +536,7 @@ export async function loadCapabilityForHome<T>(
 		isolatedHome,
 		homeIdentity,
 		settings: isolatedOptions.settings,
+		environment: isolatedOptions.environment,
 		allowExternalUserSkillSymlinks: resolveExternalUserSkillSymlinkTrust(isolatedOptions.settings),
 	};
 

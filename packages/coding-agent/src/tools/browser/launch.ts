@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getEnvValue } from "@gajae-code/utils";
 import { getPuppeteerDir } from "@gajae-code/utils/dirs";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import * as logger from "@gajae-code/utils/logger";
@@ -8,6 +9,7 @@ import { $which } from "@gajae-code/utils/which";
 import * as browsers from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
+import type { SessionLaunchEnvironment } from "../../sdk/session-environment";
 import stealthTamperingScript from "../puppeteer/00_stealth_tampering.txt" with { type: "text" };
 import stealthActivityScript from "../puppeteer/01_stealth_activity.txt" with { type: "text" };
 import stealthHairlineScript from "../puppeteer/02_stealth_hairline.txt" with { type: "text" };
@@ -82,28 +84,57 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 }
 
 /**
- * Browser launch overrides resolved from trusted environment sources only.
+ * Browser launch overrides use trusted environment defaults plus explicit session controls.
  *
  * These choose the browser binary and route/verify its traffic, so whatever can
  * set them controls what runs and who sees the session. `$env` merges the
- * caller's `cwd/.env` into `process.env`, so reading them directly would let
- * repository content pick the executable, point every request at an attacker's
- * proxy, or disable certificate validation. Resolve them the same way provider
- * credentials are: launching shell plus GJC/user-owned `.env` files, never the
- * project `.env`.
+ * caller's `cwd/.env` into `process.env`, so arbitrary child-environment reads
+ * would let repository content pick the executable, point every request at an
+ * attacker's proxy, or disable certificate validation. Use provider-credential
+ * sources as defaults, apply only validated session env/unset entries over them,
+ * and never use project `.env` values for these controls.
  */
-function trustedBrowserEnv(name: string): string | undefined {
+interface SessionBrowserEnvironmentValue {
+	specified: boolean;
+	value?: string;
+}
+
+function sessionBrowserEnvironmentValue(
+	name: string,
+	sessionEnvironment: SessionLaunchEnvironment | undefined,
+): SessionBrowserEnvironmentValue {
+	const value = getEnvValue(sessionEnvironment?.env ?? {}, name);
+	if (value !== undefined) return { specified: true, value };
+	const unset = (sessionEnvironment?.unsetEnv ?? []).some(candidate =>
+		process.platform === "win32" ? candidate.toUpperCase() === name.toUpperCase() : candidate === name,
+	);
+	return { specified: unset };
+}
+
+function trustedBrowserEnv(
+	name: string,
+	sessionEnvironment?: SessionLaunchEnvironment,
+	environment?: Record<string, string | undefined>,
+): string | undefined {
+	const sessionValue = sessionBrowserEnvironmentValue(name, sessionEnvironment);
+	if (sessionValue.specified) {
+		if (sessionValue.value === undefined) return undefined;
+		return getEnvValue(environment ?? {}, name) ?? sessionValue.value;
+	}
 	return $credentialEnv(name);
 }
 
 /** Boolean-like trusted browser env knob (`true`/`1`/`yes`/`on`). */
-function browserLaunchFlagEnabled(name: string): boolean {
-	const value = trustedBrowserEnv(name)?.toLowerCase();
+function browserLaunchFlagEnabled(
+	name: string,
+	sessionEnvironment?: SessionLaunchEnvironment,
+	environment?: Record<string, string | undefined>,
+): boolean {
+	const value = trustedBrowserEnv(name, sessionEnvironment, environment)?.toLowerCase();
 	return value === "true" || value === "1" || value === "yes" || value === "on";
 }
 
-/** Test seam: the browser launch overrides as resolved from trusted env. */
-export function resolveBrowserEnvOverridesForTest(): {
+interface BrowserEnvOverrides {
 	executablePath: string | undefined;
 	proxy: string | undefined;
 	proxyBypassLoopback: boolean;
@@ -111,16 +142,29 @@ export function resolveBrowserEnvOverridesForTest(): {
 	programFiles: string | undefined;
 	programFilesX86: string | undefined;
 	localAppData: string | undefined;
-} {
+}
+
+function resolveBrowserEnvOverrides(
+	sessionEnvironment?: SessionLaunchEnvironment,
+	environment?: Record<string, string | undefined>,
+): BrowserEnvOverrides {
 	return {
-		executablePath: trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH"),
-		proxy: trustedBrowserEnv("PUPPETEER_PROXY"),
-		proxyBypassLoopback: browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK"),
-		ignoreCertErrors: browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS"),
+		executablePath: trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH", sessionEnvironment, environment),
+		proxy: trustedBrowserEnv("PUPPETEER_PROXY", sessionEnvironment, environment),
+		proxyBypassLoopback: browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK", sessionEnvironment, environment),
+		ignoreCertErrors: browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS", sessionEnvironment, environment),
 		programFiles: trustedBrowserEnv("ProgramFiles"),
 		programFilesX86: trustedBrowserEnv("ProgramFiles(x86)"),
 		localAppData: trustedBrowserEnv("LOCALAPPDATA"),
 	};
+}
+
+/** Test seam: browser overrides from trusted sources and the explicit session overlay. */
+export function resolveBrowserEnvOverridesForTest(
+	sessionEnvironment?: SessionLaunchEnvironment,
+	environment?: Record<string, string | undefined>,
+): BrowserEnvOverrides {
+	return resolveBrowserEnvOverrides(sessionEnvironment, environment);
 }
 
 /**
@@ -129,10 +173,18 @@ export function resolveBrowserEnvOverridesForTest(): {
  * The browser is cached under ~/.gjc/puppeteer (getPuppeteerDir).
  */
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
-async function ensureChromiumExecutable(): Promise<string | undefined> {
+
+async function ensureChromiumExecutable(
+	sessionEnvironment?: SessionLaunchEnvironment,
+	environment?: Record<string, string | undefined>,
+): Promise<string | undefined> {
+	const sessionExecutable = sessionBrowserEnvironmentValue("PUPPETEER_EXECUTABLE_PATH", sessionEnvironment);
+	if (sessionExecutable.value) {
+		return getEnvValue(environment ?? {}, "PUPPETEER_EXECUTABLE_PATH") ?? sessionExecutable.value;
+	}
 	const sysChrome = resolveSystemChromium();
 	if (sysChrome) return sysChrome;
-	const envPath = trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH");
+	const envPath = sessionExecutable.specified ? undefined : trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH");
 	if (envPath) return envPath;
 	if (chromiumExecutablePromise) return chromiumExecutablePromise;
 
@@ -183,6 +235,14 @@ async function ensureChromiumExecutable(): Promise<string | undefined> {
 		);
 	});
 	return chromiumExecutablePromise;
+}
+
+/** Test seam for an explicit session executable, before the shared Chromium cache is consulted. */
+export async function resolveBrowserExecutableForTest(
+	sessionEnvironment?: SessionLaunchEnvironment,
+	environment?: Record<string, string | undefined>,
+): Promise<string | undefined> {
+	return await ensureChromiumExecutable(sessionEnvironment, environment);
 }
 
 let resolvedChromium: string | null | undefined; // undefined = unchecked; null = not found
@@ -301,8 +361,17 @@ export function resetSystemChromiumForTest(): void {
 	resolvedChromium = undefined;
 }
 
-export function headlessExecutableForProfileReuse(): string | undefined {
-	return resolveSystemChromium() ?? trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH");
+export function headlessExecutableForProfileReuse(
+	sessionEnvironment?: SessionLaunchEnvironment,
+	environment?: Record<string, string | undefined>,
+): string | undefined {
+	const sessionExecutable = sessionBrowserEnvironmentValue("PUPPETEER_EXECUTABLE_PATH", sessionEnvironment);
+	if (sessionExecutable.value) {
+		return getEnvValue(environment ?? {}, "PUPPETEER_EXECUTABLE_PATH") ?? sessionExecutable.value;
+	}
+	const systemChromium = resolveSystemChromium();
+	if (systemChromium) return systemChromium;
+	return sessionExecutable.specified ? undefined : trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH");
 }
 
 /**
@@ -379,6 +448,10 @@ export function resolveSystemChromeForProfile(): string | undefined {
 export interface LaunchHeadlessOptions {
 	headless: boolean;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
+	/** Effective child environment after applying the lifecycle session overlay. */
+	environment?: Record<string, string>;
+	/** Validated overlay provenance, so explicit session controls override trusted host defaults. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/**
 	 * Optional isolated warm-up profile directory (see profile-reuse.ts). When
 	 * set, the headless browser launches against this isolated copy of the user's
@@ -419,12 +492,13 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		// Isolated copy only (caller guarantees). Never point this at a live profile.
 		launchArgs.push(`--user-data-dir=${opts.profileWarmupDir}`);
 	}
-	const proxy = trustedBrowserEnv("PUPPETEER_PROXY");
+	const browserEnvironment = resolveBrowserEnvOverrides(opts.sessionEnvironment, opts.environment);
+	const proxy = browserEnvironment.proxy;
 	if (proxy) {
 		launchArgs.push(`--proxy-server=${proxy}`);
 		// Chrome (since v72) bypasses proxies for localhost by default. When PUPPETEER_PROXY_BYPASS_LOOPBACK
 		// is true, add <-loopback> so traffic to localhost reaches the proxy (e.g. for mitmdump/auth capture).
-		if (browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK")) {
+		if (browserEnvironment.proxyBypassLoopback) {
 			launchArgs.push("--proxy-bypass-list=<-loopback>");
 		}
 	}
@@ -433,14 +507,18 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	if (opts.geo?.locale) {
 		launchArgs.push(`--lang=${opts.geo.locale}`);
 	}
-	if (browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS")) {
+	if (browserEnvironment.ignoreCertErrors) {
 		launchArgs.push("--ignore-certificate-errors");
 	}
-	const launchEnv = opts.geo?.timezone ? { ...process.env, TZ: opts.geo.timezone } : undefined;
+	const launchEnv =
+		opts.environment === undefined && opts.geo?.timezone === undefined
+			? undefined
+			: { ...(opts.environment ?? process.env) };
+	if (launchEnv && opts.geo?.timezone) launchEnv.TZ = opts.geo.timezone;
 	return await puppeteer.launch({
 		headless: opts.headless,
 		defaultViewport: opts.headless ? initialViewport : null,
-		executablePath: await ensureChromiumExecutable(),
+		executablePath: await ensureChromiumExecutable(opts.sessionEnvironment, opts.environment),
 		args: launchArgs,
 		...(launchEnv ? { env: launchEnv } : {}),
 		ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],

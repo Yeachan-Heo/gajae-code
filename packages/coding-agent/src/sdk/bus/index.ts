@@ -160,6 +160,7 @@ import {
 	waitForToolCallBoundary,
 } from "../prompt-tool-boundary";
 import { OPERATIONS } from "../protocol/operation-registry";
+import type { SessionLaunchEnvironment } from "../session-environment";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -4321,6 +4322,7 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
+		sessionEnvironment?: SessionLaunchEnvironment;
 		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
@@ -9170,6 +9172,7 @@ export function createNotificationsExtension(
 								...(hostProcessIncarnation ? { processIncarnation: hostProcessIncarnation } : {}),
 								endpointMtimeMs,
 								endpointFileId,
+								...(options.sessionEnvironment ? { sessionEnvironment: options.sessionEnvironment } : {}),
 								...(masterRole ? { masterRole } : {}),
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});

@@ -11,6 +11,7 @@
 import { $env, isBunTestRuntime, logger, Snowflake } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import { Settings } from "../../config/settings";
+import { applySessionLaunchEnvironment, type SessionLaunchEnvironment } from "../../sdk/session-environment";
 import { type KernelDisplayOutput, renderKernelDisplay } from "./display";
 import { resolvePythonIpcTrace, resolvePythonSkipCheck } from "./env";
 import { PYTHON_PRELUDE } from "./prelude";
@@ -75,6 +76,7 @@ interface KernelLifecycleOptions {
 interface KernelStartOptions extends KernelLifecycleOptions {
 	cwd: string;
 	env?: Record<string, string | undefined>;
+	sessionEnvironment?: SessionLaunchEnvironment;
 	runtimeOptions?: PythonRuntimeOptions;
 	settings?: Settings;
 	/** @internal Synchronously registers the actual spawned kernel before startup callbacks run. */
@@ -180,6 +182,7 @@ export async function checkPythonKernelAvailability(
 	runtimeOptions?: PythonRuntimeOptions,
 	lifecycle?: PythonRuntimeLifecycleOptions,
 	settingsOverride?: Settings,
+	sessionEnvironment?: SessionLaunchEnvironment,
 ): Promise<PythonKernelAvailability> {
 	if (isBunTestRuntime() || resolvePythonSkipCheck($env)) {
 		return { ok: true };
@@ -194,11 +197,13 @@ export async function checkPythonKernelAvailability(
 			(await waitForLifecycle(Settings.init(), lifecycle, "Python kernel settings initialization"));
 		const { env } = settings.getShellConfig();
 		const baseEnv = filterEnv(env);
+		applySessionLaunchEnvironment(baseEnv, sessionEnvironment);
 		const runtime = await ensurePythonRuntime(cwd, baseEnv, runtimeOptions, lifecycle);
 		const probeEnv: Record<string, string> = {};
 		for (const [key, value] of Object.entries(runtime.env)) {
 			if (typeof value === "string") probeEnv[key] = value;
 		}
+		applySessionLaunchEnvironment(probeEnv, sessionEnvironment);
 		const remainingMs = getRemainingTimeMs(lifecycle?.deadlineMs);
 		if (remainingMs !== undefined && remainingMs <= 0) {
 			throw createAbortError("TimeoutError", "Python kernel availability check timed out");
@@ -291,6 +296,7 @@ export class PythonKernel {
 			options.runtimeOptions,
 			{ signal: options.signal, deadlineMs: options.deadlineMs },
 			options.settings,
+			options.sessionEnvironment,
 		);
 		throwIfLifecycleEnded(options, "Python kernel startup");
 		if (!availability.ok) {
@@ -301,6 +307,7 @@ export class PythonKernel {
 		throwIfLifecycleEnded(options, "Python kernel startup");
 		const { env: shellEnv } = settings.getShellConfig();
 		const baseEnv = filterEnv(shellEnv);
+		applySessionLaunchEnvironment(baseEnv, options.sessionEnvironment);
 		const runtime = await ensurePythonRuntime(options.cwd, baseEnv, options.runtimeOptions, {
 			signal: options.signal,
 			deadlineMs: options.deadlineMs,
@@ -316,6 +323,7 @@ export class PythonKernel {
 		// Unbuffered IO is critical for streaming.
 		spawnEnv.PYTHONUNBUFFERED = "1";
 		spawnEnv.PYTHONIOENCODING = "utf-8";
+		applySessionLaunchEnvironment(spawnEnv, options.sessionEnvironment);
 
 		const scriptPath = await ensureRunnerScript();
 		throwIfLifecycleEnded(options, "Python kernel startup");

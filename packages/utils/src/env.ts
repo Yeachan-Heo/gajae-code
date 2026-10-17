@@ -17,6 +17,20 @@ import {
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 
+/** Look up an environment name, honoring Windows' case-insensitive semantics. */
+export function getEnvValue(
+	environment: Readonly<Record<string, string | undefined>>,
+	name: string,
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
+	if (platform !== "win32") return environment[name];
+	const normalizedName = name.toUpperCase();
+	for (const [candidate, value] of Object.entries(environment)) {
+		if (candidate.toUpperCase() === normalizedName) return value;
+	}
+	return undefined;
+}
+
 function findClosingBrace(value: string, open: number): number {
 	let depth = 1;
 	for (let index = open + 2; index < value.length; index++) {

@@ -3,6 +3,7 @@
  * Parses SwiftLint's JSON reporter output into LSP Diagnostic format.
  */
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
+import { createCurrentSessionChildEnvironment } from "../../sdk/session-environment";
 
 /** Shape of a single violation from `swiftlint lint --reporter json`. */
 interface SwiftLintViolation {
@@ -36,6 +37,7 @@ async function runSwiftLint(
 	try {
 		const proc = Bun.spawn([command, ...args], {
 			cwd,
+			env: createCurrentSessionChildEnvironment(),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,

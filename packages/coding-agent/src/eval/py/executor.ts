@@ -2,6 +2,7 @@ import { getProjectDir, logger } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../../debug/crash-diagnostics";
 import { registerResourceOwner } from "../../runtime/process-lifecycle";
+import type { SessionLaunchEnvironment } from "../../sdk/session-environment";
 import { OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
@@ -54,6 +55,8 @@ export interface PythonExecutorOptions {
 	artifactsDir?: string;
 	/** Runtime resolution/provisioning options (RLM managed workspace venv, package seeding). */
 	runtimeOptions?: PythonRuntimeOptions;
+	/** Session-level environment overlay applied to the Python subprocess. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -543,8 +546,9 @@ function buildKernelEnv(options: {
 	artifactsDir?: string;
 	bridgeSessionId?: string;
 	bridge?: { url: string; capability: string };
+	sessionEnvironment?: SessionLaunchEnvironment;
 }): Record<string, string> | undefined {
-	const env: Record<string, string> = {};
+	const env: Record<string, string> = { ...(options.sessionEnvironment?.env ?? {}) };
 	if (options.sessionFile) env.PI_SESSION_FILE = options.sessionFile;
 	if (options.artifactsDir) env.PI_ARTIFACTS_DIR = options.artifactsDir;
 	if (options.bridge && options.bridgeSessionId) {
@@ -568,6 +572,7 @@ async function startKernel(
 		cwd,
 		settings: options.settings,
 		env: buildKernelEnv(options),
+		sessionEnvironment: options.sessionEnvironment,
 		runtimeOptions: options.runtimeOptions,
 		signal: options.signal,
 		deadlineMs: options.deadlineMs,
@@ -1329,6 +1334,7 @@ async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions
 			deadlineMs: options.deadlineMs,
 		},
 		options.settings,
+		options.sessionEnvironment,
 	);
 	throwIfExecutionCancelled(options);
 	if (!availability.ok) {

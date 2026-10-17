@@ -4,7 +4,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { safeRmSync } from "../../../scripts/safe-cleanup";
-import { $envpos, $flag, $pickenvpos, $pickflag, filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
+import {
+	$envpos,
+	$flag,
+	$pickenvpos,
+	$pickflag,
+	filterProcessEnv,
+	getEnvValue,
+	parseEnvFile,
+	parseShellEnvFile,
+} from "../src/env";
 
 const tempDirs: string[] = [];
 
@@ -121,6 +130,14 @@ describe("parseEnvFile", () => {
 			GOOGLE_APPLICATION_CREDENTIALS: "/tmp/project-adc.json",
 			DSN: "postgres://project",
 		});
+	});
+});
+
+describe("getEnvValue", () => {
+	it("uses case-insensitive names only for Windows environments", () => {
+		const environment = { session_token: "session-value" };
+		expect(getEnvValue(environment, "SESSION_TOKEN", "win32")).toBe("session-value");
+		expect(getEnvValue(environment, "SESSION_TOKEN", "linux")).toBeUndefined();
 	});
 });
 

@@ -1000,7 +1000,7 @@ async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unkno
 }
 
 async function runInspect(agentDir: string, sessionId: string): Promise<unknown> {
-	const listing = await sessionRows(agentDir, { resolveSessionId: sessionId });
+	const listing = await sessionRows(agentDir, { resolveSessionId: sessionId, includeEnvironmentNames: true });
 	const session = listing.sessions.find(candidate => candidate.sessionId === sessionId);
 	if (!session)
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);

@@ -45,6 +45,8 @@ export interface LoadMCPConfigsOptions {
 	nativeOnly?: boolean;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
+	/** Session-scoped environment for resolving MCP config references. */
+	environment?: Record<string, string>;
 	/**
 	 * Agent directory that holds the user scope (`<agentDir>/mcp.json`).
 	 * Default: `getAgentDir()`. Sessions created with their own `agentDir` pass it
@@ -146,7 +148,10 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let configurationWarning = false;
 	let warnings: string[] = [];
 	if (exactConfig) {
-		const result = await loadMCPJsonFile(options.configPath!, "project", { quiet: true });
+		const result = await loadMCPJsonFile(options.configPath!, "project", {
+			quiet: true,
+			environment: options.environment,
+		});
 		servers = result.items;
 		disabledServers = new Set(result.disabledServers);
 		warnings = result.warnings ?? [];
@@ -160,6 +165,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 			cwd,
 			agentDir: options?.agentDir,
 			settings: options?.settings,
+			environment: options?.environment,
 			providers: options?.nativeOnly === true ? ["native"] : undefined,
 		});
 		// Filter out project-level configs if disabled

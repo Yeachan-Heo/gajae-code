@@ -1,7 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $which, getRemoteDir, postmortem } from "@gajae-code/utils";
+import { getRemoteDir, postmortem } from "@gajae-code/utils";
 import { $ } from "bun";
+import {
+	createSessionChildEnvironment,
+	type SessionLaunchEnvironment,
+	whichWithSessionEnvironment,
+} from "../sdk/session-environment";
 import {
 	getControlDir,
 	getControlPathTemplate,
@@ -14,7 +19,7 @@ const REMOTE_DIR = getRemoteDir();
 const CONTROL_DIR = getControlDir();
 const CONTROL_PATH = getControlPathTemplate();
 
-const mountedPaths = new Set<string>();
+const mountedPaths = new Map<string, SessionLaunchEnvironment | undefined>();
 
 async function ensureDir(path: string, mode = 0o700): Promise<void> {
 	try {
@@ -62,50 +67,69 @@ function buildSshfsArgs(host: SSHConnectionTarget): string[] {
 	return args;
 }
 
-async function unmountPath(path: string): Promise<boolean> {
-	const fusermount = $which("fusermount") ?? $which("fusermount3");
+async function runResolvedCommand(
+	executable: string,
+	args: string[],
+	sessionEnvironment: SessionLaunchEnvironment | undefined,
+	quiet: boolean,
+) {
+	const environment = createSessionChildEnvironment(sessionEnvironment);
+	const shell = $`${executable} ${args}`;
+	const command = environment === undefined ? shell : shell.env(environment);
+	return quiet ? await command.quiet().nothrow() : await command.nothrow();
+}
+
+async function unmountPath(path: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<boolean> {
+	const fusermount =
+		whichWithSessionEnvironment("fusermount", sessionEnvironment) ??
+		whichWithSessionEnvironment("fusermount3", sessionEnvironment);
 	if (fusermount) {
-		const result = await $`${fusermount} -u ${path}`.quiet().nothrow();
+		const result = await runResolvedCommand(fusermount, ["-u", path], sessionEnvironment, true);
 		if (result.exitCode === 0) return true;
 	}
 
-	const umount = $which("umount");
+	const umount = whichWithSessionEnvironment("umount", sessionEnvironment);
 	if (!umount) return false;
-	const result = await $`${umount} ${path}`.quiet().nothrow();
+	const result = await runResolvedCommand(umount, [path], sessionEnvironment, true);
 	return result.exitCode === 0;
 }
 
-export function hasSshfs(): boolean {
-	return $which("sshfs") !== null;
+export function hasSshfs(sessionEnvironment?: SessionLaunchEnvironment): boolean {
+	return whichWithSessionEnvironment("sshfs", sessionEnvironment) !== null;
 }
 
-export async function isMounted(path: string): Promise<boolean> {
-	const mountpoint = $which("mountpoint");
+export async function isMounted(path: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<boolean> {
+	const mountpoint = whichWithSessionEnvironment("mountpoint", sessionEnvironment);
 	if (!mountpoint) return false;
-	const result = await $`${mountpoint} -q ${path}`.quiet().nothrow();
+	const result = await runResolvedCommand(mountpoint, ["-q", path], sessionEnvironment, true);
 	return result.exitCode === 0;
 }
 
 let registered = false;
 
-export async function mountRemote(host: SSHConnectionTarget, remotePath = "/"): Promise<string | undefined> {
-	if (!hasSshfs()) return undefined;
+export async function mountRemote(
+	host: SSHConnectionTarget,
+	remotePath = "/",
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<string | undefined> {
+	const sshfs = whichWithSessionEnvironment("sshfs", sessionEnvironment);
+	if (!sshfs) return undefined;
 
 	const mountPath = getMountPath(host);
 	await Promise.all([ensureDir(REMOTE_DIR), ensureDir(CONTROL_DIR), ensureDir(mountPath)]);
 
-	if (await isMounted(mountPath)) {
+	if (await isMounted(mountPath, sessionEnvironment)) {
 		if (!registered) {
 			registered = true;
 			postmortem.register("sshfs-cleanup", unmountAll);
 		}
-		mountedPaths.add(mountPath);
+		mountedPaths.set(mountPath, sessionEnvironment);
 		return mountPath;
 	}
 
 	const target = `${buildSshTarget(host.username, host.host)}:${remotePath}`;
 	const args = buildSshfsArgs(host);
-	const result = await $`sshfs ${args} ${target} ${mountPath}`.nothrow();
+	const result = await runResolvedCommand(sshfs, [...args, target, mountPath], sessionEnvironment, false);
 
 	if (result.exitCode !== 0) {
 		const detail = result.stderr.toString().trim();
@@ -113,18 +137,22 @@ export async function mountRemote(host: SSHConnectionTarget, remotePath = "/"): 
 		throw new Error(`Failed to mount ${target}${suffix}`);
 	}
 
-	mountedPaths.add(mountPath);
+	mountedPaths.set(mountPath, sessionEnvironment);
 	return mountPath;
 }
 
-export async function unmountRemote(host: SSHConnectionTarget): Promise<boolean> {
+export async function unmountRemote(
+	host: SSHConnectionTarget,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<boolean> {
 	const mountPath = getMountPath(host);
-	if (!(await isMounted(mountPath))) {
+	const effectiveEnvironment = mountedPaths.get(mountPath) ?? sessionEnvironment;
+	if (!(await isMounted(mountPath, effectiveEnvironment))) {
 		mountedPaths.delete(mountPath);
 		return false;
 	}
 
-	const success = await unmountPath(mountPath);
+	const success = await unmountPath(mountPath, effectiveEnvironment);
 	if (success) {
 		mountedPaths.delete(mountPath);
 	}
@@ -133,8 +161,8 @@ export async function unmountRemote(host: SSHConnectionTarget): Promise<boolean>
 }
 
 export async function unmountAll(): Promise<void> {
-	for (const mountPath of Array.from(mountedPaths)) {
-		await unmountPath(mountPath);
+	for (const [mountPath, sessionEnvironment] of Array.from(mountedPaths.entries())) {
+		await unmountPath(mountPath, sessionEnvironment);
 	}
 	mountedPaths.clear();
 }

@@ -1,4 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { getPythonEnvDir } from "@gajae-code/utils";
+import { Settings } from "../../src/config/settings";
 import { disposeAllKernelSessions, executePython } from "../../src/eval/py/executor";
 import type {
 	KernelExecuteResult,
@@ -13,6 +19,15 @@ const OK_RESULT: KernelExecuteResult = {
 	timedOut: false,
 	stdinRequested: false,
 };
+
+const pythonExecutableName = process.platform === "win32" ? "python.exe" : "python";
+const pythonExecutableDirectory = process.platform === "win32" ? "Scripts" : "bin";
+const hasPythonInterpreter =
+	Boolean(Bun.which("python") ?? Bun.which("python3")) ||
+	[Bun.env.VIRTUAL_ENV, Bun.env.CONDA_PREFIX, getPythonEnvDir()].some(
+		prefix =>
+			prefix !== undefined && fs.existsSync(path.join(prefix, pythonExecutableDirectory, pythonExecutableName)),
+	);
 
 class FakeKernel {
 	alive = true;
@@ -58,6 +73,69 @@ describe("PythonExecutorOptions.onKernelStart", () => {
 		expect(started[0]).toBe(started[1]);
 		expect(kernel.execute).toHaveBeenCalledTimes(2);
 	});
+
+	it.skipIf(!hasPythonInterpreter)(
+		"applies session environment unsets before spawning the Python availability probe",
+		async () => {
+			const envKeys = ["NODE_ENV", "BUN_ENV", "GJC_PYTHON_SKIP_CHECK", "PI_PYTHON_SKIP_CHECK"] as const;
+			const previousEnv = new Map(envKeys.map(key => [key, Bun.env[key]]));
+			const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "python-kernel-start-environment-"));
+			const pythonPath = path.join(tempDir, "pythonpath");
+			const markerPath = path.join(tempDir, "sitecustomize-loaded");
+			const settings = Settings.isolated();
+			const shellConfig = vi.spyOn(settings, "getShellConfig").mockImplementation(() => ({
+				shell: "",
+				args: [],
+				env: { ...Bun.env, PYTHONPATH: pythonPath },
+				prefix: undefined,
+			}));
+
+			try {
+				for (const key of envKeys) delete Bun.env[key];
+				await fsPromises.mkdir(pythonPath);
+				await Bun.write(
+					path.join(pythonPath, "sitecustomize.py"),
+					`from pathlib import Path\nPath(${JSON.stringify(markerPath)}).write_text("loaded", encoding="utf-8")\n`,
+				);
+
+				const baseline = await pythonKernel.checkPythonKernelAvailability(tempDir, undefined, undefined, settings);
+				expect(baseline.ok).toBe(true);
+				expect(baseline.pythonPath).toBeDefined();
+				expect(fs.existsSync(markerPath)).toBe(true);
+				await fsPromises.rm(markerPath);
+
+				const availability = await pythonKernel.checkPythonKernelAvailability(
+					tempDir,
+					undefined,
+					undefined,
+					settings,
+					{ unsetEnv: ["PYTHONPATH"] },
+				);
+				expect(availability.ok).toBe(true);
+				expect(availability.pythonPath).toBeDefined();
+				expect(fs.existsSync(markerPath)).toBe(false);
+
+				const execution = await executePython("import os; print(os.environ.get('PYTHONPATH', 'unset'))", {
+					cwd: tempDir,
+					settings,
+					sessionId: "kernel-start-environment",
+					kernelMode: "per-call",
+					sessionEnvironment: { unsetEnv: ["PYTHONPATH"] },
+				});
+				expect(execution.exitCode).toBe(0);
+				expect(execution.output).toContain("unset");
+				expect(fs.existsSync(markerPath)).toBe(false);
+			} finally {
+				shellConfig.mockRestore();
+				for (const key of envKeys) {
+					const value = previousEnv.get(key);
+					if (value === undefined) delete Bun.env[key];
+					else Bun.env[key] = value;
+				}
+				await fsPromises.rm(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("reports a fresh instance id when a dead retained kernel is transparently replaced", async () => {
 		const firstKernel = new FakeKernel();

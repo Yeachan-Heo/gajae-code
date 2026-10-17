@@ -72,6 +72,7 @@ import {
 	type SdkLifecycleStartupOwner,
 } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
+import { sessionLaunchEnvironment, setCurrentSessionLaunchEnvironment } from "../sdk/session-environment";
 import {
 	SdkStartupCapability,
 	type SdkStartupFailure,
@@ -387,7 +388,7 @@ function sameTranscriptIdentity(
 function lifecycleTranscriptSource(request: SessionLifecycleLaunchRequest, cwd: string): LifecycleTranscriptSource {
 	if (request.operation === "session.resume") {
 		return {
-			cwd,
+			cwd: path.resolve(request.sourceCwd ?? cwd),
 			path: request.sessionPath!,
 			id: request.sessionId,
 			identity: request.sessionIdentity!,
@@ -588,6 +589,9 @@ export async function runSessionHost(
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
+	delete process.env.GJC_SDK_LIFECYCLE_REQUEST;
+	const sessionEnvironment = sessionLaunchEnvironment(request.env, request.unsetEnv);
+	setCurrentSessionLaunchEnvironment(sessionEnvironment);
 	let constructionCleanupComplete = true;
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
@@ -1153,6 +1157,7 @@ export async function runSessionHost(
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
 						...(request.modelId ? { modelId: request.modelId } : {}),
+						...(sessionEnvironment === undefined ? {} : { sessionEnvironment }),
 						lifecycleRequestId: effectMarker,
 					},
 					startupOwner,

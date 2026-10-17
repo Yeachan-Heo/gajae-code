@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import * as path from "node:path";
+import { applySessionLaunchEnvironment, type SessionLaunchEnvironment } from "../sdk/session-environment";
 import { resolveMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
 
@@ -38,6 +39,8 @@ export interface MCPPoolKeyOptions {
 	keyConfig?: MCPServerConfig;
 	/** Effective child environment after config substitutions. */
 	effectiveEnv?: Record<string, string>;
+	/** Session subprocess environment applied to stdio children. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** Effective current working directory. */
 	effectiveCwd?: string;
 	/** Session identity. W2 always supplies this for per-session leases. */
@@ -107,7 +110,13 @@ const MINIMAL_ENV_KEYS = [
 ];
 
 function effectiveEnvironment(config: MCPServerConfig, options: MCPPoolKeyOptions): Record<string, string> {
-	if (options.effectiveEnv) return { ...options.effectiveEnv };
+	if (options.effectiveEnv) {
+		const environment = { ...options.effectiveEnv };
+		if (config.type !== "http" && config.type !== "sse") {
+			applySessionLaunchEnvironment(environment, options.sessionEnvironment);
+		}
+		return environment;
+	}
 	const inherited =
 		config.type === "http" || config.type === "sse" || config.noInheritEnv !== true
 			? hostEnvironment()
@@ -117,7 +126,12 @@ function effectiveEnvironment(config: MCPServerConfig, options: MCPPoolKeyOption
 						return value === undefined ? [] : [[key, value] as const];
 					}),
 				);
-	return config.type === "http" || config.type === "sse" ? inherited : { ...inherited, ...(config.env ?? {}) };
+	const environment =
+		config.type === "http" || config.type === "sse" ? inherited : { ...inherited, ...(config.env ?? {}) };
+	if (config.type !== "http" && config.type !== "sse") {
+		applySessionLaunchEnvironment(environment, options.sessionEnvironment);
+	}
+	return environment;
 }
 
 function effectiveCwd(config: MCPServerConfig, options: MCPPoolKeyOptions): string {

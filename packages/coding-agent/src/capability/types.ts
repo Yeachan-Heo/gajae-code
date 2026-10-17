@@ -44,6 +44,8 @@ export interface LoadContext {
 	bypassCache?: boolean;
 	/** Owning session settings for provider policy decisions. */
 	settings?: Settings;
+	/** Session-scoped environment for resolving configuration references. */
+	environment?: Record<string, string>;
 	/** User-owned permission to follow skill links outside a user scan root. */
 	allowExternalUserSkillSymlinks?: boolean;
 }
@@ -120,6 +122,8 @@ export interface LoadOptions {
 	bypassCache?: boolean;
 	/** Session settings whose provider policy applies to this load. */
 	settings?: Settings;
+	/** Session-scoped environment for resolving configuration references. */
+	environment?: Record<string, string>;
 	/** Internal: prevent explicit-home loads from consulting process-global policy. */
 	isolatedHome?: boolean;
 }

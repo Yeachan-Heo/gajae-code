@@ -12,6 +12,7 @@ import {
 } from "../gjc-runtime/python-transcript";
 import { sessionIpykernelsArtifactsDir } from "../gjc-runtime/session-layout";
 import pythonToolDescription from "../prompts/tools/python.md" with { type: "text" };
+import type { SessionLaunchEnvironment } from "../sdk/session-environment";
 
 export const PYTHON_TOOL_NAME = "python";
 
@@ -22,6 +23,7 @@ export function pythonKernelOwnerId(sessionId: string): string {
 export interface SessionPythonToolInput {
 	/** Working directory for kernel execution (session cwd). */
 	cwd: string;
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** Resolve the current working directory for each admitted invocation. */
 	getCwd?: () => string;
 	/** Session settings used for Python runtime policy. */
@@ -261,6 +263,7 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 						const result = await executePython(code, {
 							cwd: context.cwd,
 							settings: context.settings,
+							sessionEnvironment: input.sessionEnvironment,
 							sessionFile: context.sessionFile ?? undefined,
 							kernelMode: "session",
 							sessionId: context.ownerId,

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { AsyncJobManager, type FoldReason, type JobFoldEvent } from "../src/async";
 import { JobsObserver } from "../src/modes/jobs-observer";
+import type { SessionLaunchEnvironment } from "../src/sdk/session-environment";
 import type {
 	ClientBridge,
 	ClientBridgeTerminalExitStatus,
@@ -15,6 +16,7 @@ import {
 } from "../src/session/terminal-abort";
 import type { ToolSession } from "../src/tools";
 import { BashTool, STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "../src/tools/bash";
+import { stubBashExecutorSettings } from "./helpers/tool-session-settings";
 
 interface Harness {
 	session: ToolSession;
@@ -30,6 +32,7 @@ function makeHarness(
 		thresholdMs?: number;
 		maxRunningJobs?: number;
 		asyncEndpointId?: string;
+		sessionEnvironment?: SessionLaunchEnvironment;
 	} = {},
 ): Harness {
 	const delivered: Array<{ jobId: string; text: string }> = [];
@@ -45,8 +48,10 @@ function makeHarness(
 		cwd: "/tmp",
 		hasUI: false,
 		skills: [],
+		sessionEnvironment: options.sessionEnvironment,
 		getSessionFile: () => null,
 		settings: {
+			...stubBashExecutorSettings,
 			get(key: string) {
 				if (key === "async.enabled") return true;
 				if (key === "bash.autoBackground.enabled") return options.autoBackgroundEnabled ?? false;
@@ -104,6 +109,35 @@ afterEach(() => {
 });
 
 describe("BashTool ACP terminal fold", () => {
+	it("uses a local process when ACP terminals cannot apply session unsets", async () => {
+		const envName = "ACP_TERMINAL_UNSET_PROBE";
+		const secret = "acp-terminal-inherited-secret";
+		const previous = process.env[envName];
+		process.env[envName] = secret;
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => {
+				throw new Error("ACP terminal must not run when session variables are unset");
+			},
+		};
+		const createTerminal = spyOn(bridge, "createTerminal");
+		const h = makeHarness(bridge, { sessionEnvironment: { unsetEnv: [envName] } });
+		try {
+			const result = await new BashTool(h.session).execute(
+				"call-session-environment-unset",
+				{ command: `printf '%s' "\${${envName}-unset}"` },
+				undefined,
+				() => {},
+			);
+			expect(createTerminal).not.toHaveBeenCalled();
+			expect(JSON.stringify(result)).toContain("unset");
+			expect(JSON.stringify(result)).not.toContain(secret);
+		} finally {
+			if (previous === undefined) delete process.env[envName];
+			else process.env[envName] = previous;
+		}
+	});
+
 	it("registers client terminal ownership under the opaque async endpoint", async () => {
 		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
 		const handle: ClientBridgeTerminalHandle = {

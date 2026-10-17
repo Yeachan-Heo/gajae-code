@@ -1,11 +1,15 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as piUtils from "@gajae-code/utils";
 import { isRecord, logger, pathIsWithin } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { getConfigDirPaths } from "../config";
 import { type ClaudePluginRoot, getPreloadedPluginRoots } from "../discovery/helpers";
+import {
+	getCurrentSessionLaunchEnvironment,
+	type SessionLaunchEnvironment,
+	whichWithSessionEnvironment,
+} from "../sdk/session-environment";
 import { BiomeClient } from "./clients/biome-client";
 import { SwiftLintClient } from "./clients/swiftlint-client";
 import DEFAULTS from "./defaults.json" with { type: "json" };
@@ -280,7 +284,7 @@ export function hasRootMarkers(cwd: string, markers: string[]): boolean {
 // =============================================================================
 
 /**
- * Resolve a host-spawn executable from $PATH without consulting project-controlled bin directories.
+ * Resolve an executable from the effective session PATH without consulting project-controlled bin directories.
  * LSP auto-detection and DAP adapter launch both use this rule.
  *
  * Trust is evaluated on both the discovered and canonical paths, but the returned
@@ -288,9 +292,13 @@ export function hasRootMarkers(cwd: string, markers: string[]): boolean {
  * tool from argv[0], so `~/.cargo/bin/rust-analyzer -> rustup` must be spawned as
  * `rust-analyzer`, not as the resolved `rustup` binary.
  */
-export function resolveTrustedCommand(command: string, cwd: string): string | null {
+export function resolveTrustedCommand(
+	command: string,
+	cwd: string,
+	launchEnvironment: SessionLaunchEnvironment | undefined = getCurrentSessionLaunchEnvironment(),
+): string | null {
 	if (!path.isAbsolute(command) && (command.includes("/") || command.includes("\\"))) return null;
-	const discovered = path.isAbsolute(command) ? command : piUtils.$which(command);
+	const discovered = path.isAbsolute(command) ? command : whichWithSessionEnvironment(command, launchEnvironment);
 	if (!discovered) return null;
 	if (isProjectControlledPath(discovered, cwd)) return null;
 	if (!canonicalExistingPath(discovered)) return null;

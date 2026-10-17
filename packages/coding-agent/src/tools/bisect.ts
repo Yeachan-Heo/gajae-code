@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import bisectDescription from "../prompts/tools/bisect.md" with { type: "text" };
+import { createSessionChildEnvironment, type SessionLaunchEnvironment } from "../sdk/session-environment";
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
 import type { OutputMeta } from "./output-meta";
@@ -158,6 +159,7 @@ async function evaluatePredicate(
 	cwd: string,
 	timeoutMs: number,
 	signal: AbortSignal | undefined,
+	sessionEnvironment: SessionLaunchEnvironment | undefined,
 ): Promise<number> {
 	const controller = new AbortController();
 	let timedOut = false;
@@ -168,8 +170,10 @@ async function evaluatePredicate(
 	const onExternalAbort = () => controller.abort();
 	signal?.addEventListener("abort", onExternalAbort, { once: true });
 	try {
+		const environment = createSessionChildEnvironment(sessionEnvironment);
 		const child = Bun.spawn(["sh", "-c", run], {
 			cwd,
+			...(environment === undefined ? {} : { env: environment }),
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
@@ -291,7 +295,13 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 						currentRev: async () => (await git.head.sha(cwd, signal)) ?? "HEAD",
 						evaluate: async () =>
 							classifyExit(
-								await evaluatePredicate(params.run, cwd, params.stepTimeoutMs, signal),
+								await evaluatePredicate(
+									params.run,
+									cwd,
+									params.stepTimeoutMs,
+									signal,
+									this.session.sessionEnvironment,
+								),
 								params.invert,
 							),
 						mark: async verdict => {

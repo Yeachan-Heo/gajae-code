@@ -31,6 +31,7 @@ import {
 	listManagedSessionCandidates,
 	resolveManagedSessionScope,
 } from "../session-directory";
+import { sessionEnvironmentNames } from "../session-environment";
 import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
 	type SessionListSavedSessionOmission,
@@ -827,6 +828,10 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 		const resolved = input.resolveSessionId;
 		if (resolved !== undefined && (typeof resolved !== "string" || !isCanonicalSessionId(resolved)))
 			return error("invalid_input", "resolveSessionId must be a canonical safe identifier");
+		if (input.includeEnvironmentNames !== undefined && typeof input.includeEnvironmentNames !== "boolean")
+			return error("invalid_input", "includeEnvironmentNames must be a boolean");
+		if (input.includeEnvironmentNames === true && resolved === undefined)
+			return error("invalid_input", "includeEnvironmentNames requires resolveSessionId");
 		const cwd = input.cwd;
 		if (cwd !== undefined && (typeof cwd !== "string" || cwd.length === 0))
 			return error("invalid_input", "cwd must be a non-empty string");
@@ -4977,8 +4982,17 @@ export class Broker {
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
 			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			const sessionEnvironment =
+				input.includeEnvironmentNames === true
+					? this.index.findSessionLaunchEnvironment(session.sessionId, session.locator.stateRoot)
+					: undefined;
+			const inspectedSession = sessionEnvironment
+				? { ...publicSession, environment: sessionEnvironmentNames(sessionEnvironment) }
+				: publicSession;
 			const incarnation = endpointIncarnation(session, session.sessionId);
-			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
+			return incarnation === undefined
+				? inspectedSession
+				: { ...inspectedSession, endpointIncarnation: incarnation };
 		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);

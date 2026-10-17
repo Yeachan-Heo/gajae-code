@@ -29,6 +29,7 @@ export interface GjcSessionBinding {
 export interface BashRestrictionOptions {
 	profile?: BashRestrictionProfile;
 	gjcSessionBinding?: GjcSessionBinding;
+	env?: Record<string, string | undefined>;
 }
 
 const SHELL_CONTROL_CHARS = new Set([";", "|", "&", "<", ">", "(", ")"]);
@@ -373,8 +374,9 @@ function inlineStateSessionIds(words: readonly string[]): string[] {
 	return ids;
 }
 
-function gitCommonDir(directory: string): string | undefined {
+function gitCommonDir(directory: string, env?: Record<string, string | undefined>): string | undefined {
 	const result = Bun.spawnSync(["git", "-C", directory, "rev-parse", "--git-common-dir"], {
+		env,
 		stdout: "pipe",
 		stderr: "ignore",
 	});
@@ -390,7 +392,7 @@ function gitCommonDir(directory: string): string | undefined {
 }
 
 /** Same directory, or another worktree of the same git common dir (isolated tasks). */
-function sameRepository(workspace: string, target: string): boolean {
+function sameRepository(workspace: string, target: string, env?: Record<string, string | undefined>): boolean {
 	let workspaceReal: string;
 	let targetReal: string;
 	try {
@@ -400,16 +402,20 @@ function sameRepository(workspace: string, target: string): boolean {
 		return false;
 	}
 	if (workspaceReal === targetReal) return true;
-	const workspaceCommon = gitCommonDir(workspaceReal);
-	const targetCommon = gitCommonDir(targetReal);
+	const workspaceCommon = gitCommonDir(workspaceReal, env);
+	const targetCommon = gitCommonDir(targetReal, env);
 	return workspaceCommon !== undefined && workspaceCommon === targetCommon;
 }
 
-function worktreeSelectorAllowed(binding: GjcSessionBinding, rawTarget: string): boolean {
+function worktreeSelectorAllowed(
+	binding: GjcSessionBinding,
+	rawTarget: string,
+	env?: Record<string, string | undefined>,
+): boolean {
 	const trimmed = rawTarget.trim();
 	if (!trimmed) return false;
 	const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(binding.invocationCwd, trimmed);
-	return sameRepository(binding.worktreeRoot, resolved);
+	return sameRepository(binding.worktreeRoot, resolved, env);
 }
 
 function rejectUnboundGjcCommand(
@@ -423,7 +429,9 @@ function rejectUnboundGjcCommand(
 	if (sessionSelectors.some(value => !allowed.has(value.trim()))) {
 		return { allowed: false, reason: GJC_SESSION_BIND_REASON };
 	}
-	if (separateFlagValues(words, "--worktree-root").some(value => !worktreeSelectorAllowed(binding, value))) {
+	if (
+		separateFlagValues(words, "--worktree-root").some(value => !worktreeSelectorAllowed(binding, value, options.env))
+	) {
 		return { allowed: false, reason: GJC_WORKTREE_BIND_REASON };
 	}
 	return undefined;

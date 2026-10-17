@@ -1,3 +1,4 @@
+import type { SessionLaunchEnvironment } from "../../sdk/session-environment";
 import { ToolError } from "../tool-errors";
 
 export interface RunnerTask {
@@ -28,7 +29,7 @@ export interface TaskRunner {
 	 * Probe `cwd` for the manifest, the binary, and the task list.
 	 * Returns null when this runner does not apply.
 	 */
-	detect(cwd: string): Promise<DetectedRunner | null>;
+	detect(cwd: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<DetectedRunner | null>;
 }
 
 interface ParsedOp {

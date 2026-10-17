@@ -106,6 +106,7 @@ import {
 	type ReconciliationStoreInstrumentationEvent,
 	resolveReconciliationSessionFile,
 } from "../reconciliation-extensions";
+import type { SessionLaunchEnvironment } from "../session-environment";
 import {
 	reduceTurnResultContent,
 	reportableTurnResultContent,
@@ -134,7 +135,6 @@ import {
 	type SdkCapabilities,
 	type SdkSurfacePolicy,
 } from "./surface-policy";
-
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -737,6 +737,8 @@ export class SessionSdkSessionRuntime {
 export interface CreateSdkSessionRuntimeOptions {
 	/** Authoritative broker state root for this session's endpoint lifecycle. */
 	agentDir: string;
+	/** Session subprocess environment retained by the broker for future resume. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** Lifecycle-owned sessions require broker publication before they become usable. */
 	brokerRegistrationRequired?: boolean;
 	/** Trusted broker-issued lifecycle marker bound to lifecycle host index events. */
@@ -7751,6 +7753,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								pid: process.pid,
 								endpointMtimeMs,
 								endpointFileId,
+								...(options.sessionEnvironment ? { sessionEnvironment: options.sessionEnvironment } : {}),
 								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
 								...(masterRole ? { masterRole } : {}),
 							});

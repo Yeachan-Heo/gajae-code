@@ -11,4 +11,11 @@ describe("expandEnvVarsDeep project SSH secrets", () => {
 		expect(expandEnvVarsDeep(`host ${home} key ${secret}`, env, true)).toBe(`host /home/me key ${secret}`);
 		expect(expandEnvVarsDeep(database, env, true)).toBe(database);
 	});
+
+	it("expands Windows environment names case-insensitively", () => {
+		const reference = ["$", "{session_token}"].join("");
+		const env = { SESSION_TOKEN: "session-value" };
+		expect(expandEnvVarsDeep(reference, env, false, "win32")).toBe("session-value");
+		expect(expandEnvVarsDeep(reference, env, false, "linux")).toBe(reference);
+	});
 });

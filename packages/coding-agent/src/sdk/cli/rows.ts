@@ -8,6 +8,8 @@
  * rendering.
  */
 
+import type { SessionEnvironmentNames } from "../session-environment";
+
 export const SESSION_ROWS_VERSION = 2;
 
 export type SdkSessionActivityState = "active" | "idle";
@@ -33,6 +35,8 @@ export interface SdkSessionRowV1 {
 	endpointMtimeMs?: number;
 	/** Coalesced broker-owned heartbeat checkpoint (C2). */
 	activity?: SdkSessionActivityV1;
+	/** Configured environment variable names, included only by exact-session inspect. */
+	environment?: SessionEnvironmentNames;
 	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
 	lastHeartbeatAt?: number;
 	/** "legacy" for v1/v2-era rows that predate process-incarnation identity. */
@@ -183,6 +187,15 @@ function activityOf(row: Record<string, unknown>): SdkSessionActivityV1 | undefi
 	return { state, at };
 }
 
+function sessionEnvironmentNamesOf(value: unknown): SessionEnvironmentNames | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value) || !Array.isArray(value.set) || !Array.isArray(value.unset))
+		throw new Error("session environment names are malformed");
+	if ([...value.set, ...value.unset].some(name => typeof name !== "string"))
+		throw new Error("session environment names are malformed");
+	return { set: [...value.set] as string[], unset: [...value.unset] as string[] };
+}
+
 /**
  * Projects one broker `session.list` row into the credential-free v1 row DTO.
  * The row is a superset-tolerant projection: identity fields introduced by
@@ -218,6 +231,8 @@ export function toSessionRowV1(value: unknown): SdkSessionRowV1 {
 	if (endpointMtimeMs !== undefined) row.endpointMtimeMs = endpointMtimeMs;
 	const activity = activityOf(value);
 	if (activity !== undefined) row.activity = activity;
+	const environment = sessionEnvironmentNamesOf(value.environment);
+	if (environment !== undefined) row.environment = environment;
 	const lastHeartbeatAt = optionalFiniteNumber(value.lastHeartbeatAt);
 	if (lastHeartbeatAt !== undefined) row.lastHeartbeatAt = lastHeartbeatAt;
 	if (value.identityProvenance === "composite" || value.identityProvenance === "legacy")

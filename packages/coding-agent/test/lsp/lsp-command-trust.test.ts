@@ -11,6 +11,10 @@ import { shutdownAll } from "../../src/lsp/client";
 import { loadConfig } from "../../src/lsp/config";
 import { detectLspmux, getLspmuxCommand, resetLspmuxStateForTesting } from "../../src/lsp/lspmux";
 import { isProjectControlledPath } from "../../src/lsp/path-trust";
+import {
+	getCurrentSessionLaunchEnvironment,
+	setCurrentSessionLaunchEnvironment,
+} from "../../src/sdk/session-environment";
 import type { ToolSession } from "../../src/tools";
 
 const ORIGINAL_DISABLE_LSPMUX = Bun.env.PI_DISABLE_LSPMUX;
@@ -174,6 +178,50 @@ describe("LSP repository command trust", () => {
 		);
 
 		expect(loadConfig(cwd).servers["repository-custom-server"]).toBeUndefined();
+	});
+
+	it("resolves built-in linter commands from the session PATH but rejects project binaries", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-session-path-");
+		const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+		const cwd = path.join(repositoryRoot, "artifacts", `lsp-session-path-${process.pid}-${Date.now()}`);
+		const sessionBin = path.join(tempDir.path(), "session-bin");
+		const projectBin = path.join(cwd, "node_modules", ".bin");
+		const executableName = process.platform === "win32" ? "biome.exe" : "biome";
+		const sessionBiome = path.join(sessionBin, executableName);
+		const projectBiome = path.join(projectBin, executableName);
+		const sessionSwiftLint = path.join(sessionBin, process.platform === "win32" ? "swiftlint.exe" : "swiftlint");
+		const projectSwiftLint = path.join(projectBin, process.platform === "win32" ? "swiftlint.exe" : "swiftlint");
+		const forgetProjectGrant = registerOwnedDeletionRoot(cwd);
+		await fs.promises.mkdir(cwd, { recursive: true });
+		await fs.promises.mkdir(sessionBin, { recursive: true });
+		await fs.promises.mkdir(projectBin, { recursive: true });
+		await Bun.write(path.join(cwd, "biome.json"), "{}\n");
+		await Bun.write(path.join(cwd, ".swiftlint.yml"), "{}\n");
+		await Bun.write(sessionBiome, "#!/bin/sh\nexit 0\n");
+		await Bun.write(projectBiome, "#!/bin/sh\nexit 0\n");
+		await Bun.write(sessionSwiftLint, "#!/bin/sh\nexit 0\n");
+		await Bun.write(projectSwiftLint, "#!/bin/sh\nexit 0\n");
+		if (process.platform !== "win32") {
+			await fs.promises.chmod(sessionBiome, 0o755);
+			await fs.promises.chmod(projectBiome, 0o755);
+			await fs.promises.chmod(sessionSwiftLint, 0o755);
+			await fs.promises.chmod(projectSwiftLint, 0o755);
+		}
+
+		const previousSessionEnvironment = getCurrentSessionLaunchEnvironment();
+		try {
+			setCurrentSessionLaunchEnvironment({ env: { PATH: sessionBin } });
+			expect(loadConfig(cwd).servers.biome?.resolvedCommand).toBe(sessionBiome);
+			expect(loadConfig(cwd).servers.swiftlint?.resolvedCommand).toBe(sessionSwiftLint);
+
+			setCurrentSessionLaunchEnvironment({ env: { PATH: projectBin } });
+			expect(loadConfig(cwd).servers.biome).toBeUndefined();
+			expect(loadConfig(cwd).servers.swiftlint).toBeUndefined();
+		} finally {
+			setCurrentSessionLaunchEnvironment(previousSessionEnvironment);
+			safeRmSync(cwd, { recursive: true, force: true });
+			forgetProjectGrant();
+		}
 	});
 
 	it("does not trust project-scoped plugin launch fields even when the root claims user scope", async () => {

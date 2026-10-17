@@ -10,6 +10,7 @@ import {
 	withFileLock,
 } from "../../config/file-lock";
 import { repo } from "../../utils/git";
+import type { SessionLaunchEnvironment } from "../session-environment";
 import { endpointIncarnation } from "./endpoint-authority";
 import { processIncarnation } from "./process-incarnation";
 import {
@@ -162,6 +163,8 @@ export interface SessionIndexEvent {
 	hostIncarnation?: string;
 	/** Present on host_heartbeat checkpoints (C2). */
 	activity?: SessionActivity;
+	/** Persisted session launch environment; never included in public session rows. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	masterRole?: MasterRoleAttestationV2;
 	ts: number;
 	checksum: string;
@@ -925,6 +928,16 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 	const maxIndexSeq = events[events.length - 1]!.indexSeq;
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, number>();
+	const latestDeletionBySessionRoot = new Map<string, number>();
+	for (const event of events) {
+		if (event.type !== "session_deleted") continue;
+		const sessionRootKey = `${event.sessionId}\u0000${resolveEquivalentPath(event.locator.stateRoot)}`;
+		const current = latestDeletionBySessionRoot.get(sessionRootKey);
+		if (current === undefined || event.indexSeq > current)
+			latestDeletionBySessionRoot.set(sessionRootKey, event.indexSeq);
+	}
+	const latestEnvironmentRegistrationByRoot = new Map<string, number>();
+	const latestLiveEnvironmentRegistrationByRoot = new Map<string, number>();
 	for (const event of events) {
 		const key = identityKey(event);
 		const previous = latestByIdentity.get(key);
@@ -933,7 +946,20 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 			const current = latestHeartbeatByIdentity.get(key);
 			if (current === undefined || event.indexSeq > current) latestHeartbeatByIdentity.set(key, event.indexSeq);
 		}
+		if (event.type === "host_registered" && event.sessionEnvironment !== undefined) {
+			const environmentKey = `${event.sessionId}\u0000${resolveEquivalentPath(event.locator.stateRoot)}`;
+			const current = latestEnvironmentRegistrationByRoot.get(environmentKey);
+			if (current === undefined || event.indexSeq > current)
+				latestEnvironmentRegistrationByRoot.set(environmentKey, event.indexSeq);
+			const deletionSeq = latestDeletionBySessionRoot.get(environmentKey);
+			if (deletionSeq === undefined || event.indexSeq > deletionSeq) {
+				const currentLive = latestLiveEnvironmentRegistrationByRoot.get(environmentKey);
+				if (currentLive === undefined || event.indexSeq > currentLive)
+					latestLiveEnvironmentRegistrationByRoot.set(environmentKey, event.indexSeq);
+			}
+		}
 	}
+	const environmentRegistrationSeqs = new Set(latestLiveEnvironmentRegistrationByRoot.values());
 	const now = policy.clock();
 	const sessionLatest = new Map<string, SessionIndexEvent>();
 	for (const event of events) {
@@ -956,6 +982,16 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 		if (event.type === "host_heartbeat" && latestHeartbeatByIdentity.get(identityKey(event)) !== event.indexSeq)
 			continue;
 		if (expiredSessions.has(event.sessionId)) continue;
+		if (event.type === "host_registered" && event.sessionEnvironment !== undefined) {
+			const environmentKey = `${event.sessionId}\u0000${resolveEquivalentPath(event.locator.stateRoot)}`;
+			const deletionSeq = latestDeletionBySessionRoot.get(environmentKey);
+			if (deletionSeq !== undefined && event.indexSeq < deletionSeq) {
+				if (latestEnvironmentRegistrationByRoot.get(environmentKey) !== event.indexSeq) continue;
+				kept.push(withoutSessionEnvironment(event));
+				continue;
+			}
+			if (!environmentRegistrationSeqs.has(event.indexSeq)) continue;
+		}
 		kept.push(event);
 	}
 	if (policy.maxRows >= 1 && kept.length > policy.maxRows) {
@@ -983,6 +1019,11 @@ function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPol
 		return kept.filter(event => !evicted.has(event.sessionId));
 	}
 	return kept;
+}
+
+function withoutSessionEnvironment(event: SessionIndexEvent): SessionIndexEvent {
+	const { checksum: _checksum, sessionEnvironment: _sessionEnvironment, ...unsigned } = event;
+	return { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 }
 
 async function appendSync(file: string, value: string): Promise<void> {
@@ -1761,7 +1802,7 @@ export class SessionIndex {
 				this.#logOffset += Buffer.byteLength(serialized) + 1;
 				if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
 				await this.#writeAuditUnderLock();
-				if (this.#logOffset >= ROTATE_BYTES) await this.#rotate();
+				if (event.type === "session_deleted" || this.#logOffset >= ROTATE_BYTES) await this.#rotate();
 				this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 				return event;
 			});
@@ -2661,6 +2702,24 @@ export class SessionIndex {
 					terminal: false,
 				}
 			: undefined;
+	}
+
+	findSessionLaunchEnvironment(sessionId: string, stateRoot: string): SessionLaunchEnvironment | undefined {
+		const expectedRoot = resolveEquivalentPath(stateRoot);
+		const event = this.#events.findLast(
+			item =>
+				item.type === "host_registered" &&
+				item.sessionId === sessionId &&
+				item.sessionEnvironment !== undefined &&
+				resolveEquivalentPath(item.locator.stateRoot) === expectedRoot,
+		);
+		if (!event?.sessionEnvironment) return undefined;
+		return {
+			...(event.sessionEnvironment.env === undefined ? {} : { env: { ...event.sessionEnvironment.env } }),
+			...(event.sessionEnvironment.unsetEnv === undefined
+				? {}
+				: { unsetEnv: [...event.sessionEnvironment.unsetEnv] }),
+		};
 	}
 
 	hasHostRegistrationForLifecycle(sessionId: string, pid: number, lifecycleRequestId: string): boolean {

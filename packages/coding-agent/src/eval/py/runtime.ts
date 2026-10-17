@@ -7,7 +7,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $env, $which, getPythonEnvDir, WhichCachePolicy } from "@gajae-code/utils";
+import { $which, getEnvValue, getPythonEnvDir, WhichCachePolicy } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
 
 export const RLM_MANAGED_PYTHON_PACKAGES: readonly string[] = ["numpy", "pandas", "matplotlib", "polars"];
@@ -117,10 +117,10 @@ function normalizeEnvKey(key: string): string {
 	return CASE_INSENSITIVE_ENV ? key.toUpperCase() : key;
 }
 
-function resolvePathKey(env: Record<string, string | undefined>): string {
-	if (!CASE_INSENSITIVE_ENV) return "PATH";
-	const match = Object.keys(env).find(candidate => candidate.toLowerCase() === "path");
-	return match ?? "PATH";
+function resolveEnvKey(env: Record<string, string | undefined>, name: string): string {
+	if (!CASE_INSENSITIVE_ENV) return name;
+	const match = Object.keys(env).find(candidate => candidate.toUpperCase() === name.toUpperCase());
+	return match ?? name;
 }
 
 function resolveGlobalManagedPythonEnv(): string {
@@ -156,8 +156,8 @@ function runtimeFromVenv(
 	binDir: string,
 	env: Record<string, string | undefined>,
 ): PythonRuntime {
-	env.VIRTUAL_ENV = venvPath;
-	const pathKey = resolvePathKey(env);
+	env[resolveEnvKey(env, "VIRTUAL_ENV")] = venvPath;
+	const pathKey = resolveEnvKey(env, "PATH");
 	const currentPath = env[pathKey];
 	env[pathKey] = currentPath ? `${binDir}${path.delimiter}${currentPath}` : binDir;
 	return {
@@ -192,9 +192,11 @@ export function filterEnv(env: Record<string, string | undefined>): Record<strin
 /**
  * Detect virtual environment path from VIRTUAL_ENV or common locations.
  */
-export function resolveVenvPath(cwd: string): string | undefined {
-	if ($env.VIRTUAL_ENV) return $env.VIRTUAL_ENV;
-	if ($env.CONDA_PREFIX) return $env.CONDA_PREFIX;
+export function resolveVenvPath(cwd: string, env: Record<string, string | undefined>): string | undefined {
+	const virtualEnv = getEnvValue(env, "VIRTUAL_ENV");
+	if (virtualEnv) return virtualEnv;
+	const condaPrefix = getEnvValue(env, "CONDA_PREFIX");
+	if (condaPrefix) return condaPrefix;
 	const candidates = [path.join(cwd, ".venv"), path.join(cwd, "venv")];
 	for (const candidate of candidates) {
 		if (fs.existsSync(candidate)) {
@@ -463,7 +465,7 @@ export function resolvePythonRuntime(
 	options: PythonRuntimeOptions = {},
 ): PythonRuntime {
 	const env = { ...baseEnv };
-	const venvPath = env.VIRTUAL_ENV ?? resolveVenvPath(cwd);
+	const venvPath = resolveVenvPath(cwd, env);
 
 	if (venvPath) {
 		const candidate = resolvePythonCandidateInVenv(venvPath);
@@ -484,7 +486,11 @@ export function resolvePythonRuntime(
 		}
 	}
 
-	const pythonPath = $which("python") ?? $which("python3");
+	const lookupOptions = {
+		PATH: getEnvValue(env, "PATH") ?? "",
+		cache: WhichCachePolicy.Bypass,
+	};
+	const pythonPath = $which("python", lookupOptions) ?? $which("python3", lookupOptions);
 	if (!pythonPath) {
 		throw new Error("Python executable not found on PATH");
 	}
@@ -502,7 +508,7 @@ export async function ensurePythonRuntime(
 ): Promise<PythonRuntime> {
 	if (options.managedWorkspaceVenv) {
 		const env = { ...baseEnv };
-		const venvPath = env.VIRTUAL_ENV ?? resolveVenvPath(cwd);
+		const venvPath = resolveVenvPath(cwd, env);
 		if (venvPath) {
 			const candidate = resolvePythonCandidateInVenv(venvPath);
 			if (fs.existsSync(candidate.pythonPath)) {

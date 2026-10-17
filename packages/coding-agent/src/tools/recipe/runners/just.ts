@@ -1,6 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@gajae-code/utils";
+import { isEnoent, logger } from "@gajae-code/utils";
+import {
+	createSessionChildEnvironment,
+	type SessionLaunchEnvironment,
+	whichWithSessionEnvironment,
+} from "../../../sdk/session-environment";
 import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
 
 interface JustDumpRecipeRaw {
@@ -28,10 +33,15 @@ async function hasJustfile(cwd: string): Promise<boolean> {
 	return false;
 }
 
-async function dumpJustTasks(cwd: string): Promise<RunnerTask[] | null> {
+async function dumpJustTasks(
+	cwd: string,
+	sessionEnvironment: SessionLaunchEnvironment | undefined,
+): Promise<RunnerTask[] | null> {
 	try {
+		const environment = createSessionChildEnvironment(sessionEnvironment);
 		const proc = Bun.spawn(["just", "--dump", "--dump-format=json"], {
 			cwd,
+			...(environment === undefined ? {} : { env: environment }),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -58,11 +68,11 @@ async function dumpJustTasks(cwd: string): Promise<RunnerTask[] | null> {
 export const justRunner: TaskRunner = {
 	id: "just",
 	label: "Just",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<DetectedRunner | null> {
 		try {
-			if (!$which("just")) return null;
+			if (!whichWithSessionEnvironment("just", sessionEnvironment)) return null;
 			if (!(await hasJustfile(cwd))) return null;
-			const tasks = await dumpJustTasks(cwd);
+			const tasks = await dumpJustTasks(cwd, sessionEnvironment);
 			if (!tasks || tasks.length === 0) return null;
 			return { id: "just", label: "Just", commandPrefix: "just", tasks };
 		} catch (err) {

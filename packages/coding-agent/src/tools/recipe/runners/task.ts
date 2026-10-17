@@ -1,6 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@gajae-code/utils";
+import { isEnoent, logger } from "@gajae-code/utils";
+import {
+	createSessionChildEnvironment,
+	type SessionLaunchEnvironment,
+	whichWithSessionEnvironment,
+} from "../../../sdk/session-environment";
 import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
 
 interface TaskListEntry {
@@ -27,10 +32,15 @@ async function hasTaskfile(cwd: string): Promise<boolean> {
 	return false;
 }
 
-async function listTaskfileTasks(cwd: string): Promise<RunnerTask[] | null> {
+async function listTaskfileTasks(
+	cwd: string,
+	sessionEnvironment: SessionLaunchEnvironment | undefined,
+): Promise<RunnerTask[] | null> {
 	try {
+		const environment = createSessionChildEnvironment(sessionEnvironment);
 		const proc = Bun.spawn(["task", "--list-all", "--json"], {
 			cwd,
+			...(environment === undefined ? {} : { env: environment }),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -57,11 +67,11 @@ async function listTaskfileTasks(cwd: string): Promise<RunnerTask[] | null> {
 export const taskRunner: TaskRunner = {
 	id: "task",
 	label: "Task",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<DetectedRunner | null> {
 		try {
-			if (!$which("task")) return null;
+			if (!whichWithSessionEnvironment("task", sessionEnvironment)) return null;
 			if (!(await hasTaskfile(cwd))) return null;
-			const tasks = await listTaskfileTasks(cwd);
+			const tasks = await listTaskfileTasks(cwd, sessionEnvironment);
 			if (!tasks || tasks.length === 0) return null;
 			return { id: "task", label: "Task", commandPrefix: "task", tasks };
 		} catch (err) {

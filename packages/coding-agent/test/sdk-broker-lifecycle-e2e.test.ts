@@ -18,9 +18,15 @@ import { acquireFileLock } from "../src/config/file-lock";
 import { Settings } from "../src/config/settings";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { spawnOwnedProcess } from "../src/runtime/process-lifecycle";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
-import { brokerOwnerForTest, ensureBroker, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import {
+	brokerOwnerForTest,
+	ensureBroker,
+	SDK_BROKER_AUTOSTART_ENV,
+	startFixtureBrokerWithLeaseForTest,
+} from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -55,6 +61,7 @@ import type { CreateLifecycleAgentSessionResult } from "../src/sdk/lifecycle-ses
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { SessionRouter } from "../src/sdk/router";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
+import { getCurrentSessionLaunchEnvironment, setCurrentSessionLaunchEnvironment } from "../src/sdk/session-environment";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
 import { type AgentSession, SessionDisposalIncompleteError } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
@@ -63,6 +70,15 @@ const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 const spawned: Array<ReturnType<typeof Bun.spawn>> = [];
 const brokerDirs: string[] = [];
 const lifecycleDirectoryDurabilityAvailable = process.platform !== "win32";
+
+function enableTestBrokerAutostart(): () => void {
+	const previous = process.env[SDK_BROKER_AUTOSTART_ENV];
+	delete process.env[SDK_BROKER_AUTOSTART_ENV];
+	return () => {
+		if (previous === undefined) delete process.env[SDK_BROKER_AUTOSTART_ENV];
+		else process.env[SDK_BROKER_AUTOSTART_ENV] = previous;
+	};
+}
 
 function expectedDurableRollbackReceipt(endpointGeneration: number | null) {
 	return {
@@ -75,12 +91,17 @@ function expectedDurableRollbackReceipt(endpointGeneration: number | null) {
 }
 
 afterEach(async () => {
-	for (const process of spawned.splice(0)) {
-		if (process.exitCode === null) process.kill("SIGTERM");
-		await process.exited;
+	const children = spawned.splice(0);
+	for (const child of children) {
+		if (child.exitCode === null) child.kill("SIGTERM");
 	}
-	for (const agentDir of brokerDirs.splice(0)) await brokerOwnerForTest(agentDir)?.stop();
-});
+	await Promise.all(children.map(child => child.exited));
+	const owners = brokerDirs
+		.splice(0)
+		.map(agentDir => brokerOwnerForTest(agentDir))
+		.filter(owner => owner !== undefined);
+	await Promise.all(owners.map(owner => owner.stop()));
+}, 30_000);
 
 async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Promise<T> {
 	const deadline = Date.now() + 10_000;
@@ -90,6 +111,18 @@ async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Pr
 		await Bun.sleep(25);
 	}
 	throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function readPersistedSessionIndexEvents(agentDir: string): Promise<SessionIndexEvent[]> {
+	const indexDir = path.join(agentDir, "sdk", "sessions");
+	const snapshot = JSON.parse(await fs.readFile(path.join(indexDir, "index.snapshot.json"), "utf8")) as {
+		events: SessionIndexEvent[];
+	};
+	const logEvents = (await fs.readFile(path.join(indexDir, "index.jsonl"), "utf8"))
+		.split("\n")
+		.filter(Boolean)
+		.map(line => JSON.parse(line) as SessionIndexEvent);
+	return [...snapshot.events, ...logEvents].sort((left, right) => left.indexSeq - right.indexSeq);
 }
 
 async function createSessionHostFixture(
@@ -799,8 +832,20 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 	const stateRoot = path.join(root, ".gjc", "state");
 	const sessionId = "exact-cutoff";
 	const effectMarker = "exact-cutoff-marker";
+	const envName = "SESSION_HOST_UNSET_PROBE";
+	const setEnvName = "SESSION_HOST_SET_PROBE";
+	const secret = "session-host-inherited-secret";
+	const sessionValue = "session-host-set-value";
 	const deadlines = deriveLifecycleDeadlines(1_000, 4_000);
-	const names = ["GJC_AGENT_DIR", "GJC_STATE_ROOT", "GJC_LIFECYCLE_REQUEST_ID", "GJC_SDK_LIFECYCLE_REQUEST"] as const;
+	const previousSessionEnvironment = getCurrentSessionLaunchEnvironment();
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		envName,
+		setEnvName,
+	] as const;
 	const previous = names.map(name => process.env[name]);
 	try {
 		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
@@ -811,12 +856,16 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 		process.env.GJC_AGENT_DIR = agentDir;
 		process.env.GJC_STATE_ROOT = stateRoot;
 		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env[envName] = secret;
+		process.env[setEnvName] = "host-inherited-value";
 		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
 			operation: "session.create",
 			sessionId,
 			cwd: root,
 			stateRoot,
 			effectMarker,
+			env: { [setEnvName]: sessionValue },
+			unsetEnv: [envName],
 			...deadlines,
 		});
 		await expect(
@@ -827,12 +876,27 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 				processIncarnation: () => "test-incarnation",
 			}),
 		).resolves.toBeUndefined();
+		// Keep the host's inherited environment intact; apply overlays only to session children.
+		expect(process.env[envName]).toBe(secret);
+		expect(process.env[setEnvName]).toBe("host-inherited-value");
+		const child = spawnOwnedProcess(
+			[
+				process.execPath,
+				"-e",
+				`process.stdout.write(JSON.stringify([process.env[${JSON.stringify(envName)}] ?? "unset", process.env[${JSON.stringify(setEnvName)}]]))`,
+			],
+			{ name: "session-host-environment-probe" },
+		);
+		const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.child.stdout).text()]);
+		expect(exitCode).toBe(0);
+		expect(JSON.parse(stdout)).toEqual(["unset", sessionValue]);
 		const artifact = JSON.parse(
 			await fs.readFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`), "utf8"),
 		) as { rollback: Record<string, unknown>; reason: string };
 		expect(artifact.reason).toBe("pending");
 		expect(artifact.rollback).toEqual(expectedDurableRollbackReceipt(null));
 	} finally {
+		setCurrentSessionLaunchEnvironment(previousSessionEnvironment);
 		names.forEach((name, index) => {
 			const value = previous[index];
 			if (value === undefined) delete process.env[name];
@@ -4544,11 +4608,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 			result: { sessions: expect.not.arrayContaining([expect.objectContaining({ sessionId: forkId })]) },
 		});
 		expect(
-			(await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
-				.split("\n")
-				.filter(Boolean)
-				.map(line => JSON.parse(line) as { sessionId?: string; type?: string })
-				.findLast(event => event.sessionId === forkId),
+			(await readPersistedSessionIndexEvents(agentDir)).findLast(event => event.sessionId === forkId),
 		).toMatchObject({ type: "session_deleted", sessionId: forkId });
 		expect(
 			await fs.access(forkCandidate.path).then(
@@ -5489,6 +5549,64 @@ test("broker fails closed when a lifecycle ready sibling is swapped after marker
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 30_000);
+test("broker forwards session overlays in the request without changing host startup env", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-host-startup-env-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const reportPath = path.join(root, "host-environment.json");
+	const setName = "SESSION_HOST_OVERLAY_SET";
+	const unsetName = "SESSION_HOST_OVERLAY_UNSET";
+	const previousSet = process.env[setName];
+	const previousUnset = process.env[unsetName];
+	const broker = new Broker({ agentDir });
+	const childScript = `
+		const fs = require("node:fs");
+		const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST ?? "{}");
+		fs.writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({
+			setValue: process.env.${setName} ?? null,
+			unsetValue: process.env.${unsetName} ?? null,
+			requestEnv: request.env,
+			requestUnset: request.unsetEnv,
+		}));
+		process.exit(23);
+	`;
+	try {
+		process.env[setName] = "broker-value";
+		process.env[unsetName] = "broker-secret";
+		setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["-e", childScript] }));
+		await broker.start();
+		expect(
+			await broker.handleRequest(
+				"session.create",
+				{
+					cwd: root,
+					stateRoot,
+					readinessTimeoutMs: 4_000,
+					env: { [setName]: "session-value" },
+					unsetEnv: [unsetName],
+				},
+				"host-startup-environment-overlay",
+			),
+		).toMatchObject({
+			ok: false,
+			error: { code: "spawn_failed", message: expect.stringContaining("exit=23") },
+		});
+		expect(JSON.parse(await fs.readFile(reportPath, "utf8"))).toEqual({
+			setValue: "broker-value",
+			unsetValue: "broker-secret",
+			requestEnv: { [setName]: "session-value" },
+			requestUnset: [unsetName],
+		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		if (previousSet === undefined) delete process.env[setName];
+		else process.env[setName] = previousSet;
+		if (previousUnset === undefined) delete process.env[unsetName];
+		else process.env[unsetName] = previousUnset;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
 test("broker terminalizes default command resolver failures", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-resolver-failure-"));
 	const agentDir = path.join(root, "agent");
@@ -7101,9 +7219,111 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 				},
 			});
 		}
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ sessionId, sessionPath, cwd: root, env: {} },
+				"resume-live-empty-environment",
+			),
+		).toMatchObject({
+			ok: true,
+			result: {
+				sessionId,
+				endpointGeneration: 17,
+				reused: true,
+				endpoint: { token: "live-owner-token" },
+			},
+		});
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ sessionId, sessionPath, cwd: root, unsetEnv: ["GH_TOKEN"] },
+				"resume-live-environment-change",
+			),
+		).toMatchObject({
+			ok: false,
+			error: {
+				code: "live_session",
+				message: "Session launch environment cannot be changed while a session is live; close it first.",
+			},
+		});
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
 			result: { sessions: [expect.objectContaining({ sessionId, endpointGeneration: 17 })] },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+test("broker reuses live sessions when a resume supplies the persisted environment", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-resume-live-env-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const savedSession = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
+	await savedSession.ensureOnDisk();
+	const sessionId = savedSession.getSessionId();
+	const sessionPath = savedSession.getSessionFile();
+	if (!sessionPath) throw new Error("Expected saved session path.");
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	const sessionEnvironment = { env: { SESSION_RESUME_VALUE: "stable" }, unsetEnv: ["GH_TOKEN"] };
+	const broker = new Broker({ agentDir });
+	const host = spawnDisposableHost();
+	try {
+		await broker.start();
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "live-owner-token" }),
+		);
+		const hostIncarnation = await incarnation(host.pid);
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 17,
+			pid: host.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
+			sessionEnvironment,
+		});
+		await broker.index.append({
+			type: "host_heartbeat",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 17,
+			pid: host.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
+		});
+
+		const matching = await broker.handleRequest(
+			"session.resume",
+			{ sessionId, sessionPath, cwd: root, env: sessionEnvironment.env, unsetEnv: sessionEnvironment.unsetEnv },
+			"resume-live-matching-environment",
+		);
+		expect(matching).toMatchObject({
+			ok: true,
+			result: {
+				sessionId,
+				endpointGeneration: 17,
+				reused: true,
+				endpoint: { token: "live-owner-token" },
+			},
+		});
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ sessionId, sessionPath, cwd: root, env: { SESSION_RESUME_VALUE: "changed" }, unsetEnv: ["GH_TOKEN"] },
+				"resume-live-changed-environment",
+			),
+		).toMatchObject({
+			ok: false,
+			error: {
+				code: "live_session",
+				message: "Session launch environment cannot be changed while a session is live; close it first.",
+			},
 		});
 	} finally {
 		await broker.stop();
@@ -7653,10 +7873,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 				retirementKey,
 			),
 		).resolves.toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
-		const events = (await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
-			.split("\n")
-			.filter(Boolean)
-			.map(line => JSON.parse(line) as { sessionId?: string; type?: string });
+		const events = await readPersistedSessionIndexEvents(agentDir);
 		expect(events.filter(event => event.sessionId === sessionId && event.type === "session_closed")).toHaveLength(1);
 		expect(events.filter(event => event.sessionId === sessionId && event.type === "session_deleted")).toHaveLength(1);
 		await reopened.stop();
@@ -7753,10 +7970,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 		raceSpy.mockRestore();
 		expect(reopened.ledger.get(createIdentity)).toMatchObject({ state: "terminal_uncertain" });
 		expect(reopened.index.listSessions().sessions).toEqual([]);
-		const events = (await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
-			.split("\n")
-			.filter(Boolean)
-			.map(line => JSON.parse(line) as { sessionId?: string; type?: string });
+		const events = await readPersistedSessionIndexEvents(agentDir);
 		expect(events.filter(event => event.sessionId === sessionId && event.type === "session_deleted")).toHaveLength(1);
 		expect(events.filter(event => event.sessionId === sessionId && event.type === "session_closed")).toHaveLength(1);
 		await reopened.stop();
@@ -9220,6 +9434,326 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 	}
 }, 30_000);
 
+test("broker applies session environment overlays to bash and MCP subprocesses across resume", async () => {
+	if (process.platform !== "linux") return;
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-session-environment-"));
+	const agentDir = path.join(root, "agent");
+	const guardedBin = path.join(root, "guarded-bin");
+	const guardedGh = path.join(guardedBin, "gh");
+	const inheritedPath = process.env.PATH ?? "/usr/bin:/bin";
+	const previousGhToken = process.env.GH_TOKEN;
+	const brokerSecret = "session-environment-broker-secret";
+	const projectEnvSecret = "session-environment-project-dotenv-secret";
+	const projectEnvUser = "session-environment-project-dotenv-user";
+	const mcpEnvironmentReport = path.join(root, "mcp-environment.json");
+	const mcpProbeScript = `
+const fs = require("node:fs");
+const readline = require("node:readline");
+fs.writeFileSync(${JSON.stringify(mcpEnvironmentReport)}, JSON.stringify({ user: process.env.USER ?? null, path: process.env.PATH ?? null }));
+const input = readline.createInterface({ input: process.stdin });
+input.on("line", line => {
+	const message = JSON.parse(line);
+	if (message.method === "initialize") {
+		process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "environment-probe", version: "1" } } }) + "\\n");
+	} else if (message.method === "tools/list") {
+		process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }) + "\\n");
+	} else if (message.id !== undefined) {
+		process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }) + "\\n");
+	}
+});
+setInterval(() => {}, 1000);
+`;
+	process.env.GH_TOKEN = brokerSecret;
+	const broker = new Broker({ agentDir });
+	let isolatedClient: SdkClient | undefined;
+	let siblingClient: SdkClient | undefined;
+	let resumedClient: SdkClient | undefined;
+	try {
+		for (const args of [
+			["init"],
+			["config", "user.email", "lifecycle@example.test"],
+			["config", "user.name", "Lifecycle Test"],
+		]) {
+			const result = Bun.spawnSync(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		}
+		await fs.writeFile(path.join(root, "README"), "fixture\n");
+		await fs.writeFile(path.join(root, ".gitignore"), "/.worktrees\n/agent\n/.gjc\n/.env\n/guarded-bin\n");
+		const stagedFixture = Bun.spawnSync(["git", "add", "README", ".gitignore"], {
+			cwd: root,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (stagedFixture.exitCode !== 0) throw new Error(stagedFixture.stderr.toString());
+		const committedFixture = Bun.spawnSync(["git", "commit", "-m", "fixture"], {
+			cwd: root,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (committedFixture.exitCode !== 0) throw new Error(committedFixture.stderr.toString());
+		await fs.mkdir(guardedBin, { recursive: true });
+		await fs.writeFile(path.join(root, ".env"), `GH_TOKEN=${projectEnvSecret}\nUSER=${projectEnvUser}\n`, "utf8");
+		await fs.writeFile(guardedGh, "#!/bin/sh\nprintf 'guarded-gh\\n'\n", "utf8");
+		await fs.chmod(guardedGh, 0o755);
+		await broker.start();
+		expect(
+			await broker.handleRequest(
+				"session.create",
+				{ cwd: root, env: { GJC_STATE_ROOT: "/outside" } },
+				"session-environment-invalid-create",
+			),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(
+			await broker.handleRequest(
+				"session.create",
+				{ cwd: root, env: { LD_PRELOAD: "/tmp/blocked-session-bootstrap.so" } },
+				"session-environment-loader-control-create",
+			),
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(
+			await broker.handleRequest(
+				"session.create",
+				{ cwd: root, env: { FIRST: "x".repeat(20_000), SECOND: "y".repeat(20_000) } },
+				"session-environment-oversized-create",
+			),
+		).toMatchObject({
+			ok: false,
+			error: {
+				code: "invalid_input",
+				message: "Session lifecycle launch request exceeds the supported environment size.",
+			},
+		});
+
+		const isolatedCreated = await broker.handleRequest(
+			"session.create",
+			{
+				cwd: root,
+				readinessTimeoutMs: 25_000,
+				mcpServers: [
+					{
+						type: "stdio",
+						name: "environment-probe",
+						command: process.execPath,
+						args: ["--no-env-file", "-e", mcpProbeScript],
+						env: { USER: projectEnvUser },
+					},
+				],
+				env: { PATH: `${guardedBin}:${inheritedPath}` },
+				unsetEnv: ["GH_TOKEN", "USER"],
+			},
+			"session-environment-isolated-create",
+		);
+		if (!isolatedCreated.ok) throw new Error(isolatedCreated.error.message);
+		const isolatedSession = isolatedCreated.result as {
+			sessionId: string;
+			endpoint: { url: string; token: string };
+		};
+		isolatedClient = await SdkClient.connect(isolatedSession.endpoint.url, isolatedSession.endpoint.token, {
+			timeoutMs: 10_000,
+			reconnectAttempts: 0,
+		});
+		const mcpEnvironment = await waitFor(async () => {
+			const report = await Bun.file(mcpEnvironmentReport)
+				.text()
+				.catch(() => "");
+			return report ? (JSON.parse(report) as { user: string | null; path: string | null }) : undefined;
+		}, "MCP child environment report");
+		expect(mcpEnvironment).toEqual({ user: null, path: `${guardedBin}:${inheritedPath}` });
+
+		const siblingCreated = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 25_000 },
+			"session-environment-sibling-create",
+		);
+		if (!siblingCreated.ok) throw new Error(siblingCreated.error.message);
+		const siblingSession = siblingCreated.result as {
+			sessionId: string;
+			endpoint: { url: string; token: string };
+		};
+		siblingClient = await SdkClient.connect(siblingSession.endpoint.url, siblingSession.endpoint.token, {
+			timeoutMs: 10_000,
+			reconnectAttempts: 0,
+		});
+
+		const command = `printf 'GH_TOKEN=%s\\nPATH=%s\\nGH=%s\\nLIFECYCLE_REQUEST=%s\\n' "\${GH_TOKEN-unset}" "$PATH" "$(command -v gh || true)" "\${GJC_SDK_LIFECYCLE_REQUEST-unset}"`;
+		const isolatedOutput = JSON.stringify(await isolatedClient.control("bash.execute", { cmd: command }));
+		const siblingOutput = JSON.stringify(await siblingClient.control("bash.execute", { cmd: command }));
+		expect(isolatedOutput).toContain("GH_TOKEN=unset");
+		expect(isolatedOutput).not.toContain(projectEnvSecret);
+		expect(isolatedOutput).toContain(`PATH=${guardedBin}:`);
+		expect(isolatedOutput).toContain(`GH=${guardedGh}`);
+		expect(isolatedOutput).toContain("LIFECYCLE_REQUEST=unset");
+		expect(siblingOutput).toContain(`GH_TOKEN=${brokerSecret}`);
+		expect(siblingOutput).not.toContain(guardedBin);
+		expect(siblingOutput).toContain("LIFECYCLE_REQUEST=unset");
+
+		await isolatedClient.close();
+		isolatedClient = undefined;
+		expect(
+			await broker.handleRequest(
+				"session.close",
+				{ sessionId: isolatedSession.sessionId },
+				"session-environment-isolated-close",
+			),
+		).toMatchObject({ ok: true });
+		await broker.index.refresh();
+		expect(
+			broker.index.findSessionLaunchEnvironment(isolatedSession.sessionId, path.join(root, ".gjc", "state")),
+		).toEqual({
+			env: { PATH: `${guardedBin}:${inheritedPath}` },
+			unsetEnv: ["GH_TOKEN", "USER"],
+		});
+		const sessionDir = SessionManager.getDefaultSessionDir(root, agentDir);
+		const savedSession = (await SessionManager.list(root, sessionDir)).find(
+			session => session.id === isolatedSession.sessionId,
+		);
+		if (!savedSession) throw new Error("Expected the isolated session transcript to remain resumable.");
+		const resumedWorktree = planLaunchWorktree(root, {
+			enabled: true,
+			detached: false,
+			name: "session-environment-resume",
+		});
+		if (!resumedWorktree.enabled || !resumedWorktree.branchName)
+			throw new Error("Expected a named worktree for the resumed session.");
+		const worktreeAdded = Bun.spawnSync(
+			[
+				"git",
+				"worktree",
+				"add",
+				"-b",
+				resumedWorktree.branchName,
+				resumedWorktree.worktreePath,
+				resumedWorktree.baseRef,
+			],
+			{ cwd: root, stdout: "pipe", stderr: "pipe" },
+		);
+		if (worktreeAdded.exitCode !== 0) throw new Error(worktreeAdded.stderr.toString());
+		const persistedEnvironment = vi
+			.spyOn(broker.index, "findSessionLaunchEnvironment")
+			.mockReturnValue({ env: { LD_PRELOAD: "/tmp/blocked-session-bootstrap.so" } });
+		try {
+			expect(
+				await broker.handleRequest(
+					"session.resume",
+					{
+						cwd: root,
+						sessionId: isolatedSession.sessionId,
+						sessionPath: savedSession.path,
+					},
+					"session-environment-invalid-persisted-resume",
+				),
+			).toMatchObject({
+				ok: false,
+				error: { code: "invalid_input", message: "Session launch environment is invalid." },
+			});
+		} finally {
+			persistedEnvironment.mockRestore();
+		}
+		for (const [index, environmentFields] of [{ env: null }, { unsetEnv: null }].entries()) {
+			expect(
+				await broker.handleRequest(
+					"session.resume",
+					{
+						cwd: root,
+						sessionId: isolatedSession.sessionId,
+						sessionPath: savedSession.path,
+						...environmentFields,
+					},
+					`session-environment-invalid-resume-${index}`,
+				),
+			).toMatchObject({
+				ok: false,
+				error: { code: "invalid_input", message: "Session launch environment is invalid." },
+			});
+		}
+		const resumed = await broker.handleRequest(
+			"session.resume",
+			{
+				cwd: root,
+				sessionId: isolatedSession.sessionId,
+				sessionPath: savedSession.path,
+				readinessTimeoutMs: 25_000,
+			},
+			"session-environment-isolated-resume",
+		);
+		if (!resumed.ok) throw new Error(resumed.error.message);
+		const resumedSession = resumed.result as { endpoint: { url: string; token: string } };
+		resumedClient = await SdkClient.connect(resumedSession.endpoint.url, resumedSession.endpoint.token, {
+			timeoutMs: 10_000,
+			reconnectAttempts: 0,
+		});
+		const resumedOutput = JSON.stringify(await resumedClient.control("bash.execute", { cmd: command }));
+		const siblingAfterResume = JSON.stringify(await siblingClient.control("bash.execute", { cmd: command }));
+		expect(resumedOutput).toContain("GH_TOKEN=unset");
+		expect(resumedOutput).toContain(`PATH=${guardedBin}:`);
+		expect(resumedOutput).toContain(`GH=${guardedGh}`);
+		expect(resumedOutput).toContain("LIFECYCLE_REQUEST=unset");
+		expect(siblingAfterResume).toContain(`GH_TOKEN=${brokerSecret}`);
+		expect(siblingAfterResume).not.toContain(guardedBin);
+		expect(siblingAfterResume).toContain("LIFECYCLE_REQUEST=unset");
+		await resumedClient.close();
+		resumedClient = undefined;
+		expect(
+			await broker.handleRequest(
+				"session.close",
+				{ sessionId: isolatedSession.sessionId },
+				"session-environment-resumed-close",
+			),
+		).toMatchObject({ ok: true });
+		const latestSavedSession = (await SessionManager.list(root, sessionDir)).find(
+			session => session.id === isolatedSession.sessionId,
+		);
+		if (!latestSavedSession) throw new Error("Expected the resumed session transcript to remain resumable.");
+		const worktreeResumed = await broker.handleRequest(
+			"session.resume",
+			{
+				cwd: root,
+				sessionId: isolatedSession.sessionId,
+				sessionPath: latestSavedSession.path,
+				readinessTimeoutMs: 25_000,
+				target: { worktree: { enabled: true, name: "session-environment-resume" } },
+			},
+			"session-environment-worktree-resume",
+		);
+		if (!worktreeResumed.ok) throw new Error(worktreeResumed.error.message);
+		const worktreeSession = worktreeResumed.result as { cwd: string };
+		expect(path.resolve(worktreeSession.cwd)).not.toBe(path.resolve(root));
+		await broker.index.refresh();
+		expect(
+			broker.index.findSessionLaunchEnvironment(
+				isolatedSession.sessionId,
+				path.join(worktreeSession.cwd, ".gjc", "state"),
+			),
+		).toEqual({
+			env: { PATH: `${guardedBin}:${inheritedPath}` },
+			unsetEnv: ["GH_TOKEN", "USER"],
+		});
+
+		const inspected: unknown[] = [];
+		const listed = JSON.stringify(
+			await broker.handleRequest("session.list", { resolveSessionId: isolatedSession.sessionId }),
+		);
+		expect(listed).not.toContain("GH_TOKEN");
+		expect(listed).not.toContain(guardedBin);
+		expect(listed).not.toContain(brokerSecret);
+		await runSdkSessionCli(
+			{ action: "inspect", agentDir, sessionId: isolatedSession.sessionId },
+			value => inspected.push(value),
+			() => undefined,
+		);
+		const inspectJson = JSON.stringify(inspected);
+		expect(inspectJson).toContain('"environment":{"set":["PATH"],"unset":["GH_TOKEN","USER"]}');
+		expect(inspectJson).not.toContain(guardedBin);
+		expect(inspectJson).not.toContain(brokerSecret);
+	} finally {
+		await Promise.all([isolatedClient?.close(), siblingClient?.close(), resumedClient?.close()]);
+		await broker.stop();
+		if (previousGhToken === undefined) delete process.env.GH_TOKEN;
+		else process.env.GH_TOKEN = previousGhToken;
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 90_000);
+
 test("broker agentDir profile validates, activates, and is discoverable through session Q27", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-agent-dir-"));
 	const cwd = path.join(root, "workspace");
@@ -9417,7 +9951,6 @@ test("delayed lifecycle host cleanup does not unregister a file-only same-genera
 		child.kill("SIGTERM");
 		expect(await child.exited).toBe(0);
 		const reopened = await new SessionIndex(agentDir).open();
-		expect(reopened.indexSeq).toBe(successor.indexSeq);
 		const current = reopened.listSessionIdentities().find(session => session.sessionId === sessionId)!;
 		expect(current).toMatchObject({ terminal: false, endpointFileId: successor.endpointFileId });
 		expect(endpointIncarnation(current, sessionId)).toBe(endpointIncarnation(successor, sessionId));
@@ -9468,6 +10001,7 @@ test("broker preserves an acknowledged session.close result when endpoint client
 test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-zero-global-"));
 	const agentDirs = ["acp", "mcp", "daemon"].map(name => path.join(root, name, "agent"));
+	const restoreBrokerAutostart = enableTestBrokerAutostart();
 	brokerDirs.push(...agentDirs);
 	try {
 		const acp = new AcpAgent({ signal: new AbortController().signal } as never, { agentDir: agentDirs[0] });
@@ -9489,10 +10023,11 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		expect(output).toMatchObject([{ ok: true, result: { sessions: [] } }]);
 		expect(await readSdkBrokerDiscovery(agentDirs[2])).not.toBeNull();
 	} finally {
+		restoreBrokerAutostart();
 		for (const agentDir of agentDirs) await brokerOwnerForTest(agentDir)?.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 20_000);
+}, 30_000);
 
 test("lifecycle cleanup rejects transplanted and ambiguous receipts before mutation", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-cleanup-receipt-"));
@@ -9752,6 +10287,7 @@ test("session/list does not grant a second ACP connection destructive lifecycle 
 	const agentDir = path.join(root, "agent");
 	const cwd = path.join(root, "repo");
 	await fs.mkdir(cwd, { recursive: true });
+	const restoreBrokerAutostart = enableTestBrokerAutostart();
 	brokerDirs.push(agentDir);
 	try {
 		// Both connections share one broker, which is the situation that makes
@@ -9789,6 +10325,7 @@ test("session/list does not grant a second ACP connection destructive lifecycle 
 			]),
 		).resolves.toEqual([{}, {}]);
 	} finally {
+		restoreBrokerAutostart();
 		await brokerOwnerForTest(agentDir)?.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}

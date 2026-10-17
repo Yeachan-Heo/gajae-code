@@ -31,6 +31,7 @@
 import * as fs from "node:fs";
 import { logger, postmortem, ptree } from "@gajae-code/utils";
 import { type LinuxProcPidProbeResult, probeLinuxProcPidSync } from "../gjc-runtime/linux-proc";
+import { createSessionChildEnvironment, getCurrentSessionLaunchEnvironment } from "../sdk/session-environment";
 
 const DEFAULT_GRACEFUL_MS = 2_000;
 // Hard cap for how long `dispose()` waits after SIGKILL before giving up so a
@@ -212,9 +213,14 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 	// `attachSignal` only kills the single process, whereas owned teardown must
 	// signal the whole group. We wire our own abort listener below and remove it
 	// on settle so long-lived signals never accumulate listeners.
+	const sessionEnvironment = getCurrentSessionLaunchEnvironment();
+	const env =
+		sessionEnvironment === undefined
+			? opts.env
+			: createSessionChildEnvironment(sessionEnvironment, opts.env ?? process.env);
 	const child = ptree.spawn(cmd, {
 		cwd: opts.cwd,
-		env: opts.env,
+		env,
 		stdin: opts.stdin ?? "ignore",
 		detached: useGroup,
 	});

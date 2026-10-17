@@ -1502,6 +1502,116 @@ setInterval(() => {}, 1000);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("resolves stdio config values against the session environment overlay", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-session-config-environment-");
+		const configPath = join(cwd, "exact.json");
+		const envName = "MCP_CONFIG_SESSION_UNSET_PROBE";
+		const secret = "mcp-config-inherited-secret";
+		const previous = process.env[envName];
+		process.env[envName] = secret;
+		const manager = new MCPManager(cwd, null, { toolsOnly: true, sessionEnvironment: { unsetEnv: [envName] } });
+		let capturedConfig: MCPServerConfig | undefined;
+		const connection = makeConnection("stdio", async () => {});
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation(async (_name, config) => {
+			capturedConfig = config;
+			return connection;
+		});
+		vi.spyOn(mcpClient, "listTools").mockResolvedValue([]);
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						stdio: {
+							type: "stdio",
+							command: "ignored",
+							env: {
+								TOKEN: envName,
+								INTERPOLATED_TOKEN: `\${${envName}:-not-set}`,
+								COMMAND_TOKEN: `!if [ -n "$${envName}" ]; then printf leaked; else printf not-set; fi`,
+							},
+						},
+					},
+				}),
+			);
+			const result = await manager.discoverAndConnect({ configPath });
+			expect(result).toMatchObject({ connectedServers: ["stdio"] });
+			const capturedEnv = capturedConfig && "env" in capturedConfig ? capturedConfig.env : undefined;
+			expect(capturedEnv).toEqual({
+				TOKEN: envName,
+				INTERPOLATED_TOKEN: "not-set",
+				COMMAND_TOKEN: "not-set",
+			});
+			expect(JSON.stringify(capturedEnv)).not.toContain(secret);
+		} finally {
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+			if (previous === undefined) delete process.env[envName];
+			else process.env[envName] = previous;
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("stdio subprocesses preserve session unsets through MCP config references", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-session-subprocess-env-");
+		const configPath = join(cwd, "mcp.json");
+		const reportPath = join(cwd, "child-env.json");
+		const envName = "MCP_STDIO_SESSION_UNSET_PROBE";
+		const secret = "stdio-env-file-secret";
+		const nodePath = Bun.which("node");
+		if (!nodePath) throw new Error("Node.js is required for the stdio environment regression.");
+		const previous = process.env[envName];
+		process.env[envName] = secret;
+		const manager = new MCPManager(cwd, null, { toolsOnly: true, sessionEnvironment: { unsetEnv: [envName] } });
+		const serverScript = `
+const fs = require("node:fs");
+const readline = require("node:readline");
+const envName = ${JSON.stringify(envName)};
+const reportPath = ${JSON.stringify(reportPath)};
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", line => {
+	const message = JSON.parse(line);
+	if (message.method === "initialize") {
+		fs.writeFileSync(reportPath, JSON.stringify({ unset: process.env[envName] ?? null, token: process.env.TOKEN ?? null }));
+		process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "env-probe", version: "1" } } }) + "\\n");
+	} else if (message.method === "tools/list") {
+		process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }) + "\\n");
+	} else if (message.id !== undefined) {
+		process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }) + "\\n");
+	}
+});
+setInterval(() => {}, 1000);
+`;
+		try {
+			// This is the environment Bun has already merged from the project dotenv
+			// before the session overlay was applied in the isolated host.
+			await Bun.write(join(cwd, ".env"), `${envName}=${secret}\n`);
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						stdio: {
+							type: "stdio",
+							command: nodePath,
+							args: ["-e", serverScript],
+							timeout: 2_000,
+							env: { TOKEN: envName },
+						},
+					},
+				}),
+			);
+			const result = await manager.discoverAndConnect({ configPath });
+			expect(result.connectedServers).toEqual(["stdio"]);
+			await waitFor(() => Bun.file(reportPath).exists());
+			const childEnvironment = await Bun.file(reportPath).text();
+			expect(JSON.parse(childEnvironment)).toEqual({ unset: null, token: envName });
+			expect(childEnvironment).not.toContain(secret);
+		} finally {
+			await manager.disconnectAll();
+			if (previous === undefined) delete process.env[envName];
+			else process.env[envName] = previous;
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 
 	test("factory creates a normal manager without an exact config", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "gjc-mcp-factory-normal-"));

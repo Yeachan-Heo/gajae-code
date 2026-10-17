@@ -13,6 +13,7 @@ import {
 	tasksFromCargoMetadata,
 	titleFromOp,
 } from "@gajae-code/coding-agent/tools/implementations";
+import { type SessionLaunchEnvironment, whichWithSessionEnvironment } from "../../src/sdk/session-environment";
 
 const detectedRunners: DetectedRunner[] = [
 	{
@@ -50,9 +51,14 @@ const detectedRunners: DetectedRunner[] = [
 
 const tempDirs: string[] = [];
 
-function createTestSession(cwd: string, settings = Settings.isolated()): ToolSession {
+function createTestSession(
+	cwd: string,
+	settings = Settings.isolated(),
+	sessionEnvironment?: SessionLaunchEnvironment,
+): ToolSession {
 	return {
 		cwd,
+		...(sessionEnvironment === undefined ? {} : { sessionEnvironment }),
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
@@ -166,6 +172,30 @@ describe("recipe", () => {
 		const result = await tool!.execute("tool-call", { op: "say-ok" });
 		const text = result.content.find(block => block.type === "text")?.text ?? "";
 		expect(text).toContain("ok");
+	});
+
+	it("resolves task runners from the session PATH", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-recipe-session-path-"));
+		tempDirs.push(dir);
+		const commandDir = path.join(dir, "bin");
+		await fs.mkdir(commandDir);
+		const commandName = process.platform === "win32" ? "gjc-session-runner.exe" : "gjc-session-runner";
+		const commandPath = path.join(commandDir, commandName);
+		await Bun.write(commandPath, "");
+		if (process.platform !== "win32") await fs.chmod(commandPath, 0o755);
+		const makeName = process.platform === "win32" ? "make.exe" : "make";
+		const makePath = path.join(commandDir, makeName);
+		await Bun.write(makePath, "");
+		if (process.platform !== "win32") await fs.chmod(makePath, 0o755);
+
+		const sessionEnvironment: SessionLaunchEnvironment = { env: { PATH: commandDir } };
+		expect(whichWithSessionEnvironment(commandName, sessionEnvironment)).toBe(commandPath);
+		expect(whichWithSessionEnvironment(commandName, { unsetEnv: ["PATH"] })).toBeNull();
+
+		await Bun.write(path.join(dir, "Makefile"), ".PHONY: test\ntest:\n\t@echo ok\n");
+		const tool = await RecipeTool.createIf(createTestSession(dir, Settings.isolated(), sessionEnvironment));
+		expect(tool).not.toBeNull();
+		expect(tool!.description).toMatch(/make/i);
 	});
 
 	it("keeps root package scripts bare and exposes workspace package scripts as package-name/script tasks", async () => {

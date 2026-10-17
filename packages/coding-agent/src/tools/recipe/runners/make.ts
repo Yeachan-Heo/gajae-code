@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@gajae-code/utils";
+import { isEnoent, logger } from "@gajae-code/utils";
+import { type SessionLaunchEnvironment, whichWithSessionEnvironment } from "../../../sdk/session-environment";
 import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
 
 const MAKEFILE_NAMES = ["Makefile", "makefile", "GNUmakefile"] as const;
@@ -85,9 +86,9 @@ function parseMakeTargets(text: string): RunnerTask[] {
 export const makeRunner: TaskRunner = {
 	id: "make",
 	label: "Make",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<DetectedRunner | null> {
 		try {
-			if (!$which("make")) return null;
+			if (!whichWithSessionEnvironment("make", sessionEnvironment)) return null;
 			const makefile = await findMakefile(cwd);
 			if (!makefile) return null;
 			const tasks = parseMakeTargets(await Bun.file(makefile).text());

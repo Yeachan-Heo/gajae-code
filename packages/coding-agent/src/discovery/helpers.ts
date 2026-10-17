@@ -6,6 +6,7 @@ import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/nativ
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
+	getEnvValue,
 	getPluginsDir,
 	getProjectDir,
 	getTrustedHomeDir,
@@ -1062,12 +1063,25 @@ export function isSensitiveEnvName(name: string): boolean {
 	return SENSITIVE_ENV_NAME.test(name);
 }
 
-function expandEnvVars(value: string, extraEnv?: Record<string, string>, skipSensitiveNames = false): string {
+export function isStdioMcpTransportConfig(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return true;
+	const config = value as Record<string, unknown>;
+	if (config.type === "http" || config.type === "sse") return false;
+	if (config.type !== undefined) return true;
+	return Boolean(config.command) || !config.url;
+}
+
+function expandEnvVars(
+	value: string,
+	extraEnv?: Record<string, string>,
+	skipSensitiveNames = false,
+	platform: NodeJS.Platform = process.platform,
+): string {
 	return value.replace(/\$\{([^}:]+)(?::-([^}]*))?\}/g, (_, varName: string, defaultValue?: string) => {
 		if (skipSensitiveNames && isSensitiveEnvName(varName)) {
 			return defaultValue !== undefined ? defaultValue : `\${${varName}}`;
 		}
-		const envValue = extraEnv?.[varName] ?? Bun.env[varName];
+		const envValue = extraEnv === undefined ? Bun.env[varName] : getEnvValue(extraEnv, varName, platform);
 		if (envValue !== undefined) return envValue;
 		if (defaultValue !== undefined) return defaultValue;
 		return `\${${varName}}`;
@@ -1077,17 +1091,22 @@ function expandEnvVars(value: string, extraEnv?: Record<string, string>, skipSen
 /**
  * Recursively expand environment variables in an object.
  */
-export function expandEnvVarsDeep<T>(obj: T, extraEnv?: Record<string, string>, skipSensitiveNames = false): T {
+export function expandEnvVarsDeep<T>(
+	obj: T,
+	extraEnv?: Record<string, string>,
+	skipSensitiveNames = false,
+	platform: NodeJS.Platform = process.platform,
+): T {
 	if (typeof obj === "string") {
-		return expandEnvVars(obj, extraEnv, skipSensitiveNames) as T;
+		return expandEnvVars(obj, extraEnv, skipSensitiveNames, platform) as T;
 	}
 	if (Array.isArray(obj)) {
-		return obj.map(item => expandEnvVarsDeep(item, extraEnv, skipSensitiveNames)) as T;
+		return obj.map(item => expandEnvVarsDeep(item, extraEnv, skipSensitiveNames, platform)) as T;
 	}
 	if (obj !== null && typeof obj === "object") {
 		const result: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(obj)) {
-			result[key] = expandEnvVarsDeep(value, extraEnv, skipSensitiveNames);
+			result[key] = expandEnvVarsDeep(value, extraEnv, skipSensitiveNames, platform);
 		}
 		return result as T;
 	}

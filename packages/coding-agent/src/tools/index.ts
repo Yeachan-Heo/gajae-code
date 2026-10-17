@@ -10,6 +10,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
+import type { SessionLaunchEnvironment } from "../sdk/session-environment";
 import type {
 	ForkContextSeed,
 	ForkContextSeedOptions,
@@ -184,6 +185,8 @@ export interface AskAnswerSource {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/** Broker-validated environment overlay for subprocesses in this session. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether this session will bind a workflow-gate emitter after tool construction. */

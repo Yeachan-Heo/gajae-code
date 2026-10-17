@@ -18,6 +18,7 @@ import type {
 	MCPTransport,
 } from "../../runtime-mcp/types";
 import { MCPExpectedFailure, toJsonRpcError } from "../../runtime-mcp/types";
+import { applySessionLaunchEnvironment, type SessionLaunchEnvironment } from "../../sdk/session-environment";
 
 /**
  * Stdio transport for MCP servers.
@@ -96,7 +97,10 @@ export class StdioTransport implements MCPTransport {
 	onNotification?: (method: string, params: unknown) => void;
 	onRequest?: (method: string, params: unknown) => Promise<unknown>;
 
-	constructor(private config: MCPStdioServerConfig) {}
+	constructor(
+		private config: MCPStdioServerConfig,
+		private sessionEnvironment?: SessionLaunchEnvironment,
+	) {}
 
 	get connected(): boolean {
 		return this.#connected;
@@ -179,12 +183,13 @@ export class StdioTransport implements MCPTransport {
 			cwd: this.config.cwd ?? process.cwd(),
 			registerCleanup: cleanup => this.#registerCleanup(attempt, cleanup),
 		};
-		const env = this.config.noInheritEnv
+		const env: Record<string, string | undefined> = this.config.noInheritEnv
 			? buildMinimalStdioEnv(this.config.env)
 			: {
 					...Bun.env,
 					...this.config.env,
 				};
+		applySessionLaunchEnvironment(env, this.sessionEnvironment);
 		try {
 			this.#assertConnectAttemptActive(attempt);
 			if (this.config.prepareSpawn) launch = await this.config.prepareSpawn(launch);

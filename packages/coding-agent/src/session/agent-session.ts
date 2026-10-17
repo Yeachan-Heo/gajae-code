@@ -435,6 +435,11 @@ import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } f
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
+import {
+	applySessionLaunchEnvironment,
+	sessionLaunchEnvironmentUnsetNames,
+	type SessionLaunchEnvironment,
+} from "../sdk/session-environment";
 import { obfuscateMessages, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, NoModelSelectedError } from "../setup/model-onboarding-guidance";
 import {
@@ -964,6 +969,8 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** Broker-validated subprocess environment for a lifecycle-owned session. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** The session's REQUESTED effective agent directory, independent of the
 	 * global Settings singleton (which may be reused across sessions). */
 	agentDir?: string;
@@ -2902,6 +2909,7 @@ export class AgentSession {
 	sessionManager: SessionManager;
 	readonly settings: Settings;
 	readonly #requestedAgentDir: string | undefined;
+	readonly #sessionEnvironment: SessionLaunchEnvironment | undefined;
 
 	/**
 	 * The session's effective agent directory: its REQUESTED directory when
@@ -5580,6 +5588,7 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
+		this.#sessionEnvironment = config.sessionEnvironment;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
 			if (settingPath === "sessionMemory.mode") {
@@ -26901,6 +26910,12 @@ export class AgentSession {
 		this.#bashAbortControllers.add(abortController);
 
 		try {
+			const env = buildGjcRuntimeSessionEnv({
+				sessionFile: null,
+				sessionId: this.sessionId,
+				cwd,
+			});
+			applySessionLaunchEnvironment(env, this.#sessionEnvironment);
 			const result = await executeBashCommand(command, {
 				onChunk,
 				settings: this.settings,
@@ -26908,11 +26923,9 @@ export class AgentSession {
 				sessionKey: this.sessionId,
 				cwd,
 				timeout: clampTimeout("bash") * 1000,
-				env: buildGjcRuntimeSessionEnv({
-					sessionFile: null,
-					sessionId: this.sessionId,
-					cwd,
-				}),
+				env,
+				sessionEnvironment: this.#sessionEnvironment,
+				unsetEnv: sessionLaunchEnvironmentUnsetNames(this.#sessionEnvironment),
 				onMinimizedSave: originalText => saveAgentBashOriginalArtifact(publishArtifact, originalText),
 			});
 

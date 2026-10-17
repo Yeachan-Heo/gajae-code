@@ -1,7 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $which, getRemoteHostDir, getSshControlDir, isEnoent, logger, postmortem } from "@gajae-code/utils";
+import { getRemoteHostDir, getSshControlDir, isEnoent, logger, postmortem } from "@gajae-code/utils";
 import { $ } from "bun";
+import {
+	createSessionChildEnvironment,
+	type SessionLaunchEnvironment,
+	whichWithSessionEnvironment,
+} from "../sdk/session-environment";
 import { buildSshTarget, sanitizeHostName } from "./utils";
 
 export interface SSHConnectionTarget {
@@ -34,7 +39,7 @@ const CONTROL_PATH = path.join(CONTROL_DIR, "%C.sock");
 const HOST_INFO_DIR = getRemoteHostDir();
 const HOST_INFO_VERSION = 2;
 
-const activeHosts = new Map<string, SSHConnectionTarget>();
+const activeHosts = new Map<string, { host: SSHConnectionTarget; sessionEnvironment?: SessionLaunchEnvironment }>();
 const pendingConnections = new Map<string, Promise<void>>();
 const hostInfoCache = new Map<string, SSHHostInfo>();
 
@@ -104,13 +109,27 @@ function buildCommonArgs(host: SSHConnectionTarget, options?: SSHArgsOptions): s
 	return args;
 }
 
-async function runSshSync(args: string[]): Promise<{ exitCode: number | null; stderr: string }> {
-	const result = await $`ssh ${args}`.quiet().nothrow();
+async function runSshSync(
+	args: string[],
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<{ exitCode: number | null; stderr: string }> {
+	const ssh = whichWithSessionEnvironment("ssh", sessionEnvironment);
+	if (!ssh) return { exitCode: null, stderr: "ssh binary not found on PATH" };
+	const environment = createSessionChildEnvironment(sessionEnvironment);
+	const shell = $`${ssh} ${args}`;
+	const result = await (environment === undefined ? shell : shell.env(environment)).quiet().nothrow();
 	return { exitCode: result.exitCode, stderr: result.stderr.toString().trim() };
 }
 
-async function runSshCaptureSync(args: string[]): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
-	const result = await $`ssh ${args}`.quiet().nothrow();
+async function runSshCaptureSync(
+	args: string[],
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+	const ssh = whichWithSessionEnvironment("ssh", sessionEnvironment);
+	if (!ssh) return { exitCode: null, stdout: "", stderr: "ssh binary not found on PATH" };
+	const environment = createSessionChildEnvironment(sessionEnvironment);
+	const shell = $`${ssh} ${args}`;
+	const result = await (environment === undefined ? shell : shell.env(environment)).quiet().nothrow();
 	return {
 		exitCode: result.exitCode,
 		stdout: result.stdout.toString().trim(),
@@ -118,8 +137,8 @@ async function runSshCaptureSync(args: string[]): Promise<{ exitCode: number | n
 	};
 }
 
-function ensureSshBinary(): void {
-	if (!$which("ssh")) {
+function ensureSshBinary(sessionEnvironment?: SessionLaunchEnvironment): void {
+	if (!whichWithSessionEnvironment("ssh", sessionEnvironment)) {
 		throw new Error("ssh binary not found on PATH");
 	}
 }
@@ -245,9 +264,12 @@ async function persistHostInfo(host: SSHConnectionTarget, info: SSHHostInfo): Pr
 	}
 }
 
-async function probeHostInfo(host: SSHConnectionTarget): Promise<SSHHostInfo> {
+async function probeHostInfo(
+	host: SSHConnectionTarget,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<SSHHostInfo> {
 	const command = 'echo "$OSTYPE|$SHELL|$BASH_VERSION" 2>/dev/null || echo "%OS%|%COMSPEC%|"';
-	const result = await runSshCaptureSync(await buildRemoteCommand(host, command));
+	const result = await runSshCaptureSync(await buildRemoteCommand(host, command), sessionEnvironment);
 	if (result.exitCode !== 0 && !result.stdout) {
 		logger.debug("SSH host probe failed", { host: host.name, error: result.stderr });
 		const fallback: SSHHostInfo = {
@@ -310,11 +332,17 @@ async function probeHostInfo(host: SSHConnectionTarget): Promise<SSHHostInfo> {
 	const hasBash = !unexpandedPosixVars && (Boolean(bashVersion) || shell === "bash");
 	let compatShell: SSHHostInfo["compatShell"];
 	if (os === "windows" && host.compat !== false) {
-		const bashProbe = await runSshCaptureSync(await buildRemoteCommand(host, 'bash -lc "echo PI_BASH_OK"'));
+		const bashProbe = await runSshCaptureSync(
+			await buildRemoteCommand(host, 'bash -lc "echo PI_BASH_OK"'),
+			sessionEnvironment,
+		);
 		if (bashProbe.exitCode === 0 && bashProbe.stdout.includes("PI_BASH_OK")) {
 			compatShell = "bash";
 		} else {
-			const shProbe = await runSshCaptureSync(await buildRemoteCommand(host, 'sh -lc "echo PI_SH_OK"'));
+			const shProbe = await runSshCaptureSync(
+				await buildRemoteCommand(host, 'sh -lc "echo PI_SH_OK"'),
+				sessionEnvironment,
+			);
 			if (shProbe.exitCode === 0 && shProbe.stdout.includes("PI_SH_OK")) {
 				compatShell = "sh";
 			}
@@ -355,7 +383,10 @@ export async function getHostInfoForHost(host: SSHConnectionTarget): Promise<SSH
 	return await loadHostInfoFromDisk(host);
 }
 
-export async function ensureHostInfo(host: SSHConnectionTarget): Promise<SSHHostInfo> {
+export async function ensureHostInfo(
+	host: SSHConnectionTarget,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<SSHHostInfo> {
 	const cached = hostInfoCache.get(host.name);
 	if (cached) {
 		const resolved = applyCompatOverride(host, cached);
@@ -364,10 +395,10 @@ export async function ensureHostInfo(host: SSHConnectionTarget): Promise<SSHHost
 	}
 	const fromDisk = await loadHostInfoFromDisk(host);
 	if (fromDisk && !shouldRefreshHostInfo(host, fromDisk)) return fromDisk;
-	await ensureConnection(host);
+	await ensureConnection(host, sessionEnvironment);
 	const current = hostInfoCache.get(host.name);
 	if (current && !shouldRefreshHostInfo(host, current)) return current;
-	return probeHostInfo(host);
+	return probeHostInfo(host, sessionEnvironment);
 }
 
 export async function buildRemoteCommand(
@@ -388,7 +419,10 @@ function ensureSshCleanup(): void {
 	});
 }
 
-export async function ensureConnection(host: SSHConnectionTarget): Promise<void> {
+export async function ensureConnection(
+	host: SSHConnectionTarget,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<void> {
 	const key = host.name;
 	const pending = pendingConnections.get(key);
 	if (pending) {
@@ -397,40 +431,40 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 	}
 
 	const promise = (async () => {
-		ensureSshBinary();
+		ensureSshBinary(sessionEnvironment);
 		ensureControlDir();
 		await validateKeyPermissions(host.keyPath);
 
 		const target = buildSshTarget(host.username, host.host);
 		if (!supportsSshControlMaster()) {
-			activeHosts.set(key, host);
+			activeHosts.set(key, { host, sessionEnvironment });
 			ensureSshCleanup();
 			if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
-				await probeHostInfo(host);
+				await probeHostInfo(host, sessionEnvironment);
 			}
 			return;
 		}
 
-		const check = await runSshSync(["-O", "check", ...buildCommonArgs(host), target]);
+		const check = await runSshSync(["-O", "check", ...buildCommonArgs(host), target], sessionEnvironment);
 		if (check.exitCode === 0) {
-			activeHosts.set(key, host);
+			activeHosts.set(key, { host, sessionEnvironment });
 			ensureSshCleanup();
 			if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
-				await probeHostInfo(host);
+				await probeHostInfo(host, sessionEnvironment);
 			}
 			return;
 		}
 
-		const start = await runSshSync(["-M", "-N", "-f", ...buildCommonArgs(host), target]);
+		const start = await runSshSync(["-M", "-N", "-f", ...buildCommonArgs(host), target], sessionEnvironment);
 		if (start.exitCode !== 0) {
 			const detail = start.stderr ? `: ${start.stderr}` : "";
 			throw new Error(`Failed to start SSH master for ${target}${detail}`);
 		}
 
-		activeHosts.set(key, host);
+		activeHosts.set(key, { host, sessionEnvironment });
 		ensureSshCleanup();
 		if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
-			await probeHostInfo(host);
+			await probeHostInfo(host, sessionEnvironment);
 		}
 	})();
 
@@ -442,7 +476,10 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 	}
 }
 
-export async function invalidateHostMetadata(hostNames: Iterable<string>): Promise<void> {
+export async function invalidateHostMetadata(
+	hostNames: Iterable<string>,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<void> {
 	const names = [...hostNames];
 	for (const hostName of names) {
 		hostInfoCache.delete(hostName);
@@ -451,27 +488,30 @@ export async function invalidateHostMetadata(hostNames: Iterable<string>): Promi
 	for (const hostName of names) {
 		const activeHost = activeHosts.get(hostName);
 		if (activeHost) {
-			await closeConnectionInternal(activeHost);
+			await closeConnectionInternal(activeHost.host, activeHost.sessionEnvironment);
 			activeHosts.delete(hostName);
 			continue;
 		}
-		await closeConnectionInternal({ name: hostName, host: hostName });
+		await closeConnectionInternal({ name: hostName, host: hostName }, sessionEnvironment);
 	}
 }
 
-async function closeConnectionInternal(host: SSHConnectionTarget): Promise<void> {
+async function closeConnectionInternal(
+	host: SSHConnectionTarget,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): Promise<void> {
 	if (!supportsSshControlMaster()) return;
 	const target = buildSshTarget(host.username, host.host);
-	await runSshSync(["-O", "exit", ...buildCommonArgs(host), target]);
+	await runSshSync(["-O", "exit", ...buildCommonArgs(host), target], sessionEnvironment);
 }
 
-export async function closeConnection(hostName: string): Promise<void> {
-	await invalidateHostMetadata([hostName]);
+export async function closeConnection(hostName: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<void> {
+	await invalidateHostMetadata([hostName], sessionEnvironment);
 }
 
 export async function closeAllConnections(): Promise<void> {
-	for (const [name, host] of Array.from(activeHosts.entries())) {
-		await closeConnectionInternal(host);
+	for (const [name, activeHost] of Array.from(activeHosts.entries())) {
+		await closeConnectionInternal(activeHost.host, activeHost.sessionEnvironment);
 		activeHosts.delete(name);
 	}
 }

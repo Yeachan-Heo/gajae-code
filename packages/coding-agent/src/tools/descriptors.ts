@@ -390,6 +390,7 @@ const loaders: Record<string, Loader> = {
 		cached("python", () => import("./python")).then(module =>
 			module.createSessionPythonTool({
 				cwd: session.cwd,
+				sessionEnvironment: session.sessionEnvironment,
 				settings: session.settings,
 				getCwd: () => session.cwd,
 				getSessionFile: () => session.getSessionFile(),

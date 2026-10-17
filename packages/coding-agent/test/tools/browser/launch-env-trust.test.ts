@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { SessionLaunchEnvironment } from "../../../src/sdk/session-environment";
 
 /**
  * The browser launch overrides choose which binary runs and how its traffic is
@@ -35,6 +36,7 @@ const BROWSER_KEYS = [
 
 interface BrowserEnvOverrides {
 	executablePath: string | undefined;
+	resolvedExecutablePath?: string;
 	proxy: string | undefined;
 	proxyBypassLoopback: boolean;
 	ignoreCertErrors: boolean;
@@ -68,19 +70,28 @@ afterEach(() => {
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<BrowserEnvOverrides> {
+async function resolveIn(
+	cwd: string,
+	overrides: Record<string, string> = {},
+	sessionEnvironment?: SessionLaunchEnvironment,
+	resolveExecutable = false,
+): Promise<BrowserEnvOverrides> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) {
 		if (value !== undefined) env[key] = value;
 	}
 	// Never let the outer environment leak an override into the child.
 	for (const key of BROWSER_KEYS) delete env[key];
+	delete env.GJC_TEST_SESSION_ENV;
+	delete env.GJC_TEST_RESOLVE_EXECUTABLE;
 	// `$credentialEnv` also consults file sources the child env cannot mask:
 	// the agent `.env`, the GJC config `.env`, `~/.env` and the login shell rc
 	// files. Point HOME and the agent dir at empty temp dirs so a contributor who
 	// exports one of these names from a shell rc still sees a hermetic result.
 	env.HOME = tempDir();
 	env.GJC_CODING_AGENT_DIR = tempDir();
+	if (sessionEnvironment !== undefined) env.GJC_TEST_SESSION_ENV = JSON.stringify(sessionEnvironment);
+	if (resolveExecutable) env.GJC_TEST_RESOLVE_EXECUTABLE = "1";
 	Object.assign(env, overrides);
 
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
@@ -128,6 +139,41 @@ describe("browser launch env trust boundary", () => {
 		expect(resolved.executablePath).toBe("/opt/chrome/chrome");
 		expect(resolved.proxy).toBe("http://localhost:8080");
 		expect(resolved.ignoreCertErrors).toBe(true);
+	});
+
+	it("uses session browser controls and executable ahead of inherited values", async () => {
+		const resolved = await resolveIn(
+			projectDir(),
+			{
+				PUPPETEER_EXECUTABLE_PATH: "/host/chrome",
+				PUPPETEER_PROXY: "http://host-proxy:8080",
+				PUPPETEER_PROXY_BYPASS_LOOPBACK: "1",
+				PUPPETEER_PROXY_IGNORE_CERT_ERRORS: "1",
+			},
+			{
+				env: {
+					PUPPETEER_EXECUTABLE_PATH: "/session/chrome",
+					PUPPETEER_PROXY: "http://session-proxy:8080",
+				},
+				unsetEnv: ["PUPPETEER_PROXY_BYPASS_LOOPBACK", "PUPPETEER_PROXY_IGNORE_CERT_ERRORS"],
+			},
+			true,
+		);
+		expect(resolved.executablePath).toBe("/session/chrome");
+		expect(resolved.resolvedExecutablePath).toBe("/session/chrome");
+		expect(resolved.proxy).toBe("http://session-proxy:8080");
+		expect(resolved.proxyBypassLoopback).toBe(false);
+		expect(resolved.ignoreCertErrors).toBe(false);
+	});
+
+	it("lets an explicit session unset suppress an inherited proxy", async () => {
+		const resolved = await resolveIn(
+			projectDir(),
+			{ PUPPETEER_PROXY: "http://host-proxy:8080", PUPPETEER_PROXY_IGNORE_CERT_ERRORS: "true" },
+			{ unsetEnv: ["PUPPETEER_PROXY", "PUPPETEER_PROXY_IGNORE_CERT_ERRORS"] },
+		);
+		expect(resolved.proxy).toBeUndefined();
+		expect(resolved.ignoreCertErrors).toBe(false);
 	});
 
 	it("does not let the project .env override inherited values", async () => {

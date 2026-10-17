@@ -347,6 +347,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		const browser = await untilAborted(signal, () =>
 			acquireBrowser(kind, {
 				cwd: this.session.cwd,
+				sessionEnvironment: this.session.sessionEnvironment,
 				viewport: params.viewport
 					? {
 							width: params.viewport.width,

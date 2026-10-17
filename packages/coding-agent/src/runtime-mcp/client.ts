@@ -8,6 +8,7 @@
 import * as path from "node:path";
 import * as url from "node:url";
 import { getProjectDir, logger, withTimeout } from "@gajae-code/utils";
+import type { SessionLaunchEnvironment } from "../sdk/session-environment";
 import {
 	buildXMcpParamHeaders,
 	classifyMcpProbeFailure,
@@ -188,12 +189,15 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
 /**
  * Create a transport for the given server config.
  */
-function createTransport(config: MCPServerConfig): StdioTransport | HttpTransport {
+function createTransport(
+	config: MCPServerConfig,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): StdioTransport | HttpTransport {
 	const serverType = config.type ?? "stdio";
 
 	switch (serverType) {
 		case "stdio":
-			return new StdioTransport(config as MCPStdioServerConfig);
+			return new StdioTransport(config as MCPStdioServerConfig, sessionEnvironment);
 		case "http":
 			return new HttpTransport(config as MCPHttpServerConfig);
 		case "sse":
@@ -547,6 +551,7 @@ export async function connectToServer(
 		signal?: AbortSignal;
 		/** Whether to advertise the roots/list capability (default: true). */
 		advertiseRoots?: boolean;
+		sessionEnvironment?: SessionLaunchEnvironment;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	},
@@ -559,7 +564,10 @@ export async function connectToServer(
 	const preference = resolveMCPProtocolPreference(config.protocol);
 
 	const connect = async (): Promise<MCPServerConnection> => {
-		transport = createTransport(config);
+		transport = createTransport(
+			config,
+			(config.type ?? "stdio") === "stdio" ? options?.sessionEnvironment : undefined,
+		);
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
 		}

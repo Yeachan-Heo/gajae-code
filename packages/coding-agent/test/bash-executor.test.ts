@@ -1370,6 +1370,44 @@ describe("executeBash", () => {
 		expect(result.output.trim()).toBe("0:hello");
 	});
 
+	it("applies session overlays before creating shell startup snapshots", async () => {
+		if (process.platform === "win32") return;
+		const bashPath = Bun.env.SHELL?.includes("bash") ? Bun.env.SHELL : "/bin/bash";
+		if (!fs.existsSync(bashPath)) return;
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+			shell: bashPath,
+			args: ["-l", "-c"],
+			env: {
+				PATH: Bun.env.PATH ?? "",
+				HOME: Bun.env.HOME ?? tempDir,
+				SESSION_SNAPSHOT_SECRET: "workspace-secret",
+				SESSION_SNAPSHOT_VALUE: "workspace-value",
+			},
+			prefix: undefined,
+		});
+		const snapshot = vi.spyOn(shellSnapshot, "getOrCreateSnapshot").mockResolvedValue(null);
+
+		const result = await executeBash("true", {
+			cwd: tempDir,
+			timeout: 5000,
+			oneShot: true,
+			sessionEnvironment: {
+				env: { SESSION_SNAPSHOT_VALUE: "session-value" },
+				unsetEnv: ["SESSION_SNAPSHOT_SECRET"],
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(snapshot).toHaveBeenCalledWith(
+			bashPath,
+			expect.objectContaining({
+				PATH: Bun.env.PATH ?? "",
+				SESSION_SNAPSHOT_VALUE: "session-value",
+			}),
+		);
+		expect(snapshot.mock.calls[0]?.[1]).not.toHaveProperty("SESSION_SNAPSHOT_SECRET");
+	});
+
 	it("can ignore configured shell prefixes", async () => {
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: Bun.env.SHELL?.includes("bash") ? Bun.env.SHELL : "/bin/bash",

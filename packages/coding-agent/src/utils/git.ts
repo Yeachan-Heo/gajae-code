@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, hasFsCode, isEnoent, Snowflake } from "@gajae-code/utils";
+import { $which, getEnvValue, hasFsCode, isEnoent, Snowflake, WhichCachePolicy } from "@gajae-code/utils";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
 	parseFileDiffs,
@@ -9,6 +9,11 @@ import {
 	parseNumstat,
 } from "../commit/git/diff";
 import type { FileDiff, FileHunks, NumstatEntry } from "../commit/types";
+import {
+	createSessionChildEnvironment,
+	getCurrentSessionLaunchEnvironment,
+	hasSessionPathOverride,
+} from "../sdk/session-environment";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -173,8 +178,27 @@ function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
 	return new Uint8Array(input);
 }
 
-function ensureAvailable(): void {
-	if (!$which("git")) {
+function createGitCommandEnvironment(options: CommandOptions = {}): Record<string, string | undefined> | undefined {
+	const baseEnvironment = options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined;
+	const sessionEnvironment = getCurrentSessionLaunchEnvironment();
+	return sessionEnvironment === undefined
+		? baseEnvironment
+		: createSessionChildEnvironment(sessionEnvironment, baseEnvironment ?? process.env);
+}
+
+function hasCommandPathOverride(options: CommandOptions): boolean {
+	const optionPathOverride = Object.keys(options.env ?? {}).some(name =>
+		process.platform === "win32" ? name.toUpperCase() === "PATH" : name === "PATH",
+	);
+	return optionPathOverride || hasSessionPathOverride(getCurrentSessionLaunchEnvironment());
+}
+
+function ensureAvailable(options: CommandOptions = {}): void {
+	const environment = createGitCommandEnvironment(options);
+	const lookupOptions = hasCommandPathOverride(options)
+		? { PATH: getEnvValue(environment ?? process.env, "PATH") ?? "", cache: WhichCachePolicy.Bypass }
+		: undefined;
+	if (!$which("git", lookupOptions)) {
 		throw new Error("git is not installed.");
 	}
 }
@@ -196,9 +220,10 @@ async function runCommand(
 	options: CommandOptions = {},
 ): Promise<GitCommandResult> {
 	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
+	const environment = createGitCommandEnvironment(options);
 	const child = Bun.spawn(["git", ...commandArgs], {
 		cwd,
-		env: options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined,
+		env: environment,
 		signal: options.signal,
 		stdin: normalizeStdin(options.stdin),
 		stdout: "pipe",
@@ -248,7 +273,7 @@ async function runChecked(
 	args: readonly string[],
 	options: CommandOptions = {},
 ): Promise<GitCommandResult> {
-	ensureAvailable();
+	ensureAvailable(options);
 	const result = await runCommand(cwd, args, options);
 	if (result.exitCode !== 0) {
 		throw new GitCommandError(args, result);
@@ -269,7 +294,7 @@ async function tryText(
 	args: readonly string[],
 	options: CommandOptions = {},
 ): Promise<string | undefined> {
-	ensureAvailable();
+	ensureAvailable(options);
 	const result = await runCommand(cwd, args, options);
 	if (result.exitCode !== 0) return undefined;
 	return result.stdout;
@@ -1577,6 +1602,15 @@ export interface GhCommandOptions {
 	trimOutput?: boolean;
 }
 
+function currentGitHubCli(): { command: string | null; environment: Record<string, string> | undefined } {
+	const launchEnvironment = getCurrentSessionLaunchEnvironment();
+	const environment = createSessionChildEnvironment(launchEnvironment);
+	const command = !hasSessionPathOverride(launchEnvironment)
+		? $which("gh")
+		: $which("gh", { PATH: environment === undefined ? "" : (getEnvValue(environment, "PATH") ?? "") });
+	return { command, environment };
+}
+
 function formatGhFailure(args: readonly string[], stdout: string, stderr: string, options?: GhCommandOptions): string {
 	const message = (stderr || stdout).trim();
 	if (message.includes("gh auth login") || message.includes("not logged into any GitHub hosts")) {
@@ -1597,18 +1631,20 @@ function formatGhFailure(args: readonly string[], stdout: string, stderr: string
 export const github = {
 	/** Check if `gh` CLI is installed. */
 	available(): boolean {
-		return Boolean($which("gh"));
+		return currentGitHubCli().command !== null;
 	},
 
 	/** Run a raw `gh` CLI command. Does not throw on non-zero exit. */
 	async run(cwd: string, args: string[], signal?: AbortSignal, options?: GhCommandOptions): Promise<GhCommandResult> {
 		throwIfAborted(signal);
-		if (!$which("gh")) {
+		const { command, environment } = currentGitHubCli();
+		if (!command) {
 			throw new ToolError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/.");
 		}
 		try {
-			const child = Bun.spawn(["gh", ...args], {
+			const child = Bun.spawn([command, ...args], {
 				cwd,
+				env: environment,
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",

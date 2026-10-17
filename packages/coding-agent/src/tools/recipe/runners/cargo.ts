@@ -1,6 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@gajae-code/utils";
+import { isEnoent, logger } from "@gajae-code/utils";
+import {
+	createSessionChildEnvironment,
+	type SessionLaunchEnvironment,
+	whichWithSessionEnvironment,
+} from "../../../sdk/session-environment";
 import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
 
 export interface CargoMetadataTarget {
@@ -94,10 +99,15 @@ export function tasksFromCargoMetadata(metadata: CargoMetadata): RunnerTask[] {
 	return tasks;
 }
 
-async function readCargoMetadata(cwd: string): Promise<CargoMetadata | null> {
+async function readCargoMetadata(
+	cwd: string,
+	sessionEnvironment: SessionLaunchEnvironment | undefined,
+): Promise<CargoMetadata | null> {
 	try {
+		const environment = createSessionChildEnvironment(sessionEnvironment);
 		const proc = Bun.spawn(["cargo", "metadata", "--no-deps", "--format-version=1"], {
 			cwd,
+			...(environment === undefined ? {} : { env: environment }),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -114,11 +124,11 @@ async function readCargoMetadata(cwd: string): Promise<CargoMetadata | null> {
 export const cargoRunner: TaskRunner = {
 	id: "cargo",
 	label: "Cargo",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<DetectedRunner | null> {
 		try {
-			if (!$which("cargo")) return null;
+			if (!whichWithSessionEnvironment("cargo", sessionEnvironment)) return null;
 			if (!(await hasCargoManifest(cwd))) return null;
-			const metadata = await readCargoMetadata(cwd);
+			const metadata = await readCargoMetadata(cwd, sessionEnvironment);
 			if (!metadata) return null;
 			const tasks = tasksFromCargoMetadata(metadata);
 			if (tasks.length === 0) return null;

@@ -63,9 +63,9 @@ export class RecipeTool implements AgentTool<typeof recipeSchema, BashToolDetail
 
 	static async createIf(session: ToolSession): Promise<RecipeTool | null> {
 		if (!session.settings.get("recipe.enabled")) return null;
-		const detected = (await Promise.all(RUNNERS.map(runner => runner.detect(session.cwd)))).filter(
-			(runner): runner is DetectedRunner => runner !== null && runner.tasks.length > 0,
-		);
+		const detected = (
+			await Promise.all(RUNNERS.map(runner => runner.detect(session.cwd, session.sessionEnvironment)))
+		).filter((runner): runner is DetectedRunner => runner !== null && runner.tasks.length > 0);
 		if (detected.length === 0) return null;
 		return new RecipeTool(session, detected);
 	}

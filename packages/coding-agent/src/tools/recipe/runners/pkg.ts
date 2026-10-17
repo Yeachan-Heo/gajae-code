@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { $which, isEnoent, logger } from "@gajae-code/utils";
+import { isEnoent, logger } from "@gajae-code/utils";
+import { type SessionLaunchEnvironment, whichWithSessionEnvironment } from "../../../sdk/session-environment";
 import type { DetectedRunner, RunnerTask, TaskRunner } from "../runner";
 
 interface PackageJsonInfo {
@@ -9,7 +10,7 @@ interface PackageJsonInfo {
 	workspaces: string[];
 }
 
-async function resolvePackageRunner(cwd: string): Promise<string> {
+async function resolvePackageRunner(cwd: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<string> {
 	const [bunLock, bunLockb, pnpmLock, yarnLock, npmLock, npmShrink] = await Promise.all([
 		isFile(path.join(cwd, "bun.lock")),
 		isFile(path.join(cwd, "bun.lockb")),
@@ -22,7 +23,7 @@ async function resolvePackageRunner(cwd: string): Promise<string> {
 	if (pnpmLock) return "pnpm run";
 	if (yarnLock) return "yarn";
 	if (npmLock || npmShrink) return "npm run";
-	if ($which("bun")) return "bun run";
+	if (whichWithSessionEnvironment("bun", sessionEnvironment)) return "bun run";
 	return "npm run";
 }
 
@@ -154,9 +155,12 @@ async function readPackageTasks(cwd: string): Promise<RunnerTask[] | null> {
 export const pkgRunner: TaskRunner = {
 	id: "pkg",
 	label: "Pkg",
-	async detect(cwd: string): Promise<DetectedRunner | null> {
+	async detect(cwd: string, sessionEnvironment?: SessionLaunchEnvironment): Promise<DetectedRunner | null> {
 		try {
-			const [commandPrefix, tasks] = await Promise.all([resolvePackageRunner(cwd), readPackageTasks(cwd)]);
+			const [commandPrefix, tasks] = await Promise.all([
+				resolvePackageRunner(cwd, sessionEnvironment),
+				readPackageTasks(cwd),
+			]);
 			if (!tasks || tasks.length === 0) return null;
 			return { id: "pkg", label: "Pkg", commandPrefix, tasks };
 		} catch (err) {

@@ -4,6 +4,7 @@
  */
 import path from "node:path";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
+import { createCurrentSessionChildEnvironment } from "../../sdk/session-environment";
 
 // =============================================================================
 // Biome JSON Output Types
@@ -84,6 +85,7 @@ async function runBiome(
 	try {
 		const proc = Bun.spawn([command, ...args], {
 			cwd,
+			env: createCurrentSessionChildEnvironment(),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,

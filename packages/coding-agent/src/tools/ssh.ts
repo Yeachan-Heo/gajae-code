@@ -155,7 +155,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			throw new ToolError(`SSH host not loaded: ${host}`);
 		}
 
-		const hostInfo = await ensureHostInfo(hostConfig);
+		const hostInfo = await ensureHostInfo(hostConfig, this.session.sessionEnvironment);
 		const remoteCommand = buildRemoteCommand(command, cwd, hostInfo);
 
 		// Clamp to reasonable range: 1s - 3600s (1 hour)
@@ -167,6 +167,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 
 		const result = await executeSSH(hostConfig, remoteCommand, {
 			settings: this.session.settings,
+			sessionEnvironment: this.session.sessionEnvironment,
 			timeout: timeoutMs,
 			signal,
 			compatEnabled: hostInfo.compatEnabled,

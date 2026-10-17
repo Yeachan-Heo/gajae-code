@@ -72,6 +72,28 @@ describe("MCP C5 pool identity", () => {
 		expect(key(stdio({ command: "node" }))).not.toBe(key(stdio({ command: "deno" })));
 	});
 
+	test("partitions stdio overlays without exposing their values and leaves HTTP identity unchanged", () => {
+		const config = stdio({ sharing: "shared", noInheritEnv: true, env: { SESSION_ONLY: "configured" } });
+		const first = buildMCPPoolKeyIdentity("server", config, {
+			sharingMode: "shared",
+			sessionEnvironment: { env: { SESSION_ONLY: "session-secret-one" } },
+		});
+		const second = buildMCPPoolKeyIdentity("server", config, {
+			sharingMode: "shared",
+			sessionEnvironment: { env: { SESSION_ONLY: "session-secret-two" } },
+		});
+		const unset = buildMCPPoolKeyIdentity("server", config, {
+			sharingMode: "shared",
+			sessionEnvironment: { unsetEnv: ["SESSION_ONLY"] },
+		});
+		expect(first.envIdentity).not.toEqual(second.envIdentity);
+		expect(first.envIdentity).not.toEqual(unset.envIdentity);
+		expect(JSON.stringify(first)).not.toContain("session-secret-one");
+		expect(key(http("https://h/mcp"), { sessionEnvironment: { env: { SESSION_ONLY: "session-secret-one" } } })).toBe(
+			key(http("https://h/mcp")),
+		);
+	});
+
 	test("uses an empty endpoint sentinel for stdio", () => {
 		expect(buildMCPPoolKeyIdentity("server", stdio(), { sessionId: "s" }).endpointIdentity).toBe("");
 	});

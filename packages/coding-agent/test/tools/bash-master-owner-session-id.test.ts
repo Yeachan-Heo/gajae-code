@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as piNatives from "@gajae-code/natives";
 import { disposeAllShellSessions, setShellFactoryForTests } from "../../src/exec/bash-executor";
+import * as masterCli from "../../src/sdk/cli/master-cli";
 import type { ToolSession } from "../../src/tools";
 import { BashTool } from "../../src/tools/bash";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
@@ -139,6 +140,33 @@ describe("issue #5374: session identity on the bash tool-env path", () => {
 			command: echoSessionEnv(),
 		});
 		expect(textOf(result)).toContain("own=master-owner");
+	});
+
+	it("applies session unsets to direct master spawn dispatch", async () => {
+		const envName = "MASTER_SPAWN_UNSET_PROBE";
+		const secret = "direct-master-inherited-secret";
+		const previous = process.env[envName];
+		process.env[envName] = secret;
+		let dispatchedEnv: Record<string, string | undefined> | undefined;
+		vi.spyOn(masterCli, "runSdkSpawn").mockImplementation(async (_args, dependencies) => {
+			dispatchedEnv = dependencies?.env;
+			return { rendered: { code: "spawn_accepted" }, exitCode: 0 };
+		});
+		const session = {
+			...createSession("master-owner", "master-owner"),
+			getSessionAgentDir: () => "/tmp/agent",
+			sessionEnvironment: { unsetEnv: [envName] },
+		} as ToolSession;
+		try {
+			const result = await new BashTool(session).execute("direct-master-unset", {
+				command: "gjc sdk spawn --cwd /tmp --prompt session-environment-probe",
+			});
+			expect(dispatchedEnv?.[envName]).toBeUndefined();
+			expect(textOf(result)).toContain("spawn_accepted");
+		} finally {
+			if (previous === undefined) delete process.env[envName];
+			else process.env[envName] = previous;
+		}
 	});
 });
 

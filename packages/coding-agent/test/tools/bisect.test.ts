@@ -14,8 +14,13 @@ import {
 
 const FORTY_HEX = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 
-function session(cwd: string): ToolSession {
-	return { cwd, hasUI: false, getSessionFile: () => null } as unknown as ToolSession;
+function session(cwd: string, sessionEnvironment?: ToolSession["sessionEnvironment"]): ToolSession {
+	return {
+		cwd,
+		hasUI: false,
+		...(sessionEnvironment === undefined ? {} : { sessionEnvironment }),
+		getSessionFile: () => null,
+	} as unknown as ToolSession;
 }
 
 // ── temp-repo helpers ────────────────────────────────────────────────────────
@@ -196,6 +201,35 @@ describe("BisectTool.execute", () => {
 		expect(await gitRun(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(originalBranch);
 		expect(await gitRun(repo, ["status", "--porcelain"])).toBe("");
 		expect(await Bun.file(path.join(repo, ".git", "BISECT_LOG")).exists()).toBe(false);
+	});
+
+	itWithRepo("runs predicates with the session environment overlay", async repo => {
+		const good = await commitFlag(repo, "PASS\n", "c0 baseline");
+		await commitFlag(repo, "FAIL\n", "c1 regression");
+		const unsetName = "BISECT_SESSION_UNSET_PROBE";
+		const setName = "BISECT_SESSION_SET_PROBE";
+		const previousUnset = process.env[unsetName];
+		const previousSet = process.env[setName];
+		process.env[unsetName] = "host-secret";
+		delete process.env[setName];
+		try {
+			const result = await new BisectTool(
+				session(repo, { env: { [setName]: "session-value" }, unsetEnv: [unsetName] }),
+			).execute("call", {
+				good,
+				bad: "HEAD",
+				run: `test -z "$${unsetName}" && test "$${setName}" = session-value && grep -q PASS flag.txt`,
+				invert: false,
+				maxSteps: 40,
+				stepTimeoutMs: 60_000,
+			});
+			expect(result.details?.concluded).toBe(true);
+		} finally {
+			if (previousUnset === undefined) delete process.env[unsetName];
+			else process.env[unsetName] = previousUnset;
+			if (previousSet === undefined) delete process.env[setName];
+			else process.env[setName] = previousSet;
+		}
 	});
 
 	itWithRepo("finds the fixing commit in invert mode", async repo => {

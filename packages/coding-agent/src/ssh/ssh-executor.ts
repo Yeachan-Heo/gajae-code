@@ -1,5 +1,10 @@
 import { logger, ptree } from "@gajae-code/utils";
 import { Settings } from "../config/settings";
+import {
+	createSessionChildEnvironment,
+	type SessionLaunchEnvironment,
+	whichWithSessionEnvironment,
+} from "../sdk/session-environment";
 import { OutputSink } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { buildRemoteCommand, ensureConnection, ensureHostInfo, type SSHConnectionTarget } from "./connection-manager";
@@ -8,6 +13,8 @@ import { hasSshfs, mountRemote } from "./sshfs-mount";
 export interface SSHExecutorOptions {
 	/** Session settings used for output policy. */
 	settings?: Settings;
+	/** Session environment applied to SSH, connection, and mount subprocesses. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** Timeout in milliseconds */
 	timeout?: number;
 	/** Callback for streaming output chunks (already sanitized) */
@@ -61,10 +68,11 @@ export async function executeSSH(
 	command: string,
 	options?: SSHExecutorOptions,
 ): Promise<SSHResult> {
-	await ensureConnection(host);
-	if (hasSshfs()) {
+	const sessionEnvironment = options?.sessionEnvironment;
+	await ensureConnection(host, sessionEnvironment);
+	if (hasSshfs(sessionEnvironment)) {
 		try {
-			await mountRemote(host, options?.remotePath ?? "/");
+			await mountRemote(host, options?.remotePath ?? "/", sessionEnvironment);
 		} catch (err) {
 			logger.warn("SSHFS mount failed", { host: host.name, error: String(err) });
 		}
@@ -72,7 +80,7 @@ export async function executeSSH(
 
 	let resolvedCommand = command;
 	if (options?.compatEnabled) {
-		const info = await ensureHostInfo(host);
+		const info = await ensureHostInfo(host, sessionEnvironment);
 		if (info.compatShell) {
 			resolvedCommand = buildCompatCommand(info.compatShell, command);
 		} else {
@@ -80,7 +88,10 @@ export async function executeSSH(
 		}
 	}
 
-	using child = ptree.spawn(["ssh", ...(await buildRemoteCommand(host, resolvedCommand))], {
+	const ssh = whichWithSessionEnvironment("ssh", sessionEnvironment);
+	if (!ssh) throw new Error("ssh binary not found on PATH");
+	using child = ptree.spawn([ssh, ...(await buildRemoteCommand(host, resolvedCommand))], {
+		env: createSessionChildEnvironment(sessionEnvironment),
 		signal: options?.signal,
 		timeout: options?.timeout,
 		stdin: "pipe",

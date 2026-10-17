@@ -219,7 +219,7 @@ describe("stealth network posture (integration)", () => {
 		expect(probe.explicitUtc).toBe("UTC");
 	}, 120_000);
 
-	it("B5: managed cache identity includes geo and profile posture but external modes ignore geo", () => {
+	it("B5: managed cache identity includes geo, profile posture, and session environment", () => {
 		const kind = { kind: "headless", headless: true } as const;
 		const base = browserKeyForTest(kind, { geo: { timezone: "Asia/Tokyo", locale: "fr-FR" } });
 		expect(browserKeyForTest(kind, { geo: { timezone: "Asia/Tokyo", locale: "de-DE" } })).not.toBe(base);
@@ -229,8 +229,20 @@ describe("stealth network posture (integration)", () => {
 				profileReuse: "auto",
 			}),
 		).not.toBe(base);
+		const sessionEnvironment = { env: { SESSION_BROWSER_VALUE: "private-value" } };
+		const sessionKey = browserKeyForTest(kind, { sessionEnvironment });
+		expect(browserKeyForTest(kind, { sessionEnvironment: { env: { SESSION_BROWSER_VALUE: "private-value" } } })).toBe(
+			sessionKey,
+		);
 		expect(
-			browserKeyForTest({ kind: "connected", cdpUrl: "http://127.0.0.1:9222" }, { geo: { timezone: "invalid" } }),
+			browserKeyForTest(kind, { sessionEnvironment: { env: { SESSION_BROWSER_VALUE: "other-value" } } }),
+		).not.toBe(sessionKey);
+		expect(sessionKey).not.toContain("private-value");
+		expect(
+			browserKeyForTest(
+				{ kind: "connected", cdpUrl: "http://127.0.0.1:9222" },
+				{ geo: { timezone: "invalid" }, sessionEnvironment },
+			),
 		).toBe("connected:http://127.0.0.1:9222");
 	});
 	it("B6: headless browser cache serializes identical geo and separates different geo", async () => {

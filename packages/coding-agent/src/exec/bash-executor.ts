@@ -15,6 +15,7 @@ import { postmortem } from "@gajae-code/utils";
 import { projectDeclaredSpawnHookNames, stripProjectSpawnHooks } from "@gajae-code/utils/shell-config";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
+import { applySessionLaunchEnvironment, type SessionLaunchEnvironment } from "../sdk/session-environment";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	DEFAULT_MAX_BYTES,
@@ -334,6 +335,8 @@ export interface BashExecutorOptions {
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
+	/** Session environment applied before shell startup and snapshot creation. */
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/** Environment names to hide from this command's inherited environment. */
 	unsetEnv?: string[];
 	/** Artifact path/id for full output storage */
@@ -503,6 +506,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// their own documented allowlist). Only the bash tool's shell must not see
 	// project hook variables such as BASH_ENV or GIT_CONFIG_*.
 	const shellEnv = stripProjectSpawnHooks({ ...configEnv });
+	applySessionLaunchEnvironment(shellEnv, options?.sessionEnvironment);
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
 	const snapshotPath =
 		!options?.disableShellSnapshot && shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;

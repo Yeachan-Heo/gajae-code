@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
+import { createSessionChildEnvironment, type SessionLaunchEnvironment } from "../../sdk/session-environment";
 import { ToolAbortError, ToolError } from "../tool-errors";
 import {
 	findFreeCdpPort,
@@ -81,14 +83,29 @@ const ownedWarmupDirs = new WeakMap<BrowserHandle, string>();
  */
 const HEADLESS_FORCE_CLOSE_GRACE_MS = 1_500;
 
-function browserKey(kind: BrowserKind, geo?: BrowserGeo, profileReuse?: ProfileReusePosture): string {
+function sessionEnvironmentKey(environment: SessionLaunchEnvironment | undefined): string {
+	if (environment === undefined) return "";
+	const canonical = {
+		env: Object.entries(environment.env ?? {}).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+		unsetEnv: [...(environment.unsetEnv ?? [])].sort(),
+	};
+	return `:env-${createHash("sha256").update(JSON.stringify(canonical)).digest("hex")}`;
+}
+
+function browserKey(
+	kind: BrowserKind,
+	geo?: BrowserGeo,
+	profileReuse?: ProfileReusePosture,
+	sessionEnvironment?: SessionLaunchEnvironment,
+): string {
+	const environmentKey = sessionEnvironmentKey(sessionEnvironment);
 	switch (kind.kind) {
 		case "headless":
-			return `headless:${kind.headless ? "1" : "0"}:${profileReuse ?? "synthetic"}:${geo?.timezone ?? ""}:${geo?.locale ?? ""}`;
+			return `headless:${kind.headless ? "1" : "0"}:${profileReuse ?? "synthetic"}:${geo?.timezone ?? ""}:${geo?.locale ?? ""}${environmentKey}`;
 		case "spawned":
-			return `spawned:${kind.path}`;
+			return `spawned:${kind.path}${environmentKey}`;
 		case "chrome-profile":
-			return `chrome-profile:${kind.path}:${kind.userDataDir}:${kind.profileDirectory}:${kind.cdpPort ?? 0}`;
+			return `chrome-profile:${kind.path}:${kind.userDataDir}:${kind.profileDirectory}:${kind.cdpPort ?? 0}${environmentKey}`;
 		case "connected":
 			return `connected:${kind.cdpUrl}`;
 	}
@@ -99,6 +116,7 @@ export interface AcquireBrowserOptions {
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	appArgs?: string[];
 	signal?: AbortSignal;
+	sessionEnvironment?: SessionLaunchEnvironment;
 	/**
 	 * Profile-reuse posture for the default headless path (from settings
 	 * `browser.profileReuse`, resolved by the settings-aware caller). When set,
@@ -123,10 +141,10 @@ function normalizeGeo(geo: AcquireBrowserOptions["geo"]): BrowserGeo | undefined
 
 export function browserKeyForTest(
 	kind: BrowserKind,
-	opts: Pick<AcquireBrowserOptions, "geo" | "profileReuse">,
+	opts: Pick<AcquireBrowserOptions, "geo" | "profileReuse" | "sessionEnvironment">,
 ): string {
 	const geo = kind.kind === "headless" ? normalizeGeo(opts.geo) : undefined;
-	return browserKey(kind, geo, opts.profileReuse);
+	return browserKey(kind, geo, opts.profileReuse, opts.sessionEnvironment);
 }
 
 /**
@@ -144,7 +162,7 @@ export function createOwnedWarmupDirForTest(handle: BrowserHandle): string {
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	const geo = kind.kind === "headless" ? normalizeGeo(opts.geo) : undefined;
-	const key = browserKey(kind, geo, opts.profileReuse);
+	const key = browserKey(kind, geo, opts.profileReuse, opts.sessionEnvironment);
 	const existing = browsers.get(key);
 	if (existing) {
 		if (existing.browser.connected) return existing;
@@ -173,6 +191,7 @@ async function openBrowserHandle(
 	key: string,
 ): Promise<BrowserHandle> {
 	if (kind.kind === "headless") {
+		const environment = createSessionChildEnvironment(opts.sessionEnvironment);
 		let profileWarmupDir: string | undefined;
 		if (opts.profileReuse) {
 			const reuse = resolveProfileReuse({
@@ -181,7 +200,7 @@ async function openBrowserHandle(
 			});
 			if (reuse.warning) logger.warn(reuse.warning);
 			if (reuse.mode === "real" && reuse.warmupDir && reuse.discovered) {
-				const executablePath = headlessExecutableForProfileReuse();
+				const executablePath = headlessExecutableForProfileReuse(opts.sessionEnvironment, environment);
 				if (!canDecryptProfileCookies(executablePath, reuse.discovered.userDataDir)) {
 					try {
 						fs.rmSync(reuse.warmupDir, { recursive: true, force: true });
@@ -203,6 +222,8 @@ async function openBrowserHandle(
 				headless: kind.headless,
 				viewport: opts.viewport,
 				profileWarmupDir,
+				...(environment === undefined ? {} : { environment }),
+				sessionEnvironment: opts.sessionEnvironment,
 				...(geo ? { geo } : {}),
 			});
 		} catch (error) {
@@ -351,7 +372,9 @@ export async function openChromeProfileHandle(
 		}
 		const port = kind.cdpPort ?? (await findFreeCdpPort());
 		const launchArgs = buildChromeProfileLaunchArgs(kind, opts.appArgs, port);
+		const environment = createSessionChildEnvironment(opts.sessionEnvironment);
 		const child = Bun.spawn([exe, ...launchArgs], {
+			...(environment === undefined ? {} : { env: environment }),
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
@@ -385,7 +408,7 @@ export async function openChromeProfileHandle(
 		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
 	}
 	return {
-		key: browserKey(kind),
+		key: browserKey(kind, undefined, undefined, opts.sessionEnvironment),
 
 		kind,
 		browser,
@@ -420,7 +443,9 @@ async function openSpawnedBrowserHandle(
 		if (killed > 0) logger.debug("Killed existing instances before attach", { exe, killed });
 		const port = await findFreeCdpPort();
 		const launchArgs = [...(opts.appArgs ?? []), `--remote-debugging-port=${port}`];
+		const environment = createSessionChildEnvironment(opts.sessionEnvironment);
 		const child = Bun.spawn([exe, ...launchArgs], {
+			...(environment === undefined ? {} : { env: environment }),
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
@@ -452,7 +477,7 @@ async function openSpawnedBrowserHandle(
 		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
 	}
 	return {
-		key: browserKey(kind),
+		key: browserKey(kind, undefined, undefined, opts.sessionEnvironment),
 
 		kind,
 		browser,

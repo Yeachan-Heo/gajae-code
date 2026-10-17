@@ -10,6 +10,7 @@ import {
 	searchRowV1,
 } from "../broker/session-scope";
 import type { SessionBindingAuthority } from "../session-authority";
+import { isValidSessionLaunchEnvironment, type SessionLaunchEnvironment } from "../session-environment";
 import {
 	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
 	type SessionListSavedSessionOmission,
@@ -95,42 +96,45 @@ export type SessionLifecycleCoordinatorTarget =
 			readonly coordinatorSessionBranch?: string;
 	  };
 
-export type SessionCreateTarget = SessionLifecycleCoordinatorTarget & {
-	readonly cwd: string;
-	readonly stateRoot?: string;
-	readonly body?: string;
-	readonly modelPreset?: string;
-	readonly mcpServers?: readonly Record<string, unknown>[];
-	readonly worktree?: SessionLifecycleWorktreeTarget;
-	readonly readiness?: "immediate" | "deferred";
-	readonly readinessTimeoutMs?: number;
-};
+export type SessionCreateTarget = SessionLifecycleCoordinatorTarget &
+	SessionLaunchEnvironment & {
+		readonly cwd: string;
+		readonly stateRoot?: string;
+		readonly body?: string;
+		readonly modelPreset?: string;
+		readonly mcpServers?: readonly Record<string, unknown>[];
+		readonly worktree?: SessionLifecycleWorktreeTarget;
+		readonly readiness?: "immediate" | "deferred";
+		readonly readinessTimeoutMs?: number;
+	};
 
-export type SessionForkTarget = SessionLifecycleCoordinatorTarget & {
-	readonly cwd: string;
-	readonly stateRoot?: string;
-	readonly sourceSessionId?: string;
-	readonly sourceSessionPath?: string;
-	readonly sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
-	readonly body?: string;
-	readonly modelPreset?: string;
-	readonly mcpServers?: readonly Record<string, unknown>[];
-	readonly worktree?: SessionLifecycleWorktreeTarget;
-	readonly readinessTimeoutMs?: number;
-};
+export type SessionForkTarget = SessionLifecycleCoordinatorTarget &
+	SessionLaunchEnvironment & {
+		readonly cwd: string;
+		readonly stateRoot?: string;
+		readonly sourceSessionId?: string;
+		readonly sourceSessionPath?: string;
+		readonly sourceSessionIdentity?: SessionLifecycleTranscriptIdentity;
+		readonly body?: string;
+		readonly modelPreset?: string;
+		readonly mcpServers?: readonly Record<string, unknown>[];
+		readonly worktree?: SessionLifecycleWorktreeTarget;
+		readonly readinessTimeoutMs?: number;
+	};
 
-export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
-	readonly sessionId: string;
-	readonly cwd?: string;
-	readonly stateRoot?: string;
-	readonly sessionPath?: string;
-	readonly sessionIdentity?: SessionLifecycleTranscriptIdentity;
-	readonly body?: string;
-	readonly modelPreset?: string;
-	readonly mcpServers?: readonly Record<string, unknown>[];
-	readonly worktree?: SessionLifecycleWorktreeTarget;
-	readonly readinessTimeoutMs?: number;
-};
+export type SessionResumeTarget = SessionLifecycleCoordinatorTarget &
+	SessionLaunchEnvironment & {
+		readonly sessionId: string;
+		readonly cwd?: string;
+		readonly stateRoot?: string;
+		readonly sessionPath?: string;
+		readonly sessionIdentity?: SessionLifecycleTranscriptIdentity;
+		readonly body?: string;
+		readonly modelPreset?: string;
+		readonly mcpServers?: readonly Record<string, unknown>[];
+		readonly worktree?: SessionLifecycleWorktreeTarget;
+		readonly readinessTimeoutMs?: number;
+	};
 
 export type SessionCloseTarget =
 	| {
@@ -531,6 +535,11 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 		return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
 	if (!validTarget(record.target))
 		return failure(operation, "terminal", "invalid_request", "target must be an object");
+	if (
+		(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
+		!isValidSessionLaunchEnvironment(record.target.env, record.target.unsetEnv)
+	)
+		return failure(operation, "terminal", "invalid_input", "session launch environment is invalid");
 	if (operation === "session.close" && !validSessionCloseTarget(record.target))
 		return failure(operation, "terminal", "invalid_input", "session.close endpoint authority is invalid");
 	if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(record.target))
