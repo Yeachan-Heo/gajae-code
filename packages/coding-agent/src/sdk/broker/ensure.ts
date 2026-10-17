@@ -16,6 +16,7 @@ import { SdkClient, SdkClientError } from "../client/client";
 import { type BrokerStartupExitRecord, clearBrokerStartupExitRecord, readBrokerStartupExitRecord } from "./broker-exit";
 import {
 	type BrokerDiscovery,
+	type BrokerRestartIntentWithIdentity,
 	brokerProcessIncarnation,
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
@@ -679,6 +680,7 @@ export interface EnsureBrokerSettings {
 const BROKER_PUBLICATION_TIMEOUT_MS = 15_000;
 const STALE_BROKER_RETIREMENT_TIMEOUT_MS = 5_000;
 const SPAWN_LOCK_RETRY_DELAY_MS = 50;
+const BROKER_DISCOVERY_TIMEOUT_MESSAGE = "Timed out waiting for detached SDK broker discovery.";
 /** Keep the startup fence alive long enough to adopt an ownerless removal transition. */
 const STARTUP_LOCK_WAIT_MS = Math.max(
 	9_000,
@@ -787,6 +789,13 @@ export function setEnsureBrokerTimingForTest(timing: EnsureBrokerTiming | undefi
 	ensureBrokerTiming = timing ?? REAL_ENSURE_BROKER_TIMING;
 }
 
+async function waitForStartupLockRetry(deadlineAt: number): Promise<void> {
+	const remainingMs = deadlineAt - ensureBrokerTiming.now();
+	if (remainingMs <= 0) throw new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE);
+	await ensureBrokerTiming.sleep(Math.min(SPAWN_LOCK_RETRY_DELAY_MS, remainingMs));
+	if (ensureBrokerTiming.now() >= deadlineAt) throw new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE);
+}
+
 type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
 
 async function readBrokerDiscoveryBeforeDeadline(
@@ -811,6 +820,27 @@ async function readBrokerDiscoveryBeforeDeadline(
 	}
 }
 
+async function readBrokerRestartIntentBeforeDeadline(
+	agentDir: string,
+	deadline: number,
+): Promise<BrokerRestartIntentWithIdentity | null> {
+	const remainingMs = deadline - ensureBrokerTiming.now();
+	if (!Number.isFinite(remainingMs)) return await readBrokerRestartIntent(agentDir);
+	if (remainingMs <= 0) throw new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE);
+	const read = readBrokerRestartIntent(agentDir);
+	void read.catch(() => undefined);
+	const timeout = Promise.withResolvers<BrokerRestartIntentWithIdentity | null>();
+	const timer: NodeJS.Timeout = setTimeout(
+		() => timeout.reject(new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE)),
+		remainingMs,
+	);
+	try {
+		return await Promise.race([read, timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /**
  * Cross-process single-flight for the detached broker spawn (#5198).
  *
@@ -823,14 +853,41 @@ async function readBrokerDiscoveryBeforeDeadline(
  * complete owner metadata is published atomically, stale removal is bound to
  * the exact directory generation, and ownership includes the OS incarnation.
  */
-async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}): Promise<() => Promise<void>> {
+async function acquireSpawnLock(
+	agentDir: string,
+	options: SpawnLockOptions = {},
+	deadlineAt?: number,
+): Promise<() => Promise<void>> {
 	const hostIdentity = await brokerLockHostIdentity(agentDir);
-	return acquireFileLock(path.join(agentDir, "sdk", SPAWN_LOCK_TARGET_NAME), {
-		retries: Math.ceil(SPAWN_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
-		retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
-		...hostIdentity,
-		...options,
-	});
+	const retryDelayMs = options.retryDelayMs ?? SPAWN_LOCK_RETRY_DELAY_MS;
+	const retries = options.retries ?? Math.ceil(SPAWN_LOCK_WAIT_MS / retryDelayMs);
+	const remainingMs = deadlineAt === undefined ? undefined : deadlineAt - ensureBrokerTiming.now();
+	if (remainingMs !== undefined && remainingMs <= 0) throw new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE);
+	const boundedRetries =
+		remainingMs === undefined ? retries : Math.max(1, Math.min(retries, Math.ceil(remainingMs / retryDelayMs)));
+	const deadlineController = remainingMs === undefined ? undefined : new AbortController();
+	const signal =
+		deadlineController === undefined
+			? options.signal
+			: options.signal === undefined
+				? deadlineController.signal
+				: AbortSignal.any([options.signal, deadlineController.signal]);
+	const deadlineTimer =
+		deadlineController === undefined || remainingMs === undefined
+			? undefined
+			: setTimeout(() => deadlineController.abort(new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE)), remainingMs);
+	deadlineTimer?.unref?.();
+	try {
+		return await acquireFileLock(path.join(agentDir, "sdk", SPAWN_LOCK_TARGET_NAME), {
+			...hostIdentity,
+			...options,
+			...(signal === undefined ? {} : { signal }),
+			retries: boundedRetries,
+			retryDelayMs,
+		});
+	} finally {
+		if (deadlineTimer) clearTimeout(deadlineTimer);
+	}
 }
 
 /**
@@ -1467,8 +1524,11 @@ async function ensureBrokerOnce(
 	settings: EnsureBrokerSettings,
 	initiator: EnsureInitiator,
 	retriedStartupLockUnavailable = false,
+	// The one startup-lock retry shares the original discovery budget.
+	retryDeadlineAt?: number,
 ): Promise<EnsureOutcome> {
 	const initialDiscoveryDeadline =
+		retryDeadlineAt ??
 		ensureBrokerTiming.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
 	const priorOwner = owners.get(settings.agentDir);
 	const existing = await readBrokerDiscoveryBeforeDeadline(
@@ -1476,7 +1536,7 @@ async function ensureBrokerOnce(
 		settings.heartbeatTtlMs,
 		initialDiscoveryDeadline,
 	);
-	const restartIntent = await readBrokerRestartIntent(settings.agentDir);
+	const restartIntent = await readBrokerRestartIntentBeforeDeadline(settings.agentDir, initialDiscoveryDeadline);
 	if (
 		restartIntent &&
 		restartIntent.expiresAt > ensureBrokerTiming.now() &&
@@ -1507,13 +1567,15 @@ async function ensureBrokerOnce(
 	// waits for the exact lock generation to release, then rechecks discovery.
 	// Fixture leases always spawn their own.
 	let spawnLog: BrokerSpawnLog | undefined;
-	const releaseSpawnLock = initiator === "fixture-lease" ? async () => {} : await acquireSpawnLock(settings.agentDir);
+	const releaseSpawnLock =
+		initiator === "fixture-lease" ? async () => {} : await acquireSpawnLock(settings.agentDir, {}, retryDeadlineAt);
 	let spawnLockReleased = false;
 	try {
 		const deadline =
+			retryDeadlineAt ??
 			ensureBrokerTiming.now() +
-			(initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
-		const lockedIntent = await readBrokerRestartIntent(settings.agentDir);
+				(initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
+		const lockedIntent = await readBrokerRestartIntentBeforeDeadline(settings.agentDir, deadline);
 		if (
 			lockedIntent &&
 			lockedIntent.expiresAt > ensureBrokerTiming.now() &&
@@ -1529,6 +1591,10 @@ async function ensureBrokerOnce(
 		// A stale marker must never be misattributed to this spawn; clear it first.
 		await clearBrokerStartupExitRecord(settings.agentDir);
 		await clearBrokerStartupFailureMarker(settings.agentDir);
+		if (ensureBrokerTiming.now() >= deadline) {
+			await spawnLog?.handle.close().catch(() => undefined);
+			throw new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE);
+		}
 		const childSpawnedAt = Date.now();
 		const brokerArgs = [...command.args, "--agent-dir", settings.agentDir];
 		const env = brokerSpawnEnvironment(command, settings.env);
@@ -1778,7 +1844,7 @@ async function ensureBrokerOnce(
 					})
 				: discoveryError
 					? discoveryError
-					: new Error("Timed out waiting for detached SDK broker discovery.");
+					: new Error(BROKER_DISCOVERY_TIMEOUT_MESSAGE);
 		try {
 			await owner.stop();
 		} catch (cleanupError) {
@@ -1794,8 +1860,8 @@ async function ensureBrokerOnce(
 		) {
 			await releaseSpawnLock();
 			spawnLockReleased = true;
-			await ensureBrokerTiming.sleep(SPAWN_LOCK_RETRY_DELAY_MS);
-			return ensureBrokerOnce(settings, initiator, true);
+			await waitForStartupLockRetry(deadline);
+			return ensureBrokerOnce(settings, initiator, true, deadline);
 		}
 		throw failure;
 	} finally {
@@ -1911,8 +1977,16 @@ export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBroker
 
 /** Test hook: returns a stop handle for the detached broker this process spawned. */
 export const acquireSpawnLockForTest = acquireSpawnLock;
+export const waitForStartupLockRetryForTest = waitForStartupLockRetry;
 /** Test hook: proves discovery reads honor their enclosing absolute deadline. */
 export const readBrokerDiscoveryBeforeDeadlineForTest = readBrokerDiscoveryBeforeDeadline;
+/** Test hook: exercises both restart-intent reads under an inherited absolute deadline. */
+export function ensureBrokerOnceWithDeadlineForTest(
+	settings: EnsureBrokerSettings,
+	deadline: number,
+): Promise<BrokerDiscovery> {
+	return ensureBrokerOnce(settings, "discovery", true, deadline).then(outcome => outcome.discovery);
+}
 
 export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 	return owners.get(agentDir);

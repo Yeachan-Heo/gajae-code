@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	acquireFileLock,
 	FileLockAcquireError,
 	FileLockTestHooks,
 	processStartTime,
@@ -1327,6 +1328,194 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			holder: expect.stringContaining("blocked by retained removal transition"),
 		});
 		expect(await fs.exists(detachedPath)).toBe(true);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"uses the cached transition diagnosis without filesystem work after cancellation",
+		async () => {
+			const lockedFile = path.join(await makeTemp(), "aborted-transition.json");
+			const detachedPath = `${lockedFile}.lock.removing`;
+			const infoPath = path.join(detachedPath, "info");
+			await fs.mkdir(detachedPath);
+			await Bun.write(infoPath, "");
+			const old = new Date(Date.now() - 120_000);
+			await fs.utimes(infoPath, old, old);
+			const controller = new AbortController();
+			const abortReason = new Error("acquisition deadline elapsed");
+			const realSleep = Bun.sleep;
+			const lstat = vi.spyOn(fs, "lstat");
+			const transitionLstatCount = () =>
+				lstat.mock.calls.filter(([target]) => String(target) === detachedPath).length;
+			let transitionLstatCountAtAbort = 0;
+			vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
+				if (ms === 100) {
+					transitionLstatCountAtAbort = transitionLstatCount();
+					controller.abort(abortReason);
+				}
+				return await realSleep(0);
+			}) as typeof Bun.sleep);
+
+			const failure = await withFileLock(lockedFile, async () => undefined, {
+				retries: 100,
+				retryDelayMs: 100,
+				signal: controller.signal,
+			}).catch(error => error);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(failure).toMatchObject({
+				code: "orphan_transition",
+				reason: "orphan_transition",
+				orphanPath: detachedPath,
+			});
+			expect(controller.signal.aborted).toBe(true);
+			expect(transitionLstatCountAtAbort).toBeGreaterThan(0);
+			expect(transitionLstatCount()).toBe(transitionLstatCountAtAbort);
+			expect(await fs.exists(detachedPath)).toBe(true);
+		},
+	);
+
+	test("stops acquisition when cancellation occurs during local lock-key resolution", async () => {
+		const filePath = path.join(await makeTemp(), "cancelled-during-local-key.json");
+		const lockPath = `${filePath}.lock`;
+		const parent = path.dirname(lockPath);
+		const controller = new AbortController();
+		const abortReason = new Error("acquisition deadline elapsed");
+		const realpath = fs.realpath;
+		let abortedDuringLookup = false;
+		let tryAcquireStarted = false;
+		FileLockTestHooks.afterParentMkdir = target => {
+			if (target === lockPath) tryAcquireStarted = true;
+		};
+		vi.spyOn(fs, "realpath").mockImplementation((async target => {
+			const resolved = await realpath(target);
+			if (String(target) === parent && !abortedDuringLookup) {
+				abortedDuringLookup = true;
+				controller.abort(abortReason);
+			}
+			return resolved;
+		}) as typeof fs.realpath);
+
+		const failure = await acquireFileLock(filePath, { signal: controller.signal }).catch(error => error);
+		expect(failure).toBe(abortReason);
+		expect(abortedDuringLookup).toBe(true);
+		expect(tryAcquireStarted).toBe(false);
+		expect(await fs.exists(lockPath)).toBe(false);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"preserves the last orphan-transition diagnosis while cancellation races with local-key resolution",
+		async () => {
+			const filePath = path.join(await makeTemp(), "cancelled-after-orphan-transition.json");
+			const lockPath = `${filePath}.lock`;
+			const transitionPath = `${lockPath}.removing`;
+			const infoPath = path.join(transitionPath, "info");
+			await fs.mkdir(transitionPath);
+			await Bun.write(infoPath, "");
+			const old = new Date(Date.now() - 120_000);
+			await fs.utimes(infoPath, old, old);
+			const controller = new AbortController();
+			const abortReason = new Error("acquisition deadline elapsed");
+			const realpath = fs.realpath;
+			let localKeyLookups = 0;
+			vi.spyOn(fs, "realpath").mockImplementation((async target => {
+				try {
+					return await realpath(target);
+				} catch (error) {
+					if (String(target) === lockPath && ++localKeyLookups === 2) controller.abort(abortReason);
+					throw error;
+				}
+			}) as typeof fs.realpath);
+			const failure = await acquireFileLock(filePath, {
+				signal: controller.signal,
+				retries: 3,
+				retryDelayMs: 1,
+			}).catch(error => error);
+			expect(failure).toBeInstanceOf(FileLockAcquireError);
+			expect(failure).toMatchObject({
+				code: "orphan_transition",
+				reason: "orphan_transition",
+				orphanPath: transitionPath,
+			});
+			expect(controller.signal.aborted).toBe(true);
+			expect(localKeyLookups).toBe(2);
+			expect(await fs.exists(transitionPath)).toBe(true);
+		},
+	);
+
+	test("releases a lock acquired after its acquisition signal was cancelled", async () => {
+		const filePath = path.join(await makeTemp(), "cancelled-after-acquire.json");
+		const controller = new AbortController();
+		const abortReason = new Error("acquisition deadline elapsed");
+		const failure = await acquireFileLock(filePath, {
+			signal: controller.signal,
+			onAcquired: () => controller.abort(abortReason),
+		}).catch(error => error);
+		expect(failure).toBe(abortReason);
+		expect(await fs.exists(`${filePath}.lock`)).toBe(false);
+	});
+
+	test("does not start stale cleanup when cancellation races with an unsuccessful acquisition", async () => {
+		const filePath = path.join(await makeTemp(), "cancelled-during-contention.json");
+		const lockDir = `${filePath}.lock`;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		const controller = new AbortController();
+		const abortReason = new Error("acquisition deadline elapsed");
+		let staleCleanupStarted = false;
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async (source, destination) => {
+				const result = await renameNoReplacePathAsync(source, destination);
+				if (!result.ok && result.reason === "destination_exists") controller.abort(abortReason);
+				return result;
+			},
+			renameDirectoryNoReplacePathAsync,
+		});
+		FileLockTestHooks.nativeQuarantineBindings = () => {
+			staleCleanupStarted = true;
+			return {
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: () => ({ ok: false, code: "sharing_violation" }),
+			};
+		};
+
+		await expect(acquireFileLock(filePath, { signal: controller.signal, retries: 2, retryDelayMs: 1 })).rejects.toBe(
+			abortReason,
+		);
+		expect(staleCleanupStarted).toBe(false);
+		expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toContain(String(DEAD_PID));
+	});
+
+	test("does not start stale cleanup when cancellation races with stale snapshot collection", async () => {
+		const filePath = path.join(await makeTemp(), "cancelled-during-stale-snapshot.json");
+		const lockDir = `${filePath}.lock`;
+		const infoPath = path.join(lockDir, "info");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		const ownerRecord = await fs.readFile(infoPath, "utf8");
+		const controller = new AbortController();
+		const abortReason = new Error("acquisition deadline elapsed");
+		let abortedDuringSnapshot = false;
+		let staleCleanupStarted = false;
+		const realOpen = fs.open;
+		vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			const handle = await realOpen(target, flags, mode);
+			if (String(target) === infoPath && !abortedDuringSnapshot) {
+				abortedDuringSnapshot = true;
+				controller.abort(abortReason);
+			}
+			return handle;
+		});
+		FileLockTestHooks.nativeQuarantineBindings = () => {
+			staleCleanupStarted = true;
+			return {
+				snapshotDirectoryTree,
+				exactRemoveDirectoryTree: () => ({ ok: false, code: "sharing_violation" }),
+			};
+		};
+
+		await expect(acquireFileLock(filePath, { signal: controller.signal, retries: 2, retryDelayMs: 1 })).rejects.toBe(
+			abortReason,
+		);
+		expect(abortedDuringSnapshot).toBe(true);
+		expect(staleCleanupStarted).toBe(false);
+		expect(await fs.readFile(infoPath, "utf8")).toBe(ownerRecord);
 	});
 
 	test.skipIf(process.platform === "win32")(

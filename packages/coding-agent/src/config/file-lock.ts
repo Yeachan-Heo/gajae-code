@@ -2592,9 +2592,25 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	const contentionStartTimes = new Map<string, string | null>();
 	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
+	let observedOrphanTransitionPath: string | undefined;
+	// Use the last completed transition check; never start a filesystem check after cancellation.
+	const abortAcquisition = (attempts: number, originalError?: unknown): never => {
+		if (contentionObserved && observedOrphanTransitionPath !== undefined) {
+			throw new FileLockAcquireError(
+				filePath,
+				lockPath,
+				Math.max(1, attempts),
+				`orphan transition retained at ${observedOrphanTransitionPath}`,
+				"orphan_transition",
+				observedOrphanTransitionPath,
+			);
+		}
+		throw originalError ?? opts.signal?.reason ?? new Error("File lock acquisition aborted");
+	};
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
-		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
+		if (opts.signal?.aborted) abortAcquisition(attempt);
 		const localKey = await localLockKey(lockPath);
+		if (opts.signal?.aborted) abortAcquisition(attempt);
 		const priorRelease = localLockStates.get(localKey);
 		if (priorRelease && priorRelease.status !== "held" && pendingDetachedLockCleanups.has(priorRelease.owner)) {
 			await retryPendingLocalRelease(lockPath, localKey);
@@ -2608,6 +2624,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			ownerToken,
 			opts.onAcquired,
 		);
+		observedOrphanTransitionPath = isFileLockOrphanTransition(result) ? result.path : undefined;
 		if (isFileLockOrphanTransition(result)) {
 			// Adoption is identity-bound and can be refused by a transient cleanup race.
 			// Keep using the caller's bounded contention budget; the same generation is
@@ -2623,23 +2640,38 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 				);
 		} else if (result) {
 			localLockStates.set(localKey, { owner: result, status: "held" });
-			return () => releaseLock(lockPath, result, localKey);
+			const release = (): Promise<void> => releaseLock(lockPath, result, localKey);
+			if (opts.signal?.aborted) {
+				try {
+					await release();
+				} catch (releaseError) {
+					throw new AggregateError(
+						[opts.signal.reason ?? new Error("File lock acquisition aborted"), releaseError],
+						"File lock acquisition was cancelled after ownership was published, and the lock could not be released.",
+					);
+				}
+				abortAcquisition(attempt + 1);
+			}
+			return release;
 		}
 		if (!contentionObserved) {
 			contentionObserved = true;
 			opts.onContended?.();
 		}
+		if (opts.signal?.aborted) abortAcquisition(attempt + 1);
 		const pendingKey = await pendingLocalReleaseKey(lockPath, localKey);
 		const localState = localLockStates.get(pendingKey ?? localKey);
 		if (pendingKey !== undefined && localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
 			try {
 				await retryPendingLocalRelease(lockPath, pendingKey);
+				observedOrphanTransitionPath = undefined;
 				continue;
 			} catch {
 				// Keep contending below. A failed local retry is not authority to steal a
 				// lock; the owner generation remains fenced until release succeeds.
 			}
 		}
+		if (opts.signal?.aborted) abortAcquisition(attempt + 1);
 		const stale = await staleLockSnapshot(
 			lockPath,
 			opts.staleMs,
@@ -2647,9 +2679,11 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds,
 			contentionStartTimes,
 		);
+		if (opts.signal?.aborted) abortAcquisition(attempt + 1);
 		const staleRemoval = await removeStaleLockForAcquire(lockPath, stale);
 		if (staleRemoval.removed) {
 			staleRemovalFailure = undefined;
+			observedOrphanTransitionPath = undefined;
 			continue;
 		}
 		staleRemovalFailure =
@@ -2663,9 +2697,13 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		const onAbort = (): void => reject(opts.signal?.reason ?? new Error("File lock acquisition aborted"));
 		opts.signal.addEventListener("abort", onAbort, { once: true });
-		void Bun.sleep(opts.retryDelayMs).then(resolve);
+		if (opts.signal.aborted) onAbort();
+		else void Bun.sleep(opts.retryDelayMs).then(resolve);
 		try {
 			await promise;
+		} catch (error) {
+			if (opts.signal?.aborted) abortAcquisition(attempt + 1, error);
+			throw error;
 		} finally {
 			opts.signal.removeEventListener("abort", onAbort);
 		}

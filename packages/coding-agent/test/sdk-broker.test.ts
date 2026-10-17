@@ -2101,16 +2101,41 @@ describe("SDK broker identity and discovery", () => {
 		"terminates and reaps the spawned broker when discovery times out",
 		async () => {
 			const dir = await temp();
-			// Force ensureBroker's discovery reads to never resolve a live record so the
-			// discovery wait is doomed from the start. The real broker still spawns and
-			// stays alive as a detached daemon, which is exactly the orphan path the reap
-			// must close. Capture its pid from the discovery file (bypassing the spy)
-			// before ensureBroker times out and reaps it.
+			const indexLockPath = path.join(dir, "sdk", "sessions", "index.jsonl.lock");
+			await fs.mkdir(indexLockPath, { recursive: true });
+			await fs.writeFile(
+				path.join(indexLockPath, "info"),
+				JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner_token: "live-index-lock-owner" }),
+			);
+			// Force the first detached broker to refuse its startup on the live index
+			// lock, then release the lock as soon as that refusal is durable. The second
+			// broker can publish, but the discovery spy keeps it hidden from ensureBroker
+			// so the original parent deadline must still terminate and reap it.
 			const spy = vi.spyOn(brokerDiscovery, "readBrokerDiscovery").mockResolvedValue(null);
+			let pollingStartupExit = false;
+			let startupLockUnavailableObserved = false;
+			const startupExitPath = path.join(dir, "sdk", "broker.startup-exit.json");
+			const startupExitPoll = setInterval(() => {
+				if (pollingStartupExit) return;
+				pollingStartupExit = true;
+				void fs
+					.readFile(startupExitPath, "utf8")
+					.then(async raw => {
+						const record = JSON.parse(raw) as { reason?: string };
+						if (record.reason !== "startup-lock-unavailable") return;
+						startupLockUnavailableObserved = true;
+						clearInterval(startupExitPoll);
+						await fs.rm(indexLockPath, { recursive: true, force: true });
+					})
+					.catch(() => undefined)
+					.finally(() => {
+						pollingStartupExit = false;
+					});
+			}, 10);
 			try {
 				const { promise: gotPid, resolve: onPid } = Promise.withResolvers<number | undefined>();
 				void (async () => {
-					const deadline = Date.now() + 12_000;
+					const deadline = Date.now() + BROKER_DISCOVERY_BUDGET.discoveryMs + 5_000;
 					while (Date.now() < deadline) {
 						try {
 							const raw = JSON.parse(await fs.readFile(brokerDiscovery.brokerDiscoveryPath(dir), "utf8")) as {
@@ -2125,6 +2150,7 @@ describe("SDK broker identity and discovery", () => {
 				await expect(ensureBroker({ agentDir: dir })).rejects.toThrow(
 					"Timed out waiting for detached SDK broker discovery.",
 				);
+				expect(startupLockUnavailableObserved).toBe(true);
 				const brokerPid = await gotPid;
 				// The spawned detached broker must have been terminated, not orphaned. The
 				// trampoline reparents it away from this process, so once killed it may stay
@@ -2136,7 +2162,9 @@ describe("SDK broker identity and discovery", () => {
 				// No owner handle leaked for the failed agent dir.
 				expect(brokerOwnerForTest(dir)).toBeUndefined();
 			} finally {
+				clearInterval(startupExitPoll);
 				spy.mockRestore();
+				await fs.rm(indexLockPath, { recursive: true, force: true });
 				await fs.rm(dir, { recursive: true, force: true });
 			}
 		},

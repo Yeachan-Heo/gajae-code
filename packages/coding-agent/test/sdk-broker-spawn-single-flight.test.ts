@@ -13,7 +13,7 @@ import {
 } from "../src/config/file-lock";
 import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerExitRecord, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
-import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
+import type { BrokerDiscovery, BrokerRestartIntentWithIdentity } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import {
@@ -23,9 +23,11 @@ import {
 	closeBrokerClientBeforeDeadline,
 	type EnsureBrokerTiming,
 	ensureBroker,
+	ensureBrokerOnceWithDeadlineForTest,
 	readBrokerDiscoveryBeforeDeadlineForTest,
 	reconcileBrokerGenerationForStartup,
 	setEnsureBrokerTimingForTest,
+	waitForStartupLockRetryForTest,
 	withBrokerStartupLock,
 } from "../src/sdk/broker/ensure";
 import { brokerLockHostIdentity } from "../src/sdk/broker/lock-host-identity";
@@ -567,6 +569,63 @@ it("spends the parent discovery budget one composition leg at a time", async () 
 	}
 }, 15_000);
 
+it("clips the startup-lock retry delay to the remaining discovery budget", async () => {
+	const clock = virtualBudgetClock();
+	setEnsureBrokerTimingForTest(clock.timing);
+	try {
+		const deadlineAt = clock.timing.now() + 25;
+		await expect(waitForStartupLockRetryForTest(deadlineAt)).rejects.toThrow(
+			"Timed out waiting for detached SDK broker discovery.",
+		);
+		expect(clock.elapsedMs()).toBe(25);
+
+		await expect(waitForStartupLockRetryForTest(clock.timing.now())).rejects.toThrow(
+			"Timed out waiting for detached SDK broker discovery.",
+		);
+		expect(clock.elapsedMs()).toBe(25);
+
+		await waitForStartupLockRetryForTest(clock.timing.now() + 100);
+		expect(clock.elapsedMs()).toBe(75);
+	} finally {
+		setEnsureBrokerTimingForTest(undefined);
+	}
+});
+
+it("bounds pre-lock and under-lock restart-intent reads by the shared deadline", async () => {
+	const preLockDir = await temp();
+	const stalledPreLockRead = Promise.withResolvers<BrokerRestartIntentWithIdentity | null>();
+	const preLockReadSpy = spyOn(brokerDiscovery, "readBrokerRestartIntent").mockImplementation(
+		() => stalledPreLockRead.promise,
+	);
+	try {
+		await expect(ensureBrokerOnceWithDeadlineForTest({ agentDir: preLockDir }, Date.now() + 1_000)).rejects.toThrow(
+			"Timed out waiting for detached SDK broker discovery.",
+		);
+		expect(preLockReadSpy).toHaveBeenCalledTimes(1);
+	} finally {
+		preLockReadSpy.mockRestore();
+		await fs.rm(preLockDir, { recursive: true, force: true });
+	}
+
+	const underLockDir = await temp();
+	const stalledUnderLockRead = Promise.withResolvers<BrokerRestartIntentWithIdentity | null>();
+	let readCount = 0;
+	const underLockReadSpy = spyOn(brokerDiscovery, "readBrokerRestartIntent").mockImplementation(() => {
+		readCount++;
+		return readCount === 1 ? Promise.resolve(null) : stalledUnderLockRead.promise;
+	});
+	try {
+		await expect(ensureBrokerOnceWithDeadlineForTest({ agentDir: underLockDir }, Date.now() + 1_000)).rejects.toThrow(
+			"Timed out waiting for detached SDK broker discovery.",
+		);
+		expect(underLockReadSpy).toHaveBeenCalledTimes(2);
+		expect(await fs.exists(path.join(underLockDir, "sdk", "broker.spawn.lock"))).toBe(false);
+	} finally {
+		underLockReadSpy.mockRestore();
+		await fs.rm(underLockDir, { recursive: true, force: true });
+	}
+});
+
 it("bounds same-process retirement reads without heartbeat expiry and preserves both errors", async () => {
 	const dir = await temp();
 	const incarnation = brokerProcessIncarnation(process.pid);
@@ -963,6 +1022,72 @@ it("retries ordinary broker startup after its session-index lock becomes availab
 	}
 }, 45_000);
 
+it("does not launch a startup-lock retry when spawn-log I/O exhausts its shared deadline", async () => {
+	const dir = await temp();
+	const indexDir = path.join(dir, "sdk", "sessions");
+	const blockingLockPath = path.join(indexDir, "index.jsonl.lock");
+	const spawnLockPath = path.join(dir, "sdk", "broker.spawn.lock");
+	await fs.mkdir(blockingLockPath, { recursive: true });
+	await Bun.write(
+		path.join(blockingLockPath, "info"),
+		JSON.stringify({ pid: process.pid, timestamp: Date.now(), owner_token: "live-index-owner" }),
+	);
+	const unavailable = Promise.withResolvers<void>();
+	void unavailable.promise.catch(() => undefined);
+	let clockOffset = 0;
+	setEnsureBrokerTimingForTest({
+		now: () => Date.now() + clockOffset,
+		sleep: ms => Bun.sleep(ms),
+	});
+	let spawnLockAcquisitions = 0;
+	let spawnLogOpens = 0;
+	let pollInFlight = false;
+	const realOpen = fs.open;
+	const openSpy = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+		const handle = await realOpen(target, flags, mode);
+		if (String(target).includes("broker-spawn.")) {
+			spawnLogOpens++;
+			if (spawnLogOpens === 2) clockOffset = BROKER_DISCOVERY_BUDGET.discoveryMs * 2;
+		}
+		return handle;
+	});
+	FileLockTestHooks.afterParentMkdir = async lockPath => {
+		if (lockPath === spawnLockPath) spawnLockAcquisitions++;
+	};
+	const poll = setInterval(() => {
+		if (pollInFlight) return;
+		pollInFlight = true;
+		void readBrokerStartupExitRecord(dir)
+			.then(async record => {
+				if (record?.reason !== "startup-lock-unavailable") return;
+				clearInterval(poll);
+				await fs.rm(blockingLockPath, { recursive: true, force: true });
+				unavailable.resolve();
+			})
+			.catch(unavailable.reject)
+			.finally(() => {
+				pollInFlight = false;
+			});
+	}, 25);
+	try {
+		const ensurePromise = ensureBroker({ agentDir: dir });
+		await unavailable.promise;
+		const ensureFailure = await ensurePromise.catch(error => error);
+		expect(spawnLockAcquisitions).toBe(2);
+		expect(spawnLogOpens).toBe(2);
+		expect(ensureFailure).toMatchObject({ message: "Timed out waiting for detached SDK broker discovery." });
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+	} finally {
+		clearInterval(poll);
+		openSpy.mockRestore();
+		setEnsureBrokerTimingForTest(undefined);
+		FileLockTestHooks.afterParentMkdir = undefined;
+		await fs.rm(blockingLockPath, { recursive: true, force: true });
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 45_000);
+
 it("keeps the deadline reason when SIGTERM arrives during its async record fallback", async () => {
 	if (process.platform === "win32") return;
 	const dir = await temp();
@@ -1309,6 +1434,20 @@ it("the spawn lock rejects an ownerless empty directory instead of acquiring ove
 			"held by an ownerless empty lock directory",
 		);
 		expect(await fs.readdir(path.join(dir, "sdk", "broker.spawn.lock"))).toEqual([]);
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+it("bounds a contended spawn-lock retry by the remaining discovery deadline", async () => {
+	const dir = await temp();
+	const lockPath = path.join(dir, "sdk", "broker.spawn.lock");
+	try {
+		await fs.mkdir(lockPath, { recursive: true });
+		await expect(acquireSpawnLockForTest(dir, {}, Date.now() + 25)).rejects.toThrow(
+			"Timed out waiting for detached SDK broker discovery.",
+		);
+		expect(await fs.readdir(lockPath)).toEqual([]);
 	} finally {
 		await fs.rm(dir, { recursive: true, force: true });
 	}

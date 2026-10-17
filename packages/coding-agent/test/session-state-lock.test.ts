@@ -89,8 +89,8 @@ async function waitForPath(
 	predicate: (stat: fsSync.BigIntStats) => boolean,
 	label: string,
 ): Promise<void> {
-	const deadline = Date.now() + 5_000;
-	while (Date.now() < deadline) {
+	const deadline = performance.now() + 5_000;
+	while (performance.now() < deadline) {
 		try {
 			if (predicate(fsSync.lstatSync(pathname, { bigint: true }))) return;
 		} catch {
@@ -2801,24 +2801,31 @@ describe("coordinator session state lock", () => {
 		// only window where the outer lock is observable on disk.
 		const release = Promise.withResolvers<void>();
 		const holder = withSessionStateFileLock(stateFile, () => release.promise);
-		await waitForPath(`${stateFile}.lock`, stat => stat.isFile(), "state-file owner lock");
-		const persist = persistCoordinatorRuntimeStateFromEvent(
-			{ type: "tool_execution_start", toolCallId: "call-1" },
-			{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
-			{ label: "bash", observedAt: "2026-03-01T00:00:01.000Z" },
-		);
+		let persist: Promise<void> | undefined;
+		try {
+			await waitForPath(`${stateFile}.lock`, stat => stat.isFile(), "state-file owner lock");
+			persist = persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_start", toolCallId: "call-1" },
+				{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
+				{ label: "bash", observedAt: "2026-03-01T00:00:01.000Z" },
+			);
 
-		const mutationLock = path.join(root, "locks", "mutation.lock.lock");
-		await waitForPath(mutationLock, stat => stat.isDirectory(), "namespace mutation lock");
-		expect(fsSync.statSync(mutationLock).isDirectory()).toBe(true);
-		expect(fsSync.existsSync(path.join(mutationLock, "info"))).toBe(true);
-		expect(fsSync.statSync(`${stateFile}.lock`).isFile()).toBe(true);
+			const mutationLock = path.join(root, "locks", "mutation.lock.lock");
+			await waitForPath(mutationLock, stat => stat.isDirectory(), "namespace mutation lock");
+			expect(fsSync.statSync(mutationLock).isDirectory()).toBe(true);
+			expect(fsSync.existsSync(path.join(mutationLock, "info"))).toBe(true);
+			expect(fsSync.statSync(`${stateFile}.lock`).isFile()).toBe(true);
 
-		release.resolve();
-		await holder;
-		await persist;
-		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-	});
+			release.resolve();
+			await holder;
+			await persist;
+			expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		} finally {
+			release.resolve();
+			await holder.catch(() => undefined);
+			await persist?.catch(() => undefined);
+		}
+	}, 15_000);
 
 	it("re-reads authoritative bytes instead of trusting matching file metadata", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-terminal-race");

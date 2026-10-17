@@ -180,7 +180,9 @@ test("a retained transition that blocks heartbeat renewal persists its reason an
 	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats");
 	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 	try {
-		expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 20)).toBe(true);
+		// The index checkpoint keeps its bounded 15s lock-acquisition budget before
+		// reporting a retained transition; allow that operation to reach its failure.
+		expect(await completedWithin(broker, 20_000)).toBe(true);
 		expect(checkpoint).toHaveBeenCalled();
 
 		const record = await readBrokerExitRecord(broker.settings.agentDir);
@@ -200,7 +202,7 @@ test("a retained transition that blocks heartbeat renewal persists its reason an
 		checkpoint.mockRestore();
 		warn.mockRestore();
 	}
-}, 10_000);
+}, 25_000);
 
 test("a blocked heartbeat renewal does not replace a prior publication fence exit cause", async () => {
 	const broker = await startBroker();
