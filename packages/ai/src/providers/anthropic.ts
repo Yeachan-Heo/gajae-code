@@ -36,6 +36,7 @@ import {
 	getMiniMaxThinkingMode,
 	hasOpus47ApiRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
+	requiresAnthropicThinkingDisableWhenOff,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
 import { calculateCost } from "../models";
@@ -3968,7 +3969,9 @@ function buildParams(
 	}
 
 	const miniMaxMode = getMiniMaxThinkingMode(model, baseUrl);
-	if (model.reasoning && miniMaxMode === "toggle") {
+	if (options?.thinkingEnabled === false && requiresAnthropicThinkingDisableWhenOff(model.id)) {
+		params.thinking = { type: "disabled" };
+	} else if (model.reasoning && miniMaxMode === "toggle") {
 		// MiniMax's Messages endpoint defaults to off and only supports a
 		// switch. Claude budget_tokens/output_config.effort do not apply.
 		if (options?.thinkingEnabled !== undefined) {
@@ -3984,8 +3987,8 @@ function buildParams(
 
 			const compat = getAnthropicCompat(model);
 			if (mode === "anthropic-adaptive" && !compat.disableAdaptiveThinking) {
-				// Starting with Anthropic model Opus 4.7, adaptive thinking content is omitted from the
-				// response by default. Opt into summarized reasoning so thinking deltas keep
+				// Opus 4.7+, Fable, and Haiku 5+ omit adaptive thinking content by
+				// default. Opt into summarized reasoning so thinking deltas keep
 				// streaming with human-readable content for callers that rely on it.
 				const adaptive: { type: "adaptive"; display?: AnthropicThinkingDisplay } = { type: "adaptive" };
 				if (supportsAdaptiveThinkingDisplay(model.id)) {

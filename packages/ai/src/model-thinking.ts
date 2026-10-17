@@ -538,12 +538,26 @@ export function hasOpus47ApiRestrictions(modelId: string): boolean {
 	return semverGte(parsed.version, "4.7") && parsed.kind === "opus";
 }
 
+function isAnthropicHaikuAdaptiveModel(modelId: string): boolean {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	return parsed?.kind === "haiku" && semverGte(parsed.version, "5.0");
+}
+
+/**
+ * Haiku 5+ enables adaptive thinking when the `thinking` field is omitted.
+ * An explicit user-facing Off choice must therefore send `type: "disabled"`.
+ */
+export function requiresAnthropicThinkingDisableWhenOff(modelId: string): boolean {
+	return isAnthropicHaikuAdaptiveModel(modelId);
+}
+
 /**
  * Adaptive thinking `display` is supported starting with Anthropic Opus 4.7.
  * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
  * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
  * "omitted" — thinking tokens are billed but no content streams back — so it
  * must opt in like Opus 4.7+ (issue #2791).
+ * Haiku 5+ also accepts `display` and defaults it to "omitted".
  *
  * Shares `hasOpus47ApiRestrictions` version parsing on purpose: the two
  * predicates describe the same API generation, and a private `claude-opus-(\d+)-(\d+)`
@@ -554,7 +568,7 @@ export function hasOpus47ApiRestrictions(modelId: string): boolean {
  */
 export function supportsAnthropicAdaptiveThinkingDisplay(modelId: string): boolean {
 	if (/claude-fable-\d/.test(modelId)) return true;
-	return hasOpus47ApiRestrictions(modelId);
+	return hasOpus47ApiRestrictions(modelId) || isAnthropicHaikuAdaptiveModel(modelId);
 }
 
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel, THINKING_CONTROL_MODES } from "@gajae-code/ai";
+import { getBundledModel, getBundledModels, THINKING_CONTROL_MODES } from "@gajae-code/ai";
 import {
 	applyGeneratedModelPolicies,
 	clampThinkingLevelForModel,
@@ -11,6 +11,8 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	modelSupportsReasoningControl,
 	requireSupportedEffort,
+	requiresAnthropicThinkingDisableWhenOff,
+	supportsAnthropicAdaptiveThinkingDisplay,
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Context, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 import { hookFetch } from "@gajae-code/utils";
@@ -29,6 +31,14 @@ const TEST_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
 	xai: "https://api.x.ai/v1",
 	zai: "https://api.z.ai/v1",
 };
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
@@ -481,6 +491,78 @@ describe("model thinking metadata", () => {
 			"us.anthropic.claude-haiku-5-5",
 		]) {
 			expect(getBundledModel("amazon-bedrock", id as never).thinking?.mode).toBe("anthropic-budget-effort");
+		}
+	});
+
+	it("holds seeded Haiku parser and policy properties for catalog IDs (seed 0x5eed5505)", () => {
+		const haikuVersionPattern = /claude-haiku-(\d{1,2})-(\d{1,2})\b/;
+		const directCatalogCases = getBundledModels("anthropic").flatMap(model => {
+			if (model.api !== "anthropic-messages") return [];
+			const match = haikuVersionPattern.exec(model.id);
+			if (!match) return [];
+			return [
+				{
+					id: model.id,
+					api: "anthropic-messages" as const,
+					provider: "anthropic" as const,
+					major: Number(match[1]),
+					minor: Number(match[2]),
+				},
+			];
+		});
+		const bedrockCatalogCases = getBundledModels("amazon-bedrock").flatMap(model => {
+			if (model.api !== "bedrock-converse-stream") return [];
+			const match = haikuVersionPattern.exec(model.id);
+			if (!match) return [];
+			return [
+				{
+					id: model.id,
+					api: "bedrock-converse-stream" as const,
+					provider: "amazon-bedrock" as const,
+					major: Number(match[1]),
+					minor: Number(match[2]),
+				},
+			];
+		});
+		const catalogCases = [...directCatalogCases, ...bedrockCatalogCases];
+		const versions = Array.from(new Set(catalogCases.map(({ major, minor }) => `${major}.${minor}`))).sort();
+		const random = seededRandom(0x5eed_5505);
+		const randomInt = (max: number): number => Math.floor(random() * max);
+
+		expect(versions).toContain("4.5");
+		expect(versions).toContain("5.5");
+		for (const version of versions) {
+			const [major, minor] = version.split(".").map(Number);
+			if (major === undefined || minor === undefined) throw new Error(`Invalid catalog version ${version}`);
+			for (const api of ["anthropic-messages", "bedrock-converse-stream"] as const) {
+				const candidates = catalogCases.filter(
+					model => model.major === major && model.minor === minor && model.api === api,
+				);
+				expect(candidates.length).toBeGreaterThan(0);
+
+				for (let caseIndex = 0; caseIndex < 32; caseIndex++) {
+					const catalogCase = candidates[randomInt(candidates.length)];
+					if (!catalogCase) throw new Error("Expected a generated Haiku catalog case");
+
+					const model = createModel(catalogCase);
+					const isGeneration5OrLater = major >= 5;
+					const expectedMode = isGeneration5OrLater
+						? api === "anthropic-messages"
+							? "anthropic-adaptive"
+							: "anthropic-budget-effort"
+						: "budget";
+					const expectedDefault = isGeneration5OrLater && api === "anthropic-messages" ? Effort.Medium : undefined;
+					const defaultLevel = model.thinking?.defaultLevel;
+
+					expect(model.thinking?.mode).toBe(expectedMode);
+					expect(defaultLevel).toBe(expectedDefault);
+					if (defaultLevel !== undefined) {
+						expect(getSupportedEfforts(model)).toContain(defaultLevel);
+					}
+					expect(requiresAnthropicThinkingDisableWhenOff(catalogCase.id)).toBe(isGeneration5OrLater);
+					expect(supportsAnthropicAdaptiveThinkingDisplay(catalogCase.id)).toBe(isGeneration5OrLater);
+				}
+			}
 		}
 	});
 });
