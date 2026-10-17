@@ -3,6 +3,7 @@ import { APP_NAME } from "@gajae-code/utils";
 import { formatBuildLabel } from "../../build-metadata";
 import { formatKeyHint, type KeyDisplayContext } from "../../config/keybindings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
+import { sanitizeStatusText } from "../shared";
 
 export interface RecentSession {
 	name: string;
@@ -536,7 +537,8 @@ export class WelcomeComponent implements Component {
 	}
 
 	#pill(icon: string, text: string, color: ThemeColor): string {
-		return `${theme.fg("borderMuted", "[")} ${theme.fg(color, icon)} ${theme.fg("muted", text)} ${theme.fg(
+		const safeText = sanitizeStatusText(text);
+		return `${theme.fg("borderMuted", "[")} ${theme.fg(color, icon)} ${theme.fg("muted", safeText)} ${theme.fg(
 			"borderMuted",
 			"]",
 		)}`;

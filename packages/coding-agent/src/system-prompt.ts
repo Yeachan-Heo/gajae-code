@@ -75,6 +75,31 @@ function sanitizeEmbeddedPromptContent(content: string): string {
 	return escapePromptMetadata(content, { preserveNewlines: true });
 }
 
+const UNTRUSTED_CONTENT_OPEN_LINE = "<untrusted-content>\n";
+const UNTRUSTED_CONTENT_CLOSE_LINE = "\n</untrusted-content>";
+
+/**
+ * Encode an inventory description. MCP descriptions already include a host-owned
+ * untrusted-content fence; keep those delimiters and encode only the body.
+ * A body that still contains a closing fence is not that wrapper, so encode the whole value.
+ */
+function escapeInventoryDescription(description: string): string {
+	const openLength = UNTRUSTED_CONTENT_OPEN_LINE.length;
+	const closeLength = UNTRUSTED_CONTENT_CLOSE_LINE.length;
+	if (
+		description.startsWith(UNTRUSTED_CONTENT_OPEN_LINE) &&
+		description.endsWith(UNTRUSTED_CONTENT_CLOSE_LINE) &&
+		description.length >= openLength + closeLength
+	) {
+		const body = description.slice(openLength, -closeLength);
+		if (!/<\/untrusted-content>/i.test(body)) {
+			const encodedBody = escapePromptMetadata(body, { preserveNewlines: true });
+			return `${UNTRUSTED_CONTENT_OPEN_LINE}${encodedBody}${UNTRUSTED_CONTENT_CLOSE_LINE}`;
+		}
+	}
+	return escapePromptMetadata(description, { preserveNewlines: true });
+}
+
 function firstNonEmpty(...values: (string | undefined | null)[]): string | null {
 	for (const value of values) {
 		const trimmed = value?.trim();
@@ -745,12 +770,19 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
 	const hasHiddenToolDiscoveryTool = Object.hasOwn(toolRefs, "search_tool_bm25");
-	const toolInfo = toolNames.map(name => ({
-		name: toolPromptNames.get(name) ?? name,
-		internalName: name,
-		label: tools?.get(name)?.label ?? "",
-		description: tools?.get(name)?.description ?? "",
-	}));
+	// The inventory template is compiled with noEscape. Encode tool metadata here so a
+	// tools/list label or description cannot close <inventory> or insert a system block.
+	// Repeated MCP descriptions keep the host <untrusted-content> fence; only the body is encoded.
+	// The `tools` list stays raw so {{#has}} still matches the call name.
+	const toolInfo = toolNames.map(name => {
+		const meta = tools?.get(name);
+		return {
+			name: escapePromptMetadata(toolPromptNames.get(name) ?? name),
+			internalName: escapePromptMetadata(name),
+			label: escapePromptMetadata(meta?.label ?? ""),
+			description: escapeInventoryDescription(meta?.description ?? ""),
+		};
+	});
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,

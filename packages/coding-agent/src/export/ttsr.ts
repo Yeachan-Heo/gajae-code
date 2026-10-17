@@ -27,6 +27,14 @@ export interface TtsrMatchContext {
 	streamKey?: string;
 }
 
+/** An astCondition pattern parse issue observed while checking a target language. */
+export interface TtsrAstConditionDiagnostic {
+	ruleName: string;
+	lang: string;
+	patterns: string[];
+	parseErrors: string[];
+}
+
 interface ToolScope {
 	toolName?: string;
 	pathGlob?: Bun.Glob;
@@ -75,6 +83,7 @@ const DEFAULT_SETTINGS: Required<TtsrSettings> = {
 
 const SAFE_REGEX_WINDOW_CAP = 4096;
 const SAFE_REGEX_WINDOW_MULTIPLIER = 4;
+const SOURCE_SYNTAX_PARSE_ERROR = "parse error (syntax tree contains error nodes)";
 
 const DEFAULT_SCOPE: TtsrScope = {
 	allowText: true,
@@ -87,6 +96,7 @@ export class TtsrManager {
 	readonly #settings: Required<TtsrSettings>;
 	readonly #rules = new Map<string, TtsrEntry>();
 	readonly #injectionRecords = new Map<string, InjectionRecord>();
+	readonly #astConditionDiagnostics = new Map<string, TtsrAstConditionDiagnostic>();
 	readonly #buffers = new Map<string, string>();
 	readonly #lastAstSnapshots = new Map<string, string>();
 	#messageCount = 0;
@@ -555,6 +565,15 @@ export class TtsrManager {
 		return false;
 	}
 
+	/** Get observed astCondition pattern parse issues for rule diagnostics. */
+	getAstConditionDiagnostics(): TtsrAstConditionDiagnostic[] {
+		return Array.from(this.#astConditionDiagnostics.values(), diagnostic => ({
+			...diagnostic,
+			patterns: [...diagnostic.patterns],
+			parseErrors: [...diagnostic.parseErrors],
+		}));
+	}
+
 	/** Derive an ast-grep language alias from the candidate file extensions. */
 	#deriveLang(filePaths: string[] | undefined): string | undefined {
 		for (const filePath of filePaths ?? []) {
@@ -593,7 +612,7 @@ export class TtsrManager {
 		const matches: Rule[] = [];
 		for (const entry of candidates) {
 			if (!entry.astConditions) continue;
-			const matched = await this.#astConditionsMatch(entry.astConditions, snapshot, lang, signal);
+			const matched = await this.#astConditionsMatch(entry.rule.name, entry.astConditions, snapshot, lang, signal);
 			if (signal?.aborted) return [];
 			if (matched) {
 				matches.push(entry.rule);
@@ -608,7 +627,40 @@ export class TtsrManager {
 		return matches;
 	}
 
-	async #astConditionsMatch(patterns: string[], source: string, lang: string, signal?: AbortSignal): Promise<boolean> {
+	#recordAstConditionDiagnostics(
+		ruleName: string,
+		patterns: string[],
+		lang: string,
+		parseErrors: string[] | undefined,
+	): void {
+		const patternParseErrors = parseErrors?.filter(parseError => parseError !== SOURCE_SYNTAX_PARSE_ERROR) ?? [];
+		if (patternParseErrors.length === 0) return;
+
+		const key = JSON.stringify([ruleName, lang]);
+		if (this.#astConditionDiagnostics.has(key)) return;
+
+		const diagnostic: TtsrAstConditionDiagnostic = {
+			ruleName,
+			lang,
+			patterns: [...patterns],
+			parseErrors: patternParseErrors,
+		};
+		this.#astConditionDiagnostics.set(key, diagnostic);
+		logger.warn("TTSR astCondition pattern is invalid for target language", {
+			ruleName,
+			lang,
+			patterns: diagnostic.patterns,
+			parseErrors: diagnostic.parseErrors,
+		});
+	}
+
+	async #astConditionsMatch(
+		ruleName: string,
+		patterns: string[],
+		source: string,
+		lang: string,
+		signal?: AbortSignal,
+	): Promise<boolean> {
 		try {
 			const result = await astMatch({
 				patterns,
@@ -618,9 +670,13 @@ export class TtsrManager {
 				limit: 1,
 				signal,
 			});
+			if (!signal?.aborted) {
+				this.#recordAstConditionDiagnostics(ruleName, patterns, lang, result.parseErrors);
+			}
 			return result.totalMatches > 0;
 		} catch (error) {
 			logger.warn("TTSR ast match failed, treating as no match", {
+				ruleName,
 				patterns,
 				lang,
 				error: error instanceof Error ? error.message : String(error),

@@ -84,6 +84,7 @@ const EXTENSION_CONTEXT_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"clearContext",
 	"cycleModel",
 	"setModelProfile",
+	"setDefaultModelProfile",
 	"cycleThinkingLevel",
 	"setQueueMode",
 	"invokeSkill",
@@ -91,6 +92,14 @@ const EXTENSION_CONTEXT_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"operateGoal",
 	"setSdkPermissionProvider",
 	"setSdkClientBridge",
+	"sdkControl",
+]);
+const MODEL_CHANGE_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
+	"setModel",
+	"setModelTemporaryForControl",
+	"cycleModel",
+	"setModelProfile",
+	"setDefaultModelProfile",
 	"sdkControl",
 ]);
 const EXTENSION_COMMAND_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
@@ -442,6 +451,14 @@ export class ExtensionUiController {
 		return this.ctx.isStopped?.() === true;
 	}
 
+	async #withModelChangeRefresh<T>(changeModel: () => Promise<T>): Promise<T> {
+		try {
+			return await changeModel();
+		} finally {
+			if (!this.#isStopped()) this.ctx.updateEditorChrome();
+		}
+	}
+
 	#assertActive(): void {
 		if (this.#isStopped()) throw Object.assign(new Error("Interactive mode stopped"), { code: "cancelled" });
 	}
@@ -453,6 +470,9 @@ export class ExtensionUiController {
 				if (!mutationNames.has(property) || typeof member !== "function") return member;
 				return (...args: unknown[]) => {
 					this.#assertActive();
+					if (MODEL_CHANGE_MUTATIONS.has(property)) {
+						return this.#withModelChangeRefresh(async () => Reflect.apply(member, current, args));
+					}
 					return Reflect.apply(member, current, args);
 				};
 			},

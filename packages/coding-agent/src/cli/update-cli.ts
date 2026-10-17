@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { exactReplaceRetained, exactUnlink } from "@gajae-code/natives";
+import { exactReplaceRetained, exactUnlink, exactUnlinkDirect } from "@gajae-code/natives";
 import { $which, APP_NAME, isCompiledBinary, isEnoent, logger, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
@@ -1351,14 +1351,179 @@ function binaryStagingPath(targetPath: string, stamp: string): string {
 	return `${targetPath.slice(0, -extension.length)}.new.${stamp}${extension}`;
 }
 
+const UPDATE_FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const EXACT_REPLACE_DESTINATION_NAME = /^\.gjc-exact-replace-destination-([0-9a-f]+)-([0-9a-f]+)$/u;
+// Do not race a separate process that is still completing a native replacement in this directory.
+const EXACT_REPLACE_CLEANUP_GRACE_MS = 10 * 60 * 1000;
+
+function isUpdateStagingName(targetPath: string, name: string): boolean {
+	const extension = path.extname(targetPath);
+	const prefix = `${path.basename(targetPath, extension)}.new.`;
+	if (!name.startsWith(prefix)) return false;
+	const suffix = name.slice(prefix.length);
+	if (extension && !suffix.endsWith(extension)) return false;
+	const id = extension ? suffix.slice(0, -extension.length) : suffix;
+	return UPDATE_FILE_ID.test(id);
+}
+
+function isUpdateBackupName(targetPath: string, name: string): boolean {
+	const prefix = `${path.basename(targetPath)}.bak.`;
+	if (name.startsWith(prefix) && UPDATE_FILE_ID.test(name.slice(prefix.length))) return true;
+	const legacyPrefix = `${path.basename(targetPath)}-`;
+	if (!name.startsWith(legacyPrefix)) return false;
+	const legacyName = name.slice(legacyPrefix.length);
+	const marker = legacyName.indexOf(".bak.");
+	if (marker < 0) return false;
+	const version = legacyName.slice(0, marker);
+	const timestamp = legacyName.slice(marker + ".bak.".length);
+	return (
+		/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(version) && /^[0-9A-Za-z._-]+$/u.test(timestamp)
+	);
+}
+
+export function isUpdateStagingNameForTest(targetPath: string, name: string): boolean {
+	return isUpdateStagingName(targetPath, name);
+}
+
+export function isUpdateBackupNameForTest(targetPath: string, name: string): boolean {
+	return isUpdateBackupName(targetPath, name);
+}
+
+async function removeExactUpdateArtifact(filePath: string, parent: DirectoryIdentity): Promise<string | undefined> {
+	try {
+		const snapshot = await snapshotRegularFile(filePath);
+		if (!snapshot) return undefined;
+		if (snapshot.identity.parentDev !== parent.dev || snapshot.identity.parentIno !== parent.ino)
+			return `parent_identity_changed:${filePath}`;
+		const removed = exactUnlinkDirect(
+			filePath,
+			toNativeIdentity(snapshot.identity, `.gjc-update-cleanup-${randomUUID()}`),
+		);
+		if (removed.ok || removed.code === "not_found") return undefined;
+		const retained = [
+			removed.detachedPath ? `detached=${removed.detachedPath}` : undefined,
+			removed.retainedPlaceholderPath ? `placeholder=${removed.retainedPlaceholderPath}` : undefined,
+			removed.retainedUnknownPath ? `unknown=${removed.retainedUnknownPath}` : undefined,
+			removed.retainedSuccessorPath ? `successor=${removed.retainedSuccessorPath}` : undefined,
+		].filter((entry): entry is string => entry !== undefined);
+		return `exact_unlink_${removed.code ?? "failed"}:${filePath}${retained.length ? `|${retained.join("|")}` : ""}`;
+	} catch (error) {
+		return `snapshot_failed:${filePath}:${error instanceof Error ? error.message : String(error)}`;
+	}
+}
+
+/**
+ * Reclaim only generated update artifacts while holding the install lock.
+ * Keep a stage only while an active activation record owns it, and retain at
+ * most the rollback backup the record can still need.
+ */
+async function cleanupBinaryUpdateArtifacts(
+	targetPath: string,
+	originalParent: DirectoryIdentity,
+	retainedRetryCandidatePath?: string,
+): Promise<string | undefined> {
+	const parentPath = path.dirname(path.resolve(targetPath));
+	const warnings: string[] = [];
+	try {
+		const currentParent = await snapshotDirectory(parentPath);
+		if (!sameDirectoryIdentity(originalParent, currentParent)) return "installation_parent_changed";
+		const entries = await fs.promises.readdir(parentPath, { withFileTypes: true });
+		const activation = await readActivationRecord(targetPath);
+		if (activation.status === "malformed" || activation.status === "foreign") {
+			warnings.push(`activation_record_untrusted:${activation.reason}`);
+		} else {
+			const record = activation.status === "valid" ? activation.record : undefined;
+			const terminal = record?.phase === "verified" || record?.phase === "rolled_back";
+			const pinnedStages = new Set<string>();
+			if (record && !terminal) pinnedStages.add(path.resolve(record.stagingPath));
+			if (retainedRetryCandidatePath) pinnedStages.add(path.resolve(retainedRetryCandidatePath));
+			for (const entry of entries) {
+				if (!isUpdateStagingName(targetPath, entry.name)) continue;
+				const stagingPath = path.join(parentPath, entry.name);
+				if (pinnedStages.has(stagingPath)) continue;
+				const warning = await removeExactUpdateArtifact(stagingPath, originalParent);
+				if (warning) warnings.push(warning);
+			}
+
+			const recognizedBackup = record && isUpdateBackupName(targetPath, record.backupName);
+			let preserveBackup: string | undefined;
+			let mayPruneBackups = activation.status === "missing";
+			if (record && recognizedBackup) {
+				if (record.phase === "rolled_back" || !record.baseline.exists) {
+					mayPruneBackups = true;
+				} else if (record.phase === "verified" || record.phase === "published" || record.phase === "uncertain") {
+					if (record.backupIdentity) {
+						const baseline = await snapshotRegularFile(path.join(parentPath, record.backupName));
+						if (baseline && sameFileIdentity(record.backupIdentity, baseline.identity)) {
+							preserveBackup = record.backupName;
+							mayPruneBackups = true;
+						}
+					}
+				} else if (record.phase === "staged" || record.phase === "pending_activation") {
+					const current = await snapshotRegularFile(targetPath);
+					const baselineUnchanged = record.baseline.exists
+						? !!current && !!record.targetIdentity && sameFileIdentity(record.targetIdentity, current.identity)
+						: current === undefined;
+					if (baselineUnchanged) {
+						const transactionBackup = await snapshotRegularFile(path.join(parentPath, record.backupName));
+						if (!transactionBackup) mayPruneBackups = true;
+						else if (
+							record.backupIdentity &&
+							sameFileIdentity(record.backupIdentity, transactionBackup.identity)
+						) {
+							preserveBackup = record.backupName;
+							mayPruneBackups = true;
+						}
+					}
+				}
+			}
+			if (mayPruneBackups) {
+				for (const entry of entries) {
+					if (!isUpdateBackupName(targetPath, entry.name) || entry.name === preserveBackup) continue;
+					const warning = await removeExactUpdateArtifact(path.join(parentPath, entry.name), originalParent);
+					if (warning) warnings.push(warning);
+				}
+			}
+		}
+
+		if (process.platform !== "win32") {
+			const staleBefore = BigInt(Date.now() - EXACT_REPLACE_CLEANUP_GRACE_MS) * 1_000_000n;
+			for (const entry of entries) {
+				const match = EXACT_REPLACE_DESTINATION_NAME.exec(entry.name);
+				if (!match) continue;
+				const placeholderPath = path.join(parentPath, entry.name);
+				const placeholder = await snapshotRegularFile(placeholderPath);
+				if (!placeholder) continue;
+				const { identity } = placeholder;
+				if (
+					identity.parentDev !== originalParent.dev ||
+					identity.parentIno !== originalParent.ino ||
+					identity.size !== "0" ||
+					identity.nlink !== "1" ||
+					BigInt(identity.ino).toString(16) !== match[1]
+				)
+					continue;
+				// The current flow has returned from its synchronous native calls; older
+				// process IDs get the grace window above before their residue is reaped.
+				if (match[2] !== process.pid.toString(16) && BigInt(identity.mtimeNs) >= staleBefore) continue;
+				const warning = await removeExactUpdateArtifact(placeholderPath, originalParent);
+				if (warning) warnings.push(warning);
+			}
+		}
+	} catch (error) {
+		warnings.push(error instanceof Error ? error.message : String(error));
+	}
+	return warnings.length > 0 ? warnings.join("\n") : undefined;
+}
+
 /**
  * Orchestrate download → fsync → replace → verify with a strict ordering
  * contract: the downloaded temp binary MUST be flushed to stable storage
  * before it is published (renamed into place) or exec'd for verification.
  *
  * If fsync fails the temp bytes are not durable, so we abort before
- * replacement/verification and retain the staging artifact rather than risk
- * deleting a substituted pathname or installing a possibly-truncated binary.
+ * replacement/verification. Final cleanup removes the exact staging identity
+ * only when no activation record still owns it.
  */
 export async function runBinaryUpdateFlow(
 	targetPath: string,
@@ -1370,15 +1535,19 @@ export async function runBinaryUpdateFlow(
 	const tempPath = binaryStagingPath(targetPath, stamp);
 	const backupPath = `${targetPath}.bak.${stamp}`;
 	const releaseLock = await acquireBinaryUpdateLock(targetPath);
+	let originalParent: DirectoryIdentity | undefined;
+	let verification: InstalledVersionVerification | undefined;
+	let failed = false;
+	let failure: unknown;
 	try {
 		const originalTarget = await snapshotRegularFile(targetPath);
-		const originalParent = await snapshotDirectory(path.dirname(targetPath));
+		originalParent = await snapshotDirectory(path.dirname(targetPath));
 		if (!originalParent) throw new Error("installation_parent_unavailable");
 		await flow.download(url, tempPath);
 		await flow.fsync(tempPath);
 
 		flow.beforeReplace?.();
-		return await flow.replace({
+		verification = await flow.replace({
 			targetPath,
 			tempPath,
 			backupPath,
@@ -1387,9 +1556,38 @@ export async function runBinaryUpdateFlow(
 			originalParent,
 			verifyInstalledVersion: flow.verifyInstalledVersion,
 		});
-	} finally {
-		await releaseLock();
+	} catch (error) {
+		failed = true;
+		failure = error;
 	}
+	const retainedRetryCandidatePath =
+		failure instanceof ActivationRetryCandidateRepointError ? failure.candidatePath : undefined;
+	const cleanupWarning = originalParent
+		? await cleanupBinaryUpdateArtifacts(targetPath, originalParent, retainedRetryCandidatePath)
+		: undefined;
+	try {
+		await releaseLock();
+	} catch (error) {
+		if (!failed) {
+			failed = true;
+			failure = error;
+		} else {
+			logger.warn("Update install lock cleanup failed", {
+				warning: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	if (failed) {
+		if (cleanupWarning)
+			logger.warn("Update artifact cleanup failed after unsuccessful update", { warning: cleanupWarning });
+		throw failure;
+	}
+	if (!verification) throw new Error("binary_update_verification_missing");
+	if (!cleanupWarning) return verification;
+	return {
+		...verification,
+		cleanupWarning: [verification.cleanupWarning, cleanupWarning].filter(Boolean).join("\n"),
+	};
 }
 
 export async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {

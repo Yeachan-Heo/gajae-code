@@ -43,9 +43,13 @@ class RunInTerminalFakeClient {
 	#reverseHandlers = new Map<string, DapReverseRequestHandler>();
 	#alive = true;
 	readonly #exited = Promise.withResolvers<number>();
+	readonly #terminalCwd?: string;
+	readonly #terminalArgs?: string[];
 
-	constructor(cwd: string) {
+	constructor(cwd: string, terminal?: { cwd?: string; args?: string[] }) {
 		this.cwd = cwd;
+		this.#terminalCwd = terminal?.cwd;
+		this.#terminalArgs = terminal?.args;
 		this.proc = {
 			exited: this.#exited.promise,
 			exitCode: null,
@@ -70,7 +74,10 @@ class RunInTerminalFakeClient {
 		if (command === "launch") {
 			const handler = this.#reverseHandlers.get("runInTerminal");
 			if (!handler) throw new Error("runInTerminal handler was not registered");
-			return handler({ args: [BUN, "-e", "setInterval(() => {}, 1000)"], cwd: this.cwd });
+			return handler({
+				args: this.#terminalArgs ?? [BUN, "-e", "setInterval(() => {}, 1000)"],
+				cwd: this.#terminalCwd ?? this.cwd,
+			});
 		}
 		if (command === "configurationDone") return {};
 		if (command === "disconnect") {
@@ -301,6 +308,121 @@ describe("DAP lifecycle behavior", () => {
 			} finally {
 				await unrelated.dispose();
 				await unrelated.awaitExit({ timeoutMs: 1_000 });
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")("rejects runInTerminal when cwd leaves the workspace", async () => {
+		const cwd = await tempDir("gjc-dap-runterminal-bound-");
+		const outside = await tempDir("gjc-dap-runterminal-outside-");
+		const marker = path.join(outside, "ran");
+		try {
+			const manager = new DapSessionManager();
+			const fake = new RunInTerminalFakeClient(cwd, {
+				cwd: outside,
+				args: [BUN, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`],
+			});
+			const originalSpawn = DapClient.spawn;
+			DapClient.spawn = async () => fake as unknown as DapClient;
+			try {
+				const before = liveOwnedProcessCount();
+				await expect(
+					manager.launch({ adapter: STDIO_ADAPTER, program: "fake", cwd }, undefined, 25),
+				).rejects.toThrow(/escapes the workspace/);
+				expect(liveOwnedProcessCount()).toBe(before);
+				expect(await Bun.file(marker).exists()).toBe(false);
+			} finally {
+				DapClient.spawn = originalSpawn;
+			}
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"rejects runInTerminal when the execution cwd is outside the session workspace",
+		async () => {
+			const workspace = await tempDir("gjc-dap-runterminal-ws-");
+			const outside = await tempDir("gjc-dap-runterminal-exec-");
+			const marker = path.join(outside, "ran");
+			try {
+				const manager = new DapSessionManager();
+				const fake = new RunInTerminalFakeClient(workspace, {
+					cwd: outside,
+					args: [BUN, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`],
+				});
+				const originalSpawn = DapClient.spawn;
+				DapClient.spawn = async () => fake as unknown as DapClient;
+				try {
+					const before = liveOwnedProcessCount();
+					await expect(
+						manager.launch({ adapter: STDIO_ADAPTER, program: "fake", cwd: outside, workspace }, undefined, 25),
+					).rejects.toThrow(/escapes the workspace/);
+					expect(liveOwnedProcessCount()).toBe(before);
+					expect(await Bun.file(marker).exists()).toBe(false);
+				} finally {
+					DapClient.spawn = originalSpawn;
+				}
+			} finally {
+				await fs.rm(workspace, { recursive: true, force: true });
+				await fs.rm(outside, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"still allows runInTerminal when the execution cwd stays inside the session workspace",
+		async () => {
+			const workspace = await tempDir("gjc-dap-runterminal-ws-ok-");
+			const nested = path.join(workspace, "nested");
+			await fs.mkdir(nested);
+			try {
+				const manager = new DapSessionManager();
+				const fake = new RunInTerminalFakeClient(workspace, { cwd: nested });
+				const originalSpawn = DapClient.spawn;
+				DapClient.spawn = async () => fake as unknown as DapClient;
+				try {
+					const before = liveOwnedProcessCount();
+					const summary = await manager.launch(
+						{ adapter: STDIO_ADAPTER, program: "fake", cwd: nested, workspace },
+						undefined,
+						25,
+					);
+					expect(liveOwnedProcessCount()).toBeGreaterThan(before);
+					await manager.terminate(undefined, 25);
+					expect(manager.listSessions().some(session => session.id === summary.id)).toBe(false);
+				} finally {
+					DapClient.spawn = originalSpawn;
+				}
+			} finally {
+				await fs.rm(workspace, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"still allows runInTerminal when cwd stays inside the workspace",
+		async () => {
+			const cwd = await tempDir("gjc-dap-runterminal-inside-");
+			const nested = path.join(cwd, "nested");
+			await fs.mkdir(nested);
+			try {
+				const manager = new DapSessionManager();
+				const fake = new RunInTerminalFakeClient(cwd, { cwd: nested });
+				const originalSpawn = DapClient.spawn;
+				DapClient.spawn = async () => fake as unknown as DapClient;
+				try {
+					const before = liveOwnedProcessCount();
+					const summary = await manager.launch({ adapter: STDIO_ADAPTER, program: "fake", cwd }, undefined, 25);
+					expect(liveOwnedProcessCount()).toBeGreaterThan(before);
+					await manager.terminate(undefined, 25);
+					expect(manager.listSessions().some(session => session.id === summary.id)).toBe(false);
+				} finally {
+					DapClient.spawn = originalSpawn;
+				}
+			} finally {
 				await fs.rm(cwd, { recursive: true, force: true });
 			}
 		},
