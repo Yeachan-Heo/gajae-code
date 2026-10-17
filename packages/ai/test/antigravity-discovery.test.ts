@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { writeModelCache } from "../src/model-cache";
 import { resolveProviderModels } from "../src/model-manager";
 import { getBundledModel, getBundledModels } from "../src/models";
+import { getAntigravityUserAgent, getGeminiCliUserAgent } from "../src/providers/google-gemini-headers";
 import type { Api, Model } from "../src/types";
 import { fetchAntigravityDiscoveryModels } from "../src/utils/discovery/antigravity";
 
@@ -182,6 +184,129 @@ describe("Antigravity model discovery", () => {
 		expect(getBundledModel("google-antigravity", "gemini-3.7-flash-medium")).toBeUndefined();
 		expect(getBundledModel("google-antigravity", "gemini-3.7-flash-tiered")?.id).toBe("gemini-3.7-flash-tiered");
 		expect(getBundledModel("google-antigravity", "gemini-3.1-pro-low")?.id).toBe("gemini-3.1-pro-low");
+	});
+
+	it("sends project in request body when project is provided", async () => {
+		let capturedRequestBody: unknown;
+		const fetcher = (async (_url: string, init?: RequestInit) => {
+			if (init?.body) {
+				capturedRequestBody = JSON.parse(init.body as string);
+			}
+			return new Response(
+				JSON.stringify({
+					models: {
+						"gemini-4-argon": {
+							displayName: "Gemini 4 Argon",
+							supportsImages: true,
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const models = await fetchAntigravityDiscoveryModels({
+			token: "test-token",
+			endpoint: "https://antigravity.example.test",
+			project: "test-project-123",
+			fetcher,
+		});
+
+		expect(models?.map(model => model.id)).toEqual(["gemini-4-argon"]);
+		expect(capturedRequestBody).toEqual({ project: "test-project-123" });
+	});
+
+	it("uses the Gemini CLI user agent to discover Argon without a project", async () => {
+		let capturedRequestBody: unknown;
+		const capturedUserAgents: string[] = [];
+		const fetcher = (async (_url: string, init?: RequestInit) => {
+			if (init?.body) {
+				capturedRequestBody = JSON.parse(init.body as string);
+			}
+			const userAgent = new Headers(init?.headers).get("user-agent");
+			if (userAgent) capturedUserAgents.push(userAgent);
+			return new Response(
+				JSON.stringify({
+					models: {
+						"gemini-4-argon": {
+							displayName: "Gemini 4 Argon",
+							supportsImages: true,
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const models = await fetchAntigravityDiscoveryModels({
+			token: "test-token",
+			endpoint: "https://antigravity.example.test",
+			fetcher,
+		});
+
+		expect(models?.map(model => model.id)).toEqual(["gemini-4-argon"]);
+		expect(capturedRequestBody).toEqual({});
+		const expectedUserAgent = process.env.PI_AI_ANTIGRAVITY_USER_AGENT
+			? getAntigravityUserAgent()
+			: getGeminiCliUserAgent();
+		expect(capturedUserAgents).toEqual([expectedUserAgent]);
+	});
+
+	it("preserves the custom logger receiver while logging drop reasons", async () => {
+		const testLogger = {
+			entries: [] as Array<[string, Record<string, unknown> | undefined]>,
+			debug(message: string, meta?: Record<string, unknown>) {
+				this.entries.push([message, meta]);
+			},
+		};
+
+		const fetcher = (async () =>
+			new Response(
+				JSON.stringify({
+					models: {
+						"gemini-3.1-pro-low": {
+							displayName: "Gemini 3.1 Pro (Low)",
+							supportsImages: true,
+						},
+						chat_20706: {
+							displayName: "Denylisted",
+							isInternal: true,
+						},
+						"gemini-3.1-pro-high": {
+							displayName: "Retired",
+							isInternal: true,
+						},
+						"internal-hidden": {
+							displayName: "Internal Hidden",
+							isInternal: true,
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			)) as unknown as typeof fetch;
+
+		const models = await fetchAntigravityDiscoveryModels({
+			token: "test-token",
+			endpoint: "https://user:secret@antigravity.example.test/private/path?access_token=query-secret",
+			fetcher,
+			logger: testLogger,
+		});
+
+		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
+
+		const dropReasonLog = testLogger.entries.find(log => log[0] === "Antigravity discovery dropped models");
+		expect(dropReasonLog?.[1]?.dropReasons).toEqual({
+			chat_20706: "denylist",
+			"gemini-3.1-pro-high": "retired",
+			"internal-hidden": "isInternal-not-surfaced",
+		});
+		const keptModelsLog = testLogger.entries.find(log => log[0] === "Antigravity discovery kept models");
+		expect(keptModelsLog?.[1]?.keptModelIds).toEqual(["gemini-3.1-pro-low"]);
+		expect(testLogger.entries.map(([, meta]) => meta?.endpoint)).toEqual([
+			"https://antigravity.example.test",
+			"https://antigravity.example.test",
+			"https://antigravity.example.test",
+		]);
 	});
 
 	it("filters retired selectors from fresh authoritative model caches", async () => {

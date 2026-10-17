@@ -2258,7 +2258,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? { aliasIntent: "preset-equivalent" }
 			: undefined;
 		const allowedModels = await logger.time("resolveAllowedModels", () =>
-			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
+			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences, credentialSessionId),
 		);
 		const defaultRoleSpec = logger.time("resolveDefaultModelRole", () =>
 			resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
@@ -4444,7 +4444,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					startupModelReference.id,
 					startupCredentialSelector,
 				);
-			const currentStartupModel = modelRegistry.find(startupModelReference.provider, startupModelReference.id);
+			const currentStartupModel = modelRegistry.find(
+				startupModelReference.provider,
+				startupModelReference.id,
+				credentialSessionId,
+			);
 			const providerMismatchRejectsTarget =
 				startupCredentialProviderMismatch &&
 				modelRegistry.requiresStoredLiteralCredentialCacheAdmission(
@@ -4469,7 +4473,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Resolve deferred --model pattern now that extension models are registered.
 		if (!model && options.modelPattern && !startupCredentialModelRejected) {
-			const availableModels = modelRegistry.getAll();
+			const availableModels = modelRegistry.getAll(credentialSessionId);
 			const matchPreferences = {
 				usageOrder: settings.getStorage()?.getModelUsageOrder(),
 			};
@@ -4511,7 +4515,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
-			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			const allowedFallbackCandidates = await resolveAllowedModels(
+				modelRegistry,
+				settings,
+				modelMatchPreferences,
+				credentialSessionId,
+			);
 			// Candidate order is not a quality signal: catalogs sort retired models
 			// ahead of current ones whenever their IDs carry older date suffixes, so
 			// an unconfigured install would otherwise start on a model its provider

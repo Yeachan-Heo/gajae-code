@@ -1219,7 +1219,7 @@ async function resolveMemoryModel(options: {
 	const { modelRegistry, session, fallbackRole } = options;
 	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
 	if (requestedModel) {
-		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
+		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(session.credentialSessionId), {
 			settings: session.settings,
 			matchPreferences: { usageOrder: session.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry,
@@ -1233,7 +1233,7 @@ async function resolveMemoryModel(options: {
 	// before lazy model resolution): prefer the most recently used model over
 	// raw registry order. `getAll()[0]` can be a retired model the provider
 	// now rejects with 404, which permanently fails consolidation jobs.
-	const allModels = modelRegistry.getAll();
+	const allModels = modelRegistry.getAll(session.credentialSessionId);
 	const usageOrder = session.settings.getStorage()?.getModelUsageOrder() ?? [];
 	for (const usedKey of usageOrder) {
 		const match = allModels.find(model => `${model.provider}/${model.id}` === usedKey);

@@ -1,6 +1,7 @@
+import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isRetiredModelKey } from "../../model-retirements";
-import { getAntigravityUserAgent } from "../../providers/google-gemini-headers";
+import { getAntigravityUserAgent, getGeminiCliUserAgent } from "../../providers/google-gemini-headers";
 import type { Model } from "../../types";
 
 /**
@@ -171,7 +172,7 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	token: string;
 	/** Optional endpoint override. Defaults to Antigravity fallback endpoints. */
 	endpoint?: string;
-	/** Deprecated and ignored for antigravity discovery parity. */
+	/** Optional Google Cloud project ID for tier-gated model discovery. */
 	project?: string;
 	/** Optional user agent override. */
 	userAgent?: string;
@@ -185,6 +186,8 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	 * Default: `google-antigravity`.
 	 */
 	targetProvider?: "google-antigravity" | "google-gemini-cli";
+	/** Optional logger for debug diagnostics. */
+	logger?: Pick<typeof logger, "debug">;
 }
 
 /**
@@ -199,14 +202,20 @@ export async function fetchAntigravityDiscoveryModels(
 	const fetcher = options.fetcher ?? fetch;
 	const signal = options.signal ?? AbortSignal.timeout(5_000);
 	const targetProvider = options.targetProvider ?? "google-antigravity";
-	const userAgent = options.userAgent ?? getAntigravityUserAgent();
+	const userAgent = options.userAgent ?? getAntigravityDiscoveryUserAgent();
 	const endpoints = options.endpoint
 		? [trimTrailingSlashes(options.endpoint)]
 		: DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS.map(trimTrailingSlashes);
+	const debugLogger = options.logger ?? logger;
 
 	for (const endpoint of endpoints) {
+		const redactedEndpoint = redactAntigravityEndpoint(endpoint);
 		let response: Response;
 		try {
+			const requestBody: Record<string, unknown> = {};
+			if (options.project) {
+				requestBody.project = options.project;
+			}
 			response = await fetcher(`${endpoint}${FETCH_AVAILABLE_MODELS_PATH}`, {
 				method: "POST",
 				headers: {
@@ -214,12 +223,18 @@ export async function fetchAntigravityDiscoveryModels(
 					"Content-Type": "application/json",
 					"User-Agent": userAgent,
 				},
-				body: JSON.stringify({}),
+				body: JSON.stringify(requestBody),
 				signal,
 			});
 		} catch {
 			continue;
 		}
+
+		debugLogger.debug("Antigravity discovery endpoint response", {
+			endpoint: redactedEndpoint,
+			status: response.status,
+			statusText: response.statusText,
+		});
 
 		if (!response.ok) {
 			continue;
@@ -256,33 +271,37 @@ export async function fetchAntigravityDiscoveryModels(
 		const filteredModelDetails: Record<string, Partial<AntigravityDiscoveryApiModel> & { reason: string }> = {};
 
 		const models: Model<"google-gemini-cli">[] = [];
+		const modelDropReasons: Record<string, string> = {};
 
 		for (const [modelId, model] of Object.entries(parsed.models ?? {})) {
+			let dropReason: string | undefined;
+
 			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId)) {
-				if (debugEnabled) {
-					filteredByDenylist.push(modelId);
-					filteredModelDetails[modelId] = { ...model, reason: "denylist" };
-				}
-				continue;
+				dropReason = "denylist";
+			} else if (isRetiredModelKey(targetProvider, modelId)) {
+				dropReason = "retired";
+			} else if (model.disabled === true) {
+				dropReason = "disabled";
+			} else if (model.isInternal === true && !surfacedModelIds.has(modelId)) {
+				dropReason = "isInternal-not-surfaced";
 			}
-			if (isRetiredModelKey(targetProvider, modelId)) {
+
+			if (dropReason) {
+				modelDropReasons[modelId] = dropReason;
 				if (debugEnabled) {
-					filteredByRetirement.push(modelId);
-					filteredModelDetails[modelId] = { ...model, reason: `retired-${targetProvider}` };
-				}
-				continue;
-			}
-			if (model.disabled === true) {
-				if (debugEnabled) {
-					filteredByDisabled.push(modelId);
-					filteredModelDetails[modelId] = { ...model, reason: "disabled" };
-				}
-				continue;
-			}
-			if (model.isInternal === true && !surfacedModelIds.has(modelId)) {
-				if (debugEnabled) {
-					filteredByInternal.push(modelId);
-					filteredModelDetails[modelId] = { ...model, reason: "internal-not-surfaced" };
+					if (dropReason === "denylist") filteredByDenylist.push(modelId);
+					else if (dropReason === "retired") filteredByRetirement.push(modelId);
+					else if (dropReason === "disabled") filteredByDisabled.push(modelId);
+					else filteredByInternal.push(modelId);
+					filteredModelDetails[modelId] = {
+						...model,
+						reason:
+							dropReason === "retired"
+								? `retired-${targetProvider}`
+								: dropReason === "isInternal-not-surfaced"
+									? "internal-not-surfaced"
+									: dropReason,
+					};
 				}
 				continue;
 			}
@@ -316,6 +335,18 @@ export async function fetchAntigravityDiscoveryModels(
 				maxTokens: toPositiveNumber(model.maxOutputTokens, DEFAULT_MAX_TOKENS),
 			});
 		}
+
+		if (Object.keys(modelDropReasons).length > 0) {
+			debugLogger.debug("Antigravity discovery dropped models", {
+				endpoint: redactedEndpoint,
+				dropReasons: modelDropReasons,
+			});
+		}
+
+		debugLogger.debug("Antigravity discovery kept models", {
+			endpoint: redactedEndpoint,
+			keptModelIds: models.map(m => m.id),
+		});
 
 		models.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
 
@@ -424,4 +455,16 @@ function toPositiveNumber(value: unknown, fallback: number): number {
 
 function trimTrailingSlashes(value: string): string {
 	return value.replace(/\/+$/, "");
+}
+
+export function getAntigravityDiscoveryUserAgent(): string {
+	return process.env.PI_AI_ANTIGRAVITY_USER_AGENT ? getAntigravityUserAgent() : getGeminiCliUserAgent();
+}
+
+function redactAntigravityEndpoint(value: string): string {
+	try {
+		return new URL(value).origin;
+	} catch {
+		return "invalid endpoint";
+	}
 }

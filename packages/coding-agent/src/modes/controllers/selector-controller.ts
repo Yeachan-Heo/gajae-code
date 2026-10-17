@@ -2573,7 +2573,9 @@ export class SelectorController {
 		if (issues.length > 0)
 			throw new Error(issues.map(issue => `${issue.path || "setup"}: ${issue.detail}`).join("; "));
 		const setup = structuredClone(draft);
-		const generated = generateTierChains(setup, CURATED_TIER_MAP, [...this.ctx.session.modelRegistry.getAll()]);
+		const generated = generateTierChains(setup, CURATED_TIER_MAP, [
+			...this.ctx.session.modelRegistry.getAll(this.ctx.session.credentialSessionId),
+		]);
 		const provenance: AutoroutingProvenance = {
 			schema: 1,
 			source: structuredClone(generated.sourceIdentity),
