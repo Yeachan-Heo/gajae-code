@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
 import * as tls from "node:tls";
+import { gzipSync } from "node:zlib";
 import Anthropic, { type ClientOptions as AnthropicSdkClientOptions } from "@anthropic-ai/sdk";
 import type {
 	ContentBlockParam,
@@ -1581,6 +1582,97 @@ function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDe
 				statusText: response.statusText,
 				headers,
 			});
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
+}
+
+/**
+ * Compresses request bodies with gzip for first-party Anthropic endpoints.
+ * Preserves uncompressed form in debug logging and all other request properties.
+ */
+function wrapAnthropicFetchForGzip(baseFetch: FetchImpl): FetchImpl {
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			// Only compress requests to first-party Anthropic API
+			const url = new URL(input instanceof Request ? input.url : String(input), "https://api.anthropic.com");
+			const isFirstPartyAnthropicApi =
+				url.protocol.toLowerCase() === "https:" &&
+				url.hostname.toLowerCase() === "api.anthropic.com" &&
+				(url.port === "" || url.port === "443");
+
+			if (!isFirstPartyAnthropicApi || !init?.body) {
+				return baseFetch(input, init);
+			}
+
+			try {
+				// Get uncompressed body as string for logging
+				const uncompressedBody =
+					init.body instanceof ReadableStream
+						? undefined // Can't inspect streams
+						: typeof init.body === "string"
+							? init.body
+							: init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)
+								? new TextDecoder().decode(init.body)
+								: String(init.body);
+
+				// Log uncompressed body for debugging
+				if (uncompressedBody && typeof uncompressedBody === "string") {
+					logger.debug("anthropic: sending gzip-compressed request", {
+						uncompressedBodySize: uncompressedBody.length,
+					});
+				}
+
+				// Compress the body
+				let bodyBuffer: Buffer | undefined;
+				if (typeof init.body === "string") {
+					bodyBuffer = Buffer.from(init.body, "utf-8");
+				} else if (init.body instanceof ArrayBuffer) {
+					bodyBuffer = Buffer.from(init.body);
+				} else if (
+					init.body instanceof Uint8Array ||
+					init.body instanceof Int8Array ||
+					init.body instanceof Uint8ClampedArray ||
+					init.body instanceof Uint16Array ||
+					init.body instanceof Int16Array ||
+					init.body instanceof Uint32Array ||
+					init.body instanceof Int32Array ||
+					init.body instanceof Float32Array ||
+					init.body instanceof Float64Array
+				) {
+					bodyBuffer = Buffer.from(init.body);
+				}
+
+				if (!bodyBuffer) {
+					return baseFetch(input, init);
+				}
+
+				const compressedBody = gzipSync(bodyBuffer);
+
+				// Create modified init with compressed body and updated headers
+				const modifiedInit: RequestInit = {
+					...init,
+					body: compressedBody,
+					headers: new Headers(init.headers ?? {}),
+				};
+
+				// Set Content-Encoding header
+				(modifiedInit.headers as Headers).set("Content-Encoding", "gzip");
+
+				logger.debug("anthropic: gzip compression ratio", {
+					uncompressed: bodyBuffer.length,
+					compressed: compressedBody.length,
+					ratio: (compressedBody.length / bodyBuffer.length).toFixed(2),
+				});
+
+				return baseFetch(input, modifiedInit);
+			} catch (error) {
+				// If compression fails, fall back to uncompressed
+				logger.debug("anthropic: gzip compression failed, falling back to uncompressed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return baseFetch(input, init);
+			}
 		},
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
@@ -3477,8 +3569,9 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
 	const baseFetch = args.fetch ?? fetch;
 	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
+	const gzipFetch = wrapAnthropicFetchForGzip(boundedFetch);
 	const openCodeGoSessionId = resolveOpenCodeGoSessionId(model, baseUrl, args.providerSessionId, "anthropic");
-	const providerScopedFetch = wrapFetchForOpenCodeGoSession(boundedFetch, openCodeGoSessionId);
+	const providerScopedFetch = wrapFetchForOpenCodeGoSession(gzipFetch, openCodeGoSessionId);
 	const debugFetch = onSseEvent
 		? wrapFetchForSseDebug(providerScopedFetch, event => onSseEvent(event, model))
 		: providerScopedFetch;
