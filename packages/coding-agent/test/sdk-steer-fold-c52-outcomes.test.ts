@@ -68,7 +68,10 @@ async function captureSdkControl(
 	if (dispatcher === "runtime-init") {
 		await initializeExtensions(target, { reportSendError: () => {}, reportRuntimeError: () => {} });
 	} else {
-		const controller = new ExtensionUiController({ session: target } as unknown as InteractiveModeContext);
+		const controller = new ExtensionUiController({
+			updateEditorChrome: () => {},
+			session: target,
+		} as unknown as InteractiveModeContext);
 		controller.initializeHookRunner({} as ExtensionUIContext, false);
 	}
 	const sdkControl = captured?.sdkControl;

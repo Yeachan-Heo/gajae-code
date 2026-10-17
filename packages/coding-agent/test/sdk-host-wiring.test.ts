@@ -1693,7 +1693,11 @@ test("interactive extension context advertises typed SDK controls and forwards p
 			contextActions = actions;
 		},
 	};
+	let editorChromeRefreshes = 0;
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {
+			editorChromeRefreshes++;
+		},
 		session: {
 			extensionRunner: runner,
 			setSdkPermissionProvider: (provider: typeof installed) => {
@@ -1730,6 +1734,8 @@ test("interactive extension context advertises typed SDK controls and forwards p
 		}),
 	).toEqual({ provider: "runtime-provider", modelId: "runtime-model", thinkingLevel: "high" });
 	expect(selected).toEqual({ provider: "runtime-provider", id: "runtime-model", thinkingLevel: "high" });
+	// Every SDK control call refreshes the editor chrome once it settles (#6861).
+	expect(editorChromeRefreshes).toBe(2);
 	await expect(
 		contextActions?.sdkControl?.("model.set", {
 			id: "runtime-provider/runtime-model",
@@ -1753,6 +1759,7 @@ test("interactive SDK control routes synthetic gajae-code selections to session-
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: {
 			extensionRunner: runner,
 			modelRegistry: {
@@ -1802,6 +1809,7 @@ test("interactive SDK controls reject Broker-owned session handoff", async () =>
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: { extensionRunner: runner },
 	} as unknown as InteractiveModeContext);
 	controller.initializeHookRunner({} as ExtensionUIContext, false);
