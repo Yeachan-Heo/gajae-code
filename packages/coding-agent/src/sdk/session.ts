@@ -2498,7 +2498,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
-				const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
+				const hasTtsrCondition = (rule.condition?.length ?? 0) > 0 || (rule.astCondition?.length ?? 0) > 0;
+				const isTtsrRule = hasTtsrCondition ? ttsrManager.addRule(rule) : false;
 				if (isTtsrRule) {
 					continue;
 				}

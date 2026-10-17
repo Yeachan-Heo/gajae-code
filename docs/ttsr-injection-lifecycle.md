@@ -24,7 +24,8 @@ const ttsrSettings = settings.getGroup("ttsr");
 const ttsrManager = new TtsrManager(ttsrSettings);
 const rulesResult = await loadCapability<Rule>(ruleCapability.id, { cwd });
 for (const rule of rulesResult.items) {
-  if (rule.condition?.length && ttsrManager.addRule(rule)) continue;
+  const hasTtsrCondition = (rule.condition?.length ?? 0) > 0 || (rule.astCondition?.length ?? 0) > 0;
+  if (hasTtsrCondition && ttsrManager.addRule(rule)) continue;
   // non-TTSR rules continue through normal rule handling
 }
 ```
@@ -37,7 +38,7 @@ for (const rule of rulesResult.items) {
 
 Registration is skipped when:
 
-- `rule.condition` is absent or all condition regexes fail to compile
+- the rule has no `astCondition` and `rule.condition` is absent or all condition regexes fail to compile
 - a rule with the same `rule.name` was already registered in this manager
 - the rule scope excludes all monitored streams
 
@@ -110,7 +111,7 @@ Pending injections are cleared after content generation.
 
 Non-interrupting matches split by `matchContext.source`:
 
-- **`source === "tool"` (tool-source match).** The rule is bucketed into `#perToolTtsrInjections`, keyed by the matched tool call's `id`. There is **no** deferred follow-up turn and the stream is not aborted. When the tool actually produces a result, the `afterToolCall` hook prepends a rendered `ttsr-tool-reminder.md` block to `ctx.result.content` (a single `text` block inserted ahead of the tool's own content), and persists a `ttsr_injection` entry with the consumed rule names. The template payload is:
+- **`source === "tool"` (tool-source match).** The rule is bucketed into `#perToolTtsrInjections`, keyed by the matched tool call's `id`. There is **no** deferred follow-up turn and the stream is not aborted. When the tool actually produces a result, the `afterToolCall` hook prepends a rendered `ttsr-tool-reminder.md` block to `ctx.result.content` (a single `text` block inserted ahead of the tool's own content). The `ttsr_injection` entry with the consumed rule names is persisted only when that decorated result is the one the loop publishes; otherwise the provisional claim is released. The template payload is:
 
   ```xml
   <system-reminder reason="rule_violation" rule="{{name}}" path="{{path}}">
@@ -129,6 +130,16 @@ Within a single matching batch, each rule is attached to exactly one sibling too
 - The reminder is in-band on the tool result, not a separate `custom_message`/`ttsr-injection` entry. Transcript readers looking for non-interrupting TTSR activity on tool-source rules MUST inspect tool results (and the persisted `ttsr_injection` entry list), not just synthetic injection entries.
 - A single tool result may carry reminders for several rules concatenated with a blank line between rendered templates.
 - If the assistant message ends with `stopReason === "aborted"` or `"error"` before the matched tools run, the pending per-tool buckets are cleared — those rules are **not** persisted as injected and remain eligible to re-trigger on a future turn (subject to repeat policy).
+
+### `astCondition` matches
+
+`astCondition` rules are evaluated once arguments are finalized, in `beforeToolCall`, before the tool executes. They are never evaluated on streamed deltas or on the existing file:
+
+1. Look up the live tool and obtain its in-memory source digest. `write.matcherDigest` supplies the full content; `edit.matcherEntries` supplies only added source, separated by file, for replace, patch, hashline, and apply_patch edits. Vim keystrokes cannot provide a static source digest and are not evaluated.
+2. For each entry, `TtsrManager.checkAstSnapshot(digest, context, signal)` uses native `astMatch` with Smart strictness and a match limit of one. The language is the lowercase file extension, which `astMatch` resolves as a language alias or, failing that, through the same extension mapping path-based AST search uses (so `.scss` matches with the CSS grammar). Per-file contexts narrow `filePaths` to the entry path and isolate the snapshot throttle by stream key and path. Rules must pass repeat gating, `scope`, and `globs`; identical consecutive snapshots are skipped until the buffer resets. Unsupported languages and native match errors do not match. Grammars are never downloaded: only the languages compiled into the default native build match (Bash, C, C++, C#, CSS, Go, HTML, Java, JavaScript, JSON, Markdown, PHP, Python, Ruby, Rust, TOML, TypeScript/TSX, YAML); any other language never matches. Cancelled or superseded checks cannot publish reminders or schedule retries.
+3. Non-interrupting matches enter `#perToolTtsrInjections`, emit `ttsr_triggered`, and are folded into the tool result by `afterToolCall` and persisted once that result is published. Interrupting matches use the same abort/inject/retry flow as streamed regex matches. With `interruptMode: "always"`, the hook returns `{ block: true, reason }`, so the call never runs and the file remains unchanged. The aborted call still receives exactly one tool result, and the retry context contains the reminder.
+
+A rule with both `condition` and `astCondition` can trigger through either path; pending and per-tool injections are deduplicated by rule name. AST matching inspects only the proposed added text, so pre-existing matching code does not trigger an unrelated edit.
 
 ## 5. Repeat policy and gap logic
 
@@ -190,7 +201,9 @@ In the current runtime path:
 
 - interrupted injections append a hidden `custom_message` with `customType: "ttsr-injection"` and append a `ttsr_injection` entry via `appendTtsrInjection(...)`
 - deferred non-interrupting prose-source injections are marked/persisted when their queued custom message reaches `message_end`
-- non-interrupting tool-source injections are marked at match time and persisted via `appendTtsrInjection(...)` from the `afterToolCall` hook when the matched tool's result is produced
+- non-interrupting tool-source injections are claimed provisionally at match time (the rule's previous injection record is kept), folded into the matched call's result by the `afterToolCall` hook, and persisted via `appendTtsrInjection(...)` only when the loop publishes that reminder-bearing `toolResult` (settled synchronously on its `message_end`, before spill or other async handling)
+- a provisional claim whose reminder is never delivered is released and the previous record restored: the call was aborted, skipped by steering, or replaced by an aborted/skipped result after folding, or its turn ended without publishing it. A TTSR interrupt retry instead carries such reminders into its injection
+- a deferred prose reminder holds its rule names while follow-up admission is in flight and, once admitted, through the queued message itself; dropping the queued message (abort, `clearQueue`) leaves the rule eligible
 - `createAgentSession()` restores `existingSession.injectedTtsrRules` into `ttsrManager`
 
 Net effect: injected-rule suppression is persisted/restored across session reload/resume for the current branch path.

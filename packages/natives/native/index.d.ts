@@ -794,6 +794,59 @@ export interface AstFindResult {
  */
 export declare function astGrep(options: AstFindOptions): Promise<AstFindResult>
 
+/**
+ * Match ast-grep patterns against an in-memory source string; returns a
+ * promise resolved on a worker thread.
+ *
+ * This is the file-free counterpart to [`ast_grep`]: callers that already hold
+ * the source (streaming buffers, generated code, editor contents) avoid a
+ * temp-file round trip. `lang` is required since there is no path to infer it
+ * from.
+ */
+export declare function astMatch(options: AstMatchOptions): Promise<AstMatchResult>
+
+/**
+ * Options for `astMatch`: run ast-grep patterns against an in-memory source
+ * string instead of files on disk.
+ */
+export interface AstMatchOptions {
+  /** Source code to match against (parsed in memory, never read from disk). */
+  source: string
+  /**
+   * Language of `source` (required): an alias ("ts", "rust", "python") or a
+   * file extension ("scss"), resolved like a path's extension.
+   */
+  lang: string
+  /** ast-grep patterns to search for (OR across patterns). */
+  patterns: Array<string>
+  /** Rule selector for multi-rule ast-grep configurations. */
+  selector?: string
+  /** Pattern strictness; defaults to smart matching when omitted. */
+  strictness?: AstMatchStrictness
+  /** Maximum matches to return after `offset` (default applies when omitted). */
+  limit?: number
+  /** Number of leading matches to skip before applying `limit`. */
+  offset?: number
+  /** When true, include meta-variable bindings per match. */
+  includeMeta?: boolean
+  /** Optional cancellation handle (library-specific). */
+  signal?: unknown
+  /** Wall-clock timeout for the worker task in milliseconds. */
+  timeoutMs?: number
+}
+
+/** Result of an in-memory `astMatch` run. */
+export interface AstMatchResult {
+  /** Page of matches after sort, offset, and limit. */
+  matches: Array<AstFindMatch>
+  /** Total matches found before paging (can exceed `matches.length`). */
+  totalMatches: number
+  /** True when results were truncated by `limit`. */
+  limitReached: boolean
+  /** Non-fatal parse or pattern-compile errors collected during the run. */
+  parseErrors?: Array<string>
+}
+
 /** ast-grep pattern strictness (controls how patterns match syntax). */
 export declare enum AstMatchStrictness {
   /** Match at the concrete syntax tree level. */

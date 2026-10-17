@@ -5695,6 +5695,12 @@ async function executeToolCalls(
 					if (beforeResult?.block) {
 						throw new ToolCallBlockedError(beforeResult.reason);
 					}
+					// The hook may await (e.g. native TTSR matching). A run cancelled or a
+					// record skipped meanwhile already owes only its aborted/skipped result;
+					// it must not start, since non-abortable tools would still mutate state.
+					if (toolSignal?.aborted || record.skipped || interruptState.triggered) {
+						throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
+					}
 				}
 				// Reflect post-hook args so emitted tool results / afterToolCall see what actually executed.
 				record.args = effectiveArgs;

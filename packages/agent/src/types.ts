@@ -767,6 +767,27 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * - function: `_i` is NOT injected; intent is derived dynamically from (potentially partial / streaming) args.
 	 */
 	intent?: "omit" | "optional" | "require" | ((args: Partial<Static<TParameters>>) => string | undefined);
+
+	/**
+	 * Normalize (potentially partial) streamed arguments into the plain text that
+	 * stream-content matchers (e.g. TTSR rules) should inspect — the real content
+	 * the call introduces, without wire grammar such as patch prefixes or JSON
+	 * string escaping. Return `undefined` to fall back to raw argument-delta
+	 * matching.
+	 */
+	matcherDigest?: (args: unknown) => string | undefined;
+
+	/**
+	 * Per-file projection of a (potentially partial) streamed call, pairing each
+	 * touched file path with the digest of only the lines added to that file.
+	 * Path-scoped stream matchers (TTSR) evaluate each entry in isolation, so a
+	 * scoped rule like `tool:edit(*.ts)` never fires on text that actually
+	 * belongs to a sibling Markdown hunk in a multi-file payload. Takes
+	 * precedence over {@link matcherDigest} when present;
+	 * returns `undefined` (or empty) to fall back to the combined hook.
+	 */
+	matcherEntries?: (args: unknown) => readonly { path: string; digest: string }[] | undefined;
+
 	/**
 	 * Argument fields (dotted paths into the arguments object) that render to
 	 * the user as pure display text — question wording and option labels, never

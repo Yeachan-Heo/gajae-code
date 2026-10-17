@@ -151,10 +151,14 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		return this.#loadPromise;
 	}
 
-	/** Materialize this facade for contract tests without exposing it in production dispatch. */
-	async materializeForTests(): Promise<AgentTool<any, any, any>> {
-		return await this.#get();
-	}
+	/**
+	 * Resolve the underlying implementation. Pre-dispatch hooks (TTSR `astCondition`
+	 * matching) call this to read implementation-only members such as the matcher
+	 * hooks before the first `execute` would otherwise load the tool.
+	 * An arrow property (like `execute`) so session guard proxies can forward it
+	 * without losing access to the private loader state.
+	 */
+	readonly materialize = async (): Promise<AgentTool<any, any, any>> => await this.#get();
 
 	get name(): string {
 		return this.#tool?.name ?? this.descriptor.metadata.name;
@@ -246,6 +250,14 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 	}
 	get mode() {
 		return (this.#tool as any)?.mode;
+	}
+	get matcherDigest() {
+		const digest = this.#tool?.matcherDigest;
+		return digest ? digest.bind(this.#tool) : undefined;
+	}
+	get matcherEntries() {
+		const entries = this.#tool?.matcherEntries;
+		return entries ? entries.bind(this.#tool) : undefined;
 	}
 
 	readonly execute: AgentTool<any, any, any>["execute"] = async (...args) => {
