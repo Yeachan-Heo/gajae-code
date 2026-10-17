@@ -54,6 +54,8 @@ describe("resolveSources", () => {
 describe("runMigrate", () => {
 	test("--dry-run writes nothing", async () => {
 		await fs.writeFile(path.join(cwd, "CLAUDE.md"), "Project instructions.", "utf-8");
+		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "review.md"), "Review the patch.", "utf-8");
 		const report = await runMigrate({
 			from: ["claude-code"],
 			project: true,
@@ -68,10 +70,15 @@ describe("runMigrate", () => {
 		expect(report.actions).toContainEqual(
 			expect.objectContaining({ type: "instruction", name: "CLAUDE.md", status: "imported" }),
 		);
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "command", name: "review", status: "imported" }),
+		);
+		expect(renderHuman(report)).toContain("[claude-code] /review: imported");
 		expect(renderHuman(report)).toContain("[claude-code] CLAUDE.md: imported");
 		expect(await exists(path.join(cwd, ".gjc", "mcp.json"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "skills"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "AGENTS.md"))).toBe(false);
+		expect(await exists(path.join(cwd, ".gjc", "commands", "review.md"))).toBe(false);
 	});
 
 	test("--json report carries taxonomy counts by total/type/source", async () => {
@@ -87,12 +94,15 @@ describe("runMigrate", () => {
 		expect(report.summary.total).toHaveProperty("imported");
 		expect(report.summary.byType).toHaveProperty("mcp");
 		expect(report.summary.byType).toHaveProperty("skill");
+		expect(report.summary.byType).toHaveProperty("command");
 		expect(report.summary.byType).toHaveProperty("instruction");
 		expect(report.summary.bySource).toHaveProperty("claude-code");
 	});
 
 	test("--project writes under cwd/.gjc", async () => {
 		await fs.writeFile(path.join(cwd, "CLAUDE.md"), "Project instructions.", "utf-8");
+		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "ship.md"), "Ship the project.", "utf-8");
 		await runMigrate({
 			from: ["claude-code"],
 			project: true,
@@ -105,11 +115,13 @@ describe("runMigrate", () => {
 		expect(await exists(path.join(cwd, ".gjc", "mcp.json"))).toBe(true);
 		expect(await exists(path.join(cwd, ".gjc", "skills", "alpha", "SKILL.md"))).toBe(true);
 		expect(await fs.readFile(path.join(cwd, ".gjc", "AGENTS.md"), "utf-8")).toBe("Project instructions.");
+		expect(await fs.readFile(path.join(cwd, ".gjc", "commands", "ship.md"), "utf-8")).toBe("Ship the project.");
 	});
 
 	test("user scope writes under the agent dir", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-agent-"));
 		await write(".claude/CLAUDE.md", "User instructions.");
+		await write(".claude/commands/summarize.md", "Summarize $ARGUMENTS.");
 		setAgentDir(agentDir);
 		try {
 			await runMigrate({
@@ -124,6 +136,9 @@ describe("runMigrate", () => {
 			expect(await exists(path.join(agentDir, "mcp.json"))).toBe(true);
 			expect(await exists(path.join(agentDir, "skills", "alpha", "SKILL.md"))).toBe(true);
 			expect(await fs.readFile(path.join(agentDir, "AGENTS.md"), "utf-8")).toBe("User instructions.");
+			expect(await fs.readFile(path.join(agentDir, "commands", "summarize.md"), "utf-8")).toBe(
+				"Summarize $ARGUMENTS.",
+			);
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}

@@ -1,7 +1,7 @@
 /**
  * Shared types for `gjc migrate`.
  *
- * Imports MCP servers, skills, and instruction files from other coding agents
+ * Imports MCP servers, skills, slash commands, and instruction files from other coding agents
  * (Claude Code, Codex, OpenCode) into native GJC config. See the consensus plan under
  * `.gjc/plans/ralplan/` for the full taxonomy and force/collision semantics.
  */
@@ -16,7 +16,7 @@ export const MIGRATE_SOURCES: readonly MigrateSource[] = ["claude-code", "codex"
 export const CANONICAL_SOURCE_ORDER: readonly MigrateSource[] = MIGRATE_SOURCES;
 
 /** What kind of thing an action/coverage row is about. */
-export type MigrateItemType = "mcp" | "skill" | "instruction" | "source";
+export type MigrateItemType = "mcp" | "skill" | "command" | "instruction" | "source";
 
 /**
  * Per-item outcome taxonomy.
@@ -84,6 +84,14 @@ export interface InstructionCandidate {
 	content: string;
 }
 
+/** A Markdown slash command collected from a foreign coding-agent setup. */
+export interface SlashCommandCandidate {
+	source: MigrateSource;
+	/** Name without the leading slash; nested path components use `:`. */
+	name: string;
+	content: string;
+}
+
 /**
  * Source-level diagnostic for a single source/type pair (e.g. "codex mcp config
  * was malformed"). Distinct from per-item actions so absent/unreadable sources
@@ -100,6 +108,7 @@ export interface SourceDiagnostic {
 export interface AdapterResult {
 	mcpCandidates: McpCandidate[];
 	skillCandidates: SkillCandidate[];
+	slashCommandCandidates: SlashCommandCandidate[];
 	instructionCandidates: InstructionCandidate[];
 	diagnostics: SourceDiagnostic[];
 }
@@ -120,6 +129,7 @@ export interface MigrateAction {
 	/** Resolved payload the executor needs; never serialized to the report. */
 	mcp?: { config: MCPServerConfig; force: boolean };
 	skill?: { content: string };
+	command?: { content: string };
 	instruction?: { content: string };
 }
 
@@ -135,6 +145,7 @@ export type StatusCounts = Record<MigrationStatus, number>;
 export interface MigrateDestinations {
 	mcpConfigPath: string;
 	skillsDir: string;
+	commandsDir: string;
 	instructionsPath: string;
 }
 
@@ -148,7 +159,13 @@ export interface MigrateReport {
 	destinations: MigrateDestinations;
 	summary: {
 		total: StatusCounts;
-		byType: { mcp: StatusCounts; skill: StatusCounts; instruction: StatusCounts; source: StatusCounts };
+		byType: {
+			mcp: StatusCounts;
+			skill: StatusCounts;
+			command: StatusCounts;
+			instruction: StatusCounts;
+			source: StatusCounts;
+		};
 		bySource: Record<MigrateSource, StatusCounts>;
 	};
 	actions: Array<{

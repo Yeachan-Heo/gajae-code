@@ -399,10 +399,11 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 		const commandsDir = path.join(dir, "commands");
 		const result = await loadFilesFromDir<SlashCommand>(ctx, commandsDir, PROVIDER_ID, level, {
 			extensions: ["md"],
+			recursive: true,
 			scope: readScopeForLevel(level),
-			transform: (name, content, path, source) => ({
-				name: name.replace(/\.md$/, ""),
-				path,
+			transform: (_name, content, filePath, source) => ({
+				name: path.relative(commandsDir, filePath).replace(/\.md$/, "").split(path.sep).join(":"),
+				path: filePath,
 				content,
 				level,
 				_source: source,

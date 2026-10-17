@@ -1,7 +1,7 @@
 /**
  * Source adapters for `gjc migrate`.
  *
- * Each adapter returns normalized home-scoped MCP/skill candidates, selected-scope
+ * Each adapter returns normalized MCP/skill/command candidates, selected-scope
  * instruction candidates, and source-level diagnostics. Adapters never connect to
  * anything.
  */
@@ -9,7 +9,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import { normalizeSkill } from "../skill-normalizer";
-import type { AdapterResult, InstructionCandidate, MigrateSource, SkillCandidate, SourceDiagnostic } from "../types";
+import type {
+	AdapterResult,
+	InstructionCandidate,
+	MigrateSource,
+	SkillCandidate,
+	SlashCommandCandidate,
+	SourceDiagnostic,
+} from "../types";
 import { claudeCodeAdapter } from "./claude-code";
 import { codexAdapter } from "./codex";
 import { opencodeAdapter } from "./opencode";
@@ -17,9 +24,9 @@ import { opencodeAdapter } from "./opencode";
 export interface AdapterOptions {
 	/** Home directory root; overridable for tests. */
 	homeDir: string;
-	/** Source scope for instructions; other source files remain home-scoped. */
+	/** Source scope for instructions and Claude Code commands. */
 	scope: "project" | "user";
-	/** Project root used when importing project instructions. */
+	/** Project root used when importing project instructions and commands. */
 	cwd: string;
 }
 
@@ -211,6 +218,73 @@ export async function collectMarkdownPrompts(
 			});
 		}
 	}
+	return { candidates, diagnostics };
+}
+
+/**
+ * Collect Markdown slash commands. Nested command directories are represented
+ * with colon-separated names, matching Claude Code's `/group:command` syntax.
+ */
+export async function collectMarkdownCommands(
+	dir: string,
+	source: MigrateSource,
+	options: { recursive?: boolean } = {},
+): Promise<{ candidates: SlashCommandCandidate[]; diagnostics: SourceDiagnostic[] }> {
+	const candidates: SlashCommandCandidate[] = [];
+	const diagnostics: SourceDiagnostic[] = [];
+	const validNameSegment = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+	async function walk(currentDir: string, parentSegments: string[], root = false): Promise<void> {
+		const entries = await fs.readdir(currentDir, { withFileTypes: true }).catch((error: unknown) => {
+			if (root && isEnoent(error)) {
+				diagnostics.push({
+					source,
+					type: "command",
+					status: "skipped_absent_source",
+					message: `no commands dir at ${dir}`,
+				});
+			} else if (!isEnoent(error)) {
+				diagnostics.push({
+					source,
+					type: "command",
+					status: "failed_io",
+					message: `failed to read ${currentDir}: ${(error as Error).message}`,
+				});
+			}
+			return undefined;
+		});
+		if (!entries) return;
+
+		for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+			if (entry.name.startsWith(".")) continue;
+			const entryPath = path.join(currentDir, entry.name);
+			if (entry.isDirectory()) {
+				if (options.recursive) await walk(entryPath, [...parentSegments, entry.name]);
+				continue;
+			}
+			if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+
+			const nameParts = [...parentSegments, entry.name.slice(0, -3)];
+			if (!nameParts.every(part => validNameSegment.test(part))) {
+				diagnostics.push({
+					source,
+					type: "command",
+					status: "failed_invalid_source",
+					message: `unsupported slash-command path ${path.relative(dir, entryPath)}; names must use letters, numbers, dots, underscores, or hyphens`,
+				});
+				continue;
+			}
+
+			const read = await readSourceText(entryPath, source, "command");
+			if ("diagnostic" in read) {
+				diagnostics.push(read.diagnostic);
+				continue;
+			}
+			candidates.push({ source, name: nameParts.join(":"), content: read.text });
+		}
+	}
+
+	await walk(dir, [], true);
 	return { candidates, diagnostics };
 }
 

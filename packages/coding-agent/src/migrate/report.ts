@@ -30,6 +30,7 @@ export function buildReport(input: BuildReportInput): MigrateReport {
 	const byType = {
 		mcp: emptyStatusCounts(),
 		skill: emptyStatusCounts(),
+		command: emptyStatusCounts(),
 		instruction: emptyStatusCounts(),
 		source: emptyStatusCounts(),
 	};
@@ -81,12 +82,22 @@ export function renderHuman(report: MigrateReport): string {
 	lines.push(`gjc migrate${mode}: ${report.ok ? "ok" : "completed with failures"}`);
 	lines.push(`Sources: ${report.sources.join(", ") || "none"}`);
 	lines.push(
-		`Destination: mcp=${report.destinations.mcpConfigPath} skills=${report.destinations.skillsDir} instructions=${report.destinations.instructionsPath}`,
+		`Destination: mcp=${report.destinations.mcpConfigPath} skills=${report.destinations.skillsDir} commands=${report.destinations.commandsDir} instructions=${report.destinations.instructionsPath}`,
 	);
 	lines.push("");
 	lines.push(`MCP:    ${summarizeCounts(report.summary.byType.mcp)}`);
 	lines.push(`Skills: ${summarizeCounts(report.summary.byType.skill)}`);
+	lines.push(`Commands: ${summarizeCounts(report.summary.byType.command)}`);
 	lines.push(`Instructions: ${summarizeCounts(report.summary.byType.instruction)}`);
+	const commandActions = report.actions.filter(action => action.type === "command");
+	if (commandActions.length > 0) {
+		lines.push("Slash commands:");
+		for (const action of commandActions) {
+			lines.push(
+				`  - [${action.source}] /${action.name ?? ""}: ${action.status}${action.reason ? ` (${action.reason})` : ""}`,
+			);
+		}
+	}
 	const instructionActions = report.actions.filter(action => action.type === "instruction");
 	if (instructionActions.length > 0) {
 		lines.push("Instruction files:");

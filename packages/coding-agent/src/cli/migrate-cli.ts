@@ -1,5 +1,5 @@
 /**
- * `gjc migrate` — import MCP servers, skills, and instruction files from other coding agents.
+ * `gjc migrate` — import MCP servers, skills, slash commands, and instruction files from other coding agents.
  */
 import * as os from "node:os";
 import * as path from "node:path";
@@ -55,8 +55,9 @@ function resolveDestinations(project: boolean, cwd: string): MigrateDestinations
 	const scope = project ? "project" : "user";
 	const agentDir = project ? getProjectAgentDir(cwd) : getAgentDir();
 	const skillsDir = path.join(agentDir, "skills");
+	const commandsDir = path.join(agentDir, "commands");
 	const instructionsPath = path.join(agentDir, "AGENTS.md");
-	return { mcpConfigPath: getMCPConfigPath(scope, cwd), skillsDir, instructionsPath };
+	return { mcpConfigPath: getMCPConfigPath(scope, cwd), skillsDir, commandsDir, instructionsPath };
 }
 
 /** Run the migration and return the report (does not set process.exitCode). */

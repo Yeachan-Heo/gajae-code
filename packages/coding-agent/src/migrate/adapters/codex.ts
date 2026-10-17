@@ -1,5 +1,5 @@
 /**
- * Codex adapter: reads `~/.codex/config.toml` ([mcp_servers]), `~/.codex/prompts`,
+ * Codex adapter: reads `~/.codex/config.toml` ([mcp_servers]), user prompts,
  * and user-level `~/.codex/AGENTS.md` instructions. Project AGENTS.md is native GJC input.
  */
 
@@ -10,7 +10,7 @@ import {
 	type Adapter,
 	type AdapterOptions,
 	collectInstructionFile,
-	collectMarkdownPrompts,
+	collectMarkdownCommands,
 	readSourceText,
 } from "./index";
 
@@ -51,6 +51,7 @@ export const codexAdapter: Adapter = {
 		const result: AdapterResult = {
 			mcpCandidates: [],
 			skillCandidates: [],
+			slashCommandCandidates: [],
 			instructionCandidates: [],
 			diagnostics: [],
 		};
@@ -73,8 +74,10 @@ export const codexAdapter: Adapter = {
 			}
 		}
 
-		const prompts = await collectMarkdownPrompts(path.join(homeDir, ".codex", "prompts"), SOURCE);
-		result.skillCandidates.push(...prompts.candidates);
+		const prompts = await collectMarkdownCommands(path.join(homeDir, ".codex", "prompts"), SOURCE);
+		result.slashCommandCandidates.push(
+			...prompts.candidates.map(candidate => ({ ...candidate, name: `prompts:${candidate.name}` })),
+		);
 		result.diagnostics.push(...prompts.diagnostics);
 
 		if (scope === "user") {

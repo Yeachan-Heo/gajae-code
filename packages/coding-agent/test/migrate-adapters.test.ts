@@ -30,6 +30,7 @@ describe("claude-code adapter", () => {
 		const result = await getAdapter("claude-code").collect(adapterOptions());
 		expect(result.mcpCandidates).toHaveLength(0);
 		expect(result.skillCandidates).toHaveLength(0);
+		expect(result.slashCommandCandidates).toHaveLength(0);
 		expect(result.instructionCandidates).toHaveLength(0);
 		expect(result.diagnostics.every(d => d.status === "skipped_absent_source")).toBe(true);
 	});
@@ -37,12 +38,29 @@ describe("claude-code adapter", () => {
 	test("reads mcpServers and skills", async () => {
 		await writeFile(".claude.json", JSON.stringify({ mcpServers: { srv: { command: "bin" } } }));
 		await writeFile(".claude/skills/My Skill/SKILL.md", "---\nname: My Skill\ndescription: does things\n---\nBody");
+		await writeFile(".claude/commands/review.md", "---\ndescription: Review code.\n---\nReview $ARGUMENTS.");
+		await writeFile(
+			".claude/commands/security/audit.md",
+			"---\ndescription: Audit security.\n---\nAudit $ARGUMENTS.",
+		);
 		await writeFile(".claude/CLAUDE.md", "User-level Claude instructions.");
 		const result = await getAdapter("claude-code").collect(adapterOptions());
 		expect(result.mcpCandidates).toEqual([{ source: "claude-code", name: "srv", raw: { command: "bin" } }]);
 		expect(result.skillCandidates).toHaveLength(1);
 		expect(result.skillCandidates[0].slug).toBe("my-skill");
 		expect(result.skillCandidates[0].content).toContain("description: does things");
+		expect(result.slashCommandCandidates).toEqual([
+			{
+				source: "claude-code",
+				name: "review",
+				content: "---\ndescription: Review code.\n---\nReview $ARGUMENTS.",
+			},
+			{
+				source: "claude-code",
+				name: "security:audit",
+				content: "---\ndescription: Audit security.\n---\nAudit $ARGUMENTS.",
+			},
+		]);
 		expect(result.instructionCandidates).toEqual([
 			{ source: "claude-code", name: "CLAUDE.md", content: "User-level Claude instructions." },
 		]);
@@ -52,10 +70,16 @@ describe("claude-code adapter", () => {
 
 	test("project scope reads the project CLAUDE.md instead of the user file", async () => {
 		await writeFile(".claude/CLAUDE.md", "User instructions.");
+		await writeFile(".claude/commands/user-only.md", "User command.");
 		await fs.writeFile(path.join(cwd, "CLAUDE.md"), "Project instructions.", "utf-8");
+		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".claude", "commands", "ship.md"), "Project command.", "utf-8");
 		const result = await getAdapter("claude-code").collect(adapterOptions("project"));
 		expect(result.instructionCandidates).toEqual([
 			{ source: "claude-code", name: "CLAUDE.md", content: "Project instructions." },
+		]);
+		expect(result.slashCommandCandidates).toEqual([
+			{ source: "claude-code", name: "ship", content: "Project command." },
 		]);
 	});
 
@@ -67,20 +91,25 @@ describe("claude-code adapter", () => {
 });
 
 describe("codex adapter", () => {
-	test("reads TOML mcp_servers and prompt skills", async () => {
+	test("reads TOML mcp_servers and converts Markdown prompts to slash commands", async () => {
 		await writeFile(".codex/config.toml", '[mcp_servers.srv]\ncommand = "bin"\nargs = ["--x"]\n');
-		await writeFile(".codex/prompts/review.md", "Review the code carefully.");
+		await writeFile(".codex/prompts/review.md", "---\ndescription: Review code.\n---\nReview $ARGUMENTS.");
+		await writeFile(".codex/prompts/help.md", "---\ndescription: Codex help prompt.\n---\nHelp $ARGUMENTS.");
 		await writeFile(".codex/AGENTS.md", "User-level Codex instructions.");
 		const result = await getAdapter("codex").collect(adapterOptions());
 		expect(result.mcpCandidates).toHaveLength(1);
 		expect(result.mcpCandidates[0]).toMatchObject({ source: "codex", name: "srv" });
-		expect(result.skillCandidates).toHaveLength(1);
-		expect(result.skillCandidates[0].slug).toBe("review");
+		expect(result.skillCandidates).toHaveLength(0);
+		expect(result.slashCommandCandidates.map(candidate => candidate.name).sort()).toEqual([
+			"prompts:help",
+			"prompts:review",
+		]);
+		expect(result.slashCommandCandidates.find(candidate => candidate.name === "prompts:review")?.content).toBe(
+			"---\ndescription: Review code.\n---\nReview $ARGUMENTS.",
+		);
 		expect(result.instructionCandidates).toEqual([
 			{ source: "codex", name: "AGENTS.md", content: "User-level Codex instructions." },
 		]);
-		// Description synthesized from the body.
-		expect(result.skillCandidates[0].content).toContain("description:");
 	});
 
 	test("project scope leaves AGENTS.md native to GJC and does not import the user file", async () => {

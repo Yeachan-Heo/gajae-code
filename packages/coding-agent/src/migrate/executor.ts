@@ -76,7 +76,11 @@ async function writeSkillFileNoFollow(destination: string, content: string): Pro
 	}
 }
 
-async function ensureInstructionDirectory(directory: string, project: boolean): Promise<void> {
+async function ensureInstructionDirectory(
+	directory: string,
+	project: boolean,
+	label = "instruction destination",
+): Promise<void> {
 	let trustedBase = path.dirname(directory);
 	if (!project) {
 		const home = path.resolve(getTrustedHomeDir());
@@ -92,7 +96,7 @@ async function ensureInstructionDirectory(directory: string, project: boolean): 
 				try {
 					const stat = await fs.lstat(current);
 					if (!stat.isDirectory() || stat.isSymbolicLink()) {
-						throw new Error(`user instruction destination ancestor is not a real directory: ${current}`);
+						throw new Error(`user ${label} ancestor is not a real directory: ${current}`);
 					}
 					trustedBase = current;
 					break;
@@ -105,7 +109,7 @@ async function ensureInstructionDirectory(directory: string, project: boolean): 
 			}
 		}
 	}
-	await ensureRealDirectoryPathNoFollow(directory, trustedBase, "instruction destination", true, 0o700);
+	await ensureRealDirectoryPathNoFollow(directory, trustedBase, label, true, 0o700);
 }
 
 async function writeInstructionFileNoFollow(destination: string, content: string, project: boolean): Promise<void> {
@@ -113,6 +117,54 @@ async function writeInstructionFileNoFollow(destination: string, content: string
 	const handle = await fs.open(
 		destination,
 		fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_NOFOLLOW,
+		0o666,
+	);
+	try {
+		await handle.writeFile(content, "utf-8");
+	} finally {
+		await handle.close();
+	}
+}
+
+async function writeCommandFileNoFollow(
+	destination: string,
+	content: string,
+	name: string,
+	project: boolean,
+	createOnly: boolean,
+): Promise<void> {
+	const destinationDirectory = path.dirname(destination);
+	if (project) {
+		const nameParts = name.split(":");
+		let commandsRoot = destinationDirectory;
+		for (let index = 1; index < nameParts.length; index++) commandsRoot = path.dirname(commandsRoot);
+		const agentRoot = path.dirname(commandsRoot);
+		await ensureRealDirectoryPathNoFollow(
+			agentRoot,
+			path.dirname(agentRoot),
+			"slash command destination",
+			true,
+			0o700,
+		);
+		await ensureRealDirectoryPathNoFollow(commandsRoot, agentRoot, "slash command destination", true, 0o700);
+		await ensureRealDirectoryPathNoFollow(
+			destinationDirectory,
+			commandsRoot,
+			"slash command destination",
+			true,
+			0o700,
+		);
+	} else {
+		await ensureInstructionDirectory(destinationDirectory, false, "slash command destination");
+	}
+
+	const handle = await fs.open(
+		destination,
+		fsSync.constants.O_WRONLY |
+			fsSync.constants.O_CREAT |
+			fsSync.constants.O_TRUNC |
+			fsSync.constants.O_NOFOLLOW |
+			(createOnly ? fsSync.constants.O_EXCL : 0),
 		0o666,
 	);
 	try {
@@ -159,10 +211,32 @@ export async function executeActions(
 					options?.project ?? false,
 				);
 				out.push(action);
+			} else if (action.type === "command" && action.command && action.destination && action.name) {
+				await writeCommandFileNoFollow(
+					action.destination,
+					action.command.content,
+					action.name,
+					options?.project ?? false,
+					action.operation === "create",
+				);
+				out.push(action);
 			} else {
 				out.push(action);
 			}
 		} catch (error) {
+			if (
+				action.type === "command" &&
+				action.operation === "create" &&
+				(error as NodeJS.ErrnoException).code === "EEXIST"
+			) {
+				out.push({
+					...action,
+					operation: "skip",
+					status: "skipped_exists",
+					reason: "destination appeared after planning; refusing to overwrite it",
+				});
+				continue;
+			}
 			out.push({
 				...action,
 				operation: "fail",
