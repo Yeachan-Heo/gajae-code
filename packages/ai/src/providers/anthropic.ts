@@ -2290,6 +2290,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				}
 				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
+					if (options?.thinkingEnabled === false && requiresAnthropicThinkingDisableWhenOff(model.id)) {
+						nextParams.thinking = { type: "disabled" };
+					}
 				}
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);

@@ -60,6 +60,7 @@ function abortedSignal(): AbortSignal {
 }
 
 interface ThinkingPayload {
+	inferenceConfig?: { maxTokens?: number };
 	additionalModelRequestFields?: {
 		thinking?: { type?: string; display?: string; budget_tokens?: number };
 		output_config?: { effort?: string };
@@ -181,5 +182,16 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 		});
 
 		expect(payload.additionalModelRequestFields).toEqual({ thinking: { type: "disabled" } });
+	});
+
+	it("preserves the requested output cap when budget-mode Bedrock reasoning is disabled", async () => {
+		const payload = await captureSimpleBedrockPayload(budgetModel("us.anthropic.claude-haiku-4-5-20251001-v1:0"), {
+			reasoning: Effort.High,
+			disableReasoning: true,
+			maxTokens: 1024,
+		});
+
+		expect(payload.inferenceConfig?.maxTokens).toBe(1024);
+		expect(payload.additionalModelRequestFields).toBeUndefined();
 	});
 });
