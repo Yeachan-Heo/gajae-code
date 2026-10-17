@@ -40,17 +40,23 @@ function stripInlineShellComment(value: string): string {
 }
 
 /**
- * Strips an unquoted trailing `# comment` from a dotenv value the way Bun's
- * dotenv loader does: an unescaped `#` starts a comment regardless of the
- * preceding character (`a#b` loads as `a`), while `#` inside quotes or after a
- * backslash escape survives. Used only by `parseEnvFile`; shell files use
+ * Strips an unquoted trailing `# comment` the way Bun's dotenv loader does.
+ * Outside quotes, `#` starts a comment even after a backslash (`a\#b` loads
+ * as `a\`). A backslash before a quote does not open a quoted span
+ * (`a\"b#c` loads as `a\"b`). Inside quotes, a backslash skips the next byte,
+ * so `#` and the closer stay in the value. Shell files use
  * `stripInlineShellComment`, whose POSIX rule requires whitespace before `#`.
  */
 function stripInlineDotenvComment(value: string): string {
 	let quote: '"' | "'" | undefined;
 	for (let i = 0; i < value.length; i++) {
 		const char = value[i];
-		if (char === "\\") {
+		const next = value[i + 1];
+		if (!quote && char === "\\" && (next === '"' || next === "'")) {
+			i++;
+			continue;
+		}
+		if (quote && char === "\\") {
 			i++;
 			continue;
 		}
@@ -111,8 +117,9 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * `filterCredentialInheritedEnv`) decide provenance by comparing
  * `process.env` against this parse, so the accepted syntax must be a superset
  * of what Bun's own dotenv loader honors in `cwd/.env`: `export KEY=value`,
- * whitespace around `=` or `:`, and `#` comments after unquoted values (quotes keep
- * their `#`). Values that Bun would expand (`$VAR`, `${VAR}`, backticks,
+ * whitespace around `=` or `:`, and `#` comments after unquoted values, including
+ * a backslash before `#` (quotes keep their `#`). Values that Bun would expand
+ * (`$VAR`, `${VAR}`, backticks,
  * command substitution) are kept as their literal text: the trust rule only
  * needs the parser to see the key at all, and an operator environment value
  * cannot equal attacker-written expansion text, so a literal parse stays
@@ -189,9 +196,10 @@ export function canonicalEnvKey(name: string): string {
  * Keys whose last declaration is not safe to value-compare.
  *
  * The line parser drops the suffix after the first unescaped closing quote,
- * matching Bun, and strips an unquoted `#` comment. Classification refuses a
- * value that parser would not store the way Bun loaded it. Other backslashes
- * stay in the compared text. The bytes inside the quotes are not decoded.
+ * matching Bun, and strips an unquoted `#` comment even when a backslash
+ * precedes the hash. Classification refuses a value that parser would not
+ * store the way Bun loaded it. Other backslashes stay in the compared text.
+ * The bytes inside the quotes are not decoded.
  */
 function quotedDeclarationKeys(content: string): Set<string> {
 	const quoted = new Set<string>();

@@ -5,6 +5,7 @@ import { prompt } from "@gajae-code/utils";
 import analysisSystemPrompt from "../../commit/prompts/analysis-system.md" with { type: "text" };
 import analysisUserPrompt from "../../commit/prompts/analysis-user.md" with { type: "text" };
 import type { ConventionalAnalysis } from "../../commit/types";
+import { escapePromptMetadata } from "../../session/messages";
 import { toReasoningEffort } from "../../thinking";
 import { createConventionalAnalysisTool, parseConventionalAnalysisResponse } from "../shared-llm";
 
@@ -41,7 +42,13 @@ export async function generateConventionalAnalysis({
 	diff,
 }: ConventionalAnalysisInput): Promise<ConventionalAnalysis> {
 	const userContent = prompt.render(analysisUserPrompt, {
-		context_files: contextFiles && contextFiles.length > 0 ? contextFiles : undefined,
+		context_files:
+			contextFiles && contextFiles.length > 0
+				? contextFiles.map(file => ({
+						path: escapePromptMetadata(file.path),
+						content: escapePromptMetadata(file.content, { preserveNewlines: true }),
+					}))
+				: undefined,
 		user_context: userContext,
 		types_description: typesDescription,
 		recent_commits: recentCommits?.join("\n"),

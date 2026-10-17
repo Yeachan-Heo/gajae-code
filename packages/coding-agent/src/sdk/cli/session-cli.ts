@@ -279,6 +279,8 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 	let diagnostic: PublicCommandDiagnosticCode | undefined;
 	if (outcome.error.code === "idempotency_conflict") {
 		diagnostic = "lifecycle_idempotency_conflict";
+	} else if (outcome.error.code === "legacy_lifecycle_ambiguous") {
+		diagnostic = "lifecycle_legacy_history_ambiguous";
 	} else if (LIFECYCLE_INPUT_REFUSAL_CODES.has(outcome.error.code)) {
 		diagnostic = "lifecycle_input_refused";
 	}

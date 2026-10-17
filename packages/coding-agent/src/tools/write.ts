@@ -218,6 +218,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly loadMode = "discoverable";
 	readonly summary = "Write content to a file (creates or overwrites)";
 
+	/** Stream matchers should see the real file content, not its JSON-escaped argument encoding. */
+	matcherDigest(args: unknown): string | undefined {
+		if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+		const content = (args as Partial<WriteParams>).content;
+		return typeof content === "string" ? content : undefined;
+	}
+
 	readonly #writethrough: WritethroughCallback;
 
 	constructor(private readonly session: ToolSession) {

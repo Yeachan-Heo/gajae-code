@@ -1,11 +1,17 @@
 //! AST-aware structural search and rewrite powered by ast-grep.
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
+	cmp::Ordering,
+	collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
 	path::{Path, PathBuf},
 };
 
-use ast_grep_core::{MatchStrictness, matcher::Pattern, source::Edit, tree_sitter::LanguageExt};
+use ast_grep_core::{
+	AstGrep, MatchStrictness,
+	matcher::Pattern,
+	source::Edit,
+	tree_sitter::{LanguageExt, StrDoc},
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use pi_ast::{
@@ -111,6 +117,124 @@ pub struct AstFindMatch {
 	pub meta_variables: Option<HashMap<String, String>>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct AstFindOrderKey {
+	path:         String,
+	start_line:   u32,
+	start_column: u32,
+	end_line:     u32,
+	end_column:   u32,
+	byte_start:   u32,
+	byte_end:     u32,
+	sequence:     u64,
+}
+
+impl Ord for AstFindOrderKey {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self
+			.path
+			.cmp(&other.path)
+			.then(self.start_line.cmp(&other.start_line))
+			.then(self.start_column.cmp(&other.start_column))
+			.then(self.end_line.cmp(&other.end_line))
+			.then(self.end_column.cmp(&other.end_column))
+			.then(self.byte_start.cmp(&other.byte_start))
+			.then(self.byte_end.cmp(&other.byte_end))
+			.then(self.sequence.cmp(&other.sequence))
+	}
+}
+
+impl PartialOrd for AstFindOrderKey {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+#[derive(Eq, PartialEq)]
+struct RetainedAstFindMatch {
+	key:            AstFindOrderKey,
+	text:           String,
+	meta_variables: Option<HashMap<String, String>>,
+}
+
+impl Ord for RetainedAstFindMatch {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self.key.cmp(&other.key)
+	}
+}
+
+impl PartialOrd for RetainedAstFindMatch {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+fn retained_find_capacity(offset: u32, limit: u32) -> usize {
+	usize::try_from(offset.saturating_add(limit).saturating_add(1)).unwrap_or(usize::MAX)
+}
+
+fn should_retain_match(
+	retained: &BinaryHeap<RetainedAstFindMatch>,
+	capacity: usize,
+	key: &AstFindOrderKey,
+) -> bool {
+	if retained.len() < capacity {
+		return true;
+	}
+	retained
+		.peek()
+		.is_some_and(|worst_retained| key.cmp(&worst_retained.key).is_lt())
+}
+
+fn retain_bounded_match(
+	retained: &mut BinaryHeap<RetainedAstFindMatch>,
+	capacity: usize,
+	candidate: RetainedAstFindMatch,
+) {
+	if retained.len() < capacity {
+		retained.push(candidate);
+		return;
+	}
+	if let Some(mut worst_retained) = retained.peek_mut()
+		&& candidate.key.cmp(&worst_retained.key).is_lt()
+	{
+		*worst_retained = candidate;
+	}
+}
+
+fn page_retained_matches(
+	retained: BinaryHeap<RetainedAstFindMatch>,
+	offset: u32,
+	limit: u32,
+) -> (Vec<RetainedAstFindMatch>, bool) {
+	let mut retained_matches = retained.into_vec();
+	retained_matches.sort_by(|left, right| left.key.cmp(&right.key));
+	let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+	let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+	let limit_reached = retained_matches.len().saturating_sub(offset) > limit;
+	let matches = retained_matches
+		.into_iter()
+		.skip(offset)
+		.take(limit)
+		.collect::<Vec<_>>();
+	(matches, limit_reached)
+}
+
+fn retained_to_find_match(retained: RetainedAstFindMatch) -> AstFindMatch {
+	let RetainedAstFindMatch { key, text, meta_variables } = retained;
+	AstFindMatch {
+		path: key.path,
+		text,
+		byte_start: key.byte_start,
+		byte_end: key.byte_end,
+		start_line: key.start_line,
+		start_column: key.start_column,
+		end_line: key.end_line,
+		end_column: key.end_column,
+		meta_variables,
+	}
+}
+
 /// Aggregated search statistics and any parse or compile diagnostics.
 #[napi(object)]
 pub struct AstFindResult {
@@ -126,6 +250,46 @@ pub struct AstFindResult {
 	pub limit_reached:      bool,
 	/// Non-fatal parse or pattern errors collected during the run.
 	pub parse_errors:       Option<Vec<String>>,
+}
+
+/// Options for `astMatch`: run ast-grep patterns against an in-memory source
+/// string instead of files on disk.
+#[napi(object)]
+pub struct AstMatchOptions<'env> {
+	/// Source code to match against (parsed in memory, never read from disk).
+	pub source:       String,
+	/// Language of `source` (required): an alias ("ts", "rust", "python") or a
+	/// file extension ("scss"), resolved like a path's extension.
+	pub lang:         String,
+	/// ast-grep patterns to search for (OR across patterns).
+	pub patterns:     Vec<String>,
+	/// Rule selector for multi-rule ast-grep configurations.
+	pub selector:     Option<String>,
+	/// Pattern strictness; defaults to smart matching when omitted.
+	pub strictness:   Option<AstMatchStrictness>,
+	/// Maximum matches to return after `offset` (default applies when omitted).
+	pub limit:        Option<u32>,
+	/// Number of leading matches to skip before applying `limit`.
+	pub offset:       Option<u32>,
+	/// When true, include meta-variable bindings per match.
+	pub include_meta: Option<bool>,
+	/// Optional cancellation handle (library-specific).
+	pub signal:       Option<Unknown<'env>>,
+	/// Wall-clock timeout for the worker task in milliseconds.
+	pub timeout_ms:   Option<u32>,
+}
+
+/// Result of an in-memory `astMatch` run.
+#[napi(object)]
+pub struct AstMatchResult {
+	/// Page of matches after sort, offset, and limit.
+	pub matches:       Vec<AstFindMatch>,
+	/// Total matches found before paging (can exceed `matches.length`).
+	pub total_matches: u32,
+	/// True when results were truncated by `limit`.
+	pub limit_reached: bool,
+	/// Non-fatal parse or pattern-compile errors collected during the run.
+	pub parse_errors:  Option<Vec<String>>,
 }
 
 /// Options for `astEdit`: rewrite rules, scan scope, safety limits, and
@@ -231,6 +395,16 @@ fn to_u32(value: usize) -> u32 {
 
 fn resolve_supported_lang(value: &str) -> Result<SupportLang> {
 	shared_ops::resolve_supported_lang(value).map_err(|err| Error::from_reason(err.to_string()))
+}
+
+/// Resolve `ast_match`'s `lang`: a language alias, or else a file extension
+/// mapped the same way paths are (e.g. `scss` resolves to CSS), so callers that
+/// only know a file's extension match exactly what a path-based search would.
+fn resolve_match_lang(value: &str) -> Result<SupportLang> {
+	resolve_supported_lang(value).or_else(|err| {
+		let ext = value.trim_start_matches('.');
+		SupportLang::from_path(Path::new(&format!("file.{ext}"))).ok_or(err)
+	})
 }
 
 fn resolve_language(lang: Option<&str>, file_path: &Path) -> Result<SupportLang> {
@@ -392,6 +566,13 @@ fn collect_candidates(
 	Ok(files)
 }
 
+fn has_parse_error(ast: &AstGrep<StrDoc<SupportLang>>) -> bool {
+	// Recovery can insert missing tokens without producing an ERROR node.
+	ast.root()
+		.dfs()
+		.any(|node| node.is_error() || node.is_missing())
+}
+
 fn compile_pattern(
 	pattern: &str,
 	selector: Option<&str>,
@@ -400,6 +581,42 @@ fn compile_pattern(
 ) -> Result<Pattern> {
 	shared_ops::compile_pattern(pattern, selector, strictness, lang)
 		.map_err(|err| Error::from_reason(err.to_string()))
+}
+
+/// The ast-grep CLI's "Pattern contains an ERROR node" warning for a pattern
+/// that compiled although its own parse tree is rooted at an ERROR node. Such
+/// a pattern matches loosely or not at all, so callers report it as a parse
+/// issue instead of letting an empty result read as absence.
+fn error_node_warning(pattern: &str, compiled: &Pattern, language: SupportLang) -> Option<String> {
+	compiled.has_error().then(|| {
+		// Keep the pattern diagnostic on one bounded display line; the
+		// original pattern is still used for matching.
+		let mut preview = String::new();
+		let mut width = 0;
+		for ch in pattern.chars() {
+			let escaped = ch.is_control() || (ch.is_whitespace() && ch != ' ');
+			let char_width = if escaped {
+				ch.escape_unicode().count()
+			} else {
+				xutf::width_char(ch).max(1)
+			};
+			if width + char_width > 48 {
+				preview.push('…');
+				break;
+			}
+			if escaped {
+				preview.extend(ch.escape_unicode());
+			} else {
+				preview.push(ch);
+			}
+			width += char_width;
+		}
+		format!(
+			"{preview}: pattern is not valid {} on its own (contains an ERROR node); matches may be \
+			 missing or unexpected",
+			language.canonical_name()
+		)
+	})
 }
 
 fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
@@ -680,6 +897,119 @@ pub fn ast_grep(options: AstFindOptions<'_>) -> task::Promise<AstFindResult> {
 			total_matches,
 			files_with_matches: to_u32(files_with_matches.len()),
 			files_searched,
+			limit_reached,
+			parse_errors: (!parse_errors.is_empty()).then_some(parse_errors),
+		})
+	})
+}
+
+/// Match ast-grep patterns against an in-memory source string; returns a
+/// promise resolved on a worker thread.
+///
+/// This is the file-free counterpart to [`ast_grep`]: callers that already hold
+/// the source (streaming buffers, generated code, editor contents) avoid a
+/// temp-file round trip. `lang` is required since there is no path to infer it
+/// from.
+#[napi]
+pub fn ast_match(options: AstMatchOptions<'_>) -> task::Promise<AstMatchResult> {
+	let AstMatchOptions {
+		source,
+		lang,
+		patterns,
+		selector,
+		strictness,
+		limit,
+		offset,
+		include_meta,
+		signal,
+		timeout_ms,
+	} = options;
+
+	let ct = task::CancelToken::new(timeout_ms, signal);
+	let normalized_limit = limit.unwrap_or(DEFAULT_FIND_LIMIT).max(1);
+	let normalized_offset = offset.unwrap_or(0);
+
+	task::blocking("ast_match", ct, move |ct| {
+		let patterns = normalize_pattern_list(Some(patterns))?;
+		let strictness = resolve_strictness(strictness);
+		let include_meta = include_meta.unwrap_or(false);
+		let lang_str = lang.trim();
+		if lang_str.is_empty() {
+			return Err(Error::from_reason("`lang` is required for ast_match".to_string()));
+		}
+		let language = resolve_match_lang(lang_str)?;
+
+		let mut parse_errors = Vec::new();
+		let mut compiled_patterns = Vec::with_capacity(patterns.len());
+		for pattern in &patterns {
+			ct.heartbeat()?;
+			match compile_pattern(pattern, selector.as_deref(), &strictness, language) {
+				Ok(compiled) => {
+					parse_errors.extend(error_node_warning(pattern, &compiled, language));
+					compiled_patterns.push(compiled);
+				},
+				Err(err) => parse_errors.push(format!("{pattern}: {err}")),
+			}
+		}
+
+		let retained_capacity = retained_find_capacity(normalized_offset, normalized_limit);
+		let mut retained_matches = BinaryHeap::new();
+		let mut total_matches = 0u32;
+		let mut match_sequence = 0u64;
+		if !compiled_patterns.is_empty() {
+			let ast = language.ast_grep(&source);
+			if has_parse_error(&ast) {
+				parse_errors.push("parse error (syntax tree contains error nodes)".to_string());
+			}
+			for pattern in &compiled_patterns {
+				ct.heartbeat()?;
+				for matched in ast.root().find_all(pattern.clone()) {
+					ct.heartbeat()?;
+					total_matches = total_matches.saturating_add(1);
+					let range = matched.range();
+					let start = matched.start_pos();
+					let end = matched.end_pos();
+					let key = AstFindOrderKey {
+						path:         String::new(),
+						start_line:   to_u32(start.line().saturating_add(1)),
+						start_column: to_u32(start.column(matched.get_node()).saturating_add(1)),
+						end_line:     to_u32(end.line().saturating_add(1)),
+						end_column:   to_u32(end.column(matched.get_node()).saturating_add(1)),
+						byte_start:   to_u32(range.start),
+						byte_end:     to_u32(range.end),
+						sequence:     match_sequence,
+					};
+					match_sequence = match_sequence.saturating_add(1);
+					if should_retain_match(&retained_matches, retained_capacity, &key) {
+						let meta_variables = if include_meta {
+							Some(HashMap::<String, String>::from(matched.get_env().clone()))
+						} else {
+							None
+						};
+						retain_bounded_match(
+							&mut retained_matches,
+							retained_capacity,
+							RetainedAstFindMatch {
+								key,
+								text: matched.text().into_owned(),
+								meta_variables,
+							},
+						);
+					}
+				}
+			}
+		}
+
+		let (matches, limit_reached) =
+			page_retained_matches(retained_matches, normalized_offset, normalized_limit);
+		let matches = matches
+			.into_iter()
+			.map(retained_to_find_match)
+			.collect::<Vec<_>>();
+
+		Ok(AstMatchResult {
+			matches,
+			total_matches,
 			limit_reached,
 			parse_errors: (!parse_errors.is_empty()).then_some(parse_errors),
 		})
@@ -994,6 +1324,10 @@ mod tests {
 		assert_eq!(resolve_supported_lang("c").ok(), Some(SupportLang::C));
 		assert_eq!(resolve_supported_lang("cpp").ok(), Some(SupportLang::Cpp));
 		assert!(resolve_supported_lang("brainfuck").is_err());
+		assert_eq!(resolve_match_lang("scss").ok(), Some(SupportLang::Css));
+		assert_eq!(resolve_match_lang(".scss").ok(), Some(SupportLang::Css));
+		assert_eq!(resolve_match_lang("ts").ok(), Some(SupportLang::TypeScript));
+		assert!(resolve_match_lang("brainfuck").is_err());
 	}
 
 	#[test]

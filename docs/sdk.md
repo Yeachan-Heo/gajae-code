@@ -207,6 +207,20 @@ broker-bound CLI, or Coordinator MCP instead.
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
+Live tool content on both the broker-created bus host and SDK-only host uses
+`{type:"event", kind:"tool_execution_start"|"tool_execution_update"|"tool_execution_end", payload:{event_type,event}}`.
+Prompt owners receive their command/turn correlation. Explicit observers must
+negotiate **both** `turn_stream` and `session_host_observer_v1`; their copy has no
+other client's correlation, and an owner also observing receives no duplicate.
+On the internal wire, `hello` or `event_replay.capabilities` declares these opt-ins
+on the authenticated connection; replay negotiation merges with existing caps.
+Capabilities do not confer lifecycle or session identity authority.
+Tool updates carry cumulative `partialResult` snapshots, not append-only deltas;
+replace the prior snapshot. The end frame's `result` is authoritative, including
+when it differs from the last update. These content frames are best-effort and
+not retained in lifecycle replay. A replay acknowledgement without content is
+not evidence that a running tool produced no output.
+
 `bash_folded` — a foreground bash wait left the foreground and became a background job. Emitted once per fold into the replayable session event ring (so late-connecting clients receive it on `event_replay`), with `generic_safe` adapter disposition:
 
 ```json

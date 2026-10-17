@@ -304,7 +304,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 203 replaces owners that still treat a project `.gjc` file as an
  * explicit deadline-autosave opt-in for a primary checkout.
  */
-export const DAEMON_GENERATION = 204;
+export const DAEMON_GENERATION = 205;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

@@ -583,22 +583,29 @@ test("ACP lifecycle recovers a committed create with the original operation, inp
 
 test("ACP lifecycle stops after one uncertain replay and preserves the original uncertainty", async () => {
 	const sdk = new FakeSdkClient();
+	const realNow = Date.now;
+	let elapsedMs = 0;
 	const original = new SdkClientError("uncertain_after_send", "original response lost", {
 		operation: "session.create",
 	});
 	sdk.global = async (operation, input, options) => {
 		sdk.frames.push({ type: "broker_request", operation, input, ...options });
+		if (sdk.frames.length === 1) elapsedMs += 1;
 		throw sdk.frames.length === 1
 			? original
 			: new SdkClientError("uncertain_after_send", "replay response lost", { operation });
 	};
 	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	await adapter.start();
+	const clock = spyOn(Date, "now").mockImplementation(() => realNow() + elapsedMs);
 	try {
 		await expect(adapter.global("session.create", { cwd: "/workspace" }, "exhaustion-key")).rejects.toBe(original);
 		expect(sdk.frames).toHaveLength(2);
-		expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+		expect(sdk.frames[1]).toEqual({ ...sdk.frames[0], timeoutMs: expect.any(Number) });
+		expect(sdk.frames[1]?.timeoutMs).toBeLessThan(sdk.frames[0]?.timeoutMs as number);
+		expect(sdk.frames[1]?.timeoutMs).toBeGreaterThan(0);
 	} finally {
+		clock.mockRestore();
 		await adapter.close();
 	}
 });
@@ -701,6 +708,8 @@ test("ACP lifecycle waits for a late replay acknowledgment without another creat
 
 test("ACP lifecycle teardown during recovery preserves the original uncertainty", async () => {
 	const sdk = new FakeSdkClient();
+	const realNow = Date.now;
+	let elapsedMs = 0;
 	const acknowledgment = Promise.withResolvers<unknown>();
 	const original = new SdkClientError("uncertain_after_send", "committed response lost", {
 		operation: "session.create",
@@ -708,7 +717,10 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 	let closes = 0;
 	sdk.global = async (operation, input, options) => {
 		sdk.frames.push({ type: "broker_request", operation, input, ...options });
-		if (sdk.frames.length === 1) throw original;
+		if (sdk.frames.length === 1) {
+			elapsedMs += 1;
+			throw original;
+		}
 		return await acknowledgment.promise;
 	};
 	sdk.close = async () => {
@@ -719,6 +731,7 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 	};
 	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	await adapter.start();
+	const clock = spyOn(Date, "now").mockImplementation(() => realNow() + elapsedMs);
 	const recovery = adapter.lifecycle("session.create", { cwd: "/workspace" }, "teardown-key");
 	// Observe the rejection before closing the transport to avoid an unhandled rejection.
 	const failure = recovery.catch(error => error);
@@ -728,11 +741,14 @@ test("ACP lifecycle teardown during recovery preserves the original uncertainty"
 		expect(await failure).toBe(original);
 		expect(closes).toBe(1);
 		expect(sdk.frames).toHaveLength(2);
-		expect(sdk.frames[1]).toEqual(sdk.frames[0]);
+		expect(sdk.frames[1]).toEqual({ ...sdk.frames[0], timeoutMs: expect.any(Number) });
+		expect(sdk.frames[1]?.timeoutMs).toBeLessThan(sdk.frames[0]?.timeoutMs as number);
+		expect(sdk.frames[1]?.timeoutMs).toBeGreaterThan(0);
 		expect(sdk.listeners.size).toBe(0);
 		expect(sdk.reconnectListeners.size).toBe(0);
 		expect(sdk.reconnectFailedListeners.size).toBe(0);
 	} finally {
+		clock.mockRestore();
 		await adapter.close();
 	}
 });

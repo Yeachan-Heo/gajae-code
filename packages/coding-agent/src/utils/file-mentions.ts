@@ -11,7 +11,7 @@ import type { AgentMessage } from "@gajae-code/agent-core";
 import type { ImageContent } from "@gajae-code/ai/core";
 import type { glob as globFn } from "@gajae-code/natives";
 import { fuzzyMatch } from "@gajae-code/tui";
-import { formatAge, formatBytes, readImageMetadata } from "@gajae-code/utils";
+import { formatAge, formatBytes, pathIsWithin, readImageMetadata, resolveEquivalentPath } from "@gajae-code/utils";
 import { formatHashLines } from "../hashline/hash";
 import type { FileMentionMessage } from "../session/messages";
 import {
@@ -314,6 +314,26 @@ export function extractFileMentions(text: string): string[] {
 }
 
 /**
+ * Compare canonical Windows paths without folding directory names: individual
+ * directories can opt into case-sensitive names.
+ */
+export function isCanonicalWindowsPathWithin(root: string, candidate: string): boolean {
+	if (!path.win32.isAbsolute(root) || !path.win32.isAbsolute(candidate)) return false;
+
+	const canonicalRoot = path.win32.resolve(root);
+	const canonicalCandidate = path.win32.resolve(candidate);
+	const rootParts = path.win32.parse(canonicalRoot);
+	const candidateParts = path.win32.parse(canonicalCandidate);
+	if (rootParts.root.toLowerCase() !== candidateParts.root.toLowerCase()) return false;
+
+	const rootSegments = canonicalRoot.slice(rootParts.root.length).split(path.win32.sep).filter(Boolean);
+	const candidateSegments = canonicalCandidate.slice(candidateParts.root.length).split(path.win32.sep).filter(Boolean);
+	if (candidateSegments.length < rootSegments.length) return false;
+
+	return rootSegments.every((segment, index) => segment === candidateSegments[index]);
+}
+
+/**
  * Generate a FileMentionMessage containing the contents of mentioned files.
  * Returns empty array if no files could be read.
  */
@@ -336,6 +356,8 @@ export async function generateFileMentionMessages(
 	if (filePaths.length === 0) return [];
 
 	const autoResizeImages = options?.autoResizeImages ?? true;
+	const canonicalWindowsCwd = process.platform === "win32" ? await fs.realpath(cwd).catch(() => undefined) : undefined;
+	if (process.platform === "win32" && canonicalWindowsCwd === undefined) return [];
 
 	const files: FileMentionMessage["files"] = [];
 	let mentionCandidatesPromise: Promise<MentionCandidate[]> | null = null;
@@ -351,6 +373,24 @@ export async function generateFileMentionMessages(
 			continue;
 		}
 		const absolutePath = resolveReadPath(resolvedPath, cwd);
+		// Skip `..`, `~`, and outside absolute paths. On Windows, realpath both
+		// paths and compare exact components because directories can be case-sensitive.
+		// Fail closed if either real path is unavailable. Read the canonical path so
+		// replacing the original mention symlink does not retarget this read.
+		const canonicalPath =
+			process.platform === "win32"
+				? await fs.realpath(absolutePath).catch(() => undefined)
+				: resolveEquivalentPath(absolutePath);
+		if (!canonicalPath) {
+			continue;
+		}
+		const staysWithinSession =
+			process.platform === "win32"
+				? canonicalWindowsCwd !== undefined && isCanonicalWindowsPathWithin(canonicalWindowsCwd, canonicalPath)
+				: pathIsWithin(cwd, canonicalPath);
+		if (!staysWithinSession) {
+			continue;
+		}
 		// Duplicate suppression, keyed by absolute path: same path shown earlier this
 		// batch or recently in the conversation → compact note, no re-read (the path
 		// stays referenced so the model can re-fetch via the read tool).
@@ -364,14 +404,14 @@ export async function generateFileMentionMessages(
 		}
 		shownInBatch.add(absolutePath);
 		try {
-			const stat = await Bun.file(absolutePath).stat();
+			const stat = await Bun.file(canonicalPath).stat();
 			if (stat.isDirectory()) {
-				const { output, lineCount } = await buildDirectoryListing(absolutePath);
+				const { output, lineCount } = await buildDirectoryListing(canonicalPath);
 				files.push({ path: resolvedPath, content: output, lineCount });
 				continue;
 			}
 
-			const imageMetadata = await readImageMetadata(absolutePath);
+			const imageMetadata = await readImageMetadata(canonicalPath);
 			const mimeType = imageMetadata?.mimeType;
 			if (mimeType) {
 				if (stat.size > MAX_AUTO_READ_IMAGE_BYTES) {
@@ -383,7 +423,7 @@ export async function generateFileMentionMessages(
 					});
 					continue;
 				}
-				const buffer = await fs.readFile(absolutePath);
+				const buffer = await fs.readFile(canonicalPath);
 				if (buffer.length === 0) {
 					continue;
 				}
@@ -420,7 +460,7 @@ export async function generateFileMentionMessages(
 				continue;
 			}
 
-			const content = await Bun.file(absolutePath).text();
+			const content = await Bun.file(canonicalPath).text();
 			let { output, lineCount } = buildTextOutput(content, options?.maxInlineBytes);
 			if (options?.useHashLines) {
 				output = formatHashLines(output);

@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { canonicalEnvKey, getAgentDir, getConfigRootDir, getTrustedHomeDir } from "./dirs";
+import { canonicalEnvKey, getAgentDir, getConfigRootDir, getTrustedHomeDir, pathIdentityKey } from "./dirs";
 import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
@@ -215,20 +215,41 @@ try {
 	trustedEnvHome = undefined;
 }
 
-// Eagerly parse the trusted user's env files and the project .env (from cwd)
-const homeShellEnv = trustedEnvHome
-	? {
-			...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
-			...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
+// `path.resolve` does not follow symlinks, so macOS `/tmp` vs `/private/tmp`,
+// a symlink home, or a bind mount compares unequal and would load the checkout
+// as the trusted home. Keep the lexical check, then compare device/inode, then
+// `pathIdentityKey` when the filesystem has no usable inode.
+function credentialHomeMatchesCwd(home: string): boolean {
+	const cwd = process.cwd();
+	if (path.resolve(home) === path.resolve(cwd)) return true;
+	try {
+		const left = fs.statSync(home, { bigint: true });
+		const right = fs.statSync(cwd, { bigint: true });
+		if (left.isDirectory() && right.isDirectory() && left.ino !== 0n && right.ino !== 0n) {
+			return left.dev === right.dev && left.ino === right.ino;
 		}
-	: {};
-const homeEnv =
-	trustedEnvHome && path.resolve(trustedEnvHome) !== path.resolve(process.cwd())
-		? parseEnvFile(path.join(trustedEnvHome, ".env"))
+	} catch {
+		// Missing or unreadable: do not treat this directory as a credential home.
+		return true;
+	}
+	return pathIdentityKey(home) === pathIdentityKey(cwd);
+}
+
+// Eagerly parse the trusted user's env files and the project .env (from cwd).
+// When cwd is that home, both the dotenv and the shell startup files are the
+// checkout, so neither is a credential source.
+const credentialHomeIsCwd = trustedEnvHome !== undefined && credentialHomeMatchesCwd(trustedEnvHome);
+const homeShellEnv =
+	trustedEnvHome && !credentialHomeIsCwd
+		? {
+				...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
+				...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
+			}
 		: {};
+const homeEnv = trustedEnvHome && !credentialHomeIsCwd ? parseEnvFile(path.join(trustedEnvHome, ".env")) : {};
 let piEnv: Record<string, string> = {};
 let agentEnv: Record<string, string> = {};
 try {

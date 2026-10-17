@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { projectEnvSnapshot } from "../src/env-file";
+import { parseEnvFileContent, projectEnvSnapshot } from "../src/env-file";
 
 const tempDirs: string[] = [];
 
@@ -15,6 +15,98 @@ function tempDir(prefix: string): string {
 	tempDirs.push(dir);
 	return dir;
 }
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
+
+function randomString(random: () => number, alphabet: string, maxLength: number): string {
+	const length = Math.floor(random() * (maxLength + 1));
+	let value = "";
+	for (let i = 0; i < length; i++) {
+		value += alphabet[Math.floor(random() * alphabet.length)] ?? "";
+	}
+	return value;
+}
+
+describe("parseEnvFileContent dotenv comment properties", () => {
+	test("matches Bun for seeded comment, quoted-hash, and escaped-quote values", async () => {
+		const seed = 0x5eedc0de;
+		const random = seededRandom(seed);
+		const literalAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-";
+		const commentAlphabet = `${literalAlphabet} \\"'`;
+		const cases: Array<{ key: string; raw: string; expected: string }> = [];
+		const addCase = (raw: string, expected: string): void => {
+			cases.push({ key: `GJC_DOTENV_PROPERTY_${cases.length}`, raw, expected });
+		};
+
+		for (let i = 0; i < 64; i++) {
+			const prefix = randomString(random, literalAlphabet, 16);
+			const backslashes = "\\".repeat(i < 13 ? i : Math.floor(random() * 13));
+			const suffix = randomString(random, commentAlphabet, 20);
+			addCase(`${prefix}${backslashes}#${suffix}`, `${prefix}${backslashes}`);
+		}
+
+		for (let i = 0; i < 24; i++) {
+			const quote = i % 2 === 0 ? '"' : "'";
+			const prefix = randomString(random, literalAlphabet, 16);
+			const suffix = randomString(random, literalAlphabet, 20);
+			const value = `${prefix}#${suffix}`;
+			addCase(`${quote}${value}${quote}`, value);
+		}
+
+		for (let i = 0; i < 24; i++) {
+			const prefix = randomString(random, literalAlphabet, 16);
+			const escaped = randomString(random, literalAlphabet, 12);
+			const suffix = randomString(random, commentAlphabet, 16);
+			const slashCount = 1 + 2 * (i % 4);
+			const backslashes = "\\".repeat(slashCount);
+			const escapedOutside = `${prefix}${backslashes}"${escaped}#${suffix}`;
+			addCase(escapedOutside, `${prefix}${backslashes}"${escaped}`);
+
+			const quotedSuffix = randomString(random, literalAlphabet, 16);
+			const quotedEscaped = `"${prefix}${backslashes}"${escaped}#${quotedSuffix}"`;
+			addCase(quotedEscaped, `${prefix}${backslashes}"${escaped}#${quotedSuffix}`);
+		}
+
+		const dotenv = `${cases.map(({ key, raw }) => `${key}=${raw}`).join("\n")}\n`;
+		const cwd = tempDir("gjc-env-comment-property-");
+		const home = tempDir("gjc-env-comment-property-home-");
+		fs.writeFileSync(path.join(cwd, ".env"), dotenv);
+		const keys = cases.map(({ key }) => key);
+		const probe = path.join(cwd, "dotenv-probe.ts");
+		await Bun.write(
+			probe,
+			`const keys = ${JSON.stringify(keys)};\n` +
+				`console.log(JSON.stringify(Object.fromEntries(keys.map(key => [key, process.env[key] ?? null]))));\n`,
+		);
+
+		const childEnv: Record<string, string | undefined> = { ...process.env, HOME: home };
+		for (const key of keys) delete childEnv[key];
+		const proc = Bun.spawn([process.execPath, probe], {
+			cwd,
+			env: childEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 10_000,
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+
+		const bunValues = JSON.parse(stdout.trim()) as Record<string, string | null>;
+		const expected = Object.fromEntries(cases.map(({ key, expected }) => [key, expected]));
+		expect(parseEnvFileContent(dotenv), `seed ${seed}`).toEqual(expected);
+		expect(bunValues, `seed ${seed}`).toEqual(expected);
+	}, 15_000);
+});
 
 describe("projectEnvSnapshot quoted declarations", () => {
 	test("compares a plain quoted literal and refuses a quoted escape", () => {

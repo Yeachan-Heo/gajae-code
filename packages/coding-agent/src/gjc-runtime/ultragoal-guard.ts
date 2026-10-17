@@ -25,6 +25,7 @@ import {
 	type UltragoalPlan,
 	type UltragoalReceiptKind,
 } from "./ultragoal-runtime";
+import { readUltragoalSuccessionFence } from "./ultragoal-succession";
 
 export type UltragoalGuardState =
 	| "inactive"
@@ -823,7 +824,14 @@ async function consumeUltragoalNudge(input: {
 	if (!sessionId) return { nudged: false };
 	const plan = await readUltragoalPlan(input.cwd, sessionId);
 	if (!plan) return { nudged: false };
-	const target = selectUltragoalNudgeTarget(plan, { currentGoalObjective: input.currentGoal?.objective });
+	const fence = await readUltragoalSuccessionFence(input.cwd, sessionId);
+	// A goal handed off to a successor run is not this run's resolvable work. Skip
+	// fenced goals while selecting, so a retained source-owned goal can still receive
+	// the nudge (and keep aggregate drop guarded) without spending budget on the handoff.
+	const target = selectUltragoalNudgeTarget(plan, {
+		currentGoalObjective: input.currentGoal?.objective,
+		excludedGoalIds: fence?.selectedGoalIds,
+	});
 	if (!target) return { nudged: false };
 	const { budget } = await resolveUltragoalNudgeBudget(input.cwd, input.agentDir);
 	const outcome = await recordUltragoalNudgeIfBudgetRemaining({
