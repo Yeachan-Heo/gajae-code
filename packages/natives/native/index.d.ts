@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Incrementally ingests old/new text and computes an exact line diff on a
  * worker thread once both sides finish.
@@ -686,7 +687,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_18_11(): void
+export declare function __piNativesV0_18_12(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -1238,9 +1239,10 @@ export declare function exactReplacePath(sourcePath: string, destinationPath: st
  * single-link ownership; hard-linked or symlinked source/destination are
  * rejected) before anything is mutated. On Windows a pre-mutation
  * `STATUS_SHARING_VIOLATION` on the destination open is reported as a
- * distinct `sharing_violation` code with `windows_error_code` set -- exactly
- * as [`exact_replace_path`] already reports it -- and is always surfaced
- * before any rename, so it is never mistaken for a post-effect failure.
+ * distinct `sharing_violation` code, while `STATUS_ACCESS_DENIED` on a
+ * retained open or rename is reported as `access_denied`. Pre-mutation
+ * failures include the original `windows_error_code`; only known-safe rename
+ * operations retry transient access-denied or sharing-violation statuses.
  */
 export declare function exactReplaceRetained(sourcePath: string, destinationPath: string, backupName: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
@@ -2578,6 +2580,7 @@ export declare function ptyTimeoutCount(): bigint
 
 /**
  * Rasterize bounded SVG/SVGZ bytes into a PNG without resolving local files.
+ *
  * DTD/entity declarations and SVG image elements are rejected rather than
  * allowing unbounded expansion or silently returning an incomplete preview.
  *

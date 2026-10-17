@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Flatten control characters in the stats console summary labels so a session model or folder cannot forge a row or emit a terminal escape.
+
 ## [0.18.11] - 2026-10-12
 
 ## [0.18.10] - 2026-10-12

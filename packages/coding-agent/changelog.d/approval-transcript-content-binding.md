@@ -1,3 +1,0 @@
-### Fixed
-
-- Ralplan and deep-interview execution approval no longer fails at the ultragoal handoff with `execution approval transcript identity changed` after the session transcript is rewritten. Session persistence replaces the transcript file by atomic rename on full rewrites, which changes its inode, so the approval boundary now binds the approved transcript content (prefix length and SHA-256, leaf, and Ask tool call) instead of the file's device and inode. Edited, rewound, or newly user-bearing transcripts are still rejected, and approval records written before this change remain readable.

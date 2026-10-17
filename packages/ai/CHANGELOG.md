@@ -2,6 +2,74 @@
 
 ## [Unreleased]
 
+## [0.18.12] - 2026-10-16
+
+### Added
+
+- Added the `org:<organization id or name>` credential selector, matching an OAuth credential by its organization id or display name (case-insensitive).
+
+- `AuthStorageOptions.credentialPreferences` accepts an ordered, persisted soft OAuth account preference list per provider (`ConfiguredCredentialPreference[]`: selector plus optional `maxUsedFraction` cap per entry). Selection uses the first listed account that is usable and under its cap; when every listed account is blocked or capped, the unlisted accounts are ranked by balanced/earliest-reset ranking, and capped listed accounts are used only after those. Caps read the windows each provider reports, so they also apply to providers without a ranking strategy. Runtime `--credential`/`--prefer-credential` selectors and session stickiness take precedence. A list whose entries name one stored row twice (for example an email and `account:<id>` for the same login) is ignored as a whole and reported by `AuthStorage.findDuplicateCredentialPreferences()`.
+
+- Add Gemini 4 Argon (`gemini-4-argon`) and send `thinkingLevel` (low/medium/high) for Gemini 4 models instead of falling back to `thinkingBudget`.
+
+- Custom `openai-responses` relays whose base URL has a loopback hostname (`127.0.0.0/8`, `localhost`, `::1`) now send `session_id`/`x-client-request-id` affinity headers without an explicit opt-in. The ChatGPT codex backend only reuses a warmed prompt prefix for requests that carry a session identity, so such a relay previously reported zero cached tokens and replayed the entire context on every turn. Remote relays stay opt-in, known non-OpenAI provider IDs stay excluded, retention `none` still suppresses the headers, and `compat.supportsResponsesSessionAffinity: false` opts a loopback relay back out.
+
+- Added `ultrafast` as a first-class ServiceTier option, alongside existing tiers (auto, default, flex, scale, priority)
+- Support for OpenAI's ultrafast processing tier on OpenAI chat completions and Codex responses APIs
+- 6x ultrafast multiplier for API token pricing (per OpenAI's official pricing: $60 input, $300 output for gpt-6-astra)
+- Ultrafast service tier now properly resolves and sends to supported models
+
+### Changed
+
+- Use User-Agent-aware Antigravity model-cache validation so discovery catalogs are refreshed for the active client identity.
+
+- `ServiceTier` type now includes "ultrafast" as a valid option
+- `shouldSendServiceTier()` now includes ultrafast in provider send logic for OpenAI
+- OpenAI chat server schema updated to accept "ultrafast" in service_tier field
+- Codex included-usage estimates use the official Fast 2.5x and Ultrafast 8x multipliers
+
+### Fixed
+
+- Kiro streams now surface explicit content-filter refusal messages with category and explanation instead of the generic "no tokens" error when a refusal is detected. Both bearer token (via `messageMetadataEvent`) and API-key (`ksk_`, via `metadataEvent`) paths are supported, with proper provider safety-stop minting. Bearer-token text streams incrementally unless a thinking block precedes it; API-key text remains quarantined until clean EOF. Tool calls are emitted only at stream end (#6150).
+- Detail-free `stopReason: "CONTENT_FILTERED"` (without `stopDetails.refusal` object) is now treated as a refusal and suppresses unconfirmed content.
+- API-key text remains quarantined through `COMPLETED`/`TOOL_USE` metadata and is released only at clean EOF, so a later refusal or read failure cannot leak content across HTTP chunk boundaries.
+- A refusal takes precedence over ordinary errors or successful completion in the same batch or a later read. An active tool may finish its input after `TOOL_USE`, while `COMPLETED` fences tool fragments and later content.
+- Error events omit duplicate partial messages so credential-shaped upstream text cannot bypass gateway redaction or leak through SSE encoders.
+- Parser no longer resyncs into nested objects when an incomplete outer JSON frame is encountered. Incomplete frames are retained as remainder; EOF with incomplete frame throws an error.
+- Errors before clean EOF discard quarantined text and retain only explicitly completed tool calls.
+
+- API-key validation now accepts successful inference responses that contain reasoning output or end at the token limit before producing text, and reports empty or missing choices accurately.
+
+- An image Anthropic rejects with `Could not process image` no longer makes every later request in the session fail. The provider replaces the rejected image with a text placeholder and keeps omitting it on later turns and fallback models. The first repair omits the images of the newest message that has any; if the request still fails, the second omits every image (#6810).
+
+- Anthropic OAuth keeps one stored credential per organization when a single account belongs to several organizations (for example a Team workspace and a personal Max plan). Credentials now record the organization from the token response, their identity key is scoped to it, so logging in to a second organization no longer replaces or disables the first, and usage limits are reported per organization instead of being merged across them. Rows stored before this change keep working and are deduplicated once their next refresh records the organization.
+
+- Broker usage reports are matched to a credential by the identity (account, email, or project) and Anthropic organization they carry, checked against the current broker snapshot. A report without a matching identity is taken only when the provider has a single stored OAuth credential, so a lone report is no longer assigned to every credential of a provider that holds several. A credential stored without an Anthropic organization never takes a report whose organization another stored credential is scoped to, so a legacy row whose own usage fetch fails gets no fresh usage data instead of another row's or another account's limits.
+- An `org:` selector that matches more than one stored credential (organizations sharing a display name) is rejected with the candidate row ids instead of resolving to the first row, and an exact organization-id match is preferred over display-name matches. Pin ambiguity errors now list the candidate row ids.
+
+- Keep cached models from a different User-Agent out of failed-refresh fallbacks, and report the effective User-Agent in discovery diagnostics.
+
+- Replace user and tool-result images with text markers for Bedrock models without image input, including consecutive tool results, while preserving image payloads for image-capable models.
+
+- `--prefer-credential` now selects the designated OAuth account when the provider also stores API-key rows. The preferred row was matched by its index in the full credential list against OAuth-only candidate indices, so a mixed pool could move a different OAuth account to the front.
+
+- OpenAI Responses and Completions streams now use a model's configured idle timeout when no environment or request override is set, so long reasoning gaps on compatible proxies can be tuned per model. Longer request-level idle windows also bound SDK setup before response headers arrive, and SDK timers are kept within the platform-safe range. Kimi Code's Anthropic-compatible route also honors its model timeout, with environment and request overrides retaining precedence.
+
+- Normalize negative and non-finite model catalog prices to zero so bundled usage estimates cannot become negative.
+
+- Switching the model cache to a different database path now fully releases the previous database. A migration query left an unfinalized prepared statement, so closing the old connection left it open in the background; it kept the database locked and, on Windows, blocked deleting its directory.
+
+- Omit MCP tool-result image payloads from Ollama chat requests when the model does not support image input, retaining a text omission marker.
+
+- Closing AuthStorage and the model cache now deterministically finalizes their owned SQLite statements before releasing the database, allowing immediate removal of owned scratch directories on Windows.
+
+- Usage pricing now follows provider-reported effective tiers when available, and gateway responses preserve that tier for downstream clients.
+
+### Notes
+
+- Ultrafast tier is currently available for gpt-6-astra and gpt-6.1-sol. The gpt-5.6-sol model is Fast-only and is not eligible for ultrafast.
+- For unsupported models, ultrafast is omitted and provider-default processing is used; no unsupported tier is sent.
+
 ## [0.18.11] - 2026-10-12
 
 ## [0.18.10] - 2026-10-12
