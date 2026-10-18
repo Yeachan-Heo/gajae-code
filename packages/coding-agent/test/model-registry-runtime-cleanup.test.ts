@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { type AssistantMessageEventStream, clearCustomApis, getCustomApi } from "@gajae-code/ai";
 import { ModelRegistry, type ProviderConfigInput } from "@gajae-code/coding-agent/config/model-registry";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { Snowflake } from "@gajae-code/utils";
+import { hookFetch, Snowflake } from "@gajae-code/utils";
 
 describe("ModelRegistry runtime source cleanup", () => {
 	let tempDir: string;
@@ -120,6 +120,123 @@ describe("ModelRegistry runtime source cleanup", () => {
 		}
 	});
 
+	test("extension cleanup and replacement preserve unrelated Antigravity discovery", async () => {
+		await authStorage.set("google-antigravity", {
+			type: "oauth",
+			access: "antigravity-access",
+			refresh: "antigravity-refresh",
+			expires: Date.now() + 60 * 60 * 1000,
+			email: "catalog@example.com",
+			projectId: "catalog-project",
+		});
+		let discoveryFetches = 0;
+		using _hook = hookFetch(input => {
+			if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+				throw new Error(`Unexpected URL: ${String(input)}`);
+			}
+			discoveryFetches++;
+			return new Response(
+				JSON.stringify({ models: { "gemini-cleanup-dynamic": { displayName: "Cleanup regression" } } }),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, {
+			automaticRefresh: false,
+		});
+		try {
+			registry.registerProvider(
+				"runtime-provider",
+				{
+					baseUrl: "https://runtime.example.com/v1",
+					apiKey: "runtime-key",
+					api: "openai-responses",
+					models: [baseModel],
+				},
+				sourceId,
+			);
+			await registry.refreshProvider("google-antigravity", "online");
+			const discovered = registry.find("google-antigravity", "gemini-cleanup-dynamic");
+			expect(discovered).toBeDefined();
+			if (!discovered) throw new Error("Antigravity discovery did not publish its model");
+			const fetchesAfterDiscovery = discoveryFetches;
+			const assertDiscoveryPreserved = () => {
+				expect(registry.find("google-antigravity", "gemini-cleanup-dynamic")).toEqual(discovered);
+				expect(registry.getAvailable()).toContainEqual(discovered);
+				expect(registry.getActiveProviders()).toContainEqual({
+					provider: "google-antigravity",
+					connectionKind: "credential",
+				});
+				expect(discoveryFetches).toBe(fetchesAfterDiscovery);
+			};
+
+			registry.clearSourceRegistrations(sourceId);
+			assertDiscoveryPreserved();
+			expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
+			expect(await registry.getApiKeyForProvider("runtime-provider")).toBeUndefined();
+
+			registry.registerProvider(
+				"runtime-provider",
+				{
+					baseUrl: "https://runtime.example.com/v1",
+					apiKey: "runtime-key",
+					api: "openai-responses",
+					models: [baseModel],
+				},
+				sourceId,
+			);
+			assertDiscoveryPreserved();
+			registry.registerProvider(
+				"runtime-provider",
+				{
+					baseUrl: "https://replacement.example.com/v1",
+					apiKey: "replacement-key",
+					api: "openai-responses",
+					models: [{ ...baseModel, id: "replacement-model" }],
+				},
+				"ext://replacement",
+			);
+			assertDiscoveryPreserved();
+			expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
+			expect(registry.find("runtime-provider", "replacement-model")?.baseUrl).toBe(
+				"https://replacement.example.com/v1",
+			);
+			expect(await registry.getApiKeyForProvider("runtime-provider")).toBe("replacement-key");
+			registry.syncExtensionSources([]);
+			assertDiscoveryPreserved();
+			expect(registry.find("runtime-provider", "replacement-model")).toBeUndefined();
+			await registry.refreshProvider("google-antigravity", "offline");
+			assertDiscoveryPreserved();
+
+			// A signed-preset update must not publish an intermediate catalog that
+			// loses live discovery while rebuilding unrelated model metadata.
+			const publishedAvailability: boolean[] = [];
+			const unsubscribe = registry.onCatalogChanged(() => {
+				publishedAvailability.push(registry.find("google-antigravity", "gemini-cleanup-dynamic") !== undefined);
+			});
+			await Bun.write(
+				path.join(tempDir, "model-presets", "control.json"),
+				JSON.stringify({ version: 1, disabled: true }),
+			);
+			await registry.refreshStatic();
+			assertDiscoveryPreserved();
+			expect(publishedAvailability.length).toBeGreaterThan(0);
+			expect(publishedAvailability.every(Boolean)).toBe(true);
+			unsubscribe();
+
+			// Preserving the catalog must still reject discovery from an account
+			// whose credentials were removed before the next preset publication.
+			await authStorage.remove("google-antigravity");
+			await Bun.write(
+				path.join(tempDir, "model-presets", "control.json"),
+				JSON.stringify({ version: 1, disabled: false }),
+			);
+			await registry.refreshStatic();
+			expect(registry.find("google-antigravity", "gemini-cleanup-dynamic")).toBeUndefined();
+		} finally {
+			await registry.dispose();
+		}
+	});
+
 	test("shared AuthStorage keeps same-provider credentials owner-bound", async () => {
 		const secondModelsJsonPath = path.join(tempDir, "models-second.json");
 		const provider = "shared-provider";
@@ -184,6 +301,90 @@ describe("ModelRegistry runtime source cleanup", () => {
 		} finally {
 			firstRegistry.dispose();
 			secondRegistry.dispose();
+		}
+	});
+
+	test("cleanup restores configured credentials and transport instead of removed runtime state", async () => {
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"runtime-provider": {
+						baseUrl: "https://configured.example.com/v1",
+						apiKey: "configured-key",
+						api: "openai-responses",
+						models: [{ id: "configured-model" }],
+					},
+				},
+			}),
+		);
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+		try {
+			registry.registerProvider(
+				"runtime-provider",
+				{
+					baseUrl: "https://runtime.example.com/v1",
+					apiKey: "runtime-key",
+					api: "openai-responses",
+					models: [baseModel],
+				},
+				sourceId,
+			);
+			expect(await registry.getApiKeyForProvider("runtime-provider")).toBe("runtime-key");
+			registry.clearSourceRegistrations(sourceId);
+			expect(await registry.getApiKeyForProvider("runtime-provider")).toBe("configured-key");
+			expect(registry.find("runtime-provider", "runtime-model")).toBeUndefined();
+			expect(registry.find("runtime-provider", "configured-model")?.baseUrl).toBe(
+				"https://configured.example.com/v1",
+			);
+		} finally {
+			await registry.dispose();
+		}
+	});
+
+	test("cleanup does not retain discovery from the removed provider endpoint", async () => {
+		await Bun.write(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					"runtime-provider": {
+						baseUrl: "https://configured.example.com/v1",
+						apiKey: "configured-key",
+						api: "openai-responses",
+						models: [{ id: "configured-model" }],
+					},
+				},
+			}),
+		);
+		using _hook = hookFetch(input => {
+			expect(String(input)).toBe("https://runtime.example.com/v1/models");
+			return new Response(JSON.stringify({ data: [{ id: "runtime-discovered" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, undefined, { automaticRefresh: false });
+		try {
+			registry.registerProvider(
+				"runtime-provider",
+				{
+					baseUrl: "https://runtime.example.com/v1",
+					apiKey: "runtime-key",
+					api: "openai-responses",
+					models: [baseModel],
+				},
+				sourceId,
+			);
+			await registry.refreshProvider("runtime-provider", "online");
+			expect(registry.find("runtime-provider", "runtime-discovered")?.baseUrl).toBe(
+				"https://runtime.example.com/v1",
+			);
+			registry.clearSourceRegistrations(sourceId);
+			expect(registry.find("runtime-provider", "runtime-discovered")).toBeUndefined();
+			expect(registry.getProviderDiscoveryState("runtime-provider")?.status).toBe("idle");
+			expect(await registry.getApiKeyForProvider("runtime-provider")).toBe("configured-key");
+		} finally {
+			await registry.dispose();
 		}
 	});
 });
