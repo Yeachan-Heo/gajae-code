@@ -286,6 +286,43 @@ describe("AgentSession profile resume defaults", () => {
 		expect(reloadedSettings.getGlobal("task.agentModelOverrides")).toEqual({ executor: roleSelector });
 	});
 
+	it("does not materialize a history-restored profile whose activation fails", async () => {
+		const { base, profileMain } = resolveModels();
+		const baseSelector = `${base.provider}/${base.id}`;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "glm-eco",
+		});
+		session = makeSession(base, settings);
+
+		// Session history can restore the profile identity before this process has
+		// successfully activated it.
+		session.setActiveModelProfile("glm-eco");
+		expect(session.getActivatedModelProfile()).toBeUndefined();
+		await expect(
+			activateModelProfile({ session, modelRegistry, settings, profileName: "glm-eco" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		expect(session.getActiveModelProfile()).toBe("glm-eco");
+		expect(session.getActivatedModelProfile()).toBeUndefined();
+
+		await session.setModelTemporary(base, undefined, {
+			persistAsSessionDefault: true,
+			cause: "startup-override",
+		});
+		session.setConfiguredModelChain("default", [baseSelector], "startup-override", undefined, true);
+
+		const materialized = materializeActiveModelProfileAssignments({
+			session,
+			settings,
+			assignments: new Map([["executor", `${profileMain.provider}/${profileMain.id}`]]),
+		});
+
+		expect(materialized).toBe(false);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({ origin: "startup-override" });
+		expect(settings.getGlobal("modelProfile.default")).toBe("glm-eco");
+		expect(settings.getGlobal("modelRoles")).toBeUndefined();
+	});
+
 	it("cancels a guarded profile model change after a newer user selection", async () => {
 		const { base, profileMain } = resolveModels();
 		session = makeSession(base);

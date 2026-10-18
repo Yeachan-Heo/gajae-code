@@ -2932,6 +2932,7 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#activatedModelProfile: string | undefined;
 	#unavailableModelProfile: string | undefined;
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
@@ -18760,12 +18761,14 @@ export class AgentSession {
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
-	setActiveModelProfile(name: string | undefined): void {
+	/** History may restore the identity without proving this process activated the profile. */
+	setActiveModelProfile(name: string | undefined, activatedByThisProcess = false): void {
 		if (name !== this.#activeModelProfile) {
 			this.#activeProfileManualModelRoles.clear();
 			this.#activeProfileManualAgentModelOverrides.clear();
 		}
 		this.#activeModelProfile = name;
+		this.#activatedModelProfile = activatedByThisProcess ? name : undefined;
 		if (name !== undefined) {
 			this.#unavailableModelProfile = undefined;
 		}
@@ -18779,6 +18782,11 @@ export class AgentSession {
 
 	getActiveModelProfile(): string | undefined {
 		return this.#activeModelProfile;
+	}
+
+	/** A restored profile identity is not eligible for role-only materialization until activation succeeds. */
+	getActivatedModelProfile(): string | undefined {
+		return this.#activatedModelProfile === this.#activeModelProfile ? this.#activeModelProfile : undefined;
 	}
 
 	setUnavailableModelProfile(name: string | undefined): void {
@@ -28248,7 +28256,9 @@ export class AgentSession {
 						? settingsDefaultEntries
 						: (configuredDefaultChain?.entries ??
 							(sessionContext.models.default ? [sessionContext.models.default] : []));
-				this.setActiveModelProfile(targetActiveModelProfile);
+				const targetProfileWasActivated =
+					targetProfileRuntimeInstalled && this.getActivatedModelProfile() === targetActiveModelProfile;
+				this.setActiveModelProfile(targetActiveModelProfile, targetProfileWasActivated);
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
