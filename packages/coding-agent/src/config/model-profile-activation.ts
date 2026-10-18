@@ -314,6 +314,25 @@ function getMaterializedAssignments(
 	return result;
 }
 
+/**
+ * Resolve the profile a materialization may consume.
+ *
+ * Only a profile this process actually activated owns materialization. A
+ * persisted `modelProfile.default` whose activation failed (missing
+ * credentials, unknown profile) installed no bindings, so role-only selections
+ * must not consume it: callers store just the requested role and the durable
+ * profile stays in place for the next launch. An explicit default selection is
+ * the one exception: it supersedes the persisted profile as the durable default.
+ */
+function resolveMaterializationProfile(
+	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
+	includesDefault: boolean,
+): string | undefined {
+	const activeProfile = options.session.getActiveModelProfile?.();
+	if (activeProfile) return activeProfile;
+	return includesDefault ? options.settings.get("modelProfile.default") : undefined;
+}
+
 function modelRolesForMaterialization(
 	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
 ): Record<string, ModelSelectorValue> {
@@ -322,18 +341,23 @@ function modelRolesForMaterialization(
 	if (defaultChain?.origin !== "startup-override" || !defaultChain.entries[0]) return modelRoles;
 
 	// The merged runtime roles can still contain the CLI model; materialize the
-	// profile's activated default chain (or pre-existing global default) instead.
-	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
-	const profile = activeProfile ? options.session.modelRegistry?.getModelProfile?.(activeProfile) : undefined;
-	const activatedDefaultChain = options.session.getProfileInstalledOverrideState?.().configuredDefaultChain;
-	const profileDefault = activatedDefaultChain?.length
-		? activatedDefaultChain.length === 1
-			? activatedDefaultChain[0]
-			: [...activatedDefaultChain]
-		: profile
-			? resolveProfileBindings(profile).defaultSelector
-			: undefined;
-	const configuredDefault = profileDefault ?? options.settings.getGlobal("modelRoles")?.default;
+	// profile's default instead. Profile-derived defaults require an activated
+	// profile: a persisted profile that failed activation contributes nothing.
+	const activeProfile = options.session.getActiveModelProfile?.();
+	let configuredDefault: ModelSelectorValue | undefined;
+	if (activeProfile) {
+		const activatedDefaultChain = options.session.getProfileInstalledOverrideState?.().configuredDefaultChain;
+		if (activatedDefaultChain?.length) {
+			// 1. The chain this activation installed (keeps provider rewrites and fallbacks).
+			configuredDefault = activatedDefaultChain.length === 1 ? activatedDefaultChain[0] : [...activatedDefaultChain];
+		} else {
+			// 2. The activated profile's raw default binding.
+			const profile = options.session.modelRegistry?.getModelProfile?.(activeProfile);
+			if (profile) configuredDefault = resolveProfileBindings(profile).defaultSelector;
+		}
+	}
+	// 3. The pre-existing global default.
+	if (configuredDefault === undefined) configuredDefault = options.settings.getGlobal("modelRoles")?.default;
 	if (configuredDefault === undefined) delete modelRoles.default;
 	else modelRoles.default = configuredDefault;
 	return modelRoles;
@@ -511,8 +535,7 @@ function commitMaterializedProfileAssignments(
 }
 
 export function materializeActiveModelProfileAssignment(options: MaterializeModelProfileAssignmentOptions): boolean {
-	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
-	if (!activeProfile) return false;
+	if (!resolveMaterializationProfile(options, options.role === "default")) return false;
 
 	const nextModelRoles = modelRolesForMaterialization(options);
 	const nextAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
@@ -542,15 +565,13 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 }
 
 export function materializeActiveModelProfileAssignments(options: MaterializeModelProfileAssignmentsOptions): boolean {
-	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
-	if (!activeProfile) return false;
-
 	const materializedAssignments = getMaterializedAssignments(options.assignments);
+	const includesDefault = materializedAssignments.some(([role]) => role === "default");
+	if (!resolveMaterializationProfile(options, includesDefault)) return false;
 	if (materializedAssignments.length === 0) return true;
 
 	const nextModelRoles = modelRolesForMaterialization(options);
 	const nextAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
-	const includesDefault = materializedAssignments.some(([role]) => role === "default");
 
 	if (!includesDefault && !nextModelRoles.default) {
 		const defaultChain = materializeConfiguredDefaultChain(options.session);

@@ -2745,6 +2745,80 @@ describe("model profile activation", () => {
 		expect(settings.getGlobal("modelRoles")?.default).toBeUndefined();
 	});
 
+	test("role selections never materialize a persisted profile whose activation failed", async () => {
+		const baseRegistry = fakeRegistry({ missingProviders: ["provider-a"] });
+		const registry = { ...baseRegistry, getAvailable: () => baseRegistry.getAll() };
+		const startupModel = model("provider-c", "cli-model");
+		const startupSelector = `${startupModel.provider}/${startupModel.id}`;
+		const session = Object.assign(fakeSession(startupModel), { modelRegistry: registry as unknown as ModelRegistry });
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		expect(session.getActiveModelProfile()).toBeUndefined();
+
+		settings.overrideModelRoles({ default: startupSelector });
+		session.setConfiguredModelChain("default", [startupSelector], "startup-override");
+
+		expect(
+			materializeActiveModelProfileAssignments({
+				session,
+				settings,
+				assignments: new Map([["executor", "provider-c/executor"]]),
+			}),
+		).toBe(false);
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "architect",
+				selector: "provider-c/architect",
+			}),
+		).toBe(false);
+		// Callers fall back to persisting only the requested roles.
+		settings.setAgentModelOverride("executor", "provider-c/executor");
+		settings.setAgentModelOverride("architect", "provider-c/architect");
+
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [startupSelector],
+			origin: "startup-override",
+		});
+		const reloadedSettings = Settings.isolated({
+			modelRoles: settings.getGlobal("modelRoles"),
+			"task.agentModelOverrides": settings.getGlobal("task.agentModelOverrides"),
+			"modelProfile.default": settings.getGlobal("modelProfile.default"),
+		});
+		expect(reloadedSettings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(reloadedSettings.getModelRole("default")).toBeUndefined();
+		expect(reloadedSettings.getGlobal("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor",
+			architect: "provider-c/architect",
+		});
+	});
+
+	test("an explicit default selection still supersedes a persisted profile whose activation failed", async () => {
+		const registry = fakeRegistry({ missingProviders: ["provider-a"] });
+		const session = Object.assign(fakeSession(model("provider-c", "cli-model")), {
+			modelRegistry: { ...registry, getAvailable: () => registry.getAll() } as unknown as ModelRegistry,
+		});
+		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "profile-a" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		session.setConfiguredModelChain("default", ["provider-c/cli-model"], "startup-override");
+
+		expect(
+			materializeActiveModelProfileAssignment({
+				session,
+				settings,
+				role: "default",
+				selector: "provider-c/default",
+			}),
+		).toBe(true);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider-c/default" });
+		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+	});
+
 	test("profile deletion materializes the complete default fallback chain", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "delete-chain-profile",

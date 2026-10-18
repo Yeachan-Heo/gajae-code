@@ -5,6 +5,8 @@ import type { Model } from "@gajae-code/ai";
 import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
+	ModelProfileCredentialError,
+	materializeActiveModelProfileAssignments,
 	prepareModelProfileActivation,
 } from "@gajae-code/coding-agent/config/model-profile-activation";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -236,6 +238,52 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 		expect(settings.getGlobal("modelProfile.default")).toBe("codex-standard");
 		expect(settings.get("task.agentModelOverrides")).toEqual(activeAgentOverrides);
+	});
+
+	it("keeps a durable profile whose activation failed when a later role selection follows a startup override", async () => {
+		const { base, profileMain } = resolveModels();
+		const baseSelector = `${base.provider}/${base.id}`;
+		const roleSelector = `${profileMain.provider}/${profileMain.id}`;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "glm-eco",
+		});
+		session = makeSession(base, settings);
+		// The durable profile's required provider (zai) has no credentials.
+		await expect(
+			activateModelProfile({ session, modelRegistry, settings, profileName: "glm-eco" }),
+		).rejects.toBeInstanceOf(ModelProfileCredentialError);
+		expect(session.getActiveModelProfile()).toBeUndefined();
+
+		// CLI --model startup override (main.ts applyStartupModelProfiles).
+		await session.setModelTemporary(base, undefined, { persistAsSessionDefault: true, cause: "startup-override" });
+		session.setConfiguredModelChain("default", [baseSelector], "startup-override", undefined, true);
+		session.seedDefaultFallbackResolution(0, []);
+
+		// Role-only selection (selector-controller non-default role path).
+		session.markUserModelSelection();
+		const materialized = materializeActiveModelProfileAssignments({
+			session,
+			settings,
+			assignments: new Map([["executor", roleSelector]]),
+		});
+		expect(materialized).toBe(false);
+		session.markProfileRoleOverrideManual("task.agentModelOverrides", "executor");
+		settings.setAgentModelOverride("executor", roleSelector);
+
+		expect(session.model).toEqual(base);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: [baseSelector],
+			origin: "startup-override",
+		});
+		const reloadedSettings = Settings.isolated({
+			modelRoles: settings.getGlobal("modelRoles"),
+			"task.agentModelOverrides": settings.getGlobal("task.agentModelOverrides"),
+			"modelProfile.default": settings.getGlobal("modelProfile.default"),
+		});
+		expect(reloadedSettings.getGlobal("modelProfile.default")).toBe("glm-eco");
+		expect(reloadedSettings.getGlobal("modelRoles")).toBeUndefined();
+		expect(reloadedSettings.getGlobal("task.agentModelOverrides")).toEqual({ executor: roleSelector });
 	});
 
 	it("cancels a guarded profile model change after a newer user selection", async () => {
