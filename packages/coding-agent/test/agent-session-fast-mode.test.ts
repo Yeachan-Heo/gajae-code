@@ -251,7 +251,7 @@ describe("ToolSession adapter fast-mode delegation", () => {
 
 	async function toolSession(): Promise<ToolSession> {
 		const tool = created.session.getToolByName("subagent");
-		const materialize = (tool as { materializeForTests?: () => Promise<unknown> } | undefined)?.materializeForTests;
+		const materialize = (tool as { materialize?: () => Promise<unknown> } | undefined)?.materialize;
 		if (!tool || !materialize) throw new Error("subagent lazy tool is not registered");
 		const implementation = await materialize.call(tool);
 		return (implementation as { session: ToolSession }).session;

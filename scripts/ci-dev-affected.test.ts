@@ -1153,6 +1153,8 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/other/index.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
 		"packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
+		"packages/coding-agent/test/tools/tool-catalog.test.ts",
+		"packages/coding-agent/test/tools/discoverable-description-stable.test.ts",
 		"packages/coding-agent/test/session/session-memory-integration.test.ts",
 	];
 
@@ -1489,6 +1491,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			const tasks = targeted([source]);
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
+	});
+	test("tool catalog changes schedule freshness and discoverable-description regressions", () => {
+		const keys = targeted(["packages/coding-agent/src/tools/tool-catalog.generated.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/tools/tool-catalog.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/tools/discoverable-description-stable.test.ts");
 	});
 
 	test("model-registry changes schedule the availability-split regression suite", () => {

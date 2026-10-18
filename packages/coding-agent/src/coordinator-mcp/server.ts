@@ -2157,17 +2157,52 @@ const eventWebhookTails = new Map<string, Promise<void>>();
 const eventWebhookStartupTails = new Map<string, Promise<void>>();
 const EVENT_WEBHOOK_ERROR_CAP = 240;
 
+const EVENT_WEBHOOK_DIAGNOSTIC_CAP = 512;
+
+/** Printable ASCII only, so a journal id cannot inject another diagnostic line. */
+function webhookEventDiagnosticToken(eventId: string, maxLength: number): string {
+	if (maxLength <= 0) return "";
+	let token = "";
+	for (let index = 0; index < eventId.length && token.length < maxLength; index += 1) {
+		const code = eventId.charCodeAt(index);
+		if (code >= 0x20 && code <= 0x7e) token += eventId[index];
+	}
+	return token;
+}
+
+/** Test-only access for generated normalization and truncation properties. */
+export function webhookEventDiagnosticTokenForTest(eventId: string, maxLength: number): string {
+	return webhookEventDiagnosticToken(eventId, maxLength);
+}
+
 async function appendEventWebhookDiagnostic(namespaceDir: string, eventId: string, error: unknown): Promise<void> {
 	const code =
 		error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
 			? error.message.slice(0, EVENT_WEBHOOK_ERROR_CAP)
 			: "event_webhook_delivery_failed";
-	const line = `${new Date().toISOString()} event=${eventId} error=${code}\n`;
+	const timestamp = new Date().toISOString();
+	const prefix = `${timestamp} event=`;
+	const suffix = ` error=${code}\n`;
+	const token = webhookEventDiagnosticToken(eventId, EVENT_WEBHOOK_DIAGNOSTIC_CAP - prefix.length - suffix.length);
+	const line = `${prefix}${token}${suffix}`;
 	try {
-		await fs.appendFile(path.join(namespaceDir, "event-webhook-errors.log"), line.slice(0, 512), { mode: 0o600 });
+		await fs.appendFile(
+			path.join(namespaceDir, "event-webhook-errors.log"),
+			line.slice(0, EVENT_WEBHOOK_DIAGNOSTIC_CAP),
+			{ mode: 0o600 },
+		);
 	} catch {
 		// Diagnostics are best-effort; sink problems must never propagate upward.
 	}
+}
+
+/** Test-only access for diagnostic record boundary coverage. */
+export async function appendEventWebhookDiagnosticForTest(
+	namespaceDir: string,
+	eventId: string,
+	error: unknown,
+): Promise<void> {
+	await appendEventWebhookDiagnostic(namespaceDir, eventId, error);
 }
 
 function enqueueEventWebhook(namespaceDir: string, event: CoordinatorEvent): void {

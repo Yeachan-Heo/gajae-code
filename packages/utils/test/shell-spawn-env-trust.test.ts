@@ -17,6 +17,18 @@ const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts")
 const HOOK_KEYS = [
 	"BASH_ENV",
 	"BUN_OPTIONS",
+	"NODE_OPTIONS",
+	"PYTHONPATH",
+	"PYTHONUSERBASE",
+	"PYTHONSTARTUP",
+	"PERL5OPT",
+	"PERL5LIB",
+	"JAVA_TOOL_OPTIONS",
+	"JDK_JAVA_OPTIONS",
+	"LD_PRELOAD",
+	"LD_AUDIT",
+	"LD_LIBRARY_PATH",
+	"DYLD_LIBRARY_PATH",
 	"GIT_ASKPASS",
 	"GIT_EXEC_PATH",
 	"GIT_PROXY_COMMAND",
@@ -223,5 +235,57 @@ describe("bash spawn env Bun startup options", () => {
 	it("keeps a trusted inherited BUN_OPTIONS value when the project does not declare it", async () => {
 		const probe = await probeIn(tempDir(), false, { BUN_OPTIONS: "--no-env-file" });
 		expect(probe.BUN_OPTIONS).toBe("--no-env-file");
+	});
+});
+
+describe("bash spawn env interpreter injection", () => {
+	for (const autoload of [true, false]) {
+		it(`drops project interpreter and loader declarations (autoload=${autoload})`, async () => {
+			const probe = await probeIn(
+				tempDir(
+					"NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nPYTHONUSERBASE=./userbase\nPYTHONSTARTUP=./startup.py\nJAVA_TOOL_OPTIONS=-javaagent:./agent.jar\nJDK_JAVA_OPTIONS=-javaagent:./agent.jar\nLD_PRELOAD=./planted.so\nLD_AUDIT=./audit.so\nLD_LIBRARY_PATH=./lib\nDYLD_LIBRARY_PATH=./lib\n",
+				),
+				autoload,
+			);
+			expect(probe).toMatchObject({
+				NODE_OPTIONS: null,
+				PYTHONPATH: null,
+				PYTHONUSERBASE: null,
+				PYTHONSTARTUP: null,
+				JAVA_TOOL_OPTIONS: null,
+				JDK_JAVA_OPTIONS: null,
+				LD_PRELOAD: null,
+				LD_AUDIT: null,
+				LD_LIBRARY_PATH: null,
+				DYLD_LIBRARY_PATH: null,
+			});
+		});
+	}
+
+	it("keeps interpreter variables the launching shell exported with a different value", async () => {
+		const probe = await probeIn(
+			tempDir(
+				"NODE_OPTIONS=--require ./r.js\nPYTHONPATH=.\nPYTHONUSERBASE=./userbase\nPYTHONSTARTUP=./startup.py\nJAVA_TOOL_OPTIONS=-javaagent:./agent.jar\nJDK_JAVA_OPTIONS=-javaagent:./agent.jar\nLD_LIBRARY_PATH=./lib\n",
+			),
+			true,
+			{
+				NODE_OPTIONS: "--max-old-space-size=4096",
+				PYTHONPATH: "/opt/operator/lib",
+				PYTHONUSERBASE: "/opt/operator/python",
+				PYTHONSTARTUP: "/opt/operator/startup.py",
+				JAVA_TOOL_OPTIONS: "-XX:+UseContainerSupport",
+				JDK_JAVA_OPTIONS: "-XX:+UseContainerSupport",
+				LD_LIBRARY_PATH: "/opt/cuda/lib64",
+			},
+		);
+		expect(probe).toMatchObject({
+			NODE_OPTIONS: "--max-old-space-size=4096",
+			PYTHONPATH: "/opt/operator/lib",
+			PYTHONUSERBASE: "/opt/operator/python",
+			PYTHONSTARTUP: "/opt/operator/startup.py",
+			JAVA_TOOL_OPTIONS: "-XX:+UseContainerSupport",
+			JDK_JAVA_OPTIONS: "-XX:+UseContainerSupport",
+			LD_LIBRARY_PATH: "/opt/cuda/lib64",
+		});
 	});
 });

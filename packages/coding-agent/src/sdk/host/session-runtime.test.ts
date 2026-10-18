@@ -38,7 +38,7 @@ import {
 } from "../bus/reconciliation-store";
 import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
-import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
+import { SESSION_HOST_OBSERVER_CAPABILITY, TOOL_ACTIVITY_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	type CreateSdkSessionRuntimeOptions,
@@ -1660,6 +1660,62 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		expect(transport.sent).toContainEqual({ type: "event", kind: "message_update", payload: {} });
 		await runtime.stop();
+	});
+	test("applies authoritative replay capabilities before live delivery when the native callback lags", async () => {
+		const replayResponse = Promise.withResolvers<SdkFrame>();
+		const transport = memoryTransport(frame => {
+			if (frame.type === "event_replay_result" && frame.id === "replay-before-capability-update")
+				replayResponse.resolve(frame);
+		});
+		let negotiateCapabilities: ((connectionId: string, capabilities: readonly string[]) => void) | undefined;
+		const hookedTransport: SessionSdkTransport = {
+			...transport,
+			onNegotiatedCapabilities(handler) {
+				negotiateCapabilities = handler;
+				return () => {
+					if (negotiateCapabilities === handler) negotiateCapabilities = undefined;
+				};
+			},
+		};
+		const runtime = new SessionSdkSessionRuntime({ transport: hookedTransport });
+		await runtime.start();
+		try {
+			if (!negotiateCapabilities) throw new Error("transport capability callback was not registered");
+			const observerCapabilities = [
+				TOOL_ACTIVITY_CAPABILITY,
+				TURN_STREAM_CAPABILITY,
+				SESSION_HOST_OBSERVER_CAPABILITY,
+			];
+			runtime.emitEvent({ kind: "tool_activity", payload: { phase: "started" } });
+			transport.feed("observer", {
+				type: "event_replay",
+				id: "replay-before-capability-update",
+				sinceGeneration: runtime.generation,
+				sinceSeq: 0,
+				capabilities: observerCapabilities,
+			});
+			const replay = await replayResponse.promise;
+			expect(replay.events).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "tool_activity" })]));
+			const observerRequirements = [TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY];
+			expect(runtime.connectionIdsWithCapabilities(observerRequirements)).toEqual(["observer"]);
+
+			runtime.sendFrameToCapabilities(observerRequirements, {
+				type: "event",
+				kind: "tool_activity",
+				payload: { phase: "updated" },
+			});
+			expect(transport.sent).toContainEqual({
+				type: "event",
+				kind: "tool_activity",
+				payload: { phase: "updated" },
+			});
+
+			// A delayed hello snapshot can omit event_replay additions; capability sets only grow per connection.
+			negotiateCapabilities("observer", [TOOL_ACTIVITY_CAPABILITY]);
+			expect(runtime.connectionIdsWithCapabilities(observerRequirements)).toEqual(["observer"]);
+		} finally {
+			await runtime.stop();
+		}
 	});
 	test("ignores late negotiated capabilities after the authoritative connection closes", async () => {
 		const transport = memoryTransport();

@@ -1,6 +1,6 @@
 ### Added
 
-- `AuthStorageOptions.credentialPreferences` accepts a persisted soft OAuth account preference per provider (`ConfiguredCredentialPreference`: selector plus optional `maxUsedFraction`). The preferred row is moved ahead of balanced/earliest-reset ranking while it is usable, and yields to the normal ranking when it is blocked, no longer stored, or its most-used known usage window has reached `maxUsedFraction`. Runtime `--credential`/`--prefer-credential` selectors and session stickiness take precedence.
+- `AuthStorageOptions.credentialPreferences` accepts an ordered, persisted soft OAuth account preference list per provider (`ConfiguredCredentialPreference[]`: selector plus optional `maxUsedFraction` cap per entry). Selection uses the first listed account that is usable and under its cap; when every listed account is blocked or capped, the unlisted accounts are ranked by balanced/earliest-reset ranking, and capped listed accounts are used only after those. Caps read the windows each provider reports, so they also apply to providers without a ranking strategy. Runtime `--credential`/`--prefer-credential` selectors and session stickiness take precedence. A list whose entries name one stored row twice (for example an email and `account:<id>` for the same login) is ignored as a whole and reported by `AuthStorage.findDuplicateCredentialPreferences()`.
 
 ### Fixed
 

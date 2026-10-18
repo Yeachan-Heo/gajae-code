@@ -103,7 +103,7 @@ describe("gjc accounts with org:<organization> selectors", () => {
 		const result = await accountsJson({
 			action: "pin",
 			provider: "anthropic",
-			selector: "org:Acme",
+			selectors: ["org:Acme"],
 			flags: { persistent: true, json: true },
 		});
 

@@ -189,6 +189,7 @@ import {
 	parsePersistedCredentialSelector,
 	resolveStartupAuthConfig,
 	type StartupAuthConfigSnapshot,
+	startupAuthConfigError,
 } from "../session/startup-auth-config";
 import {
 	isOwnedCompletionEnvelopeAllowed,
@@ -795,7 +796,7 @@ export async function discoverAuthStorage(
 			credentialRankingMode,
 			credentialPreferences,
 		});
-		return await reloadDiscoveredAuthStorage(storage);
+		return rejectDuplicateCredentialPreferences(await reloadDiscoveredAuthStorage(storage), agentDir);
 	}
 	const dbPath = getAgentDbPath(agentDir);
 	const storage = await AuthStorage.create(dbPath, {
@@ -804,7 +805,7 @@ export async function discoverAuthStorage(
 		credentialRankingMode,
 		credentialPreferences,
 	});
-	return await reloadDiscoveredAuthStorage(storage);
+	return rejectDuplicateCredentialPreferences(await reloadDiscoveredAuthStorage(storage), agentDir);
 }
 
 async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthStorage> {
@@ -819,6 +820,26 @@ async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthSt
 		throw error;
 	}
 	return storage;
+}
+
+/**
+ * Two preference entries can name one stored account through different selectors (`email:` and `account:` for the
+ * same login). Only the loaded rows reveal that, so the startup-config check finishes here and fails closed like any
+ * other invalid preference list.
+ */
+function rejectDuplicateCredentialPreferences(storage: AuthStorage, agentDir: string): AuthStorage {
+	const duplicates = storage.findDuplicateCredentialPreferences();
+	if (duplicates.length === 0) return storage;
+	logger.warn("Configured credential preferences name one account twice", {
+		providers: duplicates.map(({ provider }) => sanitizeProviderForLog(provider)),
+	});
+	const error = startupAuthConfigError(agentDir, "invalid-credential-preferences");
+	try {
+		storage.close();
+	} catch (cleanupError) {
+		throw attachStartupCleanupDiagnostic(error, cleanupError);
+	}
+	throw error;
 }
 
 /** Ranking is resolved as part of the typed startup-auth snapshot. */
@@ -2477,7 +2498,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
-				const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
+				const hasTtsrCondition = (rule.condition?.length ?? 0) > 0 || (rule.astCondition?.length ?? 0) > 0;
+				const isTtsrRule = hasTtsrCondition ? ttsrManager.addRule(rule) : false;
 				if (isTtsrRule) {
 					continue;
 				}

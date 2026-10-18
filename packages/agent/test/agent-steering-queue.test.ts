@@ -64,6 +64,50 @@ describe("Agent steering admission", () => {
 		expect(h.agent.hasQueuedSteering()).toBe(false);
 	});
 
+	it("commits a steering cohort in one step under the default one-at-a-time mode", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		await h.entered;
+
+		const head = userMessage("cohort head");
+		const tail = userMessage("cohort tail");
+		expect(h.agent.steerCohort([head, tail]).admitted).toBe(true);
+		expect(h.agent.snapshotSteering()).toEqual([head, tail]);
+
+		h.release();
+		await run;
+
+		// The cohort is committed as one unit: both messages reach the same request
+		// even though the default mode takes one steering record per step.
+		const index = h.agent.state.messages.indexOf(head);
+		expect(index).toBeGreaterThanOrEqual(0);
+		expect(h.agent.state.messages[index + 1]).toBe(tail);
+		expect(
+			h.mock.calls.some(call => call.context.messages.includes(head) && call.context.messages.includes(tail)),
+		).toBe(true);
+	});
+
+	it("reports a steering cohort only while its members stay contiguous", async () => {
+		const h = liveRunHarness();
+		const run = h.agent.prompt("go");
+		await h.entered;
+		const head = userMessage("reported head");
+		const tail = userMessage("reported tail");
+		expect(h.agent.steerCohort([head, tail]).admitted).toBe(true);
+
+		const queued = h.agent.snapshotSteering();
+		expect([...h.agent.steeringCohorts(queued).keys()]).toEqual([head, tail]);
+		// A partial or reordered list is no longer the cohort, so a caller that
+		// re-routes one cannot claim an atomic unit it does not have.
+		expect(h.agent.steeringCohorts([tail, head]).size).toBe(0);
+		expect(h.agent.steeringCohorts([head]).size).toBe(0);
+		expect(h.agent.steeringCohorts([tail]).size).toBe(0);
+		expect(h.agent.steeringCohorts([head, userMessage("unrelated")]).size).toBe(0);
+
+		h.release();
+		await run;
+	});
+
 	it("rejects a steer once the live run's signal is aborted", async () => {
 		const h = liveRunHarness();
 		const run = h.agent.prompt("go");

@@ -2081,6 +2081,7 @@ async fn handle_conn(ws: ConnectionWebSocket, state: Arc<ServerState>, cancel: C
 			capabilities::THREADED.into(),
 			capabilities::CONTEXT.into(),
 			capabilities::TURN_STREAM.into(),
+			capabilities::SESSION_HOST_OBSERVER_V1.into(),
 			capabilities::IMAGES.into(),
 			capabilities::CONFIG.into(),
 			capabilities::CLIENT_PING_PONG.into(),
@@ -2420,6 +2421,38 @@ where
 	S: SinkExt<Message> + Unpin,
 {
 	if is_v3_frame(text) {
+		// event_replay can negotiate capabilities on the same authenticated socket
+		// as hello. Publish the merged native snapshot before forwarding the request.
+		if let Ok(frame) = serde_json::from_str::<serde_json::Value>(text)
+			&& frame.get("type").and_then(serde_json::Value::as_str) == Some("event_replay")
+			&& let Some(requested) = frame
+				.get("capabilities")
+				.and_then(serde_json::Value::as_array)
+			&& requested.iter().all(serde_json::Value::is_string)
+		{
+			let _ = state
+				.connections
+				.lock()
+				.get_mut(connection_id)
+				.map(|connection| {
+					for capability in requested.iter().filter_map(serde_json::Value::as_str) {
+						if !connection
+							.capabilities
+							.iter()
+							.any(|existing| existing == capability)
+						{
+							connection.capabilities.push(capability.to_owned());
+						}
+					}
+					connection.negotiation = Negotiation::Negotiated;
+					*awaiting = false;
+					let _ = state.cap_tx.send(CapabilityUpdate {
+						connection_id: connection_id.to_owned(),
+						capabilities:  connection.capabilities.clone(),
+					});
+				});
+			let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
+		}
 		return state
 			.frame_tx
 			.send((
@@ -2604,7 +2637,7 @@ where
 }
 
 /// Attaches the authoritative, locally negotiated capability set to forwarded
-/// `event_replay` frames. Hello is handled before later frames on a connection,
+/// `event_replay` frames. Negotiation is handled before forwarding the request,
 /// so this does not depend on an asynchronously mirrored host cache.
 fn attach_event_replay_capabilities(
 	text: &str,
@@ -3564,7 +3597,37 @@ mod tests {
 		handle.stop();
 	}
 	#[tokio::test]
-	async fn event_replay_forwards_authoritative_capabilities_after_repeated_hello() {
+	async fn event_replay_negotiates_observation_without_client_hello() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut frames = handle.take_frame_receiver().expect("frame receiver");
+		let mut updates = handle
+			.take_capability_receiver()
+			.expect("capability receiver");
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		ws.send(Message::Text(
+			r#"{"type":"event_replay","id":"observe","capabilities":["turn_stream","session_host_observer_v1"]}"#.into(),
+		)).await.unwrap();
+		let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(update.capabilities, vec![
+			capabilities::TURN_STREAM,
+			capabilities::SESSION_HOST_OBSERVER_V1
+		]);
+		let (connection_id, frame) = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(connection_id, update.connection_id);
+		let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+		assert_eq!(frame["capabilities"], serde_json::json!(update.capabilities));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn event_replay_merges_capabilities_after_repeated_hello() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut frames = handle.take_frame_receiver().expect("frame receiver");
 		let mut ws = connect(&handle, "secret").await;
@@ -3572,7 +3635,7 @@ mod tests {
 		send_hello(&mut ws, vec![]).await;
 		send_hello(&mut ws, vec![capabilities::TOOL_ACTIVITY_V1.into()]).await;
 		ws.send(Message::Text(
-			r#"{"type":"event_replay","id":"replay-forged","capabilities":["forged"]}"#.into(),
+			r#"{"type":"event_replay","id":"replay-observer","capabilities":["session_host_observer_v1"]}"#.into(),
 		))
 		.await
 		.unwrap();
@@ -3582,7 +3645,13 @@ mod tests {
 			.expect("timed out waiting for replay frame")
 			.expect("frame receiver closed");
 		let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
-		assert_eq!(frame["capabilities"], serde_json::json!([capabilities::TOOL_ACTIVITY_V1]));
+		assert_eq!(
+			frame["capabilities"],
+			serde_json::json!([
+				capabilities::TOOL_ACTIVITY_V1,
+				capabilities::SESSION_HOST_OBSERVER_V1
+			])
+		);
 		handle.stop();
 	}
 
@@ -4298,6 +4367,7 @@ mod tests {
 			capabilities::THREADED,
 			capabilities::CONTEXT,
 			capabilities::TURN_STREAM,
+			capabilities::SESSION_HOST_OBSERVER_V1,
 			capabilities::IMAGES,
 			capabilities::CONFIG,
 			capabilities::CLIENT_PING_PONG,

@@ -117,6 +117,7 @@ import {
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
+	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
@@ -5106,9 +5107,13 @@ export function createNotificationsExtension(
 		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
 			const incarnation = liveHostConnection(connectionId);
 			if (!incarnation) return;
+			const previous = hostCapCache.get(connectionId);
+			const merged =
+				previous?.generation === incarnation.generation ? new Set(previous.capabilities) : new Set<string>();
+			for (const capability of capabilities) merged.add(capability);
 			hostCapCache.set(connectionId, {
 				generation: incarnation.generation,
-				capabilities: new Set(capabilities),
+				capabilities: merged,
 			});
 		};
 		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
@@ -5850,7 +5855,7 @@ export function createNotificationsExtension(
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
-			if (!runtime) return;
+			if (!runtime || runtime.stopping || runtime.serverStopped || runtimes.get(id) !== runtime) return;
 			cleanupPromptRecords();
 			const handle = ctx.getActivePromptHandle();
 			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
@@ -5863,12 +5868,14 @@ export function createNotificationsExtension(
 				)
 			)
 				correlations.unshift(root);
+			const owners = new Set<string>();
 			for (const correlation of correlations) {
 				// Renewal is attributed exactly like the correlated delivery below.
 				renewPromptDeadline(correlation, event);
 				noteToolDispatchBoundary(correlation, event);
 				const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 				if (!submission || submission.abandoned) continue;
+				owners.add(submission.connectionId);
 				const frame = {
 					type: "event",
 					kind: event.type,
@@ -5880,6 +5887,25 @@ export function createNotificationsExtension(
 					continue;
 				}
 				deliverCorrelatedFrame(submission, frame);
+			}
+			// Broker-created hosts use this bus, not the SDK-only extension. Observers
+			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Keep cumulative partialResult snapshots and authoritative final result
+			// intact, and off the durable lifecycle replay ring, like owner content.
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
+				TURN_STREAM_CAPABILITY,
+				SESSION_HOST_OBSERVER_CAPABILITY,
+			]) ?? []) {
+				if (owners.has(connectionId)) continue;
+				try {
+					sdkRuntime?.sendFrameTo(connectionId, {
+						type: "event",
+						kind: event.type,
+						payload: toAgentWireEventPayload(event),
+					});
+				} catch {
+					// Content delivery is best-effort and must not interrupt execution.
+				}
 			}
 		};
 		/**
@@ -8447,6 +8473,13 @@ export function createNotificationsExtension(
 						return;
 					}
 					if (typedFrame.type === "event_replay") {
+						const capabilities = typedFrame.capabilities;
+						if (
+							Array.isArray(capabilities) &&
+							capabilities.every((capability: unknown) => typeof capability === "string")
+						) {
+							rememberHostCapabilities(inbound.connectionId, capabilities as string[]);
+						}
 						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;

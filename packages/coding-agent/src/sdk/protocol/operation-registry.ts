@@ -354,8 +354,15 @@ export const OPERATIONS: readonly Operation[] = [
 					: id === "G10"
 						? ["invalid_input", "not_found", "idempotency_conflict", "lifecycle_pending", "terminal_uncertain"]
 						: ["G03", "G04", "G05"].includes(id)
-							? ["invalid_request", "unknown_model_profile", "model_profile_registry_error"]
-							: ["invalid_request"],
+							? [
+									"invalid_request",
+									"unknown_model_profile",
+									"model_profile_registry_error",
+									"legacy_lifecycle_ambiguous",
+								]
+							: ["G06", "G07", "G08"].includes(id)
+								? ["invalid_request", "legacy_lifecycle_ambiguous"]
+								: ["invalid_request"],
 			adapterDispositions:
 				id === "G02"
 					? dispositions({

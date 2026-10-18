@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { calculateCost, getBundledModel } from "../src/models";
 import modelsJson from "../src/models.json" with { type: "json" };
+import { applyAnthropicUsageExtras } from "../src/providers/anthropic";
 import { populateResponsesUsageFromResponse } from "../src/providers/openai-responses-shared";
 import type { AssistantMessage, Model, Usage } from "../src/types";
 
@@ -125,6 +126,149 @@ describe("calculateCost", () => {
 		calculateCost(model, usage);
 
 		expect(usage.cost.total).toBeCloseTo(2.18, 8);
+	});
+
+	it("bundles the direct Haiku 5.5 long-context price tier", () => {
+		const rawCatalog = modelsJson as unknown as Record<string, Record<string, Model>>;
+		const expected = {
+			threshold: 100_000,
+			cost: { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 },
+		};
+		const model = getBundledModel("anthropic", "claude-haiku-5-5");
+
+		expect(rawCatalog.anthropic?.["claude-haiku-5-5"]?.longContextPricing).toEqual(expected);
+		expect(model.longContextPricing).toEqual(expected);
+	});
+
+	it("applies Haiku 5.5 long-context rates only above 100K total prompt tokens", () => {
+		const model = getBundledModel("anthropic", "claude-haiku-5-5");
+		const usage = (input: number, cacheRead: number, cacheWrite: number): Usage => ({
+			input,
+			output: 1_000,
+			cacheRead,
+			cacheWrite,
+			totalTokens: input + cacheRead + cacheWrite + 1_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const atThreshold = usage(100_000, 0, 0);
+		const aboveThreshold = usage(80_000, 20_000, 1);
+
+		calculateCost(model, atThreshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(atThreshold.cost).toEqual({
+			input: 0.01,
+			output: 0.0005,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0.0105,
+		});
+		expect(aboveThreshold.cost.input).toBeCloseTo(0.04, 12);
+		expect(aboveThreshold.cost.output).toBeCloseTo(0.0025, 12);
+		expect(aboveThreshold.cost.cacheRead).toBeCloseTo(0.001, 12);
+		expect(aboveThreshold.cost.cacheWrite).toBeCloseTo(0.000000625, 12);
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.043500625, 12);
+	});
+
+	it("bills Haiku 5.5 1-hour cache writes at the 1-hour rate in both prompt tiers", () => {
+		const model = getBundledModel("anthropic", "claude-haiku-5-5");
+		const usageWith = (input: number, cacheWrite: number, ephemeral1h?: number): Usage => ({
+			input,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite,
+			totalTokens: input + cacheWrite,
+			...(ephemeral1h === undefined ? {} : { cttl: { ephemeral1h, ephemeral5m: cacheWrite - ephemeral1h } }),
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		// 150K 1-hour writes in a 200K prompt: above the 100K tier at $1/MTok.
+		const long = usageWith(50_000, 150_000, 150_000);
+		calculateCost(model, long);
+		expect(long.cost.cacheWrite).toBeCloseTo(0.15, 12);
+		// 80K 1-hour writes in a prompt at or below 100K: $0.20/MTok.
+		const short = usageWith(10_000, 80_000, 80_000);
+		calculateCost(model, short);
+		expect(short.cost.cacheWrite).toBeCloseTo(0.016, 12);
+		// A mixed split bills each component at its own rate.
+		const mixed = usageWith(50_000, 150_000, 100_000);
+		calculateCost(model, mixed);
+		expect(mixed.cost.cacheWrite).toBeCloseTo(0.1 + 0.03125, 12);
+		// No TTL breakdown reported: fall back to the 5-minute cache-write rate.
+		const unsplit = usageWith(50_000, 150_000);
+		calculateCost(model, unsplit);
+		expect(unsplit.cost.cacheWrite).toBeCloseTo(0.09375, 12);
+	});
+
+	it("prices Haiku 5.5 usage reported by the Anthropic provider end to end", () => {
+		const model = getBundledModel("anthropic", "claude-haiku-5-5");
+		const usage: Usage = {
+			input: 50_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 150_000,
+			totalTokens: 200_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		applyAnthropicUsageExtras(usage, {
+			cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 150_000 },
+		} as never);
+		calculateCost(model, usage);
+		expect(usage.cttl).toEqual({ ephemeral1h: 150_000 });
+		expect(usage.cost.cacheWrite).toBeCloseTo(0.15, 12);
+	});
+
+	it("holds seeded Haiku 5.5 pricing properties over generated token partitions", () => {
+		let state = 0x5eed_6872;
+		const rand = (max: number): number => {
+			state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+			return Math.floor((state / 0x1_0000_0000) * max);
+		};
+		const haiku55 = getBundledModel("anthropic", "claude-haiku-5-5");
+		const haiku45 = getBundledModel("anthropic", "claude-haiku-4-5");
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-5-5");
+		const near = [0, 1, 99_999, 100_000, 100_001, 500_000];
+		for (let i = 0; i < 200; i++) {
+			const input = i % 3 === 0 ? near[rand(near.length)]! : rand(300_000);
+			const cacheRead = rand(200_000);
+			const cacheWrite = rand(200_000);
+			const oneHour = rand(cacheWrite + 1);
+			const mk = (withSplit: boolean): Usage => ({
+				input,
+				output: rand(10_000),
+				cacheRead,
+				cacheWrite,
+				totalTokens: input + cacheRead + cacheWrite,
+				...(withSplit ? { cttl: { ephemeral1h: oneHour, ephemeral5m: cacheWrite - oneHour } } : {}),
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			});
+			const total = input + cacheRead + cacheWrite;
+			const tier = total > 100_000;
+			const usage = mk(true);
+			calculateCost(haiku55, usage);
+			// Tier selection counts input, cache reads and cache writes; the boundary is exclusive.
+			const rate = tier
+				? { i: 0.5, o: 2.5, r: 0.05, w5: 0.625, w1: 1 }
+				: { i: 0.1, o: 0.5, r: 0.01, w5: 0.125, w1: 0.2 };
+			expect(usage.cost.input).toBeCloseTo((rate.i * input) / 1e6, 9);
+			expect(usage.cost.output).toBeCloseTo((rate.o * usage.output) / 1e6, 9);
+			expect(usage.cost.cacheRead).toBeCloseTo((rate.r * cacheRead) / 1e6, 9);
+			expect(usage.cost.cacheWrite).toBeCloseTo((rate.w5 * (cacheWrite - oneHour) + rate.w1 * oneHour) / 1e6, 9);
+			expect(usage.cost.total).toBeCloseTo(
+				usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite,
+				12,
+			);
+			// Without a TTL split every write token is billed at the 5-minute rate.
+			const unsplit = mk(false);
+			calculateCost(haiku55, unsplit);
+			expect(unsplit.cost.cacheWrite).toBeCloseTo((rate.w5 * cacheWrite) / 1e6, 9);
+			// Other models never pick up Haiku 5.5's tier or 1-hour rate.
+			for (const other of [haiku45, sonnet]) {
+				const u = mk(true);
+				calculateCost(other, u);
+				expect(u.cost.cacheWrite).toBeCloseTo((other.cost.cacheWrite * cacheWrite) / 1e6, 9);
+				expect(u.cost.input).toBeCloseTo((other.cost.input * input) / 1e6, 9);
+			}
+		}
 	});
 
 	it("prices OpenAI Codex GPT models from the matching OpenAI catalog entry", () => {

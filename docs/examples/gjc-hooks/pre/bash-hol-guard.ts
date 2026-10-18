@@ -18,7 +18,7 @@ const GUARD_TIMEOUT_MS = 10_000;
 const GUARD_CLEANUP_GRACE_MS = 500;
 
 /**
- * Optional project-local example: copy this file to .gjc/hooks/pre/bash.ts.
+ * Optional example: copy this file to ~/.gjc/agent/hooks/pre/bash.ts.
  * HOL Guard must be installed and available on PATH.
  */
 export default function registerHolGuardPreflight(api: HookApi): void {

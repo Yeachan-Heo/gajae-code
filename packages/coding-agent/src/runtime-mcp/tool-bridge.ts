@@ -306,6 +306,70 @@ export function createMCPToolName(serverName: string, toolName: string): string 
 	return `mcp__${sanitizedServerName}_${normalizedToolName}`;
 }
 
+/** Instance payloads on a schema node. Framing these would change the arguments a tool still accepts. */
+const MCP_SCHEMA_LITERAL_KEYS = new Set(["default", "const", "enum", "examples", "example"]);
+/** Prose the model reads. Structural keywords such as type, pattern, and $ref stay literal. */
+const MCP_SCHEMA_PROSE_KEYS = new Set(["description", "title", "$comment"]);
+/** Values are schemas keyed by a name that is not itself a schema keyword. */
+const MCP_SCHEMA_MAP_KEYS = new Set(["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]);
+const MCP_SCHEMA_LIST_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
+
+function assignOwn(target: Record<string, unknown>, key: string, value: unknown): void {
+	if (key === "__proto__") {
+		Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+		return;
+	}
+	target[key] = value;
+}
+
+function frameMcpSchemaMap(map: Record<string, unknown>, seen: WeakSet<object>): Record<string, unknown> {
+	const output: Record<string, unknown> = {};
+	for (const name of Object.keys(map)) assignOwn(output, name, frameMcpSchemaNode(map[name], seen));
+	return output;
+}
+
+/** Frame one schema node. Property names inside schema maps are not treated as keywords. */
+function frameMcpSchemaNode(value: unknown, seen: WeakSet<object>): unknown {
+	if (!value || typeof value !== "object") return value;
+	if (seen.has(value)) return value;
+	seen.add(value);
+	if (Array.isArray(value)) return value.map(item => frameMcpSchemaNode(item, seen));
+	const output: Record<string, unknown> = {};
+	for (const key of Object.keys(value)) {
+		const child = (value as Record<string, unknown>)[key];
+		if (MCP_SCHEMA_LITERAL_KEYS.has(key)) {
+			assignOwn(output, key, child);
+			continue;
+		}
+		if (MCP_SCHEMA_PROSE_KEYS.has(key) && typeof child === "string") {
+			assignOwn(output, key, wrapUntrustedContent(child));
+			continue;
+		}
+		if (MCP_SCHEMA_MAP_KEYS.has(key) && child && typeof child === "object" && !Array.isArray(child)) {
+			assignOwn(output, key, frameMcpSchemaMap(child as Record<string, unknown>, seen));
+			continue;
+		}
+		if (MCP_SCHEMA_LIST_KEYS.has(key) && Array.isArray(child)) {
+			assignOwn(
+				output,
+				key,
+				child.map(item => frameMcpSchemaNode(item, seen)),
+			);
+			continue;
+		}
+		assignOwn(output, key, frameMcpSchemaNode(child, seen));
+	}
+	return output;
+}
+
+function mcpModelDescription(description: string | undefined, serverName: string): string {
+	return wrapUntrustedContent(description ?? `MCP tool from ${serverName}`);
+}
+
+function mcpModelParameters(inputSchema: MCPToolDefinition["inputSchema"]): TSchema {
+	return frameMcpSchemaNode(normalizeSchemaForMCP(inputSchema), new WeakSet()) as TSchema;
+}
+
 /**
  * Parse an MCP tool name back to server and tool components.
  *
@@ -380,8 +444,8 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		this.#isAvailable = options?.isAvailable;
 		this.name = createMCPToolName(resolvedConnection.name, tool.name);
 		this.label = `${resolvedConnection.name}/${tool.name}`;
-		this.description = tool.description ?? `MCP tool from ${resolvedConnection.name}`;
-		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
+		this.description = mcpModelDescription(tool.description, resolvedConnection.name);
+		this.parameters = mcpModelParameters(tool.inputSchema);
 		this.mcpToolName = tool.name;
 		this.mcpServerName = resolvedConnection.name;
 		this.gjcPluginBundle = resolvedConnection._source?.provider === GJC_PLUGIN_MCP_PROVIDER;
@@ -520,8 +584,8 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	) {
 		this.name = createMCPToolName(serverName, tool.name);
 		this.label = `${serverName}/${tool.name}`;
-		this.description = tool.description ?? `MCP tool from ${serverName}`;
-		this.parameters = normalizeSchemaForMCP(tool.inputSchema) as TSchema;
+		this.description = mcpModelDescription(tool.description, serverName);
+		this.parameters = mcpModelParameters(tool.inputSchema);
 		this.mcpToolName = tool.name;
 		this.mcpServerName = serverName;
 		this.gjcPluginBundle = source?.provider === GJC_PLUGIN_MCP_PROVIDER;

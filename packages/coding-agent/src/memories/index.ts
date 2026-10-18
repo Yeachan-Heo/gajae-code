@@ -1041,6 +1041,29 @@ function redactSecrets(input: string): string {
 	for (const pattern of patterns) {
 		out = out.replace(pattern, "[REDACTED]");
 	}
+	return redactBearerAndBasicAssignments(out);
+}
+
+/**
+ * Bearer and Basic assignments have no vendor prefix, so the rules above miss
+ * them. A following word with no digit, "+", "/", or "=" stays, which keeps
+ * phrases such as "Basic authentication" and "the bearer of".
+ */
+function bearerOrBasicValueIsCredential(value: string): boolean {
+	if (value.length < 8) return false;
+	if (value.includes("+") || value.includes("/") || value.includes("=")) return true;
+	return value.length >= 12 && /[0-9]/.test(value);
+}
+
+function redactBearerAndBasicAssignments(input: string): string {
+	const labeled = /(["']?authorization["']?\s*[:=]\s*["']?)((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	const bare = /\b((?:bearer|basic)\s+["']?)([A-Za-z0-9._~+/=-]{8,})/gi;
+	let out = input.replace(labeled, (match, label: string, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${label}${scheme}[REDACTED]` : match,
+	);
+	out = out.replace(bare, (match, scheme: string, value: string) =>
+		bearerOrBasicValueIsCredential(value) ? `${scheme}[REDACTED]` : match,
+	);
 	return out;
 }
 

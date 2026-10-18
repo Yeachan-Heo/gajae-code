@@ -3662,6 +3662,7 @@ export class SelectorController {
 					if (option === `Use ${currentDefault.id}`) {
 						try {
 							await this.ctx.session.setModel(currentDefault);
+							this.ctx.updateEditorChrome();
 							this.ctx.showStatus(`Switched to ${currentDefault.provider}/${currentDefault.id}`);
 						} catch (err) {
 							this.ctx.showError(err instanceof Error ? err.message : String(err));

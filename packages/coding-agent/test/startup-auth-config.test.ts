@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { SqliteAuthCredentialStore } from "@gajae-code/ai";
 import { getAgentDbPath } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { validateSettingPatch } from "../src/config/settings-schema";
+import { discoverAuthStorage } from "../src/sdk/session";
 import {
 	isValidPersistedCredentialSelector,
 	resolveStartupAuthConfig,
@@ -169,50 +171,94 @@ describe("startup auth config", () => {
 		});
 	});
 
-	it("reads soft credential preferences with the shared usage threshold", async () => {
+	it("reads ordered credential preferences with per-account usage caps", async () => {
 		clearAuthEnv();
 		const agentDir = await makeAgentDir(
 			[
 				"auth:",
 				"  credentialPreferences:",
-				"    anthropic: email:cheap@example.com",
+				"    anthropic:",
+				"      - cheap@example.com",
+				"      - shared@example.com: 75",
+				"      - email:prefixed@example.com: 40.5",
+				"      - account:acct-9: 100",
 				"    openai-codex: account:acct-1",
-				"  credentialPreferenceMaxUsedPercent: 90",
+				"    kimi-code: solo@example.com",
 			].join("\n"),
 		);
 
-		await expect(resolveStartupAuthConfig(agentDir)).resolves.toMatchObject({
-			credentialPreferences: {
-				anthropic: { selector: { kind: "email", value: "cheap@example.com" }, maxUsedFraction: 0.9 },
-				"openai-codex": { selector: { kind: "account", value: "acct-1" }, maxUsedFraction: 0.9 },
-			},
-		});
-
-		const noThreshold = await makeAgentDir(
-			"auth:\n  credentialPreferences:\n    anthropic: email:cheap@example.com\n",
-		);
-		const resolved = await resolveStartupAuthConfig(noThreshold);
+		const resolved = await resolveStartupAuthConfig(agentDir);
 		expect(resolved.credentialPreferences).toEqual({
-			anthropic: { selector: { kind: "email", value: "cheap@example.com" } },
+			anthropic: [
+				{ selector: { kind: "email", value: "cheap@example.com" } },
+				{ selector: { kind: "email", value: "shared@example.com" }, maxUsedFraction: 0.75 },
+				{ selector: { kind: "email", value: "prefixed@example.com" }, maxUsedFraction: 0.405 },
+				// A 100 percent cap is the same as no cap: only blocking moves past the account.
+				{ selector: { kind: "account", value: "acct-9" } },
+			],
+			"openai-codex": [{ selector: { kind: "account", value: "acct-1" } }],
+			"kimi-code": [{ selector: { kind: "email", value: "solo@example.com" } }],
 		});
 	});
 
-	it("fails closed for numeric, malformed, or out-of-range credential preferences", async () => {
+	it.each([
+		["a numeric row id", "    anthropic: id:42\n"],
+		["a non-mapping section", null],
+		["a value that is not an account", "    anthropic: cheap\n"],
+		["an empty list", "    anthropic: []\n"],
+		["a numeric id inside a list", "    anthropic:\n      - cheap@example.com\n      - id:42\n"],
+		["the same account twice", "    anthropic:\n      - cheap@example.com\n      - Cheap@Example.com: 50\n"],
+		["two accounts in one entry", "    anthropic:\n      - cheap@example.com: 50\n        other@example.com: 50\n"],
+		["a zero cap", "    anthropic:\n      - cheap@example.com: 0\n"],
+		["a cap over 100", "    anthropic:\n      - cheap@example.com: 101\n"],
+		["a string cap", '    anthropic:\n      - cheap@example.com: "75%"\n'],
+		["a nested list", "    anthropic:\n      - - cheap@example.com\n"],
+	])("fails closed for credential preferences with %s", async (_label, body) => {
 		clearAuthEnv();
-		for (const config of [
-			"auth:\n  credentialPreferences:\n    anthropic: id:42\n",
-			"auth:\n  credentialPreferences: preference-section-secret\n",
-			"auth:\n  credentialPreferences:\n    anthropic: cheap@example.com\n",
-			"auth:\n  credentialPreferenceMaxUsedPercent: 0\n",
-			"auth:\n  credentialPreferenceMaxUsedPercent: 101\n",
-			'auth:\n  credentialPreferenceMaxUsedPercent: "90"\n',
-		]) {
-			const agentDir = await makeAgentDir(config);
-			await expectStartupAuthConfigError(
-				resolveStartupAuthConfig(agentDir),
-				"invalid-credential-preferences",
-				"preference-section-secret",
-			);
+		const agentDir = await makeAgentDir(
+			body === null
+				? "auth:\n  credentialPreferences: preference-section-secret\n"
+				: `auth:\n  credentialPreferences:\n${body}`,
+		);
+		await expectStartupAuthConfigError(
+			resolveStartupAuthConfig(agentDir),
+			"invalid-credential-preferences",
+			"preference-section-secret",
+		);
+	});
+
+	it.each([
+		["fails closed when two entries name one stored account", "acct-cheap", true],
+		["opens the store when the entries name different stored accounts", "acct-other", false],
+	])("%s through different selectors", async (_label, cheapAccountId, rejected) => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			"auth:\n  credentialPreferences:\n    anthropic:\n      - cheap@example.com: 50\n      - account:acct-cheap\n",
+		);
+		const store = await SqliteAuthCredentialStore.open(getAgentDbPath(agentDir));
+		try {
+			store.upsertAuthCredentialForProvider("anthropic", {
+				type: "oauth",
+				access: "access-cheap",
+				refresh: "refresh-cheap",
+				expires: Date.now() + 3_600_000,
+				email: "cheap@example.com",
+				accountId: cheapAccountId,
+			});
+		} finally {
+			store.close();
+		}
+
+		const discovery = discoverAuthStorage(agentDir);
+		if (rejected) {
+			await expectStartupAuthConfigError(discovery, "invalid-credential-preferences", "cheap@example.com");
+			return;
+		}
+		const storage = await discovery;
+		try {
+			expect(storage.findDuplicateCredentialPreferences()).toEqual([]);
+		} finally {
+			storage.close();
 		}
 	});
 
@@ -317,33 +363,43 @@ describe("startup auth config", () => {
 		]);
 	});
 
-	it("validates preference records as portable selectors with a bounded threshold", () => {
-		expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: "email:cheap@example.com" } })).toEqual(
+	it("validates preference records with the startup parser grammar", () => {
+		for (const value of [
+			"email:cheap@example.com",
+			"cheap@example.com",
+			["cheap@example.com", { "account:acct-1": 75 }],
+		]) {
+			expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: value } })).toEqual([]);
+		}
+		for (const value of [
+			"id:27",
 			[],
-		);
-		expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: "id:27" } })).toEqual([
-			{ path: "auth.credentialPreferences.anthropic", detail: "Expected portable-credential-selector." },
-		]);
-		expect(validateSettingPatch({ "auth.credentialPreferenceMaxUsedPercent": 90 })).toEqual([]);
-		expect(validateSettingPatch({ "auth.credentialPreferenceMaxUsedPercent": 0 })).not.toEqual([]);
-		expect(validateSettingPatch({ "auth.credentialPreferenceMaxUsedPercent": 101 })).not.toEqual([]);
+			[{ "cheap@example.com": 0 }],
+			[{ "cheap@example.com": 50, "other@example.com": 50 }],
+			["cheap@example.com", "cheap@example.com"],
+		]) {
+			expect(validateSettingPatch({ "auth.credentialPreferences": { anthropic: value } })).toEqual([
+				{ path: "auth.credentialPreferences.anthropic", detail: "Expected credential-preference-list." },
+			]);
+		}
 	});
 
 	it("ignores project-scoped credential preferences", async () => {
 		clearAuthEnv();
 		const agentDir = await makeAgentDir(
-			"auth:\n  credentialPreferences:\n    anthropic: email:global@example.com\n  credentialPreferenceMaxUsedPercent: 80\n",
+			"auth:\n  credentialPreferences:\n    anthropic:\n      - global@example.com: 80\n",
 		);
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-auth-project-"));
 		tempDirs.push(projectDir);
 		await fs.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
 		await fs.writeFile(
 			path.join(projectDir, ".gjc", "config.yml"),
-			"auth:\n  credentialPreferences:\n    anthropic: email:project@example.com\n  credentialPreferenceMaxUsedPercent: 10\n",
+			"auth:\n  credentialPreferences:\n    anthropic:\n      - project@example.com: 10\n",
 		);
 
 		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
-		expect(settings.get("auth.credentialPreferences")).toEqual({ anthropic: "email:global@example.com" });
-		expect(settings.get("auth.credentialPreferenceMaxUsedPercent")).toBe(80);
+		expect(settings.get("auth.credentialPreferences")).toEqual({
+			anthropic: [{ "global@example.com": 80 }],
+		});
 	});
 });

@@ -151,6 +151,7 @@ describe("model cache migrations", () => {
 			["dynamic-a"],
 			"provenance-a",
 			[createModel("dynamic-a", "Dynamic A")],
+			undefined,
 			observedAt + 2,
 			[createModel("fallback-a", "Fallback A")],
 			false,
@@ -198,6 +199,7 @@ describe("model cache migrations", () => {
 			ids,
 			"provenance-a",
 			observed?.models ?? [],
+			undefined,
 			observedAt + 1,
 			[createModel("dynamic-a", "Failed Fetch")],
 			false,
@@ -209,6 +211,56 @@ describe("model cache migrations", () => {
 		expect(
 			readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => observedAt, dbPath)?.models[0]?.name,
 		).toBe("Concurrent B");
+	});
+
+	it("does not conditionally replace a row whose discovery User-Agent changed after observation", () => {
+		const observedAt = 1_700_000_000_000;
+		const observedModels = [createModel("dynamic-a", "Dynamic A")];
+		writeModelCache(
+			"ollama-cloud",
+			observedAt,
+			observedModels,
+			true,
+			"static",
+			dbPath,
+			["dynamic-a"],
+			"provenance-a",
+			"antigravity-ide",
+		);
+		const observed = readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => observedAt, dbPath);
+		writeModelCache(
+			"ollama-cloud",
+			observedAt,
+			observedModels,
+			true,
+			"static",
+			dbPath,
+			["dynamic-a"],
+			"provenance-a",
+			"antigravity/cli/1.3.4",
+		);
+
+		const updated = updateModelCacheIfUnchanged(
+			"ollama-cloud",
+			observedAt,
+			["dynamic-a"],
+			"provenance-a",
+			observed?.models ?? [],
+			observed?.discoveryUserAgent,
+			observedAt + 1,
+			[createModel("fallback-a", "Fallback A")],
+			false,
+			"static",
+			dbPath,
+			[],
+			"provenance-a",
+			"antigravity/cli/1.3.4",
+		);
+
+		expect(updated).toBe(false);
+		expect(readModelCache("ollama-cloud", TTL_MS, () => observedAt, dbPath)?.discoveryUserAgent).toBe(
+			"antigravity/cli/1.3.4",
+		);
 	});
 
 	it("inserts a cache row only when the provider is absent", () => {

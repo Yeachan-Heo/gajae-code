@@ -316,7 +316,6 @@ const GLOBAL_ONLY_AUTH_SETTING_KEYS = new Set([
 	"credentialPins",
 	"credentialPinStoreIdentity",
 	"credentialPreferences",
-	"credentialPreferenceMaxUsedPercent",
 ]);
 const LOCAL_NOTIFICATION_SETTING_PATHS = new Set(
 	[...LOCAL_NOTIFICATION_SETTING_KEYS].map(key => `notifications.${key}`),

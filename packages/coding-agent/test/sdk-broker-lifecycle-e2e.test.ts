@@ -20,7 +20,7 @@ import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
-import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
+import { brokerOwnerForTest, ensureBroker, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -9489,6 +9489,7 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		expect(output).toMatchObject([{ ok: true, result: { sessions: [] } }]);
 		expect(await readSdkBrokerDiscovery(agentDirs[2])).not.toBeNull();
 	} finally {
+		for (const agentDir of agentDirs) await brokerOwnerForTest(agentDir)?.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
@@ -9788,6 +9789,25 @@ test("session/list does not grant a second ACP connection destructive lifecycle 
 			]),
 		).resolves.toEqual([{}, {}]);
 	} finally {
+		await brokerOwnerForTest(agentDir)?.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 30_000);
+
+test("broker owner shuts down through its retained endpoint after agent directory removal", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-owner-dir-removed-"));
+	const agentDir = path.join(root, "agent");
+	const discovery = await ensureBroker({ agentDir });
+	const owner = brokerOwnerForTest(agentDir);
+	if (!owner) throw new Error("expected a locally owned SDK broker");
+	try {
+		expect(discovery.pid).not.toBe(process.pid);
+		await fs.rm(root, { recursive: true, force: true });
+		const stoppedAt = Date.now();
+		await owner.stop();
+		expect(Date.now() - stoppedAt).toBeLessThan(5_000);
+	} finally {
+		await owner.stop().catch(() => undefined);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

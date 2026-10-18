@@ -1480,6 +1480,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.editor.setPlaceholder(this.#getComposerPlaceholder());
 		this.#setComposerTopBorder();
+		// Every live model switch (/model, profiles, cycling, fallback) refreshes the
+		// editor chrome; keep the welcome model/provider pills on the same signal.
+		this.#welcomeComponent?.setModel(
+			this.session.model?.name ?? "Unknown",
+			this.session.model?.provider ?? "Unknown",
+		);
 		this.ui.requestRender();
 	}
 

@@ -1203,11 +1203,11 @@ function registerBrokerOwner(
 					handoff = undefined;
 				} else if (publishedDiscovery) {
 					try {
-						await shutdownPublishedBrokerViaRpc(
-							agentDir,
+						await shutdownBrokerViaRpc(
 							publishedDiscovery,
 							Date.now() +
 								Math.max(BROKER_DISCOVERY_BUDGET.staleRetirementMs, timing.gracefulMs + timing.killVerifyMs),
+							agentDir,
 						);
 					} catch (error) {
 						if (process.platform === "darwin" && expectedBrokerPid !== child.pid) throw error;
@@ -1343,9 +1343,15 @@ async function shutdownPublishedBrokerViaRpc(
 		else await waitForBrokerIdentityGone(discovery, deadline);
 		return;
 	}
+	await shutdownBrokerViaRpc(current, deadline, agentDir);
+}
+
+/** Stop a broker whose authenticated discovery was retained by its local owner. */
+async function shutdownBrokerViaRpc(discovery: BrokerDiscovery, deadline: number, agentDir: string): Promise<void> {
+	if (brokerIdentityIsGone(discovery)) return;
 	const remainingMs = deadline - ensureBrokerTiming.now();
 	if (remainingMs <= 0) throw new Error("SDK broker shutdown deadline elapsed before RPC connection.");
-	const client = await SdkClient.connect(current.url, current.token, {
+	const client = await SdkClient.connect(discovery.url, discovery.token, {
 		timeoutMs: Math.max(1, Math.min(2_000, remainingMs)),
 	});
 	try {

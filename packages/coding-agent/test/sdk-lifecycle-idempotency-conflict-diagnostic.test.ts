@@ -22,8 +22,7 @@ import {
  * conflict must therefore survive as exactly one fixed diagnostic whose text is
  * pinned here literally, not derived from the production constant.
  *
- * The broker reaches this code from several distinct causes — a reused key with
- * different input, and the ledger's legacy-row admission guard among them — so
+ * The broker reaches this code from several distinct identity/fingerprint checks, so
  * the text must not name a cause, and must not suggest that retrying under a new
  * key is safe. The broker's own message is never rendered: it may carry request
  * keys, agent paths, or credentials, and the public envelope cannot inspect it.
@@ -140,9 +139,8 @@ describe("lifecycle idempotency conflict diagnostic", () => {
 	});
 
 	/**
-	 * `session.create` is the route that motivated this diagnostic: a conflict there
-	 * can come from the ledger's legacy-row admission guard rather than a reused key,
-	 * so the rendered text must stay cause-neutral.
+	 * `session.create` conflicts retain cause-neutral text. Ambiguous legacy
+	 * admission now has its own code and diagnostic, tested separately.
 	 */
 	it("renders the cause-neutral text for a conflicting session.create", async () => {
 		const result = await render(await createOutcome("idempotency_conflict"), true);

@@ -767,6 +767,28 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * - function: `_i` is NOT injected; intent is derived dynamically from (potentially partial / streaming) args.
 	 */
 	intent?: "omit" | "optional" | "require" | ((args: Partial<Static<TParameters>>) => string | undefined);
+
+	/**
+	 * Project a call's finalized arguments into the plain source it introduces,
+	 * without wire grammar such as patch prefixes or JSON string escaping. The
+	 * session calls this in `beforeToolCall`, before the tool runs, so
+	 * pre-execution matchers (TTSR `astCondition` rules) inspect the content.
+	 * Return `undefined` when the call has no static digest; it is then not
+	 * matched.
+	 */
+	matcherDigest?: (args: unknown) => string | undefined;
+
+	/**
+	 * Per-file projection of a call's finalized arguments, pairing each touched
+	 * file path with the digest of only the lines added to that file.
+	 * Path-scoped pre-execution matchers (TTSR) evaluate each entry in isolation, so a
+	 * scoped rule like `tool:edit(*.ts)` never fires on text that actually
+	 * belongs to a sibling Markdown hunk in a multi-file payload. Takes
+	 * precedence over {@link matcherDigest} when present;
+	 * returns `undefined` (or empty) to fall back to the combined hook.
+	 */
+	matcherEntries?: (args: unknown) => readonly { path: string; digest: string }[] | undefined;
+
 	/**
 	 * Argument fields (dotted paths into the arguments object) that render to
 	 * the user as pure display text — question wording and option labels, never

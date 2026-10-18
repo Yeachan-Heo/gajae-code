@@ -147,7 +147,13 @@ export class BrokerTransport {
 			sendError(socket, frame.id, "invalid_input", "idempotencyKey must be a string");
 			return;
 		}
-		if (!this.#broker.ownsDiscovery) {
+		// After initial publication, the owner retains the authenticated endpoint
+		// so it can stop this exact broker even after discovery is lost. Before
+		// publication readiness, shutdown remains unavailable.
+		if (
+			!this.#broker.ownsDiscovery &&
+			!(frame.operation === "broker.shutdown" && this.#broker.hasPublishedDiscovery)
+		) {
 			sendError(socket, frame.id, "unavailable", "broker publication is unavailable");
 			return;
 		}

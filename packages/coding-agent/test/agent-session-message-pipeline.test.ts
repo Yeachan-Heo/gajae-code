@@ -850,7 +850,7 @@ describe("AgentSession message pipeline", () => {
 		expect(seen).toEqual([expected, expected, expected]);
 	});
 
-	it("flushes queued background exchanges during prompt teardown without waiting for polling timers", async () => {
+	it("steers a queued background exchange into the live run instead of the turn's end", async () => {
 		const model: Model = {
 			id: "background-flush-model",
 			name: "background-flush-model",
@@ -865,6 +865,7 @@ describe("AgentSession message pipeline", () => {
 		};
 		const started = Promise.withResolvers<void>();
 		const finish = Promise.withResolvers<void>();
+		let providerCalls = 0;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: {
@@ -874,6 +875,7 @@ describe("AgentSession message pipeline", () => {
 				tools: [],
 			},
 			streamFn: () => {
+				providerCalls++;
 				const stream = new AssistantMessageEventStream();
 				void (async () => {
 					stream.push({ type: "start", partial: createAssistantMessage("") });
@@ -903,6 +905,10 @@ describe("AgentSession message pipeline", () => {
 			.filter(message => message.role === "custom")
 			.filter(message => String(message.customType).startsWith("irc:"));
 		expect(ircBefore).toHaveLength(0);
+		// The exchange belongs to the live run from here: the loop commits steering
+		// messages at its next step boundary, so a long goal-mode turn can no longer
+		// defer the exchange past the end of the whole turn.
+		expect(agent.snapshotSteering().filter(message => message.role === "custom")).toHaveLength(1);
 
 		finish.resolve();
 		await promptPromise;
@@ -913,7 +919,92 @@ describe("AgentSession message pipeline", () => {
 		expect(customMessages).toHaveLength(1);
 		expect(customMessages[0]?.customType).toBe("irc:incoming");
 		expect(customMessages[0]?.content).toContain("ping");
-		expect(agent.state.messages.at(-1)).toBe(customMessages[0]);
+		// The steered exchange opened its own model step, so the provider received it
+		// while the turn was still running.
+		expect(providerCalls).toBeGreaterThanOrEqual(2);
+	});
+
+	it("retries a background exchange queued between tool steps once the run streams again", async () => {
+		const model: Model = {
+			id: "background-retry-model",
+			name: "background-retry-model",
+			provider: "mock",
+			api: "mock",
+			baseUrl: "mock://",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+		};
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		let providerCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["system prompt"],
+				messages: [],
+				tools: [],
+			},
+			streamFn: () => {
+				providerCalls++;
+				const stream = new AssistantMessageEventStream();
+				void (async () => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					started.resolve();
+					await finish.promise;
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				})();
+				return stream;
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: testModelRegistry as never,
+		});
+		sessions.push(session);
+
+		const promptPromise = session.prompt("hello");
+		await started.promise;
+
+		// A parent between tool steps is busy with no open stream: the window a
+		// subagent's message lands in during a long goal-mode turn. The run's own
+		// stream flag is what that window looks like from here, so flip it directly
+		// for the duration of the queueing call.
+		const runState = agent.state as { isStreaming: boolean };
+		runState.isStreaming = false;
+		await session.respondAsBackground({ from: "0-Main", message: "between steps", awaitReply: false });
+		expect(agent.snapshotSteering()).toHaveLength(0);
+		expect(
+			agent.state.messages.some(
+				message => message.role === "custom" && String(message.customType).startsWith("irc:"),
+			),
+		).toBe(false);
+		runState.isStreaming = true;
+
+		// The next agent event retries the delivery; the loop then commits the exchange
+		// at the following step boundary.
+		agent.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "between-steps",
+			toolName: "read",
+			args: {},
+		} as never);
+		expect(agent.snapshotSteering().filter(message => message.role === "custom")).toHaveLength(1);
+
+		finish.resolve();
+		await promptPromise;
+
+		const exchanged = agent.state.messages
+			.filter(message => message.role === "custom")
+			.filter(message => String(message.customType).startsWith("irc:"));
+		expect(exchanged).toHaveLength(1);
+		expect(exchanged[0]?.content).toContain("between steps");
+		expect(providerCalls).toBeGreaterThanOrEqual(2);
 	});
 	it("settles public agent_end before a slow extension handler finishes", async () => {
 		const extensionStarted = Promise.withResolvers<void>();

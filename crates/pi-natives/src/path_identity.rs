@@ -960,7 +960,8 @@ const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
 
 #[cfg(any(windows, test))]
 /// `STATUS_ACCESS_DENIED`, kept distinct from owner-identity failures because
-/// Windows directory rename can fail before mutation while a child is open.
+/// Windows replacement opens and renames can fail before mutation while a
+/// handle denies the requested sharing or delete access.
 const STATUS_ACCESS_DENIED: i32 = 0xc000_0022u32 as i32;
 
 #[cfg(any(windows, test))]
@@ -980,9 +981,26 @@ fn ntstatus_code(status: i32) -> &'static str {
 fn publication_rename_error_code(code: &'static str) -> &'static str {
 	match code {
 		// Preserve the existing owner-only security contract everywhere else. A
-		// failed Windows no-replace rename has a distinct access-denied meaning.
+		// denied Windows publication syscall is not an owner-identity failure.
 		"owner_mismatch" => "access_denied",
 		other => other,
+	}
+}
+
+#[cfg(any(windows, test))]
+fn retained_replace_error_code(status: i32) -> &'static str {
+	publication_rename_error_code(ntstatus_code(status))
+}
+
+#[cfg(any(windows, test))]
+/// Exact-replace code for a held-path open that already mapped its NTSTATUS
+/// through [`ntstatus_code`]. A denied open of the staged source or the live
+/// destination is a publication failure, not an owner-identity one (#6760).
+fn exact_replace_open_error_code(code: Option<&str>) -> &str {
+	match code {
+		Some("owner_mismatch") => "access_denied",
+		Some(code) => code,
+		None => "io_error",
 	}
 }
 
@@ -997,40 +1015,61 @@ const fn is_retryable_exact_replace_status(status: i32) -> bool {
 
 #[cfg(windows)]
 /// STATUS_INVALID_PARAMETER: the synthetic NTSTATUS used for early,
-/// pre-syscall name validation rejections in the status-returning open path
-/// (e.g. an embedded NUL or an oversized name), which never reach
-/// `NtCreateFile` and so have no real NTSTATUS to report. Distinct from
-/// `STATUS_SHARING_VIOLATION` and never retried.
+/// pre-syscall name validation rejections in the status-returning open/rename
+/// paths (e.g. an embedded NUL or an oversized name), which never reach the
+/// underlying syscall and so have no real NTSTATUS to report. Distinct from
+/// transient publication statuses and never retried.
 const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
 
-/// Bound on transient retries for the exact-replace destination open on
-/// Windows, matching the reporter's controlled 30 x 100 ms reproduction window
-/// (~1.2 s of contention) with margin. The delay keeps the retry hot loop from
-/// busy-spinning the persistence fence; the bound keeps a persistent holder
-/// from freezing a session for more than ~3 s.
+/// Bound on transient retries for pre-mutation exact-replace operations on
+/// Windows. Thirty attempts with 100 ms between them bounds a persistent
+/// denial to about three seconds without busy-spinning.
 #[cfg(any(windows, test))]
-const EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT: u32 = 30;
+const EXACT_REPLACE_RETRY_LIMIT: u32 = 30;
 #[cfg(any(windows, test))]
-const EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS: u64 = 100;
+const EXACT_REPLACE_RETRY_DELAY_MS: u64 = 100;
 
 #[cfg(any(windows, test))]
-/// Open a Windows handle with bounded transient retry on sharing violations.
+/// Open a Windows handle with bounded retry on sharing violations.
 /// `open` returns the raw NTSTATUS on failure; only
 /// [`is_retryable_exact_replace_status`] failures are retried, and only up to
-/// [`EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT`] attempts with a bounded delay
+/// [`EXACT_REPLACE_RETRY_LIMIT`] attempts with a bounded delay
 /// between them. This is the narrow pre-mutation syscall boundary: the caller
 /// must ensure nothing has been renamed or unlinked before the open.
 fn open_with_transient_retry<T>(mut open: impl FnMut() -> Result<T, i32>) -> Result<T, i32> {
-	for attempt in 0..EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT {
+	for attempt in 0..EXACT_REPLACE_RETRY_LIMIT {
 		match open() {
 			Ok(handle) => return Ok(handle),
 			Err(status)
 				if is_retryable_exact_replace_status(status)
-					&& attempt + 1 < EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT =>
+					&& attempt + 1 < EXACT_REPLACE_RETRY_LIMIT =>
 			{
-				std::thread::sleep(std::time::Duration::from_millis(
-					EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS,
-				));
+				std::thread::sleep(std::time::Duration::from_millis(EXACT_REPLACE_RETRY_DELAY_MS));
+			},
+			Err(status) => return Err(status),
+		}
+	}
+	unreachable!("the retry bound guarantees at least one attempt")
+}
+
+#[cfg(any(windows, test))]
+const fn is_retryable_exact_replace_rename_status(status: i32) -> bool {
+	status == STATUS_ACCESS_DENIED || status == STATUS_SHARING_VIOLATION
+}
+
+#[cfg(any(windows, test))]
+/// Retry exact-replace rename failures only for bounded transient statuses.
+/// Both statuses are returned before the requested rename takes effect, so
+/// the caller can safely retry this one operation without publishing twice.
+fn rename_with_transient_retry<T>(mut rename: impl FnMut() -> Result<T, i32>) -> Result<T, i32> {
+	for attempt in 0..EXACT_REPLACE_RETRY_LIMIT {
+		match rename() {
+			Ok(result) => return Ok(result),
+			Err(status)
+				if is_retryable_exact_replace_rename_status(status)
+					&& attempt + 1 < EXACT_REPLACE_RETRY_LIMIT =>
+			{
+				std::thread::sleep(std::time::Duration::from_millis(EXACT_REPLACE_RETRY_DELAY_MS));
 			},
 			Err(status) => return Err(status),
 		}
@@ -1048,10 +1087,11 @@ fn native_windows_error_code(status: i32) -> String {
 #[cfg(test)]
 mod exact_replace_windows_retry_policy_tests {
 	use super::{
-		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		STATUS_ACCESS_DENIED, STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status,
+		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, STATUS_ACCESS_DENIED,
+		STATUS_SHARING_VIOLATION, exact_replace_open_error_code,
+		is_retryable_exact_replace_rename_status, is_retryable_exact_replace_status,
 		native_windows_error_code, ntstatus_code, open_with_transient_retry,
-		publication_rename_error_code,
+		publication_rename_error_code, rename_with_transient_retry, retained_replace_error_code,
 	};
 
 	#[test]
@@ -1073,8 +1113,20 @@ mod exact_replace_windows_retry_policy_tests {
 
 	#[test]
 	fn retry_budget_and_delay_are_bounded() {
-		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT, 30);
-		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, 100);
+		assert_eq!(EXACT_REPLACE_RETRY_LIMIT, 30);
+		assert_eq!(EXACT_REPLACE_RETRY_DELAY_MS, 100);
+	}
+
+	#[test]
+	fn exact_replace_rename_retries_access_denied_and_sharing_violations_only() {
+		assert!(is_retryable_exact_replace_rename_status(STATUS_ACCESS_DENIED));
+		assert!(is_retryable_exact_replace_rename_status(STATUS_SHARING_VIOLATION));
+		for status in [0xc000_0034u32 as i32, 0xc000_007fu32 as i32, 0xc000_000du32 as i32] {
+			assert!(
+				!is_retryable_exact_replace_rename_status(status),
+				"0x{status:08X} must not retry",
+			);
+		}
 	}
 
 	#[test]
@@ -1087,6 +1139,55 @@ mod exact_replace_windows_retry_policy_tests {
 			"access_denied"
 		);
 		assert_eq!(ntstatus_code(STATUS_SHARING_VIOLATION), "sharing_violation");
+	}
+
+	#[test]
+	fn exact_replace_denied_open_is_access_denied_not_owner_mismatch() {
+		// #6760: a denied open of the staged source or the live destination
+		// surfaced as `owner_mismatch` and aborted `gjc update` on Windows.
+		assert_eq!(
+			exact_replace_open_error_code(Some(ntstatus_code(STATUS_ACCESS_DENIED))),
+			"access_denied"
+		);
+		assert_eq!(
+			exact_replace_open_error_code(Some(ntstatus_code(STATUS_SHARING_VIOLATION))),
+			"sharing_violation"
+		);
+		assert_eq!(exact_replace_open_error_code(Some("reparse_point")), "reparse_point");
+		assert_eq!(exact_replace_open_error_code(None), "io_error");
+	}
+
+	#[test]
+	fn retained_replace_access_denied_is_not_an_owner_mismatch() {
+		assert_eq!(retained_replace_error_code(STATUS_ACCESS_DENIED), "access_denied");
+	}
+
+	#[test]
+	fn rename_retry_succeeds_after_transient_access_denied() {
+		let mut failures = 2;
+		let attempts = std::cell::Cell::new(0);
+		let renamed = rename_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			if failures > 0 {
+				failures -= 1;
+				Err(STATUS_ACCESS_DENIED)
+			} else {
+				Ok(())
+			}
+		});
+		assert_eq!(renamed, Ok(()));
+		assert_eq!(attempts.get(), 3, "2 transient failures then success");
+	}
+
+	#[test]
+	fn rename_retry_exhausts_the_budget_and_preserves_access_denied() {
+		let attempts = std::cell::Cell::new(0);
+		let renamed: Result<(), i32> = rename_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			Err(STATUS_ACCESS_DENIED)
+		});
+		assert_eq!(renamed, Err(STATUS_ACCESS_DENIED));
+		assert_eq!(attempts.get(), EXACT_REPLACE_RETRY_LIMIT);
 	}
 
 	#[test]
@@ -1114,7 +1215,7 @@ mod exact_replace_windows_retry_policy_tests {
 			Err(STATUS_SHARING_VIOLATION)
 		});
 		assert_eq!(opened, Err(STATUS_SHARING_VIOLATION));
-		assert_eq!(attempts.get(), EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT);
+		assert_eq!(attempts.get(), EXACT_REPLACE_RETRY_LIMIT);
 	}
 
 	#[test]
@@ -1747,9 +1848,10 @@ pub fn exact_replace_path(
 /// single-link ownership; hard-linked or symlinked source/destination are
 /// rejected) before anything is mutated. On Windows a pre-mutation
 /// `STATUS_SHARING_VIOLATION` on the destination open is reported as a
-/// distinct `sharing_violation` code with `windows_error_code` set -- exactly
-/// as [`exact_replace_path`] already reports it -- and is always surfaced
-/// before any rename, so it is never mistaken for a post-effect failure.
+/// distinct `sharing_violation` code, while `STATUS_ACCESS_DENIED` on a
+/// retained open or rename is reported as `access_denied`. Pre-mutation
+/// failures include the original `windows_error_code`; only known-safe rename
+/// operations retry transient access-denied or sharing-violation statuses.
 #[napi]
 pub fn exact_replace_retained(
 	source_path: String,
@@ -10845,12 +10947,13 @@ mod platform {
 	};
 
 	use super::{
-		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, STATUS_INVALID_PARAMETER,
-		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code, sha256,
+		EXACT_REPLACE_RETRY_DELAY_MS, EXACT_REPLACE_RETRY_LIMIT, ExactFileIdentity,
+		NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
+		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
+		exact_replace_open_error_code, is_retryable_exact_replace_status, native_windows_error_code,
+		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
+		rename_with_transient_retry, retained_replace_error_code, sha256,
 		volume_case_sensitivity_from_flags,
 	};
 
@@ -10878,10 +10981,19 @@ mod platform {
 		static EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT: std::cell::Cell<u32> =
 			const { std::cell::Cell::new(0) };
 	}
+	#[cfg(test)]
+	thread_local! {
+		static EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT: std::cell::Cell<Option<i32>> =
+			const { std::cell::Cell::new(None) };
+	}
 
 	#[cfg(test)]
 	pub(super) fn inject_exact_replace_destination_open_sharing_violations(count: u32) {
 		EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT.with(|target| target.set(count));
+	}
+	#[cfg(test)]
+	pub(super) fn inject_exact_replace_retained_publish_status(status: Option<i32>) {
+		EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT.with(|target| target.set(status));
 	}
 
 	#[cfg(test)]
@@ -10894,6 +11006,10 @@ mod platform {
 			target.set(current - 1);
 			true
 		})
+	}
+	#[cfg(test)]
+	fn take_injected_exact_replace_retained_publish_status() -> Option<i32> {
+		EXACT_REPLACE_RETAINED_PUBLISH_STATUS_INJECT.with(|target| target.replace(None))
 	}
 
 	#[cfg(not(test))]
@@ -11527,25 +11643,29 @@ mod platform {
 		handles_same_object_checked(left, right).unwrap_or(false)
 	}
 
-	fn rename_handle(
+	fn rename_handle_status(
 		handle: HANDLE,
 		parent_handle: HANDLE,
 		name: &[u16],
 		replace_if_exists: bool,
-	) -> Result<(), &'static str> {
-		let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or("io_error")?;
+	) -> Result<(), i32> {
+		let name_bytes = name
+			.len()
+			.checked_mul(size_of::<u16>())
+			.ok_or(STATUS_INVALID_PARAMETER)?;
 		let file_name_offset = std::mem::offset_of!(HandleRenameInformation, file_name);
 		let allocation_size = file_name_offset
 			.checked_add(name_bytes)
-			.ok_or("io_error")?
+			.ok_or(STATUS_INVALID_PARAMETER)?
 			.max(size_of::<HandleRenameInformation>());
-		let allocation_size_u32 = u32::try_from(allocation_size).map_err(|_| "io_error")?;
+		let allocation_size_u32 =
+			u32::try_from(allocation_size).map_err(|_| STATUS_INVALID_PARAMETER)?;
 		if file_name_offset % align_of::<u16>() != 0 {
-			return Err("io_error");
+			return Err(STATUS_INVALID_PARAMETER);
 		}
 		let words = allocation_size
 			.checked_add(size_of::<usize>() - 1)
-			.ok_or("io_error")?
+			.ok_or(STATUS_INVALID_PARAMETER)?
 			/ size_of::<usize>();
 		let mut storage = vec![0usize; words];
 		let rename = storage.as_mut_ptr().cast::<HandleRenameInformation>();
@@ -11556,7 +11676,8 @@ mod platform {
 		unsafe {
 			(*rename).replace_if_exists = u8::from(replace_if_exists);
 			(*rename).root_directory = parent_handle;
-			(*rename).file_name_length = u32::try_from(name_bytes).map_err(|_| "io_error")?;
+			(*rename).file_name_length =
+				u32::try_from(name_bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
 			let file_name = storage
 				.as_mut_ptr()
 				.cast::<u8>()
@@ -11582,8 +11703,48 @@ mod platform {
 		if rename_status >= 0 {
 			Ok(())
 		} else {
-			Err(ntstatus_code(rename_status))
+			Err(rename_status)
 		}
+	}
+
+	fn rename_handle(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+		replace_if_exists: bool,
+	) -> Result<(), &'static str> {
+		rename_handle_status(handle, parent_handle, name, replace_if_exists).map_err(ntstatus_code)
+	}
+
+	fn rename_pre_retirement_with_transient_retry(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+		replace_if_exists: bool,
+	) -> Result<(), i32> {
+		// This bounded wait is safe only while the live destination still exists.
+		// Never use it for publication after retiring the predecessor: restore the
+		// predecessor before any retry delay in that state.
+		rename_with_transient_retry(|| {
+			rename_handle_status(handle, parent_handle, name, replace_if_exists)
+		})
+	}
+
+	fn publish_retained_source_once(
+		handle: HANDLE,
+		parent_handle: HANDLE,
+		name: &[u16],
+	) -> Result<(), i32> {
+		#[cfg(test)]
+		if let Some(status) = take_injected_exact_replace_retained_publish_status() {
+			return Err(status);
+		}
+		rename_handle_status(handle, parent_handle, name, false)
+	}
+
+	fn retained_replace_rename_failure(status: i32) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure(retained_replace_error_code(status))
+			.with_windows_error_code(native_windows_error_code(status))
 	}
 
 	fn detach_directory(
@@ -11704,7 +11865,9 @@ mod platform {
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -11772,7 +11935,7 @@ mod platform {
 						// log and operator diagnostics can identify a sharing conflict.
 						"sharing_violation"
 					} else {
-						ntstatus_code(status)
+						retained_replace_error_code(status)
 					},
 				)
 				.with_windows_error_code(native_windows_error_code(status));
@@ -12054,9 +12217,13 @@ mod platform {
 	/// exact no-replace rename whenever that name is still vacant; if it is not
 	/// (an external successor claimed it), the predecessor remains durably
 	/// recoverable at exactly its caller-recorded `backup_name`.
-	/// `STATUS_SHARING_VIOLATION` on the destination open is detected and
-	/// reported before any rename, exactly as in `exact_replace_path`, so it is
-	/// never confused with a post-effect failure.
+	/// `STATUS_SHARING_VIOLATION` on the destination open and transient
+	/// `STATUS_ACCESS_DENIED`/`STATUS_SHARING_VIOLATION` failures retiring the
+	/// predecessor are retried only while the live destination still exists. The
+	/// source publication is attempted once after retirement; a failure restores
+	/// the predecessor immediately before returning, so the public path is never
+	/// vacant during a retry delay. Pre-mutation results retain the native
+	/// status; failures after retirement preserve the recovery paths.
 	pub(super) fn exact_replace_retained(
 		source_path: &Path,
 		destination_path: &Path,
@@ -12107,7 +12274,9 @@ mod platform {
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
-				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+				return NativeExactUnlinkResult::failure(exact_replace_open_error_code(
+					result.code.as_deref(),
+				));
 			},
 		};
 		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -12150,8 +12319,8 @@ mod platform {
 			return NativeExactUnlinkResult::failure("io_error");
 		};
 		// Pre-mutation, retryable-sharing-violation destination open -- identical
-		// boundary to exact_replace_path. A sharing violation here always fires
-		// before any rename, so it is never mistaken for a post-effect failure.
+		// boundary to exact_replace_path. Any access-denied status is still
+		// classified as a publication failure, not an ownership mismatch.
 		let destination_handle = match open_with_transient_retry(|| {
 			if take_injected_exact_replace_destination_open_sharing_violation() {
 				return Err(STATUS_SHARING_VIOLATION);
@@ -12174,7 +12343,7 @@ mod platform {
 					if is_retryable_exact_replace_status(status) {
 						"sharing_violation"
 					} else {
-						ntstatus_code(status)
+						retained_replace_error_code(status)
 					},
 				)
 				.with_windows_error_code(native_windows_error_code(status));
@@ -12228,9 +12397,13 @@ mod platform {
 		// crash after it commits leaves the predecessor durably at the exact
 		// caller-recorded `backup_name` with `destination_name` vacant -- both
 		// states are fully described by evidence the caller already holds.
-		if let Err(code) = rename_handle(destination.target, parent_handle, &backup_name_wide, false)
-		{
-			return NativeExactUnlinkResult::failure(code);
+		if let Err(status) = rename_pre_retirement_with_transient_retry(
+			destination.target,
+			parent_handle,
+			&backup_name_wide,
+			false,
+		) {
+			return retained_replace_rename_failure(status);
 		}
 		let mut retired_destination: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(destination.target, &mut retired_destination) } == 0
@@ -12269,13 +12442,14 @@ mod platform {
 				NativeExactUnlinkResult::detached_failure(code, backup_path_string)
 			};
 		}
-		match rename_handle(source.target, parent_handle, &destination_name_wide, false) {
+		match publish_retained_source_once(source.target, parent_handle, &destination_name_wide) {
 			Ok(()) => NativeExactUnlinkResult::detached(backup_path_string),
-			Err(code) => {
-				// The publish itself failed: restore the predecessor to its original
-				// name (exact no-replace rename, never overwriting a name that is no
-				// longer vacant) whenever that name is still vacant, exactly as
-				// exact_replace_path does on this failure path.
+			Err(status) => {
+				let code = retained_replace_error_code(status);
+				// The source publish is attempted once after retirement: waiting here
+				// would leave the public name vacant. Restore the predecessor
+				// immediately with an exact no-replace rename, never overwriting a
+				// name that is no longer vacant.
 				let restored_destination =
 					rename_handle(destination.target, parent_handle, &destination_name_wide, false)
 						.is_ok();
@@ -12297,6 +12471,129 @@ mod platform {
 					}
 				}
 			},
+		}
+	}
+
+	#[cfg(test)]
+	mod exact_replace_retained_retry_tests {
+		use std::{
+			fs,
+			os::windows::io::AsRawHandle,
+			path::{Path, PathBuf},
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::{
+			super::{ExactFileIdentity, STATUS_ACCESS_DENIED, apply_owner_only_path_security, sha256},
+			BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, HANDLE, exact_replace_retained,
+			inject_exact_replace_retained_publish_status, open_directory_exact,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-exact-replace-retained-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				fs::create_dir(&path).expect("create retained replace temp directory");
+				Self(path)
+			}
+		}
+
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = fs::remove_dir_all(&self.0);
+			}
+		}
+
+		fn file_information(handle: HANDLE) -> BY_HANDLE_FILE_INFORMATION {
+			let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			assert_ne!(
+				unsafe { GetFileInformationByHandle(handle, &mut information) },
+				0,
+				"read file identity",
+			);
+			information
+		}
+
+		fn identity(path: &Path, parent: &Path, bytes: &[u8]) -> ExactFileIdentity {
+			let file = fs::File::open(path).expect("open retained replace file");
+			let information = file_information(file.as_raw_handle() as HANDLE);
+			let parent = open_directory_exact(parent).expect("open retained replace parent");
+			let parent_information = file_information(parent.target);
+			let filetime = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+				| u64::from(information.ftLastWriteTime.dwLowDateTime);
+			let mtime_ns = i128::from(filetime) * 100 - 11_644_473_600_000_000_000i128;
+			ExactFileIdentity {
+				dev:               u64::from(information.dwVolumeSerialNumber),
+				ino:               (u64::from(information.nFileIndexHigh) << 32)
+					| u64::from(information.nFileIndexLow),
+				nlink:             Some(u64::from(information.nNumberOfLinks)),
+				parent_dev:        Some(u64::from(parent_information.dwVolumeSerialNumber)),
+				parent_ino:        Some(
+					(u64::from(parent_information.nFileIndexHigh) << 32)
+						| u64::from(parent_information.nFileIndexLow),
+				),
+				size:              (u64::from(information.nFileSizeHigh) << 32)
+					| u64::from(information.nFileSizeLow),
+				mtime_ns:          i64::try_from(mtime_ns).expect("mtime fits i64"),
+				directory:         false,
+				detach_only:       false,
+				quarantine_name:   None,
+				sha256:            Some(sha256(bytes)),
+				allow_hard_link:   false,
+				require_hard_link: false,
+			}
+		}
+
+		struct ResetPublishFailureInjection;
+
+		impl Drop for ResetPublishFailureInjection {
+			fn drop(&mut self) {
+				inject_exact_replace_retained_publish_status(None);
+			}
+		}
+
+		#[test]
+		fn denied_source_publish_restores_live_predecessor_without_retrying_vacancy() {
+			let temporary = TempDir::new();
+			let source = temporary.0.join("staging.exe");
+			let destination = temporary.0.join("gjc.exe");
+			let backup_name = "gjc.exe.backup";
+			let backup = temporary.0.join(backup_name);
+			fs::write(&source, b"new binary").expect("write staged executable");
+			fs::write(&destination, b"old binary").expect("write installed executable");
+			for path in [&source, &destination] {
+				let secured = apply_owner_only_path_security(
+					path.to_string_lossy().into_owned(),
+					"file".to_owned(),
+				);
+				assert!(secured.ok, "owner-only security failed: {:?}", secured.code);
+			}
+			let source_identity = identity(&source, &temporary.0, b"new binary");
+			let destination_identity = identity(&destination, &temporary.0, b"old binary");
+			let _reset_injection = ResetPublishFailureInjection;
+			inject_exact_replace_retained_publish_status(Some(STATUS_ACCESS_DENIED));
+
+			let result = exact_replace_retained(
+				&source,
+				&destination,
+				backup_name,
+				&source_identity,
+				&destination_identity,
+			);
+
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("access_denied"));
+			assert_eq!(result.detached_path, None);
+			assert_eq!(fs::read(&destination).expect("read restored executable"), b"old binary");
+			assert_eq!(fs::read(&source).expect("read retained staged executable"), b"new binary");
+			assert!(!backup.exists(), "the predecessor must be restored before returning");
 		}
 	}
 

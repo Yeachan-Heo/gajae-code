@@ -1559,16 +1559,19 @@ describe("autoresearch research-only allowance", () => {
 		}
 	});
 
-	it("keeps the sanctioned research surface writable", async () => {
+	it("blocks shell mutations of the harness while allowing execution and the mission CLI", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "autoresearch", "research");
 
 		for (const command of [
 			"echo '#!/bin/sh' > autoresearch.sh",
 			"chmod +x autoresearch.sh",
-			"bash autoresearch.sh",
-			"gjc autoresearch read --json",
+			"ln -sf src/product.ts autoresearch.sh",
 		]) {
+			expect((await decideBash(cwd, command)).blocked, command).toBe(true);
+		}
+
+		for (const command of ["bash autoresearch.sh", "gjc autoresearch read --json"]) {
 			expect((await decideBash(cwd, command)).blocked, command).toBe(false);
 		}
 	});
@@ -1855,16 +1858,24 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
-	it("keeps a research artifact write and non-mutating eval or python allowed", async () => {
+	it("requires direct file tools for harness writes and allows non-mutating eval or python", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "autoresearch", "research");
-		const harness = await getWorkflowMutationDecision({
-			cwd,
-			sessionId: "session-a",
-			tool: tool("python"),
-			args: { code: 'write("autoresearch.sh", "#!/usr/bin/env bash\\n")\n' },
-		});
-		expect(harness.blocked).toBe(false);
+		for (const [name, args] of [
+			["python", { code: 'write("autoresearch.sh", "#!/usr/bin/env bash\\n")\n' }],
+			[
+				"eval",
+				{ cells: [{ language: "js", code: 'fs.writeFileSync("autoresearch.sh", "#!/usr/bin/env bash\\n")\n' }] },
+			],
+		] as const) {
+			const codeWrite = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool(name),
+				args,
+			});
+			expect(codeWrite.blocked).toBe(true);
+		}
 		const direct = await getWorkflowMutationDecision({
 			cwd,
 			sessionId: "session-a",
@@ -1872,6 +1883,13 @@ describe("bash scanner quoting model", () => {
 			args: { path: "autoresearch.sh", content: "#!/usr/bin/env bash\n" },
 		});
 		expect(direct.blocked).toBe(false);
+		const edited = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("edit"),
+			args: { path: "autoresearch.sh", edits: [{ old_text: "METRIC old", new_text: "METRIC new" }] },
+		});
+		expect(edited.blocked).toBe(false);
 
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		for (const [name, args] of [

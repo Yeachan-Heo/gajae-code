@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $pickCredentialEnv, Snowflake } from "@gajae-code/utils";
+import { $pickCredentialEnv } from "@gajae-code/utils";
 
 /** Returns the user's preferred editor command, or undefined if not configured. */
 export function getEditorCommand(): string | undefined {
@@ -119,10 +119,22 @@ export async function openInEditor(
 	options?: OpenInEditorOptions,
 ): Promise<string | null> {
 	const ext = options?.extension ?? ".md";
-	const tmpFile = path.join(os.tmpdir(), `gjc-editor-${Snowflake.next()}${ext}`);
+	// Random directory plus an exclusive create: a preexisting symlink under the
+	// temp directory is not opened, and the draft is not left world-readable.
+	let tempDir: string | undefined;
+	let tmpFile = "";
 
 	try {
-		await Bun.write(tmpFile, content);
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-editor-"));
+		if (process.platform !== "win32") await fs.chmod(tempDir, 0o700);
+		tmpFile = path.join(tempDir, `draft${ext}`);
+		const handle = await fs.open(tmpFile, "wx", 0o600);
+		try {
+			await handle.writeFile(content);
+		} finally {
+			await handle.close();
+		}
+		if (process.platform !== "win32") await fs.chmod(tmpFile, 0o600);
 
 		const [editor, ...editorArgs] = editorCmd.split(" ");
 		const stdio = options?.stdio ?? ["inherit", "inherit", "inherit"];
@@ -147,10 +159,12 @@ export async function openInEditor(
 		}
 		return null;
 	} finally {
-		try {
-			await fs.rm(tmpFile, { force: true });
-		} catch {
-			// Ignore cleanup errors
+		if (tempDir) {
+			try {
+				await fs.rm(tempDir, { recursive: true, force: true });
+			} catch {
+				// Ignore cleanup errors
+			}
 		}
 	}
 }

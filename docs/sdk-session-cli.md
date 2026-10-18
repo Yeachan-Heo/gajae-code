@@ -349,6 +349,40 @@ not proof that the create did not execute, so callers must not resubmit solely
 because lookup reports `not_found`. Reconciliation failures exit nonzero while
 preserving the structured outcome in JSON.
 
+### Legacy lifecycle admission fence
+
+`operation_failed` with diagnostic `lifecycle_legacy_history_ambiguous` means the
+broker refused the **new request before dispatch** because a pre-index ledger
+row cannot establish that its target is unrelated. The underlying broker code is
+`legacy_lifecycle_ambiguous`, distinct from key reuse (`idempotency_conflict`) and
+an already admitted operation with an uncertain effect (`terminal_uncertain`).
+The public outcome and retryability remain `unknown`: refusing this request does
+not settle earlier effects.
+
+- Preserve the original operation, caller request key, exact target/input, and
+  ledger. A new key, empty/config-only transcript, `live:false`, or `deleted:false`
+  is not proof that a legacy effect did not occur. Do not force deletion or edit,
+  truncate, or remove the ledger.
+- For a prior `session.create` whose original key and create target are known,
+  use the read-only `session.lookup` command above. `not_found`, `conflict`, and
+  `uncertain` do not authorize another mutation. Public lookup currently supports
+  create only; do not invent a lookup for delete or close.
+- `retire` is limited to its complete identity-bound uncertain-create proof.
+  It is not an override for opaque legacy rows. Missing original identity or
+  terminal effect evidence requires operator/maintainer investigation; there is
+  no automatic safe retirement for such a row. Preserve it unresolved.
+- Proven final `terminal_ok`/`terminal_error` legacy rows recording only other
+  sessions may already pass admission with an unrelated key. Rows recording the
+  target, lacking target evidence, or reusing its key remain fenced. Unresolved
+  `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
+  history stays fenced even for an apparently unrelated empty session. Recovery
+  after restart marking a row `terminal_uncertain` is not proof of no effect.
+
+This diagnostic identifies the actual admission guard without exposing ledger
+identities, request hashes, filesystem paths, credentials, or broker free text.
+Other failures do not receive it; do not attribute every unknown delete outcome
+to legacy history.
+
 A separately connected local controller can stop the active turn and its exact
 owned work with an explicitly confirmed operator abort:
 

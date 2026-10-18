@@ -521,6 +521,10 @@ export interface SdkOnlyDeadlineRecoveryCheckpoint {
  * dispatch, replay/event publication, and reverse-provider lifecycle without
  * importing any notification adapter or native notification class.
  */
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((item: unknown) => typeof item === "string");
+}
+
 export class SessionSdkSessionRuntime {
 	readonly host: SessionSdkHost;
 	readonly transport: SessionSdkTransport;
@@ -551,6 +555,16 @@ export class SessionSdkSessionRuntime {
 			onFrame: handler =>
 				options.transport.onFrame((connectionId, frame) => {
 					this.#connectionIds.add(connectionId);
+					if (
+						!options.connectionCapabilities &&
+						frame.type === "event_replay" &&
+						isStringArray(frame.capabilities)
+					) {
+						this.#connectionCapabilities.set(
+							connectionId,
+							new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...frame.capabilities]),
+						);
+					}
 					handler(connectionId, frame);
 				}),
 		});
@@ -562,7 +576,10 @@ export class SessionSdkSessionRuntime {
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
 			if (options.connectionCapabilities && this.#connectionCapabilitiesProvider(connectionId) === undefined) return;
 			this.#connectionIds.add(connectionId);
-			this.#connectionCapabilities.set(connectionId, new Set(negotiated));
+			this.#connectionCapabilities.set(
+				connectionId,
+				new Set([...(this.#connectionCapabilities.get(connectionId) ?? []), ...negotiated]),
+			);
 		});
 		this.#malformedDisposer = options.transport.onMalformedFrame?.((connectionId, message) => {
 			this.host.handleMalformedFrame(connectionId, message);

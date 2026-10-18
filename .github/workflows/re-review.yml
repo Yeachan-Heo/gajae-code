@@ -203,16 +203,25 @@ jobs:
 
             const reviewers = JSON.parse(process.env.REVIEWERS_JSON);
 
-            await github.request(
-              'POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers/rerequest',
-              {
+            // GitHub's dedicated re-request endpoint returned an empty HTTP 500 for every
+            // call on this repository, so use the standard
+            // review-request endpoint, which re-notifies reviewers who already reviewed.
+            try {
+              await github.rest.pulls.requestReviewers({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: pr.data.number,
-                reviewers: reviewers,
-                headers: { 'X-GitHub-Api-Version': '2026-03-10' },
-              },
-            );
+                reviewers,
+              });
+            } catch (error) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `Failed to re-request reviews from ${reviewers.join(', ')}: ${error.message}`,
+              });
+              throw error;
+            }
 
       - name: React to comment on success
         if: steps.get-reviewers.outcome == 'success' && steps.get-reviewers.outputs.result != '[]'

@@ -226,16 +226,23 @@ export async function createSdkWebSocketTransport(
 										);
 										return;
 									}
-									if (
+									const isInitialHello =
 										frame.type === "hello" &&
 										frame.protocolVersion === 3 &&
-										(frame.capabilities === undefined || Array.isArray(frame.capabilities)) &&
-										!helloReceived.has(socket.data.connectionId)
+										!helloReceived.has(socket.data.connectionId);
+									if (
+										(isInitialHello || frame.type === "event_replay") &&
+										(frame.capabilities === undefined ||
+											(Array.isArray(frame.capabilities) &&
+												frame.capabilities.every((value: unknown) => typeof value === "string")))
 									) {
-										const capabilities = Array.isArray(frame.capabilities)
-											? frame.capabilities.filter((value): value is string => typeof value === "string")
-											: [];
-										helloReceived.add(socket.data.connectionId);
+										const capabilities = [
+											...new Set([
+												...(negotiatedCapabilities.get(socket.data.connectionId) ?? []),
+												...((frame.capabilities as string[] | undefined) ?? []),
+											]),
+										];
+										if (isInitialHello) helloReceived.add(socket.data.connectionId);
 										negotiatedCapabilities.set(socket.data.connectionId, new Set(capabilities));
 										capabilitiesHandler?.(socket.data.connectionId, capabilities);
 									}

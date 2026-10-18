@@ -8,7 +8,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
   ${APP_NAME} state                - Inspect or manage persisted GJC state
   ${APP_NAME} auth-broker         - Manage the auth-broker (credential vault)
-  ${APP_NAME} accounts             - List, check, pin, and remove stored OAuth accounts
+  ${APP_NAME} accounts             - List, check, pin, prefer, and remove stored OAuth accounts
   ${APP_NAME} models presets       - Inspect, refresh, pin, rollback, or disable the signed model preset registry
   ${APP_NAME} auth-gateway        - Run an auth-gateway forward proxy
   ${APP_NAME} harness              - Run harness control-plane commands

@@ -251,7 +251,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
-	"packages/coding-agent/src/tools/tool-catalog.generated.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
+	"packages/coding-agent/src/tools/tool-catalog.generated.ts": [
+		"packages/coding-agent/test/tools/tool-catalog.test.ts",
+		"packages/coding-agent/test/tools/discoverable-description-stable.test.ts",
+	],
 	"packages/coding-agent/scripts/generate-tool-catalog.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
 	// Function Hooks and the extension/hook adapters share one bounded owner
 	// shard: changing any layer can alter registration, dispatch, or payload

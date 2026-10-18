@@ -6,6 +6,17 @@ interface TieredPricing {
 }
 
 const LONG_CONTEXT_THRESHOLD = 272_000;
+// Anthropic Haiku 5.5's direct Messages API charges five times the base rates
+// when prompt input exceeds 100K tokens, including cached input.
+// https://platform.claude.com/docs/en/models/haiku-5-5/overview#pricing
+const ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING: LongContextPricing = {
+	threshold: 100_000,
+	cost: { input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 },
+};
+// `ModelCost.cacheWrite` is the 5-minute cache-write rate. Haiku 5.5 charges 1-hour
+// writes at twice the base input rate in each prompt-length tier ($0.20 up to 100K
+// tokens, $1 above), and the provider defaults to `ttl: "1h"`.
+const ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H = { standard: 0.2, longContext: 1 };
 
 const GPT_5_6_SOL_PRICING: TieredPricing = {
 	cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
@@ -93,6 +104,48 @@ export function getOpenAIModelCost<TApi extends Api>(model: Model<TApi>, inputTo
 		return undefined;
 	}
 	return inputTokens > pricing.longContextPricing.threshold ? pricing.longContextPricing.cost : pricing.cost;
+}
+
+export function getAnthropicModelCost<TApi extends Api>(
+	model: Model<TApi>,
+	inputTokens: number,
+): ModelCost | undefined {
+	if (
+		model.provider !== "anthropic" ||
+		model.api !== "anthropic-messages" ||
+		model.id !== "claude-haiku-5-5" ||
+		inputTokens <= ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold
+	) {
+		return undefined;
+	}
+	return ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.cost;
+}
+
+/**
+ * $/million rate for 1-hour cache writes, or undefined when the model has a single
+ * cache-write rate. Cost calculation applies it to `usage.cttl.ephemeral1h` and bills
+ * the remaining cache-write tokens at `ModelCost.cacheWrite`.
+ */
+export function getAnthropicCacheWriteOneHourRate<TApi extends Api>(
+	model: Model<TApi>,
+	inputTokens: number,
+): number | undefined {
+	if (model.provider !== "anthropic" || model.api !== "anthropic-messages" || model.id !== "claude-haiku-5-5") {
+		return undefined;
+	}
+	return inputTokens > ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold
+		? ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H.longContext
+		: ANTHROPIC_HAIKU_5_5_CACHE_WRITE_1H.standard;
+}
+
+export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>): void {
+	if (model.provider !== "anthropic" || model.api !== "anthropic-messages" || model.id !== "claude-haiku-5-5") {
+		return;
+	}
+	model.longContextPricing = {
+		threshold: ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.threshold,
+		cost: { ...ANTHROPIC_HAIKU_5_5_LONG_CONTEXT_PRICING.cost },
+	};
 }
 
 export function applyOpenAIModelPricing<TApi extends Api>(model: Model<TApi>): void {

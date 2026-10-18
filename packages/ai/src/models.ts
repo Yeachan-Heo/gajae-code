@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { registerProviderSafetyStopModel } from "./adapter-internals/provider-safety-stop";
-import { getOpenAIModelCost } from "./model-pricing";
+import { getAnthropicCacheWriteOneHourRate, getAnthropicModelCost, getOpenAIModelCost } from "./model-pricing";
 import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 // `with { type: "file" }` is embedded by `bun build --compile` and resolves to
@@ -105,11 +105,18 @@ export function getBundledModels(provider: GeneratedProvider): Model<Api>[] {
 
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
 	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-	const pricing = getOpenAIModelCost(model, inputTokens) ?? model.cost;
+	const pricing = getAnthropicModelCost(model, inputTokens) ?? getOpenAIModelCost(model, inputTokens) ?? model.cost;
 	usage.cost.input = (pricing.input / 1000000) * usage.input;
 	usage.cost.output = (pricing.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (pricing.cacheRead / 1000000) * usage.cacheRead;
-	usage.cost.cacheWrite = (pricing.cacheWrite / 1000000) * usage.cacheWrite;
+	const oneHourRate = getAnthropicCacheWriteOneHourRate(model, inputTokens);
+	// Bill the response's 1-hour cache-write tokens at the 1-hour rate; everything else
+	// (5-minute writes and any unattributed remainder) uses the model's cacheWrite rate.
+	const oneHourTokens =
+		oneHourRate === undefined ? 0 : Math.min(Math.max(usage.cttl?.ephemeral1h ?? 0, 0), usage.cacheWrite);
+	usage.cost.cacheWrite =
+		(pricing.cacheWrite / 1000000) * (usage.cacheWrite - oneHourTokens) +
+		((oneHourRate ?? 0) / 1000000) * oneHourTokens;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage.cost;
 }

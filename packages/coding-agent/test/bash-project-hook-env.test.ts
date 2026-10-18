@@ -16,6 +16,18 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"NODE_OPTIONS",
+	"PYTHONPATH",
+	"PYTHONUSERBASE",
+	"PYTHONSTARTUP",
+	"PERL5OPT",
+	"PERL5LIB",
+	"JAVA_TOOL_OPTIONS",
+	"JDK_JAVA_OPTIONS",
+	"LD_PRELOAD",
+	"LD_AUDIT",
+	"LD_LIBRARY_PATH",
+	"DYLD_INSERT_LIBRARIES",
 	"BUN_OPTIONS",
 	"GIT_ASKPASS",
 	"GIT_EXEC_PATH",
@@ -158,6 +170,218 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 		const dotenv = `GIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=core.fsmonitor\nGIT_CONFIG_VALUE_0=${target.hook}\n`;
 		expect(await runProbe(target, "worker", { GJC_TEST_DOTENV_AFTER_START: dotenv })).toBe(false);
 	});
+
+	// Interpreters the command starts load code named by the environment. Each
+	// case plants the payload in the project and runs the interpreter from the
+	// bash tool; skipped when the interpreter is not installed.
+	const RUNTIME_VECTORS: { name: string; binary: string; command: string; plant: (project: Project) => string }[] = [
+		{
+			name: "NODE_OPTIONS",
+			binary: "node",
+			command: "node -e 0",
+			plant: ({ cwd, marker }) => {
+				fs.writeFileSync(
+					path.join(cwd, "preload.cjs"),
+					`require("fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+				);
+				return `NODE_OPTIONS=--require ${path.join(cwd, "preload.cjs")}\n`;
+			},
+		},
+		{
+			name: "PYTHONPATH",
+			binary: "python3",
+			command: "python3 -c 0",
+			plant: ({ cwd, marker }) => {
+				fs.writeFileSync(path.join(cwd, "sitecustomize.py"), `open(${JSON.stringify(marker)}, "w").write("ran")\n`);
+				return `PYTHONPATH=${cwd}\n`;
+			},
+		},
+		{
+			name: "PYTHONUSERBASE",
+			binary: "python3",
+			command: "python3 -c 0",
+			plant: ({ cwd, marker }) => {
+				const userBase = path.join(cwd, "userbase");
+				const python = Bun.which("python3");
+				if (!python) throw new Error("python3 is required to find the user site path");
+				const site = Bun.spawnSync([python, "-c", "import site; print(site.USER_SITE)"], {
+					cwd,
+					env: { ...process.env, PYTHONUSERBASE: userBase, PYTHONPATH: undefined, PYTHONSTARTUP: undefined },
+				});
+				if (site.exitCode !== 0) throw new Error(`python3 failed: ${site.stderr.toString()}`);
+				const userSite = site.stdout.toString().trim();
+				if (!userSite || userSite === "None") throw new Error("python3 did not report a user site path");
+				fs.mkdirSync(userSite, { recursive: true });
+				fs.writeFileSync(
+					path.join(userSite, "usercustomize.py"),
+					`open(${JSON.stringify(marker)}, "w").write("ran")\n`,
+				);
+				return `PYTHONUSERBASE=${userBase}\n`;
+			},
+		},
+		{
+			name: "PERL5OPT",
+			binary: "perl",
+			command: "perl -e 0",
+			plant: ({ cwd, marker }) => {
+				fs.writeFileSync(
+					path.join(cwd, "Planted.pm"),
+					`open(my $f, ">", ${JSON.stringify(marker)}); print $f "ran"; 1;\n`,
+				);
+				return `PERL5OPT=-MPlanted\nPERL5LIB=${cwd}\n`;
+			},
+		},
+	];
+	for (const vector of RUNTIME_VECTORS) {
+		it.skipIf(!Bun.which(vector.binary))(
+			`does not let a project ${vector.name} inject code into ${vector.binary}`,
+			async () => {
+				const target = project(vector.plant);
+				const command = `${vector.command} >/dev/null 2>&1; echo probe-done`;
+				expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+			},
+		);
+	}
+
+	// The JVM loads a `-javaagent` from JAVA_TOOL_OPTIONS and JDK_JAVA_OPTIONS before `main`.
+	for (const key of ["JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS"]) {
+		it.skipIf(!Bun.which("javac") || !Bun.which("jar") || !Bun.which("java"))(
+			`does not let a project ${key} agent load into java`,
+			async () => {
+				const target = project(({ cwd, marker }) => {
+					const source = path.join(cwd, "Planted.java");
+					fs.writeFileSync(
+						source,
+						`public class Planted { public static void premain(String a) throws Exception { java.nio.file.Files.write(java.nio.file.Paths.get(${JSON.stringify(marker)}), new byte[0]); } }\n`,
+					);
+					fs.writeFileSync(path.join(cwd, "manifest.txt"), "Premain-Class: Planted\n");
+					for (const argv of [
+						["javac", source],
+						["jar", "cfm", "planted.jar", "manifest.txt", "Planted.class"],
+					]) {
+						const step = Bun.spawnSync(argv, { cwd });
+						if (step.exitCode !== 0) throw new Error(`${argv[0]} failed: ${step.stderr.toString()}`);
+					}
+					return `${key}=-javaagent:${path.join(cwd, "planted.jar")}\n`;
+				});
+				const command = "java -version >/dev/null 2>&1; echo probe-done";
+				expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+			},
+			60_000,
+		);
+	}
+
+	// The dynamic loader runs a preloaded library in every dynamically linked
+	// command, including a plain `ls`.
+	it.skipIf(process.platform !== "linux" || !Bun.which("cc"))(
+		"does not let a project LD_PRELOAD library load into shell commands",
+		async () => {
+			const target = project(({ cwd, marker }) => {
+				const source = path.join(cwd, "preload.c");
+				fs.writeFileSync(
+					source,
+					`#include <stdio.h>\n__attribute__((constructor)) static void planted(void) { FILE *f = fopen(${JSON.stringify(marker)}, "w"); if (f) fclose(f); }\n`,
+				);
+				const library = path.join(cwd, "preload.so");
+				const cc = Bun.spawnSync(["cc", "-shared", "-fPIC", "-o", library, source]);
+				if (cc.exitCode !== 0) throw new Error(`cc failed: ${cc.stderr.toString()}`);
+				return `LD_PRELOAD=${library}\n`;
+			});
+			expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: "ls >/dev/null; echo probe-done" })).toBe(
+				false,
+			);
+		},
+	);
+
+	// `LD_AUDIT` modules are loaded by the loader itself, before the program runs.
+	it.skipIf(process.platform !== "linux" || !Bun.which("cc"))(
+		"does not let a project LD_AUDIT module load into shell commands",
+		async () => {
+			const target = project(({ cwd, marker }) => {
+				const source = path.join(cwd, "audit.c");
+				fs.writeFileSync(
+					source,
+					`#include <stdio.h>\nunsigned int la_version(unsigned int v) { FILE *f = fopen(${JSON.stringify(marker)}, "w"); if (f) fclose(f); return v; }\n`,
+				);
+				const library = path.join(cwd, "audit.so");
+				const cc = Bun.spawnSync(["cc", "-shared", "-fPIC", "-o", library, source]);
+				if (cc.exitCode !== 0) throw new Error(`cc failed: ${cc.stderr.toString()}`);
+				return `LD_AUDIT=${library}\n`;
+			});
+			expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: "ls >/dev/null; echo probe-done" })).toBe(
+				false,
+			);
+		},
+	);
+
+	// `LD_LIBRARY_PATH` is searched before the system directories, so a project
+	// library with the soname of one `ls` links against shadows it. The planted
+	// copy is an ELF filter on the real library, so `ls` still works.
+	const lsDependency = (() => {
+		if (process.platform !== "linux" || !Bun.which("cc") || !Bun.which("ldd")) return undefined;
+		const ls = Bun.which("ls");
+		if (!ls) return undefined;
+		const ldd = Bun.spawnSync(["ldd", ls]).stdout.toString();
+		for (const line of ldd.split("\n")) {
+			const match = /^\s*(\S+)\s+=>\s+(\/\S+)/.exec(line);
+			if (match && !/^(?:libc|libm|libdl|libpthread|ld-linux)[.-]/.test(match[1]!)) {
+				return { soname: match[1]!, real: match[2]! };
+			}
+		}
+		return undefined;
+	})();
+	it.skipIf(!lsDependency)("does not let a project LD_LIBRARY_PATH shadow a library of shell commands", async () => {
+		const target = project(({ cwd, marker }) => {
+			const source = path.join(cwd, "shadow.c");
+			fs.writeFileSync(
+				source,
+				`#include <stdio.h>\n__attribute__((constructor)) static void planted(void) { FILE *f = fopen(${JSON.stringify(marker)}, "w"); if (f) fclose(f); }\n`,
+			);
+			const libDir = path.join(cwd, "lib");
+			fs.mkdirSync(libDir);
+			const { soname, real } = lsDependency!;
+			const cc = Bun.spawnSync([
+				"cc",
+				"-shared",
+				"-fPIC",
+				"-o",
+				path.join(libDir, soname),
+				source,
+				`-Wl,-soname,${soname}`,
+				`-Wl,--filter,${real}`,
+			]);
+			if (cc.exitCode !== 0) throw new Error(`cc failed: ${cc.stderr.toString()}`);
+			return `LD_LIBRARY_PATH=${libDir}\n`;
+		});
+		expect(await runProbe(target, "worker", { GJC_TEST_PROBE_COMMAND: "ls >/dev/null 2>&1; echo probe-done" })).toBe(
+			false,
+		);
+	});
+
+	it.skipIf(!Bun.which("python3"))("still honors a PYTHONPATH the launching shell exported", async () => {
+		const target = project(() => "PYTHONPATH=/nonexistent-project-path\n");
+		const trusted = path.join(target.cwd, "trusted");
+		fs.mkdirSync(trusted);
+		fs.writeFileSync(
+			path.join(trusted, "sitecustomize.py"),
+			`open(${JSON.stringify(target.marker)}, "w").write("ran")\n`,
+		);
+		const command = "python3 -c 0 >/dev/null 2>&1; echo probe-done";
+		expect(await runProbe(target, "worker", { PYTHONPATH: trusted, GJC_TEST_PROBE_COMMAND: command })).toBe(true);
+	});
+
+	it.skipIf(process.platform !== "linux" || !Bun.which("python3") || !Bun.which("script"))(
+		"does not run a project PYTHONSTARTUP file in the interactive PTY",
+		async () => {
+			const target = project(({ cwd, marker }) => {
+				const startup = path.join(cwd, "startup.py");
+				fs.writeFileSync(startup, `open(${JSON.stringify(marker)}, "w").write("ran")\n`);
+				return `PYTHONSTARTUP=${startup}\n`;
+			});
+			const command = "printf 'exit()\\n' | script -qec 'python3' /dev/null; echo probe-done";
+			expect(await runProbe(target, "pty", { ...forwarded(target), GJC_TEST_PROBE_COMMAND: command })).toBe(false);
+		},
+	);
 
 	// The PTY runs a real `bash -lc` that inherits the host environment. A
 	// top-level host never holds dotenv values there, but a child GJC launched

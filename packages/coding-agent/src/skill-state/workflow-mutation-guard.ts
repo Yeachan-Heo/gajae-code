@@ -35,7 +35,7 @@ export const RALPLAN_MUTATION_BLOCK_MESSAGE =
 export const ULTRAGOAL_GOAL_PLANNING_MUTATION_BLOCK_MESSAGE =
 	"Ultragoal goal-planning phase boundary: finish goal planning and record goals through `gjc ultragoal` before editing code. Product-code mutation tools and patch execution are blocked until goal planning completes and execution begins.";
 export const AUTORESEARCH_MUTATION_BLOCK_MESSAGE =
-	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked everywhere, on every branch. Mission research artifacts (`autoresearch.sh` at the workdir root and mission state through the sanctioned `gjc autoresearch` CLI) stay writable; run experiments through the `python` tool, or finish the mission and hand off to an approved implementation workflow.";
+	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked everywhere, on every branch. Write the root `autoresearch.sh` only with direct file tools; mission state stays writable through the sanctioned `gjc autoresearch` CLI. Run experiments through the `python` tool, or finish the mission and hand off to an approved implementation workflow.";
 
 /** Resolve the phase-boundary block message for the active planning skill. */
 function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
@@ -53,6 +53,7 @@ function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
 export const WORKFLOW_MUTATION_TOOL_NAMES = ["edit", "write", "ast_edit", "bash", "github", "eval", "python"] as const;
 
 const BLOCKED_TOOL_NAMES = new Set<string>(WORKFLOW_MUTATION_TOOL_NAMES);
+const AUTORESEARCH_HARNESS_FILE_TOOL_NAMES = new Set(["edit", "write"]);
 
 export function isWorkflowMutationTool(name: string): boolean {
 	return BLOCKED_TOOL_NAMES.has(name);
@@ -88,14 +89,15 @@ const BASH_COMMAND_WRAPPER_SOURCE =
  */
 const BASH_COMMAND_POSITION_KEYWORD_RE = /(?:^|[;&|(\n{}])\s*(?:then|else|elif|do|in|\{|!)(?=\s)/gi;
 const BASH_MUTATION_COMMAND_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate|chmod|ln)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
 	"gi",
 );
 /** Command-word extractor; must accept the same prefixes as `BASH_MUTATION_COMMAND_RE`. */
 const BASH_MUTATION_COMMAND_NAME_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\\b`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate|chmod|ln)\\b`,
 	"i",
 );
+const BASH_CHMOD_MODE_RE = /^(?:[0-7]{1,4}|(?:[ugoa]*[+=-][rwxXstugo]*)(?:,[ugoa]*[+=-][rwxXstugo]*)*)$/;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
 	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:sed|perl)\\b([^;&|()\\n]*)`,
 	"gi",
@@ -1676,10 +1678,20 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]?.match(BASH_MUTATION_COMMAND_NAME_RE)?.[1]?.toLowerCase();
-		const targetParts =
-			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"
-				? parts.slice(-1)
-				: parts;
+		const chmodModeIndex =
+			commandName === "chmod" ? parts.findIndex(part => BASH_CHMOD_MODE_RE.test(cleanShellWord(part))) : -1;
+		let targetParts = parts;
+		if (
+			commandName === "cp" ||
+			commandName === "mv" ||
+			commandName === "install" ||
+			commandName === "truncate" ||
+			commandName === "ln"
+		) {
+			targetParts = parts.slice(-1);
+		} else if (commandName === "chmod" && chmodModeIndex >= 0) {
+			targetParts = parts.filter((_part, index) => index !== chmodModeIndex);
+		}
 		let extractedTarget = false;
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
@@ -2356,12 +2368,20 @@ export async function getWorkflowMutationDecision(
 	// name is not authorization: an `autoresearch/*` branch isolates keep/discard
 	// bookkeeping, it does not turn product edits into research.
 	//
+	// Shell and code-execution tools can run multiple operations before writing,
+	// so checking the harness once cannot protect the later write destination.
+	// Only direct file-mutation tools may use the harness exception.
 	// The allowance requires at least one named target: `every` is vacuously true
 	// for an empty list, so an opaque mutation that resolves to NO target (e.g.
 	// `python3 -c "open('src/product.ts','w').write('x')"`) would otherwise skip
 	// the fail-closed check below and be waved through on a research mission.
+	// Bash is a compound command list, not a write boundary: an earlier `ln` or
+	// `mv` can retarget the harness before a later redirection. Harness changes
+	// must use a single-target file tool so the final path is checked for symlinks
+	// immediately before that write operation.
 	if (
 		planning.skill === "autoresearch" &&
+		AUTORESEARCH_HARNESS_FILE_TOOL_NAMES.has(input.tool.name) &&
 		targets.paths.length > 0 &&
 		!targets.unknown &&
 		targets.paths.every(p => isAutoresearchAuthorizedResearchPath(input.cwd, p))
