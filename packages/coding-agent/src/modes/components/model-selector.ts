@@ -793,7 +793,7 @@ export class ModelSelectorComponent extends Container {
 			this.#configuredDefaultChain ?? normalizeModelSelectorValue(this.#settings.getModelRole("default"));
 		if (configuredChain.length < 2) return false;
 
-		const allModels = this.#modelRegistry.getAll();
+		const allModels = this.#modelRegistry.getAll(this.#authSessionId);
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		return configuredChain.slice(1).some(selector => {
 			const resolved = resolveModelRoleValue(selector, allModels, {
@@ -809,7 +809,7 @@ export class ModelSelectorComponent extends Container {
 
 	#loadRoleModels(): RoleAssignments {
 		const roles: RoleAssignments = {};
-		const allModels = this.#modelRegistry.getAll();
+		const allModels = this.#modelRegistry.getAll(this.#authSessionId);
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		const agentModelOverrides = this.#settings.get("task.agentModelOverrides");
 		const activeProfile = this.#activeModelProfile
@@ -921,7 +921,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#buildAvailableModelItems(): ModelItem[] {
-		return this.#modelRegistry.getAvailable().map((model: Model) => ({
+		return this.#modelRegistry.getAvailable(this.#authSessionId).map((model: Model) => ({
 			kind: "provider",
 			provider: model.provider,
 			id: model.id,
@@ -1310,7 +1310,7 @@ export class ModelSelectorComponent extends Container {
 			if (isInheritedRoleSelector(configuredSelector)) continue;
 			const selectors = resolveConfiguredModelPatterns(configuredSelector, this.#settings);
 			for (const selector of selectors.length > 0 ? selectors : [configuredSelector]) {
-				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
 					settings: this.#settings,
 					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 					modelRegistry: this.#modelRegistry,
@@ -1423,7 +1423,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#getProfileAvailableModels(): Model[] {
-		return this.#modelRegistry.getAvailable();
+		return this.#modelRegistry.getAvailable(this.#authSessionId);
 	}
 
 	#createProfileResolutionRegistry(availableModels: readonly Model[]) {
@@ -2162,7 +2162,7 @@ export class ModelSelectorComponent extends Container {
 		for (const role of PROFILE_ROLE_PREVIEW_ORDER) {
 			const selector = profile.modelMapping[role];
 			if (!selector) continue;
-			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+			const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(this.#authSessionId), {
 				settings: this.#settings,
 				matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,

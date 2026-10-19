@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
+import type { CacheControlEphemeral, MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
 import {
+	applyPromptCaching,
 	isAnthropicCacheBreakpointOverflowError,
 	normalizeCacheControlTtlOrdering,
 	streamAnthropic,
@@ -23,6 +24,39 @@ const canonicalModel: Model<"anthropic-messages"> = {
 
 type CacheControl = { type: string; ttl?: string };
 type Payload = MessageCreateParamsStreaming & { cache_control?: CacheControl };
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let value = Math.imul(state ^ (state >>> 15), state | 1);
+		value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+		return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+	};
+}
+
+function pick<T>(random: () => number, items: readonly T[]): T {
+	return items[Math.floor(random() * items.length)]!;
+}
+
+function cacheMarkerLayout(payload: Payload): Map<string, CacheControl> {
+	const markers = new Map<string, CacheControl>();
+	const record = (path: string, block: { cache_control?: CacheControl | null }): void => {
+		if (block.cache_control) markers.set(path, { ...block.cache_control });
+	};
+	record("root", payload);
+	for (const [index, tool] of (payload.tools ?? []).entries()) record(`tools.${index}`, tool);
+	if (Array.isArray(payload.system)) {
+		for (const [index, block] of payload.system.entries()) record(`system.${index}`, block);
+	}
+	for (const [messageIndex, message] of payload.messages.entries()) {
+		if (!Array.isArray(message.content)) continue;
+		for (const [blockIndex, block] of message.content.entries()) {
+			record(`messages.${messageIndex}.${blockIndex}`, block as { cache_control?: CacheControl | null });
+		}
+	}
+	return markers;
+}
 
 function abortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -151,9 +185,17 @@ describe("Anthropic prompt caching", () => {
 		]);
 
 		expect(canonical.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+		expect(canonical.system).toEqual([
+			{ type: "text", text: "Stable instructions" },
+			{ type: "text", text: "Second stable instruction", cache_control: canonical.cache_control },
+		]);
 		// Compatible Claude gateways default to explicit block markers because many
 		// proxies add their own controls or do not understand the root field.
 		expect(proxiedClaude.cache_control).toBeUndefined();
+		expect(proxiedClaude.system).toEqual([
+			{ type: "text", text: "Stable instructions" },
+			{ type: "text", text: "Second stable instruction" },
+		]);
 		expect(
 			(proxiedClaude.messages.at(-1)?.content as Array<{ cache_control?: CacheControl }>)[0]?.cache_control,
 		).toEqual({
@@ -161,9 +203,159 @@ describe("Anthropic prompt caching", () => {
 		});
 		// A verified gateway can explicitly opt into top-level automatic caching.
 		expect(automatic.cache_control).toEqual({ type: "ephemeral" });
-		expect(cacheControls(automatic)).toEqual([{ type: "ephemeral" }]);
+		expect(automatic.system).toEqual([
+			{ type: "text", text: "Stable instructions" },
+			{ type: "text", text: "Second stable instruction", cache_control: automatic.cache_control },
+		]);
+		expect(cacheControls(automatic)).toEqual([{ type: "ephemeral" }, { type: "ephemeral" }]);
 		// Non-Claude models on unknown compatible endpoints still get no generated caching.
 		expect(nonClaude.cache_control).toBeUndefined();
+	});
+	it("does not add a system marker when automatic caching has no system blocks", async () => {
+		const payload = await capturePayload(canonicalModel, { ...context(), systemPrompt: undefined });
+		expect(payload.system).toBeUndefined();
+		expect(cacheControls(payload)).toEqual([{ type: "ephemeral", ttl: "1h" }]);
+	});
+	it("preserves an existing system breakpoint without adding another", () => {
+		const params = cacheParams({
+			system: [
+				{ type: "text", text: "stable", cache_control: { type: "ephemeral", ttl: "1h" } },
+				{ type: "text", text: "tail" },
+			],
+		});
+		applyPromptCaching(params, "automatic", { type: "ephemeral", ttl: "1h" });
+		expect(params.system).toEqual([
+			{ type: "text", text: "stable", cache_control: { type: "ephemeral", ttl: "1h" } },
+			{ type: "text", text: "tail" },
+		]);
+		expect(cacheControls(params)).toHaveLength(2);
+		normalizeCacheControlTtlOrdering(params);
+	});
+	it("keeps the automatic system breakpoint within the total cap and retry budget", () => {
+		for (const budget of [2, 1] as const) {
+			for (const existingCount of [0, 2, 3]) {
+				const params = cacheParams({
+					system: [{ type: "text", text: "stable" }],
+					tools: Array.from({ length: existingCount }, (_, index) => ({
+						name: `tool_${index}`,
+						input_schema: { type: "object" },
+						cache_control: { type: "ephemeral", ttl: "1h" },
+					})),
+				});
+				applyPromptCaching(params, "automatic", { type: "ephemeral", ttl: "1h" }, budget);
+				const hasSystemMarker = budget === 2 && existingCount < 3;
+				expect(params.system).toEqual([
+					{
+						type: "text",
+						text: "stable",
+						...(hasSystemMarker ? { cache_control: { type: "ephemeral", ttl: "1h" } } : {}),
+					},
+				]);
+				expect(cacheControls(params)).toHaveLength(existingCount + 1 + Number(hasSystemMarker));
+				normalizeCacheControlTtlOrdering(params);
+			}
+		}
+	});
+	describe("generated cache-marker layouts", () => {
+		for (let seed = 0; seed < 500; seed++) {
+			it(`preserves allocation invariants for seed ${seed}`, () => {
+				const random = seededRandom(seed);
+				const mode = pick(random, ["automatic", "explicit", "none"] as const);
+				const budget = pick(random, [0, 1, 2] as const);
+				// Use the same TTL for existing and generated markers so every layout
+				// satisfies the provider's long-before-short TTL ordering rule.
+				const control: CacheControlEphemeral = { type: "ephemeral" };
+				const ttl = pick(random, [undefined, "5m", "1h"] as const);
+				if (ttl) control.ttl = ttl;
+				const cacheControl = pick(random, [control, undefined]);
+				const systemCount = pick(random, [0, 1, 2, 3, 4, 5]);
+				const toolCount = pick(random, [0, 1, 2, 3]);
+				const messages = pick<MessageCreateParamsStreaming["messages"]>(random, [
+					[{ role: "user", content: [{ type: "text", text: "Question" }] }],
+					[
+						{ role: "user", content: [{ type: "text", text: "Question" }] },
+						{ role: "assistant", content: [{ type: "text", text: "Answer" }] },
+						{ role: "user", content: [{ type: "text", text: "Continue" }] },
+					],
+					[
+						{ role: "user", content: [{ type: "text", text: "Question" }] },
+						{
+							role: "assistant",
+							content: [{ type: "tool_use", id: "call_1", name: "lookup", input: {} }],
+						},
+						{
+							role: "user",
+							content: [
+								{ type: "tool_result", tool_use_id: "call_1", content: "Answer" },
+								{ type: "text", text: "Use the answer" },
+							],
+						},
+					],
+				]);
+				const params = cacheParams({
+					system: Array.from({ length: systemCount }, (_, index) => ({ type: "text", text: `System ${index}` })),
+					tools: Array.from({ length: toolCount }, (_, index) => ({
+						name: index === 0 ? "lookup" : `tool_${index}`,
+						input_schema: { type: "object" },
+					})),
+					messages,
+				});
+				const slots: Array<{ block: { cache_control?: CacheControl | null }; message: boolean }> = [
+					{ block: params, message: false },
+					...(params.tools ?? []).map(block => ({ block, message: false })),
+					...(Array.isArray(params.system) ? params.system : []).map(block => ({ block, message: false })),
+					...messages.flatMap(message =>
+						Array.isArray(message.content)
+							? message.content.map(block => ({
+									block: block as { cache_control?: CacheControl | null },
+									message: true,
+								}))
+							: [],
+					),
+				];
+				// Shuffle before allocating to cover markers at arbitrary positions,
+				// including full-cap layouts without an existing top-level marker.
+				for (let index = slots.length - 1; index > 0; index--) {
+					const other = Math.floor(random() * (index + 1));
+					[slots[index], slots[other]] = [slots[other]!, slots[index]!];
+				}
+				let remaining = pick(random, [0, 1, 2, 3, 4]);
+				let messageRemaining = pick(random, [0, 1, 2]);
+				for (const slot of slots) {
+					if (remaining === 0) break;
+					if (slot.message && messageRemaining === 0) continue;
+					slot.block.cache_control = { ...control };
+					remaining--;
+					if (slot.message) messageRemaining--;
+				}
+
+				normalizeCacheControlTtlOrdering(params);
+				const before = cacheMarkerLayout(params);
+				const hadSystemMarker = [...before.keys()].some(path => path.startsWith("system."));
+				const disabled = mode === "none" || budget === 0 || cacheControl === undefined;
+				// Automatic caching reserves a root breakpoint before the system one.
+				const countWithRoot = before.size + Number(!before.has("root"));
+				const shouldAddSystem =
+					!disabled && mode === "automatic" && budget > 1 && !hadSystemMarker && countWithRoot < 4;
+
+				applyPromptCaching(params, mode, cacheControl, budget);
+
+				const after = cacheMarkerLayout(params);
+				// A caller layout already at the cap plus the automatic root marker is rejected
+				// later by validateCacheControls, as before this change; the system marker
+				// itself must never be what takes the request past the cap.
+				expect(cacheControls(params).length).toBeLessThanOrEqual(Math.max(4, countWithRoot));
+				for (const [path, marker] of before) expect(after.get(path)).toEqual(marker);
+				if (disabled) expect(after).toEqual(before);
+				for (let index = 0; index < systemCount; index++) {
+					const path = `system.${index}`;
+					const expected = shouldAddSystem && index === systemCount - 1 ? control : before.get(path);
+					expect(after.get(path)).toEqual(expected);
+				}
+				if (cacheControls(params).length > 4) expect(() => normalizeCacheControlTtlOrdering(params)).toThrow();
+				else normalizeCacheControlTtlOrdering(params);
+			});
+		}
 	});
 	it("classifies the dispatched model id and honors every cache opt-out", async () => {
 		const proxyUrl = "https://proxy.example.test/anthropic";
@@ -239,7 +431,12 @@ describe("Anthropic prompt caching", () => {
 		for (const { name, model, options, expected } of cases) {
 			const payload = await capturePayload(model, context(), undefined, options?.cacheRetention);
 			expect(payload.model, name).toBe(model.id);
-			expect(cacheControls(payload), name).toEqual(expected ? [expected] : []);
+			const expectedControls = expected
+				? model.compat?.promptCacheMode === "automatic"
+					? [expected, expected]
+					: [expected]
+				: [];
+			expect(cacheControls(payload), name).toEqual(expectedControls);
 		}
 	});
 	it("preserves configured cache retention through GitLab Duo and lets request options win", async () => {

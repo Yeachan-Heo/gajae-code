@@ -87,8 +87,13 @@ const setTitleTool: Tool = {
 	},
 };
 
-function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel?: Model<Api>): Model<Api> | undefined {
-	const availableModels = registry.getAvailable();
+function getTitleModel(
+	registry: ModelRegistry,
+	settings: Settings,
+	currentModel?: Model<Api>,
+	credentialSessionId?: string,
+): Model<Api> | undefined {
+	const availableModels = registry.getAvailable(credentialSessionId);
 	if (availableModels.length === 0) return undefined;
 
 	const titleModel = resolveRoleSelection(["default"], settings, availableModels, registry)?.model;
@@ -122,7 +127,7 @@ export async function generateSessionTitle(
 	currentModel?: Model<Api>,
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined,
 ): Promise<string | null> {
-	const model = getTitleModel(registry, settings, currentModel);
+	const model = getTitleModel(registry, settings, currentModel, sessionId);
 	if (!model) {
 		logger.debug("title-generator: no title model found");
 		return null;

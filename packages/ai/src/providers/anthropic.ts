@@ -3877,7 +3877,7 @@ function applyExplicitPromptCaching(
 	}
 }
 
-function applyPromptCaching(
+export function applyPromptCaching(
 	params: AnthropicCacheParams,
 	cacheMode: AnthropicCacheMode,
 	cacheControl?: AnthropicCacheControl,
@@ -3886,9 +3886,18 @@ function applyPromptCaching(
 	if (!cacheControl || cacheMode === "none" || budget === 0) return;
 	validateCacheControls(params);
 	if (cacheMode === "automatic") {
-		// Automatic mode only ever emits one marker, so any non-zero budget
-		// covers it; the zero case already returned above.
 		params.cache_control = { ...cacheControl };
+		// #2383's moving breakpoint reasoning holds within a session, not across
+		// sessions: anchor tools + system so new messages can reuse that prefix.
+		if (
+			budget > 1 &&
+			Array.isArray(params.system) &&
+			!params.system.some(block => block.cache_control) &&
+			countCacheControlBreakpoints(params) < 4
+		) {
+			const lastBlock = params.system.at(-1);
+			if (lastBlock) lastBlock.cache_control = { ...cacheControl };
+		}
 		return;
 	}
 	applyExplicitPromptCaching(params, cacheControl, budget);

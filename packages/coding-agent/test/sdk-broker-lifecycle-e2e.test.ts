@@ -6358,13 +6358,18 @@ test("broker distinguishes an absent ledger from a damaged ledger during create 
 			.filter(Boolean)
 			.map(line => JSON.parse(line) as Record<string, unknown>);
 		const damagedOperationRows = damagedRows.filter(row => row.identity === damagedIdentity);
-		expect(damagedOperationRows.findLast(row => row.operationKey === `session.create\0${damagedKey}`)).toMatchObject({
-			state: "terminal_uncertain",
-		});
-		const effectIntent = damagedOperationRows.findLast(row => row.state === "terminal_uncertain")?.effectIntent as
-			| { sessionId?: unknown }
-			| undefined;
-		if (typeof effectIntent?.sessionId === "string") damagedSessionId = effectIntent.sessionId;
+		// The broker writes its terminal row before verifying persistence. A damaged
+		// read-back makes the caller's answer conservative (`terminal_uncertain`), but
+		// the ledger keeps the proven terminal row: proven terminal records admit no
+		// successor, so the identity still replays the real create result on reopen.
+		const damagedTerminal = damagedOperationRows.findLast(
+			row => row.operationKey === `session.create\0${damagedKey}`,
+		);
+		expect(damagedTerminal).toMatchObject({ state: "terminal_ok" });
+		expect(damagedOperationRows.some(row => row.state === "terminal_uncertain")).toBe(false);
+		const damagedSessionIdFromLedger = (damagedTerminal?.response as { result?: { sessionId?: unknown } } | undefined)
+			?.result?.sessionId;
+		if (typeof damagedSessionIdFromLedger === "string") damagedSessionId = damagedSessionIdFromLedger;
 	} finally {
 		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
 		for (const [sessionId, key] of [

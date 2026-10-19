@@ -408,7 +408,7 @@ function concretizeMaterializedAssignmentValues(
 	// Materialized assignments are persisted into `modelRoles` and
 	// `task.agentModelOverrides` and later consumed by profile execution, so they
 	// resolve against the same catalog profile activation uses.
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable(credentialSessionId);
 	const authenticatedModels = availableModels.filter(model => {
 		const isCredentiallessProvider = modelRegistry.isCredentiallessProvider?.bind(modelRegistry);
 		const hasUsableAuth = modelRegistry.authStorage?.hasUsableAuth?.bind(modelRegistry.authStorage);
@@ -899,7 +899,7 @@ export async function resolveMissingSessionModelRecovery(options: {
 		options.skips.length === options.defaultEntries.length &&
 		options.skips.every(skip => skip.reason === "unknown_model");
 	if (!allSelectorsUnknown) return undefined;
-	const fullCatalog = options.modelRegistry.getAll();
+	const fullCatalog = options.modelRegistry.getAll(options.credentialSessionId);
 	const catalogIndex = createRegistrySelectorIndex(fullCatalog);
 	const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
 		options.defaultEntries,
@@ -1060,7 +1060,9 @@ export async function resolveModelProfileDefaultChain(options: {
 			allRoutable && proxyProvider !== undefined ? [proxyProvider] : [...group],
 		);
 	}
-	const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
+	const availableModels =
+		options.modelRegistry.getAvailable?.(options.credentialSessionId) ??
+		options.modelRegistry.getAll(options.credentialSessionId);
 	let bindings = resolveProfileBindings(profile);
 	if (alternativeGroups.length > 0)
 		bindings = rewriteBindingsProviders(bindings, authenticatedProviders, alternativeGroups);
@@ -1077,7 +1079,7 @@ export async function resolveModelProfileDefaultChain(options: {
 	await preflightModelProfileRoleBindings({
 		profile,
 		bindings,
-		roleCatalogModels: options.modelRegistry.getAll(),
+		roleCatalogModels: options.modelRegistry.getAll(options.credentialSessionId),
 		settings: options.settings as Settings,
 		modelRegistry: options.modelRegistry as ModelRegistry,
 		sessionId: "",
@@ -1263,11 +1265,15 @@ function formatMaterializedSelector(selector: string, model: Model<Api>): string
 	if (!explicitThinkingLevel || parseModelString(clampedSelector)?.thinkingLevel) return clampedSelector;
 	return formatModelSelectorValue(clampedSelector, explicitThinkingLevel);
 }
-function getBareSelectorCredentialProviders(selector: string, modelRegistry: ModelRegistry): string[] {
+function getBareSelectorCredentialProviders(
+	selector: string,
+	modelRegistry: ModelRegistry,
+	credentialSessionId?: string,
+): string[] {
 	const suffix = splitSelectorThinkingSuffix(selector);
 	const alias = (suffix.thinkingLevel ? suffix.selector : selector).trim().toLowerCase();
 	const providers = modelRegistry
-		.getAll()
+		.getAll(credentialSessionId)
 		.filter(model => {
 			const modelId = model.id.trim().toLowerCase();
 			return modelId === alias || modelId.slice(modelId.lastIndexOf("/") + 1) === alias;
@@ -1338,7 +1344,11 @@ async function resolveAndClampSelectorValue(
 		}
 		if (!resolved.model) {
 			if (bareAlias) {
-				const providers = getBareSelectorCredentialProviders(selector, options.modelRegistry);
+				const providers = getBareSelectorCredentialProviders(
+					selector,
+					options.modelRegistry,
+					options.credentialSessionId,
+				);
 				const selectorSuffix = splitSelectorThinkingSuffix(selector);
 				const bareSelector = selectorSuffix.thinkingLevel ? selectorSuffix.selector : selector;
 				const aliasKnown =
@@ -1430,8 +1440,9 @@ async function concretizeProfileSelectorValue(
 	selectorValue: ModelSelectorValue,
 	prepared: PreparedModelProfileActivation,
 ): Promise<ModelSelectorValue> {
-	const candidates = prepared.modelRegistry.getAvailable?.() ?? prepared.modelRegistry.getAll();
 	const credentialSessionId = prepared.session.credentialSessionId ?? prepared.session.sessionId;
+	const candidates =
+		prepared.modelRegistry.getAvailable?.(credentialSessionId) ?? prepared.modelRegistry.getAll(credentialSessionId);
 	const concrete = await Promise.all(
 		normalizeModelSelectorValue(selectorValue).map(async selector => {
 			const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
@@ -1682,8 +1693,9 @@ export async function prepareModelProfileActivation(
 			);
 		}
 
-		const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
-		const roleCatalogModels = options.modelRegistry.getAll();
+		const availableModels =
+			options.modelRegistry.getAvailable?.(credentialSessionId) ?? options.modelRegistry.getAll(credentialSessionId);
+		const roleCatalogModels = options.modelRegistry.getAll(credentialSessionId);
 		let bindings = resolveProfileBindings(profile);
 		if (alternativeGroups.length > 0) {
 			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);

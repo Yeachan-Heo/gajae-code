@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import { hookFetch } from "@gajae-code/utils";
 import {
 	applyUltrafastTierModelPolicies,
 	CODEX_GPT6_IDS,
+	fetchAntigravityModels,
 	injectAlibabaTokenPlanModels,
 	injectCodexGpt6Models,
 	injectImageGenerationModels,
@@ -10,7 +12,36 @@ import {
 } from "../scripts/generate-models";
 import modelsJson from "../src/models.json" with { type: "json" };
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../src/provider-models/openai-compat";
+import { getGeminiCliUserAgent } from "../src/providers/google-gemini-headers";
 import type { Model } from "../src/types";
+
+describe("fetchAntigravityModels", () => {
+	it("forwards the stored project ID to discovery", async () => {
+		let requestBody: unknown;
+		const requestUserAgents: string[] = [];
+		using _hook = hookFetch((input, init) => {
+			if (!String(input).endsWith("/v1internal:fetchAvailableModels")) {
+				throw new Error(`Unexpected URL: ${String(input)}`);
+			}
+			requestBody = JSON.parse(String(init?.body ?? "{}")) as unknown;
+			const userAgent = new Headers(init?.headers).get("user-agent");
+			if (userAgent) requestUserAgents.push(userAgent);
+			return new Response(JSON.stringify({ models: { "gemini-4-argon": { displayName: "Gemini 4 Argon" } } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const models = await fetchAntigravityModels({
+			accessToken: "generator-access-token",
+			projectId: "generator-project",
+		});
+
+		expect(requestBody).toEqual({ project: "generator-project" });
+		expect(requestUserAgents).toEqual([getGeminiCliUserAgent()]);
+		expect(models.map(model => model.id)).toEqual(["gemini-4-argon"]);
+	});
+});
 
 describe("injectCodexGpt6Models", () => {
 	it("resets the seed row of every injected Codex GPT-6 model", () => {

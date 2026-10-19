@@ -854,7 +854,7 @@ export function resolveImageRoleModel(
 ): Model | undefined {
 	const roleValue = settings.getModelRole("image");
 	if (!roleValue) return undefined;
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable(options?.credentialSessionId);
 	const resolved = resolveModelRoleValue(roleValue, availableModels, {
 		settings,
 		modelRegistry,

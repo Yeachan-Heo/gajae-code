@@ -14,11 +14,13 @@ export interface GoogleVertexModelManagerConfig {
 export interface GoogleAntigravityModelManagerConfig {
 	oauthToken?: string;
 	endpoint?: string;
+	project?: string;
 }
 
 export interface GoogleGeminiCliModelManagerConfig {
 	oauthToken?: string;
 	endpoint?: string;
+	project?: string;
 }
 
 const CLOUD_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com";
@@ -58,6 +60,7 @@ export function googleAntigravityModelManagerOptions(
 						fetchAntigravityDiscoveryModels({
 							token,
 							endpoint: config?.endpoint,
+							project: config?.project,
 							userAgent: ua,
 						}),
 				}
@@ -80,6 +83,7 @@ export function googleGeminiCliModelManagerOptions(
 						const models = await fetchAntigravityDiscoveryModels({
 							token,
 							endpoint,
+							project: config?.project,
 							targetProvider: "google-gemini-cli",
 							userAgent: ua,
 						});

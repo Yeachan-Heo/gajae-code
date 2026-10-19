@@ -10,8 +10,9 @@ import { assertLoopbackCdpUrl } from "./browser/cdp-url";
 import { isChromeProfileExecutableForLaunch, isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
 import { chromeUserDataRoots, type DiscoveryEnv, defaultDiscoveryEnv } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
-import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
+import type { Observation, RunResultOk, ScreenshotResult } from "./browser/tab-protocol";
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
+import { wrapUntrustedContent } from "./fetch";
 import type { OutputMeta } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -392,8 +393,8 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		const verb = result.created ? "Opened" : "Reused";
 		const lines = [
 			`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser)}`,
-			`URL: ${url}`,
-			title ? `Title: ${title}` : null,
+			`URL: ${frameBrowserPageText(url)}`,
+			title ? `Title: ${frameBrowserPageText(title)}` : null,
 		].filter((l): l is string => typeof l === "string");
 		details.result = lines.join("\n");
 		return toolResult(details).text(lines.join("\n")).done();
@@ -446,9 +447,9 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 
 		if (screenshots.length) details.screenshots = screenshots;
 
-		const content = [...displays];
+		const content = frameBrowserPageDisplays(displays);
 		if (returnValue !== undefined) {
-			content.push({ type: "text", text: stringifyReturnValue(returnValue) });
+			content.push({ type: "text", text: frameBrowserPageText(stringifyReturnValue(returnValue)) });
 		}
 		if (!content.length) {
 			content.push({ type: "text", text: `Ran code on tab ${JSON.stringify(name)}` });
@@ -496,9 +497,9 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		});
 
 		if (screenshots.length) details.screenshots = screenshots;
-		const content = [...displays];
+		const content = frameBrowserPageDisplays(displays);
 		if (returnValue !== undefined) {
-			content.push({ type: "text", text: stringifyReturnValue(returnValue) });
+			content.push({ type: "text", text: frameBrowserPageText(stringifyReturnValue(returnValue)) });
 		}
 		if (!content.length) {
 			content.push({ type: "text", text: `Ran ${steps.length} action(s) on tab ${JSON.stringify(name)}` });
@@ -547,6 +548,15 @@ function sameBrowserKind(a: BrowserKind, b: BrowserKind): boolean {
 	}
 	if (a.kind === "connected" && b.kind === "connected") return a.cdpUrl === b.cdpUrl;
 	return false;
+}
+
+/** Page URL, title, extract/observe text, and script return values are external content. */
+function frameBrowserPageText(text: string): string {
+	return wrapUntrustedContent(text);
+}
+
+function frameBrowserPageDisplays(displays: RunResultOk["displays"]): RunResultOk["displays"] {
+	return displays.map(block => (block.type === "text" ? { ...block, text: frameBrowserPageText(block.text) } : block));
 }
 
 /** Max chars of a browser return value surfaced into the tool result (F22). */

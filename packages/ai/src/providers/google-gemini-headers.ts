@@ -93,12 +93,12 @@ This means you do **NOT** need to poll in a loop while waiting for messages or u
  *
  * Overridable via PI_AI_ANTIGRAVITY_USER_AGENT environment variable.
  */
-export let getAntigravityUserAgent = () => {
-	const override = process.env.PI_AI_ANTIGRAVITY_USER_AGENT;
-	const userAgent = override || "antigravity/cli/1.3.4 (os_type=darwin; arch=arm64; aidev_client; auth_method=oauth)";
-	getAntigravityUserAgent = () => userAgent;
-	return userAgent;
-};
+export function getAntigravityUserAgent(): string {
+	return (
+		process.env.PI_AI_ANTIGRAVITY_USER_AGENT ||
+		"antigravity/cli/1.3.4 (os_type=darwin; arch=arm64; aidev_client; auth_method=oauth)"
+	);
+}
 
 export const getAntigravityRequestHeaders = () => ({
 	"User-Agent": getAntigravityUserAgent(),

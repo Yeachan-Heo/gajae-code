@@ -169,8 +169,9 @@ function getSuggestionModel(
 	registry: ModelRegistry,
 	settings: Settings,
 	currentModel?: Model<Api>,
+	credentialSessionId?: string,
 ): Model<Api> | undefined {
-	const availableModels = registry.getAvailable();
+	const availableModels = registry.getAvailable(credentialSessionId);
 	if (availableModels.length === 0) return undefined;
 	const model = resolveRoleSelection(["default"], settings, availableModels, registry)?.model;
 	if (model) return model;
@@ -203,7 +204,7 @@ export async function generatePromptSuggestion(
 	const context = buildPromptSuggestionContext(messages);
 	if (!context) return null;
 
-	const model = getSuggestionModel(registry, settings, currentModel);
+	const model = getSuggestionModel(registry, settings, currentModel, sessionId);
 	if (!model) {
 		logger.debug("prompt-suggestion: no model available");
 		return null;

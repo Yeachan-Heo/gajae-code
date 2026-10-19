@@ -797,6 +797,54 @@ function appendOutputNotice(
 
 const kUnwrappedExecute = Symbol("OutputMeta.UnwrappedExecute");
 
+const UNTRUSTED_FENCE_OPEN = "<untrusted-content>\n";
+const UNTRUSTED_FENCE_CLOSE = "\n</untrusted-content>";
+
+function hasOuterUntrustedFence(text: string): boolean {
+	return (
+		text.startsWith(UNTRUSTED_FENCE_OPEN) &&
+		text.endsWith(UNTRUSTED_FENCE_CLOSE) &&
+		text.length > UNTRUSTED_FENCE_OPEN.length + UNTRUSTED_FENCE_CLOSE.length
+	);
+}
+
+/**
+ * Tail truncation keeps a suffix, so an outer untrusted-content fence loses its
+ * opening tag. Reapply that fence around the retained body. Embedded closing
+ * tags stay escaped. The fenced excerpt stays within `maxBytes`.
+ */
+function truncateTailKeepingUntrustedFence(
+	fullText: string,
+	options: { maxBytes: number; maxLines: number },
+): TruncationResult {
+	const truncated = truncateTail(fullText, options);
+	if (!hasOuterUntrustedFence(fullText)) return truncated;
+	if (truncated.content.startsWith(UNTRUSTED_FENCE_OPEN) && truncated.content.endsWith(UNTRUSTED_FENCE_CLOSE)) {
+		return truncated;
+	}
+	const overhead =
+		Buffer.byteLength(UNTRUSTED_FENCE_OPEN, "utf-8") + Buffer.byteLength(UNTRUSTED_FENCE_CLOSE, "utf-8");
+	const body = fullText.slice(UNTRUSTED_FENCE_OPEN.length, fullText.length - UNTRUSTED_FENCE_CLOSE.length);
+	const innerBudget = Math.max(0, options.maxBytes - overhead);
+	const inner = truncateTail(body, { maxBytes: innerBudget, maxLines: options.maxLines });
+	let escaped = inner.content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
+	let content = `${UNTRUSTED_FENCE_OPEN}${escaped}${UNTRUSTED_FENCE_CLOSE}`;
+	if (Buffer.byteLength(content, "utf-8") > options.maxBytes) {
+		const fitted = truncateTail(escaped, { maxBytes: innerBudget, maxLines: options.maxLines });
+		escaped = fitted.content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>");
+		content = `${UNTRUSTED_FENCE_OPEN}${escaped}${UNTRUSTED_FENCE_CLOSE}`;
+	}
+	if (Buffer.byteLength(content, "utf-8") > options.maxBytes) return truncated;
+	return {
+		...truncated,
+		content,
+		truncated: true,
+		truncatedBy: inner.truncatedBy ?? truncated.truncatedBy,
+		outputLines: content.split("\n").length,
+		outputBytes: Buffer.byteLength(content, "utf-8"),
+	};
+}
+
 // =============================================================================
 // Centralized artifact spill for large tool results
 // =============================================================================
@@ -925,7 +973,7 @@ async function spillLargeResultToArtifact(
 				maxHeadBytes: headBytes,
 				maxHeadLines: tailLines,
 			})
-		: truncateTail(fullText, {
+		: truncateTailKeepingUntrustedFence(fullText, {
 				maxBytes: tailBytes,
 				maxLines: tailLines,
 			});
@@ -1066,11 +1114,11 @@ async function enforceInlineResultBackstop(
 				maxHeadBytes: Math.min(headBytes, Math.floor(budget / 2)),
 				maxHeadLines: tailLines,
 			})
-		: truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+		: truncateTailKeepingUntrustedFence(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
 
 	// Defensive clamp: guarantee the contract even for pathological marker sizes.
 	if (Buffer.byteLength(truncated.content, "utf-8") > maxInlineBytes) {
-		truncated = truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
+		truncated = truncateTailKeepingUntrustedFence(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
 	}
 
 	// Rebuild content preserving original block order while replacing text content.

@@ -19,6 +19,7 @@ import {
 	openArchive,
 	parseArchivePathCandidates,
 } from "./archive-reader";
+import { wrapUntrustedContent } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import { formatMatchLine } from "./match-line-format";
@@ -552,7 +553,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 						missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 					};
 					const text = warningNote ? `No matches found\n${warningNote}` : "No matches found";
-					const noMatchResult = toolResult(details).text(text).done();
+					const noMatchResult = toolResult(details).text(wrapUntrustedContent(text)).done();
 					await cleanupArchiveScratch();
 					throwIfSearchCancelled();
 					return noMatchResult;
@@ -676,7 +677,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				if (truncation.truncated) details.truncation = truncation;
 				if (linesTruncated) details.linesTruncated = true;
 				const resultBuilder = toolResult(details)
-					.text(output)
+					.text(wrapUntrustedContent(output))
 					.limits({ columnMax: linesTruncated ? DEFAULT_MAX_COLUMN : undefined });
 				if (truncation.truncated) {
 					resultBuilder.truncation(truncation, { direction: "head" });
