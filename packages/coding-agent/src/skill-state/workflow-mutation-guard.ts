@@ -1890,14 +1890,23 @@ function pythonSystemCallArguments(script: string): { starts: number[]; unclassi
 		}
 	}
 	// `os.system` can reach the shell under another name: a captured callable
-	// (`run = os.system`), a module alias (`import os as o`), or any other
-	// `<obj>.system(...)`. Neither form names its command here, so the shell
-	// payload is unclassifiable rather than invisible.
+	// (`run = os.system`), a module alias (`import os as o`), a direct import alias
+	// (`from os import system as run`), or any other `<obj>.system(...)`. Neither form
+	// names its command here, so the shell payload is unclassifiable rather than invisible.
 	const systemCalls = (script.match(/\.\s*system\s*\(/g) ?? []).length;
 	const osSystemCalls = (script.match(/\bos\s*\.\s*system\s*\(/g) ?? []).length;
 	if (systemCalls > osSystemCalls) unclassifiable = true;
 	if (/\b[A-Za-z_]\w*\s*=\s*(?:os\s*\.\s*(?:system|popen)|subprocess\s*\.\s*\w+)\b/.test(script))
 		unclassifiable = true;
+	// Detect `from os import system as <name>` and then calls to `<name>(...)`
+	const fromOsImport = /\bfrom\s+os\s+import\s+system\s+as\s+([A-Za-z_]\w*)\b/.exec(script);
+	if (fromOsImport) {
+		const importedName = fromOsImport[1];
+		const importedCalls = new RegExp(`\\b${importedName}\\s*\\(`, "g");
+		if (importedCalls.test(script)) {
+			unclassifiable = true;
+		}
+	}
 	return { starts, unclassifiable };
 }
 
@@ -2084,6 +2093,13 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 				rawScript = words[index]?.slice(longOption.length + 1);
 			}
 			if (rawScript === undefined) continue;
+			// Node preload options (-r/--require) load external files that cannot be scanned,
+			// so fail closed when encountered.
+			if ((option === "-r" || option === "--require") && /^(?:node|bun)$/.test(binary)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
 			const script = cleanInterpreterCodeWord(rawScript);
 			if (
 				script === undefined ||
@@ -2135,7 +2151,7 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 
 function interpreterCodeOptions(binary: string): string[] {
 	if (/^(?:python|pypy)/.test(binary)) return ["-c"];
-	if (/^(?:node|bun)$/.test(binary)) return ["-e", "--eval", "-p", "--print"];
+	if (/^(?:node|bun)$/.test(binary)) return ["-r", "--require", "-e", "--eval", "-p", "--print"];
 	if (binary === "deno") return ["eval", "-e", "--eval"];
 	if (/^(?:ruby|jruby|perl|lua)/.test(binary)) return ["-e"];
 	if (/^php/.test(binary)) return ["-r"];
@@ -2212,7 +2228,12 @@ function interpreterCodeContainsWriteApi(
 				!streamMutated &&
 				/^\.\s*write\s*\(/.test(script.slice(index)) &&
 				/\b(?:process|Bun)\s*\.\s*(?:stdout|stderr)\s*$/.test(script.slice(0, index));
-			if (!outputWrite) return true;
+			// Aliased mutation: if process.stdout is passed through a function or parameter,
+			// it may be rebound. Fail closed when there are function definitions or calls
+			// that could capture and mutate the stream object.
+			const hasAliasVectors = outputWrite &&
+				(/[\(\[]\s*[A-Za-z_]\w*\s*=>|\([^)]*(?:process|Bun)\s*\.\s*(?:stdout|stderr)[^)]*\)/.test(script));
+			if (!outputWrite || hasAliasVectors) return true;
 		}
 		index += 1;
 	}
@@ -2231,13 +2252,63 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice("open".length);
 	const statementEnd = body.search(/[;\n}]/);
 	const statement = statementEnd < 0 ? body : body.slice(0, statementEnd);
-	const quoted = [...statement.matchAll(/(['"])((?:\\.|(?!\1)[^\n])*?)\1/g)].map(match => match[2] ?? "");
-	const modes = quoted.filter(value => /^\s*[<>+|]/.test(value));
-	if (modes.length === 0) return false;
-	return modes.every(value => {
-		const mode = value.trimStart();
-		return mode.startsWith("<") && !mode.startsWith("<+");
-	});
+	
+	// Parse arguments properly: count commas to find the MODE position (second argument)
+	// and extract only that argument.
+	let depth = 0;
+	let inString = false;
+	let stringChar = "";
+	let commaCount = 0;
+	let modeStart = -1;
+	let modeEnd = -1;
+	
+	for (let i = 0; i < statement.length; i++) {
+		const ch = statement[i];
+		
+		if (inString) {
+			if (ch === "\\" && i + 1 < statement.length) {
+				i++; // skip escape sequence
+				continue;
+			}
+			if (ch === stringChar) {
+				inString = false;
+			}
+			continue;
+		}
+		
+		if (ch === "'" || ch === '"') {
+			inString = true;
+			stringChar = ch;
+			continue;
+		}
+		
+		if (ch === "(") depth++;
+		else if (ch === ")") depth--;
+		else if (ch === "," && depth === 0) {
+			commaCount++;
+			if (commaCount === 1) {
+				// This comma separates first and second arguments
+				modeStart = i + 1;
+			}
+			if (commaCount === 2) {
+				// This comma ends the mode argument
+				modeEnd = i;
+				break;
+			}
+		}
+	}
+	
+	if (modeStart === -1) return false; // Can't find MODE argument
+	if (modeEnd === -1) modeEnd = statement.length;
+	
+	const modeArg = statement.slice(modeStart, modeEnd).trim();
+	
+	// Extract the mode value if it's a quoted string; if it's a variable, fail closed
+	const quotedMode = /^(['"])(.*?)\1$/.exec(modeArg);
+	if (!quotedMode) return false; // Variable mode, fail closed
+	
+	const mode = quotedMode[2].trim();
+	return mode.startsWith("<") && !mode.startsWith("<+");
 }
 
 function skipJavaScriptTemplate(script: string, index: number): number {

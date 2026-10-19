@@ -2926,4 +2926,63 @@ describe("bash scanner quoting model", () => {
 			}
 		}
 	});
+
+	// Regression tests for review findings from #6895
+	it("blocks Node preload (-r) with stdout exemption", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		// Node -r loads code before -e, which is not scanned
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: `node -r /tmp/payload.cjs -e 'process.stdout.write("status")'` },
+		});
+		expect(decision.blocked).toBe(true);
+	});
+
+	it("blocks aliased stdout stream mutations", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		// Can reassign stdout through an alias and then write
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: {
+				command: `node -e '(s => (s.write=require("fs").writeFileSync, s.write("src/product.ts","PWNED")))(process.stdout)'`,
+			},
+		});
+		expect(decision.blocked).toBe(true);
+	});
+
+	it("classifies Perl open mode operand, not unrelated strings", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		// Perl open with unrelated die string should not be treated as read-only
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: {
+				command: `perl -e 'my $m = ">"; open F, $m, "src/product.ts" or die "<"; print F "PWNED"'`,
+			},
+		});
+		expect(decision.blocked).toBe(true);
+	});
+
+	it("detects imported os.system callable aliases in Python", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		// from os import system as run; run(...) should be detected
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: {
+				command: `python3 -c 'from os import system as run; run("printf PWNED > src/product.ts")'`,
+			},
+		});
+		expect(decision.blocked).toBe(true);
+	});
 });

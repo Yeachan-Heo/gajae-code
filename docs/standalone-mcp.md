@@ -158,9 +158,13 @@ From the Git repository you want GJC to inspect.
 Sem is a project-scope **stdio** server, so GJC spawns it only when the user
 config opts in. A project settings file cannot grant that flag; set it in the
 user config (`~/.gjc/agent/config.yml`, or the active agent directory). This is
-a global setting that covers every checkout, so remove it after the example:
+a global setting that covers every checkout, so restore it after the example.
+First, record whether the setting was previously set:
 
 ```bash
+# Note the prior value (output is empty if unset, 'true' or 'false' if set).
+gjc config get mcp.enableProjectConfig
+# Enable project stdio servers for this example.
 gjc config set mcp.enableProjectConfig true
 ```
 
@@ -195,19 +199,23 @@ Remove the registration with `gjc mcp remove sem --project`.
 `mcp.enableProjectConfig` is a **global** user setting: it applies to every
 checkout you open, not just this repository or Sem. Setting it to `false` is not
 the equivalent of leaving it alone — `false` disables *every* project-scope MCP
-source, including project HTTP and SSE servers that load by default. Remove the
-key from your user settings instead, which restores the unset behavior (project
-HTTP/SSE enabled, project stdio servers not spawned):
+source, including project HTTP and SSE servers that load by default.
+
+After the example, restore the setting to its prior state. If you recorded that
+it was unset (empty output), you can simply leave it unset by not setting it
+again in future sessions. If you recorded a prior value, restore it:
 
 ```bash
-# Prints the agent directory that holds the user settings.json.
-gjc config path
+# Restore to the prior value you recorded (e.g., 'true' or 'false').
+gjc config set mcp.enableProjectConfig <prior-value>
 ```
 
-Delete only the `mcp.enableProjectConfig` entry from that `settings.json`,
-leaving the rest of the file intact. `gjc config reset mcp.enableProjectConfig`
-is not equivalent: the setting has a schema default of `false`, so reset writes
-an explicit `false` and disables project HTTP/SSE sources everywhere.
+**Important:** The `gjc config reset` command is not the correct cleanup. The
+setting has a schema default of `false`, so `reset` writes an explicit `false`
+value, which disables every project-scope MCP source everywhere (including
+project HTTP and SSE servers that load by default), not the desired unset
+behavior. Always restore to the prior value you recorded, or leave it unset
+if it was previously unset.
 
 ### Optional: preview overlapping branch changes with Weave
 
