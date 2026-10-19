@@ -89,6 +89,26 @@ describe("ultragoal Git integration base resolution", () => {
 		});
 	});
 
+	it("uses checked-out local main for uncommitted checkpoint changes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-main-checkpoint-"));
+		try {
+			await fixtureGit(root, "init");
+			await fixtureGit(root, "branch", "-M", "main");
+			await commitFixtureFile(root, "baseline.txt");
+			await Bun.write(path.join(root, "baseline.txt"), "changed\n");
+
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.baseRef).toBe("main");
+			expect(changeSet?.mergeBase).toBe(await fixtureGit(root, "rev-parse", "HEAD"));
+			expect(changeSet?.paths).toEqual([
+				{ path: "baseline.txt", oldPath: undefined, status: "modified", category: "other" },
+			]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("retains distinct origin/develop when local develop is checked out", async () => {
 		await withIntegrationFixture(async (root, baseline) => {
 			await fixtureGit(root, "update-ref", "refs/remotes/origin/develop", baseline);
