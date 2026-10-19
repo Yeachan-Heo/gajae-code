@@ -159,12 +159,11 @@ export function projectSafeHomeOverride(explicit?: Record<string, string>): Reco
 /**
  * Build the spawn environment (cached).
  *
- * `CI=true` is injected unless the documented `GJC_BASH_NO_CI` (or its legacy
- * `PI_BASH_NO_CI` / `CLAUDE_BASH_NO_CI` aliases) is set to a canonical truthy
- * flag value.
+ * The spawn environment is the inherited process environment plus the fixed
+ * hardening entries below. `CI` is not injected: a process that did not export
+ * it must not look like CI to the tools it runs.
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
-	const noCI = $pickflag("GJC_BASH_NO_CI", "PI_BASH_NO_CI", "CLAUDE_BASH_NO_CI");
 	const inherited = filterProcessEnv(Bun.env);
 	delete inherited.GJC_SESSION_FILE;
 	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
@@ -175,7 +174,6 @@ function buildSpawnEnv(shell: string): Record<string, string> {
 		GPG_TTY: "not a tty",
 		GJCCODE: "1",
 		CLAUDECODE: "1",
-		...(noCI ? {} : { CI: "true" }),
 	} as Record<string, string>;
 }
 

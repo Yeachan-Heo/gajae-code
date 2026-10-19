@@ -128,15 +128,30 @@ async function hashAddedFiles(cwd: string, paths: readonly UltragoalChangeSetPat
 
 export async function spawnText(
 	command: string[],
-	options: { cwd: string; timeoutMs?: number },
+	options: { cwd: string; timeoutMs?: number; stdin?: string },
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
 	try {
-		const proc = Bun.spawn(command, { cwd: options.cwd, stdout: "pipe", stderr: "pipe" });
+		const proc = Bun.spawn(command, { cwd: options.cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 		const timeout = setTimeout(() => proc.kill(), options.timeoutMs ?? 5000);
+		// Drain both pipes while the stdin write runs: a child that never reads
+		// stdin blocks the write, and a child that fills stdout before draining
+		// stdin blocks the read.
+		const stdinWrite = (async () => {
+			const stdin = proc.stdin;
+			if (!stdin || options.stdin === undefined) return;
+			try {
+				stdin.write(options.stdin);
+				await stdin.end();
+			} catch {
+				// The child closed stdin or the timer killed it; the exit code
+				// already reports the failure.
+			}
+		})();
 		const [stdoutBytes, stderrBytes, exitCode] = await Promise.all([
 			new Response(proc.stdout).arrayBuffer(),
 			new Response(proc.stderr).arrayBuffer(),
 			proc.exited,
+			stdinWrite,
 		]);
 		clearTimeout(timeout);
 		let stdout: string;
@@ -205,7 +220,9 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 			"master",
 		];
 		const currentBranch = await spawnText(["git", "symbolic-ref", "--quiet", "HEAD"], { cwd, timeoutMs: 3000 });
+		const currentRef = currentBranch.ok ? currentBranch.stdout.trim() : undefined;
 		let best: { ref: string; ahead: number } | undefined;
+
 		for (const candidate of candidates) {
 			const exists = await spawnText(["git", "rev-parse", "--symbolic-full-name", "--verify", candidate], {
 				cwd,
@@ -213,8 +230,10 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 			});
 			if (!exists.ok) continue;
 			// Exclude only the checked-out local ref, not distinct refs at the same
-			// commit or remote-tracking refs with the same branch name.
-			if (currentBranch.ok && exists.stdout.trim() === currentBranch.stdout.trim()) continue;
+			// commit or remote-tracking refs with the same branch name. Comparing
+			// the checked-out ref to HEAD hides committed work as a complete empty
+			// capture; without an independent baseline, resolution must fail closed.
+			if (currentRef && exists.stdout.trim() === currentRef) continue;
 			const mergeBase = await spawnText(["git", "merge-base", "HEAD", candidate], { cwd, timeoutMs: 3000 });
 			if (!mergeBase.ok || !mergeBase.stdout.trim()) continue;
 			const count = await spawnText(["git", "rev-list", "--count", `${mergeBase.stdout.trim()}..HEAD`], {

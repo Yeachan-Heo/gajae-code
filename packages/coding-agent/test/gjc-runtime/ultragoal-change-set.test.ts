@@ -74,12 +74,54 @@ describe("ultragoal Git integration base resolution", () => {
 		});
 	});
 
-	it("fails closed when checked-out develop is the only integration ref", async () => {
+	it.each(["main", "master", "dev", "develop"])("refuses checked-out %s as the only integration ref", async branch => {
 		await withIntegrationFixture(async root => {
-			await commitFixtureFile(root, "feature.txt");
-			await expect(resolveGitBase(root)).rejects.toThrow("authoritative integration base");
-			await expect(computeCheckpointChangeSet(root)).rejects.toThrow("authoritative integration base");
+			await fixtureGit(root, "branch", "-m", branch);
+			await Bun.write(path.join(root, "feature.txt"), "feature.txt\n");
+			await expect(resolveGitBase(root)).rejects.toThrow("unable to resolve an authoritative integration base");
+			await expect(computeCheckpointChangeSet(root)).rejects.toThrow(
+				"unable to resolve an authoritative integration base",
+			);
 		});
+	});
+
+	it.each([
+		"main",
+		"master",
+		"dev",
+		"develop",
+	])("does not authenticate an empty checkpoint for committed-only work on standalone %s", async branch => {
+		await withIntegrationFixture(async root => {
+			await fixtureGit(root, "branch", "-m", branch);
+			await commitFixtureFile(root, "feature.txt");
+			expect(await fixtureGit(root, "status", "--porcelain")).toBe("");
+			expect(await fixtureGit(root, "diff", "--name-only", "HEAD^...HEAD")).toBe("feature.txt");
+			await expect(resolveGitBase(root)).rejects.toThrow("unable to resolve an authoritative integration base");
+			await expect(computeCheckpointChangeSet(root)).rejects.toThrow(
+				"unable to resolve an authoritative integration base",
+			);
+		});
+	});
+
+	it("captures uncommitted main changes against an independent baseline", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-main-checkpoint-"));
+		try {
+			await fixtureGit(root, "init");
+			await fixtureGit(root, "branch", "-M", "main");
+			await commitFixtureFile(root, "baseline.txt");
+			await fixtureGit(root, "branch", "dev");
+			await Bun.write(path.join(root, "baseline.txt"), "changed\n");
+
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.baseRef).toBe("dev");
+			expect(changeSet?.mergeBase).toBe(await fixtureGit(root, "rev-parse", "HEAD"));
+			expect(changeSet?.paths).toEqual([
+				{ path: "baseline.txt", oldPath: undefined, status: "modified", category: "other" },
+			]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("retains distinct origin/develop when local develop is checked out", async () => {
