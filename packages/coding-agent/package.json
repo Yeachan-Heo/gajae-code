@@ -91,7 +91,8 @@
 		"@babel/types": "catalog:",
 		"@types/babel__traverse": "catalog:",
 		"@types/bun": "catalog:",
-		"@types/ws": "catalog:"
+		"@types/ws": "catalog:",
+		"fast-check": "catalog:"
 	},
 	"engines": {
 		"bun": ">=1.4.0"

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { modeStatePath } from "../src/gjc-runtime/session-layout";
+import { modeStatePath, sessionLogsDir } from "../src/gjc-runtime/session-layout";
 import { dispatchGjcNativeSkillHook } from "../src/hooks/native-skill-hook";
 
 const roots: string[] = [];
@@ -188,5 +188,93 @@ describe("codex native hook session env", () => {
 		});
 		expect(output?.decision).toBe("block");
 		expect(output?.stopReason).not.toBe(LEAK);
+	}, 60_000);
+});
+
+async function runMalformed(
+	root: string,
+	envPatch: Record<string, string | undefined>,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (typeof value === "string") env[key] = value;
+	}
+	for (const [key, value] of Object.entries(envPatch)) {
+		if (value === undefined) delete env[key];
+		else env[key] = value;
+	}
+	const proc = Bun.spawn(["bun", path.resolve(import.meta.dir, "..", "src", "cli.ts"), "codex-native-hook"], {
+		cwd: root,
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		env,
+	});
+	proc.stdin.write("{");
+	proc.stdin.end();
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { stdout, stderr, exitCode };
+}
+
+async function hookLog(root: string, sessionId: string): Promise<string | undefined> {
+	const dir = sessionLogsDir(root, sessionId);
+	let names: string[];
+	try {
+		names = await fs.readdir(dir);
+	} catch (error) {
+		if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+			return undefined;
+		}
+		throw error;
+	}
+	const logs = names.filter(name => name.startsWith("native-hook-") && name.endsWith(".jsonl"));
+	if (logs.length === 0) return undefined;
+	const bodies = await Promise.all(logs.map(name => fs.readFile(path.join(dir, name), "utf8")));
+	return bodies.join("");
+}
+
+describe("codex native hook session id logs", () => {
+	it("does not append hook logs under a session id planted by the project dotenv", async () => {
+		const root = await tempDir();
+		await Bun.write(path.join(root, ".env"), "GJC_SESSION_ID=victim-session\n");
+		const result = await runMalformed(root, { GJC_SESSION_ID: "victim-session" });
+		expect(result.exitCode, result.stderr).toBe(0);
+		const output = JSON.parse(result.stdout.trim()) as { decision?: string };
+		expect(output.decision).toBe("block");
+		expect(await hookLog(root, "victim-session")).toBeUndefined();
+		expect(result.stderr).toContain("native_hook_stdin_parse_error");
+	}, 60_000);
+
+	it("appends hook logs for an operator session id the project does not declare", async () => {
+		const root = await tempDir();
+		await Bun.write(path.join(root, ".env"), "UNRELATED_PROJECT_FLAG=1\n");
+		const result = await runMalformed(root, { GJC_SESSION_ID: "operator-session" });
+		expect(result.exitCode, result.stderr).toBe(0);
+		const body = await hookLog(root, "operator-session");
+		expect(body).toContain("native_hook_stdin_parse_error");
+	}, 60_000);
+
+	it("keeps an operator session id when the project declares a different one", async () => {
+		const root = await tempDir();
+		await Bun.write(path.join(root, ".env"), "GJC_SESSION_ID=victim-session\n");
+		const result = await runMalformed(root, { GJC_SESSION_ID: "operator-session" });
+		expect(result.exitCode, result.stderr).toBe(0);
+		expect(await hookLog(root, "operator-session")).toContain("native_hook_stdin_parse_error");
+		expect(await hookLog(root, "victim-session")).toBeUndefined();
+	}, 60_000);
+
+	it("does not append hook logs when the project session id declaration is dynamic", async () => {
+		const root = await tempDir();
+		await Bun.write(path.join(root, ".env"), "GJC_SESSION_ID=$GJC_PLANTED_SESSION\n");
+		const result = await runMalformed(root, {
+			GJC_SESSION_ID: "operator-session",
+			GJC_PLANTED_SESSION: "operator-session",
+		});
+		expect(result.exitCode, result.stderr).toBe(0);
+		expect(await hookLog(root, "operator-session")).toBeUndefined();
 	}, 60_000);
 });
