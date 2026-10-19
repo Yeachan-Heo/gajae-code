@@ -74,21 +74,24 @@ function extractOpenAIErrorMessage(body: unknown): string {
 	const error = obj.error;
 
 	if (typeof error === "string") {
-		// String error: "invalid_grant"
+		// String error: "invalid_grant", optionally explained by error_description.
+		// Parts are joined so an empty error string never leaves a dangling separator.
 		const desc = obj.error_description;
-		const description = typeof desc === "string" && desc.length > 0 ? `: ${desc}` : "";
-		return `${error}${description}`;
+		const parts = desc !== undefined && typeof desc === "string" && desc.length > 0 ? [error, desc] : [error];
+		return parts.filter(part => part.length > 0).join(": ");
 	}
 
 	if (typeof error === "object" && error !== null) {
-		// Object error: {message, type, code}
+		// Object error: {message, type, code}. `code` wins over `type`, but only when
+		// it is a usable string — a numeric or empty code must fall back to the type
+		// rather than silently dropping both.
 		const err = error as Record<string, unknown>;
-		const code = err.code || err.type;
+		const code = typeof err.code === "string" && err.code.length > 0 ? err.code : err.type;
 		const msg = err.message;
 
 		const parts: string[] = [];
-		if (code && typeof code === "string") parts.push(code);
-		if (msg && typeof msg === "string") parts.push(msg);
+		if (typeof code === "string" && code.length > 0) parts.push(code);
+		if (typeof msg === "string" && msg.length > 0) parts.push(msg);
 		return parts.join(": ");
 	}
 
