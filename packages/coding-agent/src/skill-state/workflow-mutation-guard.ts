@@ -2231,8 +2231,9 @@ function interpreterCodeContainsWriteApi(
 			// Aliased mutation: if process.stdout is passed through a function or parameter,
 			// it may be rebound. Fail closed when there are function definitions or calls
 			// that could capture and mutate the stream object.
-			const hasAliasVectors = outputWrite &&
-				(/[\(\[]\s*[A-Za-z_]\w*\s*=>|\([^)]*(?:process|Bun)\s*\.\s*(?:stdout|stderr)[^)]*\)/.test(script));
+			const hasAliasVectors =
+				outputWrite &&
+				/[([]\s*[A-Za-z_]\w*\s*=>|\([^)]*(?:process|Bun)\s*\.\s*(?:stdout|stderr)[^)]*\)/.test(script);
 			if (!outputWrite || hasAliasVectors) return true;
 		}
 		index += 1;
@@ -2252,7 +2253,7 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice("open".length);
 	const statementEnd = body.search(/[;\n}]/);
 	const statement = statementEnd < 0 ? body : body.slice(0, statementEnd);
-	
+
 	// Parse arguments properly: count commas to find the MODE position (second argument)
 	// and extract only that argument.
 	let depth = 0;
@@ -2261,10 +2262,10 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 	let commaCount = 0;
 	let modeStart = -1;
 	let modeEnd = -1;
-	
+
 	for (let i = 0; i < statement.length; i++) {
 		const ch = statement[i];
-		
+
 		if (inString) {
 			if (ch === "\\" && i + 1 < statement.length) {
 				i++; // skip escape sequence
@@ -2275,13 +2276,13 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 			}
 			continue;
 		}
-		
+
 		if (ch === "'" || ch === '"') {
 			inString = true;
 			stringChar = ch;
 			continue;
 		}
-		
+
 		if (ch === "(") depth++;
 		else if (ch === ")") depth--;
 		else if (ch === "," && depth === 0) {
@@ -2297,16 +2298,16 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 			}
 		}
 	}
-	
+
 	if (modeStart === -1) return false; // Can't find MODE argument
 	if (modeEnd === -1) modeEnd = statement.length;
-	
+
 	const modeArg = statement.slice(modeStart, modeEnd).trim();
-	
+
 	// Extract the mode value if it's a quoted string; if it's a variable, fail closed
 	const quotedMode = /^(['"])(.*?)\1$/.exec(modeArg);
 	if (!quotedMode) return false; // Variable mode, fail closed
-	
+
 	const mode = quotedMode[2].trim();
 	return mode.startsWith("<") && !mode.startsWith("<+");
 }
