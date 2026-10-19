@@ -96,6 +96,12 @@ packages/coding-agent/binaries/
 # Tests write evidence there and read it back within the same run;
 # test fixtures belong in packages/*/test/fixtures/ instead.
 /artifacts/
+# These suites also write relative to packages/tui when run through its package script.
+# Keep the issue-3798 historical evidence pair tracked in the same directory.
+/packages/tui/artifacts/g003-qa-report.json
+/packages/tui/artifacts/g011-qa-report.json
+/packages/tui/artifacts/g014-qa-report.json
+/packages/tui/artifacts/g015-qa-report.json
 .release-040-artifacts/
 
 # Python SDK build output
