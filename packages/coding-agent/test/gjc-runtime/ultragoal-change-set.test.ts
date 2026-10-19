@@ -340,6 +340,30 @@ describe("ultragoal change-set extraction", () => {
 		expect(result.stderr).toContain("not valid UTF-8");
 	});
 
+	it("feeds the provided stdin payload to the spawned command", async () => {
+		const result = await spawnText([process.execPath, "-e", "process.stdin.pipe(process.stdout)"], {
+			cwd: process.cwd(),
+			stdin: "hash-object payload",
+		});
+		expect(result.ok).toBe(true);
+		expect(result.stdout).toBe("hash-object payload");
+	});
+
+	it("derives the empty tree id from the repository object format", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-empty-tree-"));
+		try {
+			await Bun.spawn(["git", "init"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited;
+			const sha1 = await spawnText(["git", "hash-object", "-t", "tree", "--stdin"], {
+				cwd: root,
+				stdin: "",
+			});
+			expect(sha1.ok).toBe(true);
+			expect(sha1.stdout.trim()).toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("preserves a leading UTF-8 BOM as part of the first pathname", async () => {
 		const result = await spawnText(
 			[

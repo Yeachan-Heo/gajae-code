@@ -128,10 +128,21 @@ async function hashAddedFiles(cwd: string, paths: readonly UltragoalChangeSetPat
 
 export async function spawnText(
 	command: string[],
-	options: { cwd: string; timeoutMs?: number },
+	options: { cwd: string; timeoutMs?: number; stdin?: string },
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
 	try {
-		const proc = Bun.spawn(command, { cwd: options.cwd, stdout: "pipe", stderr: "pipe" });
+		const proc = Bun.spawn(command, {
+			cwd: options.cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: options.stdin === undefined ? "ignore" : "pipe",
+		});
+		const stdin = proc.stdin;
+		const input = options.stdin;
+		if (stdin && input !== undefined) {
+			stdin.write(input);
+			await stdin.end();
+		}
 		const timeout = setTimeout(() => proc.kill(), options.timeoutMs ?? 5000);
 		const [stdoutBytes, stderrBytes, exitCode] = await Promise.all([
 			new Response(proc.stdout).arrayBuffer(),
