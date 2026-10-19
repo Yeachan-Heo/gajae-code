@@ -8,6 +8,7 @@ import {
 	MAX_PASTED_IMAGE_PIXELS,
 	MAX_PASTED_IMAGE_SOURCE_BYTES,
 } from "../../utils/image-limits";
+import { isAnimatedImage } from "../../utils/pasted-image-loading";
 import { TypedControlError } from "./control/dispatch";
 
 const MAX_CHUNK_BYTES = 96 * 1024;
@@ -261,6 +262,8 @@ export class PromptImageUploadStore {
 				metadata.width * metadata.height > MAX_PASTED_IMAGE_PIXELS
 			)
 				invalid("Image MIME type, structure or dimensions are invalid.");
+			if (isAnimatedImage(bytes, metadata.mimeType) !== false)
+				invalid("Animated or malformed images are not supported.");
 			const decodedBytes = metadata.width * metadata.height * 4;
 			if (processBytes + transientBytes + decodedBytes > MAX_PROCESS_BYTES)
 				busy("Image decoding capacity exceeded.");

@@ -499,18 +499,20 @@ observers and active-handle accessor before advertising staging.
 Model-facing and chat adapters cannot invoke these machine-only controls.
 
 1. `turn.image.begin` takes `{ mimeType, byteLength, sha256, batchId? }` and returns
-   `{ id, nextSequence: 0 }`. MIME is PNG, JPEG, WebP, or GIF; the digest is lowercase
-   SHA-256 of the original bytes. Each image is at most 20 MiB.
+   `{ id, nextSequence: 0 }`. Supported formats are static PNG, JPEG, WebP, and GIF;
+   animated PNG, WebP, and GIF images are rejected. The digest is lowercase SHA-256
+   of the original bytes. Each image is at most 20 MiB.
 2. `turn.image.append` takes `{ id, sequence, data }`, with canonical base64 encoding
    of at most 96 KiB decoded bytes, and acknowledges `nextSequence` and
    `receivedBytes`. Sequence numbers must be contiguous.
 3. `turn.image.finish` takes `{ id }` and validates size, digest, MIME, dimensions,
-   and decoding without transcoding. `turn.image.discard` takes `{ id }` to abandon
-   an unredeemed upload.
+   static-image policy, and decoding without transcoding. `turn.image.discard` takes
+   `{ id }` to abandon an unredeemed upload.
 4. `turn.prompt` can take `stagedImages: [{ id }]` instead of `images`. Redemption is
    atomic, ordered, one-shot, and scoped to the same authenticated connection and
    session. Image-only prompts may use `text: ""`; direct and staged images cannot
-   be mixed. Provider input retains the original bytes and MIME.
+   be mixed. Provider input retains the original bytes and MIME without transcoding or
+   byte loss.
 
 There are at most 16 outstanding uploads and 16 images per prompt, bounded session
 source/accepted budgets of 64 MiB, and process-wide memory/decode budgets. Uploads

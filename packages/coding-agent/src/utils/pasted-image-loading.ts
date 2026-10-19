@@ -320,7 +320,7 @@ function hasWebpAnimation(bytes: Buffer): boolean {
 	return false;
 }
 
-function isAnimatedImage(bytes: Buffer, mimeType: string): boolean | undefined {
+export function isAnimatedImage(bytes: Buffer, mimeType: string): boolean | undefined {
 	if (mimeType === "image/gif") {
 		const frames = gifFrameCount(bytes);
 		return frames === undefined ? undefined : frames > 1;

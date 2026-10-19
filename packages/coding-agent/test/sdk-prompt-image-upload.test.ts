@@ -2,10 +2,12 @@ import { expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import { REQUEST_FRAME_BYTES } from "../src/sdk/transport/relay";
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MAX_CHUNK_BYTES = 96 * 1024;
 const alwaysConnected = (_owner: string): boolean => true;
+const STATIC_GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
 
 function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
 	const name = Buffer.from(type, "ascii");
@@ -66,10 +68,20 @@ function originalLargePng(seed = 0x12345678): Buffer {
 }
 
 const digest = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
-const descriptor = (bytes: Buffer) => ({ mimeType: "image/png", byteLength: bytes.length, sha256: digest(bytes) });
+const descriptor = (bytes: Buffer, mimeType = "image/png") => ({
+	mimeType,
+	byteLength: bytes.length,
+	sha256: digest(bytes),
+});
 
-function upload(store: PromptImageUploadStore, owner: string, bytes: Buffer, batchId?: string): string {
-	const input = descriptor(bytes);
+function upload(
+	store: PromptImageUploadStore,
+	owner: string,
+	bytes: Buffer,
+	batchId?: string,
+	mimeType = "image/png",
+): string {
+	const input = descriptor(bytes, mimeType);
 	const { id } = store.begin(owner, batchId === undefined ? input : { ...input, batchId });
 	let sequence = 0;
 	for (let offset = 0; offset < bytes.length; offset += MAX_CHUNK_BYTES) {
@@ -83,10 +95,33 @@ function upload(store: PromptImageUploadStore, owner: string, bytes: Buffer, bat
 	return id;
 }
 
-async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer, batchId?: string): Promise<string> {
-	const id = upload(store, owner, bytes, batchId);
+async function stage(
+	store: PromptImageUploadStore,
+	owner: string,
+	bytes: Buffer,
+	batchId?: string,
+	mimeType = "image/png",
+): Promise<string> {
+	const id = upload(store, owner, bytes, batchId, mimeType);
 	await store.finish(owner, { id });
 	return id;
+}
+
+function animatedGif(commentBytes = 0): Buffer {
+	const imageMarker = STATIC_GIF.indexOf(0x2c);
+	const trailer = STATIC_GIF.lastIndexOf(0x3b);
+	const frame = STATIC_GIF.subarray(imageMarker, trailer);
+	const comment: Buffer[] = [];
+	if (commentBytes > 0) {
+		comment.push(Buffer.from([0x21, 0xfe]));
+		for (let remaining = commentBytes; remaining > 0; ) {
+			const blockLength = Math.min(remaining, 255);
+			comment.push(Buffer.from([blockLength]), Buffer.alloc(blockLength, 0x61));
+			remaining -= blockLength;
+		}
+		comment.push(Buffer.from([0]));
+	}
+	return Buffer.concat([STATIC_GIF.subarray(0, imageMarker), frame, frame, ...comment, Buffer.from([0x3b])]);
 }
 
 function fillNearLimit(store: PromptImageUploadStore): string[] {
@@ -122,6 +157,33 @@ test("a valid original image larger than 256 KiB survives chunk upload and one-s
 			expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
 			accepted.release();
 			accepted.release();
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		store.close();
+	}
+});
+
+test.each([
+	["two-frame GIF", animatedGif(), 0],
+	["two-frame GIF larger than 256 KiB", animatedGif(REQUEST_FRAME_BYTES + 1), REQUEST_FRAME_BYTES],
+] as const)("finish rejects %s and discard permits a static GIF roundtrip", async (_description, bytes, minimumBytes) => {
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		expect(bytes.length).toBeGreaterThan(minimumBytes);
+		expect(bytes.length).toBeLessThanOrEqual(20 * 1024 * 1024);
+		expect(await new Bun.Image(bytes).metadata()).toMatchObject({ width: 1, height: 1 });
+		const id = upload(store, "sender", bytes, undefined, "image/gif");
+		await expect(store.finish("sender", { id })).rejects.toMatchObject({ code: "invalid_input" });
+		expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "invalid_input" }));
+		expect(store.discard("sender", { id })).toEqual({ discarded: true });
+
+		const staticId = await stage(store, "sender", STATIC_GIF, undefined, "image/gif");
+		const accepted = store.redeem("sender", [{ id: staticId }]);
+		try {
+			expect(accepted.images[0]?.mimeType).toBe("image/gif");
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(STATIC_GIF)).toBe(true);
 		} finally {
 			accepted.release();
 		}
