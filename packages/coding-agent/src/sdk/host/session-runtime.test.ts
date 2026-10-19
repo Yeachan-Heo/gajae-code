@@ -10179,6 +10179,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
 		const claimEntered = Promise.withResolvers<void>();
 		const releaseClaim = Promise.withResolvers<void>();
+		const persistenceEvents: PersistenceInstrumentationEvent[] = [];
+		const durableAttempts: string[] = [];
 		const epoch = 83;
 		let harness: InvocationHarness | undefined;
 		let startPromise: Promise<void> | undefined;
@@ -10194,6 +10196,20 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				},
 				persistInterceptor: () => {},
 				agentFailedWriteFailures: 0,
+				onPersistenceInstrumentation: event => {
+					if (persistenceEvents.length < 64)
+						persistenceEvents.push({
+							...event,
+							error: event.error?.slice(0, 256),
+							detail: event.detail?.slice(0, 256),
+						});
+				},
+				onDurableAttempt: attempt => {
+					if (durableAttempts.length < 64)
+						durableAttempts.push(
+							`${attempt.type ?? "unclassified"}:${attempt.outcome}:${attempt.commandId ?? ""}:${attempt.turnId ?? ""}:${attempt.terminalAt ?? ""}`,
+						);
+				},
 				persistHolds: [
 					{
 						type: "deadline_claim",
@@ -10225,9 +10241,27 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const accepted = await harness.control("turn.prompt", { text: "start while expiring" });
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
-			const claimDeadline = Date.now() + 2_000;
+			const claimWaitStartedAt = Date.now();
+			const claimDeadline = claimWaitStartedAt + 2_000;
 			while (!claimWasEntered && Date.now() < claimDeadline) await Bun.sleep(5);
-			expect(claimWasEntered).toBe(true);
+			try {
+				expect(claimWasEntered).toBe(true);
+			} catch (error) {
+				throw new Error(
+					`${error instanceof Error ? error.message : String(error)}; claim_setup=${JSON.stringify({
+						accepted,
+						correlation,
+						elapsedMs: Date.now() - claimWaitStartedAt,
+						claimWasEntered,
+						handleReads,
+						abortCalls,
+						persistenceEvents,
+						durableAttempts,
+						broadcasts: harness.broadcasts.slice(-16),
+					})}`,
+					{ cause: error },
+				);
+			}
 			await claimEntered.promise;
 			startPromise = harness.emit("agent_start");
 			const captureDeadline = Date.now() + 2_000;
@@ -10262,8 +10296,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		let claimWasEntered = false;
 		let handleReads = 0;
 		let boundaryWaitStarted = false;
+		let toolDrainWasObserved = false;
 		let abortCalls = 0;
-		let terminalEventPromise: Promise<void> | undefined;
 		try {
 			harness = await invocationHarness("deadline-start-race", cwd, {
 				settings: zeroProgressSettings,
@@ -10291,8 +10325,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					},
 					pendingToolExecutions: () => {
 						if (activeTools.size > 0) boundaryWaitStarted = true;
-						else if (boundaryWaitStarted && terminalEventPromise === undefined)
-							terminalEventPromise = harness?.emit("agent_end", { stopReason: "cancelled" });
+						else if (boundaryWaitStarted) toolDrainWasObserved = true;
 						return [...activeTools];
 					},
 					abortPromptAndWaitWithTerminal: async () => {
@@ -10317,15 +10350,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(5);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_start")).toHaveLength(1);
+			// The producer emits its real end after tool settlement; the ledger observer stays read-only.
 			activeTools.clear();
-			const terminalEventDeadline = Date.now() + 2_000;
-			while (terminalEventPromise === undefined && Date.now() < terminalEventDeadline) await Bun.sleep(5);
-			expect(terminalEventPromise).toBeDefined();
-			await terminalEventPromise;
+			await harness.emit("agent_end", { stopReason: "cancelled" });
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
+			expect(toolDrainWasObserved).toBe(true);
 			expect(abortCalls).toBeLessThanOrEqual(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
