@@ -6964,44 +6964,58 @@ test("SDK session switches rotate endpoint authority before publishing the repla
 			getUsageStatistics: () => ({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
 		},
 	};
-	const handlers = start(ctx);
+	const handlers = start(ctx, undefined, () => {}, false, new Map(), undefined, false);
 	const endpointAPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionA}.json`);
-	await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
-	const endpointA = JSON.parse(fs.readFileSync(endpointAPath, "utf8")) as { url: string; token: string };
-	const clientA = new WebSocket(`${endpointA.url}/?token=${encodeURIComponent(endpointA.token)}`);
-	sockets.push(clientA);
-	await new Promise<void>((resolve, reject) => {
-		clientA.addEventListener("open", () => resolve(), { once: true });
-		clientA.addEventListener("error", () => reject(new Error("session A WebSocket error")), { once: true });
-	});
+	try {
+		await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
+		const endpointA = JSON.parse(fs.readFileSync(endpointAPath, "utf8")) as { url: string; token: string };
+		const clientA = new WebSocket(`${endpointA.url}/?token=${encodeURIComponent(endpointA.token)}`);
+		sockets.push(clientA);
+		await new Promise<void>((resolve, reject) => {
+			clientA.addEventListener("open", () => resolve(), { once: true });
+			clientA.addEventListener("error", () => reject(new Error("session A WebSocket error")), { once: true });
+		});
 
-	activeSessionId = sessionB;
-	await handlers.get("session_switch")?.(
-		{
-			type: "session_switch",
-			reason: "new",
-			previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
-		},
-		ctx,
-	);
-	const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
-	await waitFor(() => !fs.existsSync(endpointAPath) && fs.existsSync(endpointBPath), "rotated session endpoint");
-	const endpointB = JSON.parse(fs.readFileSync(endpointBPath, "utf8")) as { url: string; token: string };
-	expect(endpointB.token).not.toBe(endpointA.token);
-	await waitFor(() => clientA.readyState === WebSocket.CLOSED, "session A client close");
+		activeSessionId = sessionB;
+		await handlers.get("session_switch")?.(
+			{
+				type: "session_switch",
+				reason: "new",
+				previousSessionFile: path.join(cwd, "sessions", `ts_${sessionA}.jsonl`),
+			},
+			ctx,
+		);
+		const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
+		await waitFor(() => !fs.existsSync(endpointAPath) && fs.existsSync(endpointBPath), "rotated session endpoint");
+		const endpointB = JSON.parse(fs.readFileSync(endpointBPath, "utf8")) as { url: string; token: string };
+		expect(endpointB.token).not.toBe(endpointA.token);
+		await waitFor(() => clientA.readyState === WebSocket.CLOSED, "session A client close");
 
-	const staleTokenClient = new WebSocket(`${endpointB.url}/?token=${encodeURIComponent(endpointA.token)}`);
-	sockets.push(staleTokenClient);
-	await Promise.race([
-		new Promise<void>(resolve => {
-			staleTokenClient.addEventListener("close", () => resolve(), { once: true });
-			staleTokenClient.addEventListener("error", () => resolve(), { once: true });
-		}),
-		Bun.sleep(1_000).then(() => {
-			throw new Error("stale session token was not rejected by the replacement host");
-		}),
-	]);
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		const staleTokenClient = new WebSocket(`${endpointB.url}/?token=${encodeURIComponent(endpointA.token)}`);
+		sockets.push(staleTokenClient);
+		await Promise.race([
+			new Promise<void>(resolve => {
+				staleTokenClient.addEventListener("close", () => resolve(), { once: true });
+				staleTokenClient.addEventListener("error", () => resolve(), { once: true });
+			}),
+			Bun.sleep(1_000).then(() => {
+				throw new Error("stale session token was not rejected by the replacement host");
+			}),
+		]);
+	} finally {
+		try {
+			await handlers.get("session_shutdown")!(
+				{ type: "session_shutdown" },
+				{
+					...ctx,
+					sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionA },
+				},
+			);
+		} finally {
+			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+		}
+	}
 });
 
 for (const eventType of ["session_switch", "session_branch"] as const) {
@@ -7026,18 +7040,31 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 				}),
 			},
 		};
-		// Fail A's owner release exactly once so the rotate-time stopSession(prevId)
-		// throws the retained-retry AggregateError.
-		const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
-		try {
-			const startupCapability = new SdkStartupCapability(undefined, "immediate", "rotation-failure-marker");
-			const handlers = start(ctx, undefined, () => {}, false, new Map(), {
+		const startupCapability = new SdkStartupCapability(undefined, "immediate", "rotation-failure-marker");
+		const handlers = start(
+			ctx,
+			undefined,
+			() => {},
+			false,
+			new Map(),
+			{
 				startupCapability,
 				lifecycleRequired: true,
-			});
+			},
+			false,
+		);
+		let restoreStop: (() => void) | undefined;
+		try {
+			await handlers.get("session_start")!({ type: "session_start" }, ctx);
 			await expect(startupCapability.promise).resolves.toEqual({ status: "started" });
 			const endpointAPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionA}.json`);
 			await waitFor(() => fs.existsSync(endpointAPath), "session A endpoint");
+			// Fail A's owner release exactly once so the rotate-time stopSession(prevId)
+			// throws the retained-retry AggregateError. Install this only after the full
+			// predecessor session_start handler and endpoint are ready, so startup cleanup
+			// cannot consume the rotation fault.
+			const stop = spyOn(SessionSdkHost.prototype, "stop").mockRejectedValueOnce(new Error("host stop failed"));
+			restoreStop = () => stop.mockRestore();
 
 			activeSessionId = sessionB;
 			// A retained predecessor cleanup must fail closed and rethrow before any
@@ -7054,19 +7081,21 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			// The failed predecessor release quarantines B: no successor endpoint is published.
 			const endpointBPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionB}.json`);
 			expect(fs.existsSync(endpointBPath)).toBe(false);
-
-			// With the mock restored, A's retained cleanup can still complete.
-			stop.mockRestore();
-			await expect(
-				handlers.get("session_shutdown")!(
-					{ type: "session_shutdown" },
-					{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionA } },
-				),
-			).resolves.toBeUndefined();
-
-			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
 		} finally {
-			stop.mockRestore();
+			// With the mock restored, A's retained cleanup can still complete. Keep
+			// this assertion and always shut down B as well, including when an earlier
+			// assertion fails before the rotation completes.
+			restoreStop?.();
+			try {
+				await expect(
+					handlers.get("session_shutdown")!(
+						{ type: "session_shutdown" },
+						{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionA } },
+					),
+				).resolves.toBeUndefined();
+			} finally {
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+			}
 		}
 		// Rotating two real hosts and their predecessor releases exceeds the
 		// default 5s budget on a loaded shard; the assertions stay unchanged.
