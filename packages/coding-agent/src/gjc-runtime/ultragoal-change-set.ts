@@ -167,7 +167,6 @@ async function getEmptyTreeId(cwd: string): Promise<string> {
 	const result = await spawnText(["git", "hash-object", "-t", "tree", "--stdin"], {
 		cwd,
 		timeoutMs: 3000,
-		stdin: "", // Empty input for empty tree
 	});
 	if (result.ok && result.stdout.trim()) {
 		return result.stdout.trim();

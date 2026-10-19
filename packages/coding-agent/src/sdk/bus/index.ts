@@ -2986,10 +2986,12 @@ function sdkControlSurface(
 			correlation: { commandId: string; turnId: string },
 			preflightSignal: AbortSignal,
 			submissionSettled: Promise<void>,
-		) => {
-			accepted: () => void;
-			promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
-		} | void,
+		) =>
+			| {
+					accepted: () => void;
+					promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			  }
+			| undefined,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
