@@ -201,6 +201,23 @@ export function canonicalEnvKey(name: string): string {
  * store the way Bun loaded it. Other backslashes stay in the compared text.
  * The bytes inside the quotes are not decoded.
  */
+/**
+ * Keys Bun's dotenv loader accepts that are not shell identifiers. Bun loads
+ * names containing `-` or `.` (e.g. `npm_config_node-options`, which npm reads as
+ * `node-options`), but the line parser keeps only identifiers, so provenance
+ * would never see them. They are refused as dynamic, like a dropped quoted key.
+ */
+function nonIdentifierDeclarationKeys(content: string): Set<string> {
+	const keys = new Set<string>();
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const key = /^(?:export\s+)?([A-Za-z0-9_.-]+)\s*(?:=|:)/.exec(trimmed)?.[1];
+		if (key && !isValidEnvName(key)) keys.add(canonicalEnvKey(key));
+	}
+	return keys;
+}
+
 function quotedDeclarationKeys(content: string): Set<string> {
 	const quoted = new Set<string>();
 	for (const line of content.split("\n")) {
@@ -359,9 +376,10 @@ export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnaps
 			if (quoted.has(key) || /[$`]/.test(value)) dynamic.add(key);
 			else dynamic.delete(key);
 		}
-		// The line parser drops a key when `.` cannot cross a carriage return.
-		// Keep that key in the snapshot so the value Bun loaded is not an override.
-		for (const key of quoted) {
+		// The line parser drops a key when `.` cannot cross a carriage return, or
+		// when Bun accepts a non-identifier name. Keep that key in the snapshot so
+		// the value Bun loaded is not an override.
+		for (const key of [...quoted, ...nonIdentifierDeclarationKeys(content)]) {
 			if (seen.has(key)) continue;
 			values[key] = "";
 			dynamic.add(key);
