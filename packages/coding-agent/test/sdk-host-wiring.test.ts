@@ -1590,24 +1590,47 @@ test("lifecycle startup settles failure when native callback registration throws
 	}
 });
 
-test("session_start swallows startup plus owner-release failure without surfacing an extension error", async () => {
+test.each([
+	false,
+	true,
+])("session_start swallows startup plus owner-release failure without surfacing an extension error (peer cleanup=%s)", async peerCleanup => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-startup-cleanup-double-failure-"));
 	dirs.push(cwd);
 	const sessionId = `startup-cleanup-double-failure-${Date.now()}`;
-	// `mockRejectedValueOnce` on a shared prototype is a one-shot global: a peer
-	// test scheduled concurrently in the same shard can consume the single
-	// rejection, after which this test's own `start`/`stop` resolve, startup
-	// never sets `suppressExtensionError`, and the error surfaces. Scope the
-	// rejection to this test's first call instead so shard composition cannot
-	// steal it.
+	const startupScope = new AsyncLocalStorage<boolean>();
+	const peer = new SessionSdkHost({
+		sessionId: `${sessionId}-peer`,
+		stateRoot: cwd,
+		token: "test-unstarted-peer",
+		sendFrame: () => {
+			throw new Error("Unstarted peer must not send frames.");
+		},
+		onFrame: () => {
+			throw new Error("Unstarted peer must not install a frame handler.");
+		},
+	});
+	let peerStopResult: unknown;
+	// A first-call boolean on a shared prototype is still global. Inject only
+	// inside this startup's async scope and leave unrelated cleanup untouched.
+	let ownedServerStarts = 0;
+	let ownedHostStops = 0;
 	let serverStartRejected = false;
 	const serverStartImpl = NotificationServer.prototype.start;
 	const serverStart = spyOn(NotificationServer.prototype, "start").mockImplementation(async function (
 		this: NotificationServer,
 		...args: Parameters<NotificationServer["start"]>
 	) {
-		if (!serverStartRejected) {
+		const owned = startupScope.getStore() === true;
+		if (owned) ownedServerStarts++;
+		if (owned && !serverStartRejected) {
 			serverStartRejected = true;
+			if (peerCleanup)
+				peerStopResult = await startupScope
+					.exit(() => peer.stop())
+					.then(
+						value => value,
+						error => error,
+					);
 			throw new Error("server start failed");
 		}
 		return await serverStartImpl.apply(this, args);
@@ -1618,7 +1641,9 @@ test("session_start swallows startup plus owner-release failure without surfacin
 		this: SessionSdkHost,
 		...args: Parameters<SessionSdkHost["stop"]>
 	) {
-		if (!hostStopRejected) {
+		const owned = startupScope.getStore() === true;
+		if (owned) ownedHostStops++;
+		if (owned && !hostStopRejected) {
 			hostStopRejected = true;
 			throw new Error("host stop failed");
 		}
@@ -1647,10 +1672,11 @@ test("session_start swallows startup plus owner-release failure without surfacin
 		const surfaced: Array<{ event: string }> = [];
 		runner.onError(error => surfaced.push(error));
 
-		await expect(runner.emit({ type: "session_start" })).resolves.toBeUndefined();
+		await expect(startupScope.run(true, () => runner.emit({ type: "session_start" }))).resolves.toBeUndefined();
 		expect(surfaced).toEqual([]);
-		expect(serverStart).toHaveBeenCalledTimes(1);
-		expect(hostStop).toHaveBeenCalledTimes(2);
+		expect(ownedServerStarts).toBe(1);
+		expect(ownedHostStops).toBe(2);
+		if (peerCleanup) expect(peerStopResult).toBe("already");
 		const breadcrumbs = errorSpy.mock.calls.map(args => String(args[0]));
 		expect(
 			breadcrumbs.some(
