@@ -4052,12 +4052,40 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 			ok: true,
 			result: { status: "terminal_ok" },
 		});
-		expect(
-			await naturalClient.query("successor-deadline-stays-failed", { kind: "prompt", ...successorCorrelation }),
-		).toMatchObject({
-			ok: true,
-			result: { status: "failed", error: { code: "prompt_deadline_exceeded" } },
+		const historicalResult = await naturalClient.query("successor-deadline-stays-failed", {
+			kind: "prompt",
+			...successorCorrelation,
 		});
+		try {
+			expect(historicalResult).toMatchObject({
+				ok: true,
+				result: { status: "failed", error: { code: "prompt_deadline_exceeded" } },
+			});
+		} catch (error) {
+			// Capture only after failure: no extra I/O or await can mask a restart race
+			// on the successful path. Keep quarantined documents before fixture cleanup.
+			const storePath = reconciliationStorePath(path.join(cwd, "session.jsonl"), sessionId);
+			let persistence: unknown;
+			try {
+				const basename = path.basename(storePath);
+				persistence = fs
+					.readdirSync(path.dirname(storePath))
+					.filter(name => name === basename || name.startsWith(`${basename}.`))
+					.map(name => {
+						try {
+							return { name, raw: fs.readFileSync(path.join(path.dirname(storePath), name), "utf8") };
+						} catch (captureError) {
+							return { name, captureError: String(captureError) };
+						}
+					});
+			} catch (captureError) {
+				persistence = { captureError: String(captureError) };
+			}
+			throw new Error(
+				`SDK restart lost historical deadline result: ${JSON.stringify({ historicalResult, successorCorrelation, persistence })}`,
+				{ cause: error },
+			);
+		}
 	} finally {
 		// Restore the fake lease clock before awaited teardown: if shutdown
 		// throws, an active Date.now spy would leak into every later test.
