@@ -31,6 +31,7 @@ async function seedGitRepo(root: string, files: Record<string, string>): Promise
 	}
 	await $`git add .`.cwd(root).quiet();
 	await $`git commit -m base`.cwd(root).quiet();
+	await $`git update-ref refs/remotes/origin/dev HEAD`.cwd(root).quiet();
 	for (const [file, content] of Object.entries(files)) {
 		await Bun.write(path.join(root, file), content);
 	}
