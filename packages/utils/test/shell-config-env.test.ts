@@ -14,13 +14,10 @@ import { getShellConfig, resetShellConfigCache } from "../src/procmgr";
  */
 
 const KEYS = [
-	"GJC_BASH_NO_CI",
-	"PI_BASH_NO_CI",
-	"CLAUDE_BASH_NO_CI",
 	"GJC_BASH_NO_LOGIN",
 	"PI_BASH_NO_LOGIN",
 	"CLAUDE_BASH_NO_LOGIN",
-	// Inherited into the spawn env otherwise, which would confound the CI assertions.
+	// Inherited into the spawn env otherwise, which would confound assertions.
 	"CI",
 ] as const;
 
@@ -49,33 +46,20 @@ function configWith(env: Record<string, string>): ReturnType<typeof getShellConf
 	return getShellConfig();
 }
 
-describe("spawn env CI suppression (GJC_BASH_NO_CI)", () => {
-	it("injects CI=true when no knob is set", () => {
-		expect(getShellConfig().env.CI).toBe("true");
+describe("spawn env CI environment (no default injection)", () => {
+	it("does not inject CI when no environment variable is set", () => {
+		expect(getShellConfig().env.CI).toBeUndefined();
 	});
 
-	it("honors the documented GJC_BASH_NO_CI", () => {
+	it("preserves inherited CI when already set in the process environment", () => {
+		expect(configWith({ CI: "true" }).env.CI).toBe("true");
+		expect(configWith({ CI: "false" }).env.CI).toBe("false");
+	});
+
+	it("does not use GJC_BASH_NO_CI since there is no default CI to suppress", () => {
+		// GJC_BASH_NO_CI is no longer relevant; inherited CI is always passed through.
 		expect(configWith({ GJC_BASH_NO_CI: "1" }).env.CI).toBeUndefined();
-	});
-
-	it("honors the legacy PI_BASH_NO_CI alias", () => {
-		expect(configWith({ PI_BASH_NO_CI: "1" }).env.CI).toBeUndefined();
-	});
-
-	it("honors the legacy CLAUDE_BASH_NO_CI alias", () => {
-		expect(configWith({ CLAUDE_BASH_NO_CI: "1" }).env.CI).toBeUndefined();
-	});
-
-	it.each(["0", "false", "off", "no"])("treats GJC_BASH_NO_CI=%s as not set", value => {
-		expect(configWith({ GJC_BASH_NO_CI: value }).env.CI).toBe("true");
-	});
-
-	it("resolves GJC-first: an explicit GJC_BASH_NO_CI=0 beats a truthy legacy alias", () => {
-		expect(configWith({ GJC_BASH_NO_CI: "0", PI_BASH_NO_CI: "1" }).env.CI).toBe("true");
-	});
-
-	it("skips a blank GJC_BASH_NO_CI and falls through to the legacy alias", () => {
-		expect(configWith({ GJC_BASH_NO_CI: "   ", PI_BASH_NO_CI: "1" }).env.CI).toBeUndefined();
+		expect(configWith({ GJC_BASH_NO_CI: "1", CI: "true" }).env.CI).toBe("true");
 	});
 });
 
