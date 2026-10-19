@@ -1042,7 +1042,8 @@ export function lifecycleSessionHostBaseEnv(
 	launch: { env?: Readonly<Record<string, string>>; unsetEnv?: readonly string[] },
 ): Record<string, string> {
 	const removed = new Set([...(launch.unsetEnv ?? []), ...Object.keys(launch.env ?? {})].map(sessionEnvKey));
-	const base: Record<string, string> = {};
+	// Valid names like `__proto__` must remain own environment entries.
+	const base = Object.create(null) as Record<string, string>;
 	for (const [name, value] of Object.entries(inherited)) {
 		if (name === "GJC_MASTER_CAPABILITY" || typeof value !== "string" || removed.has(sessionEnvKey(name))) continue;
 		base[name] = value;

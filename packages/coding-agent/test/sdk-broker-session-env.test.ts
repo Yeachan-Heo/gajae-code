@@ -8,6 +8,49 @@ import {
 	setLifecycleCommandResolverForTest,
 } from "../src/sdk/broker/lifecycle";
 
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
+
+function randomInt(random: () => number, max: number): number {
+	return Math.floor(random() * max);
+}
+
+function randomEnvName(random: () => number, index: number): string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+	let suffix = "";
+	for (let charIndex = 0; charIndex < 8; charIndex++) {
+		suffix += alphabet[randomInt(random, alphabet.length)] ?? "a";
+	}
+	return `PROPERTY_${index}_${suffix}`;
+}
+
+function randomEnvValue(random: () => number): string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-/:=";
+	const length = randomInt(random, 48);
+	let value = "";
+	for (let charIndex = 0; charIndex < length; charIndex++) {
+		value += alphabet[randomInt(random, alphabet.length)] ?? "a";
+	}
+	return value;
+}
+
+function flipFirstLetterCase(value: string): string {
+	const index = value.search(/[A-Za-z]/u);
+	if (index < 0) throw new Error("expected an environment name with an ASCII letter");
+	const letter = value[index]!;
+	const flipped = letter === letter.toUpperCase() ? letter.toLowerCase() : letter.toUpperCase();
+	return `${value.slice(0, index)}${flipped}${value.slice(index + 1)}`;
+}
+
+function envEntries(value: Readonly<Record<string, string>>): Array<[string, string]> {
+	return Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
+}
+
 async function tempRoot(label: string): Promise<string> {
 	return await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-${label}-`));
 }
@@ -37,6 +80,59 @@ describe("lifecycle per-session env validation (#6735)", () => {
 	])("#given %s #then it is rejected", (_label, input) => {
 		expect(lifecycleSessionEnv(input)).toBeNull();
 	});
+
+	test("holds generated validation and case-matching properties (seed 0x6735a11)", () => {
+		const seed = 0x6735a11;
+		const random = seededRandom(seed);
+		const windows = process.platform === "win32";
+
+		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {
+			const name = randomEnvName(random, caseIndex);
+			const value = randomEnvValue(random);
+			const accepted = lifecycleSessionEnv({ env: { [name]: value } });
+			expect(accepted, `seed ${seed}, case ${caseIndex}`).toEqual({ env: { [name]: value } });
+			expect(Object.keys(accepted?.env ?? {}).every(key => !key.toUpperCase().startsWith("GJC_"))).toBe(true);
+
+			const reserved = `gJc_${name.slice("PROPERTY_".length)}`;
+			expect(lifecycleSessionEnv({ env: { [reserved]: value } }), `seed ${seed}, case ${caseIndex}`).toBeNull();
+			expect(lifecycleSessionEnv({ unsetEnv: [reserved] }), `seed ${seed}, case ${caseIndex}`).toBeNull();
+
+			expect(lifecycleSessionEnv({ env: { [name]: value }, unsetEnv: [name] })).toBeNull();
+
+			const caseVariant = flipFirstLetterCase(name);
+			const caseVariantCollision = lifecycleSessionEnv({ env: { [name]: value }, unsetEnv: [caseVariant] });
+			expect(caseVariantCollision === null, `seed ${seed}, case ${caseIndex}`).toBe(windows);
+
+			const caseVariantUnsetDuplicate = lifecycleSessionEnv({ unsetEnv: [name, caseVariant] });
+			expect(caseVariantUnsetDuplicate === null, `seed ${seed}, case ${caseIndex}`).toBe(windows);
+
+			const caseVariantEnvDuplicate = lifecycleSessionEnv({
+				env: { [name]: value, [caseVariant]: randomEnvValue(random) },
+			});
+			expect(caseVariantEnvDuplicate === null, `seed ${seed}, case ${caseIndex}`).toBe(windows);
+		}
+	});
+
+	test("accepts exact env entry, name, and value limits and rejects the next value", () => {
+		const maxEntries = 256;
+		const maxNameLength = 256;
+		const maxValueLength = 131_072;
+		const env = Object.fromEntries(
+			Array.from({ length: maxEntries }, (_, index) => [`ENTRY_${index}`, `value-${index}`]),
+		);
+		const unsetEnv = Array.from({ length: maxEntries }, (_, index) => `UNSET_${index}`);
+		const longestName = `A${"_".repeat(maxNameLength - 1)}`;
+		const longestValue = "x".repeat(maxValueLength);
+
+		expect(lifecycleSessionEnv({ env })).not.toBeNull();
+		expect(lifecycleSessionEnv({ env: { ...env, ENTRY_256: "too many" } })).toBeNull();
+		expect(lifecycleSessionEnv({ unsetEnv })).not.toBeNull();
+		expect(lifecycleSessionEnv({ unsetEnv: [...unsetEnv, "UNSET_256"] })).toBeNull();
+		expect(lifecycleSessionEnv({ env: { [longestName]: longestValue } })).not.toBeNull();
+		expect(lifecycleSessionEnv({ env: { [`${longestName}_`]: "x" } })).toBeNull();
+		expect(lifecycleSessionEnv({ env: { VALUE: longestValue } })).not.toBeNull();
+		expect(lifecycleSessionEnv({ env: { VALUE: `${longestValue}x` } })).toBeNull();
+	});
 });
 
 describe("lifecycle session host base env (#6735)", () => {
@@ -46,6 +142,45 @@ describe("lifecycle session host base env (#6735)", () => {
 			{ env: { PATH: "/opt/a/bin:/usr/bin", TENANT: "a" }, unsetEnv: ["CI"] },
 		);
 		expect(base).toEqual({ PATH: "/opt/a/bin:/usr/bin", KEEP: "1", TENANT: "a" });
+	});
+
+	test("holds generated composition properties (seed 0x6735c0de)", () => {
+		const seed = 0x6735c0de;
+		const random = seededRandom(seed);
+		const windows = process.platform === "win32";
+		const envKey = (name: string): string => (windows ? name.toUpperCase() : name);
+
+		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {
+			const keepName = randomEnvName(random, caseIndex * 4);
+			const overrideName = randomEnvName(random, caseIndex * 4 + 1);
+			const unsetName = randomEnvName(random, caseIndex * 4 + 2);
+			const explicitName = randomEnvName(random, caseIndex * 4 + 3);
+			const inheritedEntries: Array<[string, string]> = [
+				[keepName, randomEnvValue(random)],
+				[overrideName, randomEnvValue(random)],
+				[unsetName, randomEnvValue(random)],
+				["GJC_MASTER_CAPABILITY", randomEnvValue(random)],
+				["__proto__", randomEnvValue(random)],
+			];
+			const inherited = Object.fromEntries(inheritedEntries) as Record<string, string>;
+			const overrideKey = flipFirstLetterCase(overrideName);
+			const unsetKey = flipFirstLetterCase(unsetName);
+			const env = { [overrideKey]: randomEnvValue(random), [explicitName]: randomEnvValue(random) };
+			const unsetEnv = [unsetKey];
+			const actual = lifecycleSessionHostBaseEnv(inherited, { env, unsetEnv });
+			const removed = new Set([...unsetEnv, ...Object.keys(env)].map(envKey));
+			const expectedEntries = inheritedEntries.filter(
+				([name]) => name !== "GJC_MASTER_CAPABILITY" && !removed.has(envKey(name)),
+			);
+			const expected = Object.fromEntries([...expectedEntries, ...Object.entries(env)]) as Record<string, string>;
+
+			expect(envEntries(actual), `seed ${seed}, case ${caseIndex}`).toEqual(envEntries(expected));
+			expect(Object.hasOwn(actual, "GJC_MASTER_CAPABILITY")).toBe(false);
+			expect(actual[overrideKey]).toBe(env[overrideKey]);
+			expect(Object.hasOwn(actual, overrideName)).toBe(!windows);
+			expect(Object.hasOwn(actual, unsetName)).toBe(!windows);
+			expect(Object.hasOwn(actual, "__proto__")).toBe(true);
+		}
 	});
 });
 
