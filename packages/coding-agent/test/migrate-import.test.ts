@@ -201,6 +201,54 @@ describe("end-to-end import", () => {
 		expect(expandSlashCommand("/claude-code:review:security src/auth.ts", commands)).toContain("Review src/auth.ts.");
 	});
 
+	test("Claude Code subagents import with mapped tools and never shadow a bundled role", async () => {
+		await fs.mkdir(path.join(cwd, ".claude", "agents"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".claude", "agents", "auditor.md"),
+			"---\nname: auditor\ndescription: Reviews diffs.\ntools: Read, Bash, WebFetch, TodoWrite\nmodel: sonnet\n---\n\nYou audit diffs.\n",
+			"utf-8",
+		);
+		await fs.writeFile(
+			path.join(cwd, ".claude", "agents", "executor.md"),
+			"---\nname: executor\ndescription: Shadow attempt.\n---\n\nDo not shadow.\n",
+			"utf-8",
+		);
+
+		const report = await runMigrate(opts({ from: ["claude-code"] }));
+		const imported = path.join(cwd, ".gjc", "agents", "auditor.md");
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({ type: "agent", name: "auditor", destination: imported, status: "imported" }),
+		);
+		const content = await fs.readFile(imported, "utf-8");
+		expect(content).toContain("You audit diffs.");
+		expect(content).toContain("read");
+		expect(content).toContain("bash");
+		expect(content).toContain("web_search");
+		// Tools without a GJC equivalent are dropped and reported, never written.
+		expect(content).not.toContain("todo");
+		expect(content).not.toContain("sonnet");
+
+		const namespaced = path.join(cwd, ".gjc", "agents", "claude-code-executor.md");
+		expect(report.actions).toContainEqual(
+			expect.objectContaining({
+				type: "agent",
+				name: "claude-code-executor",
+				destination: namespaced,
+				status: "imported",
+				warnings: expect.arrayContaining([expect.stringContaining("bundled executor role")]),
+			}),
+		);
+		// The bundled executor role keeps its name: no file claims it.
+		await expect(fs.stat(path.join(cwd, ".gjc", "agents", "executor.md"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+
+		const rerun = await runMigrate(opts({ from: ["claude-code"] }));
+		expect(rerun.actions).toContainEqual(
+			expect.objectContaining({ type: "agent", name: "auditor", status: "skipped_exists" }),
+		);
+	});
+
 	test("Claude commands colliding with built-ins are namespaced", async () => {
 		await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
 		await fs.writeFile(path.join(cwd, ".claude", "commands", "help.md"), "Help $ARGUMENTS.", "utf-8");

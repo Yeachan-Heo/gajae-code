@@ -83,6 +83,41 @@ describe("claude-code adapter", () => {
 		]);
 	});
 
+	test("maps Claude agent tools, drops unsupported ones, and rejects unusable agent files", async () => {
+		await writeFile(
+			".claude/agents/auditor.md",
+			"---\nname: auditor\ndescription: Reviews diffs.\ntools: Read, Grep, Bash, NotebookEdit\n---\n\nAudit the diff.\n",
+		);
+		await writeFile(".claude/agents/no-description.md", "---\nname: nodesc\n---\nBody only.\n");
+		await writeFile(".claude/agents/bad name.md", "---\nname: bad name\ndescription: x\n---\nBody.\n");
+
+		const result = await getAdapter("claude-code").collect(adapterOptions());
+		const auditor = result.agentCandidates.find(candidate => candidate.name === "auditor");
+		expect(auditor).toBeDefined();
+		expect(auditor?.content).toContain("Audit the diff.");
+		expect(auditor?.content).toContain("read");
+		expect(auditor?.content).toContain("grep");
+		expect(auditor?.content).toContain("bash");
+		expect(auditor?.content).not.toContain("notebookedit");
+		expect(auditor?.warnings).toEqual([expect.stringContaining('dropped agent tool "NotebookEdit"')]);
+
+		expect(result.agentCandidates.some(candidate => candidate.name === "nodesc")).toBe(false);
+		expect(result.diagnostics).toContainEqual(
+			expect.objectContaining({
+				type: "agent",
+				status: "failed_invalid_source",
+				message: expect.stringContaining("no-description.md"),
+			}),
+		);
+		expect(result.diagnostics).toContainEqual(
+			expect.objectContaining({
+				type: "agent",
+				status: "failed_invalid_source",
+				message: expect.stringContaining("bad name"),
+			}),
+		);
+	});
+
 	test("malformed mcp config yields failed_invalid_source", async () => {
 		await writeFile(".claude.json", "{ not json");
 		const result = await getAdapter("claude-code").collect(adapterOptions());

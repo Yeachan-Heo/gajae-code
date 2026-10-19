@@ -392,6 +392,8 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"telemetry.enabled",
 	// Destination of the operator Hindsight server. A project file must not redirect it.
 	"hindsight.apiUrl",
+	// Destination of generic remote compaction. A project file must not redirect the transcript POST.
+	"compaction.remoteEndpoint",
 	// Operator consent for repository skills. A project file must not flip it.
 	"skills.trustProjectSkills",
 	"skills.enablePiProject",

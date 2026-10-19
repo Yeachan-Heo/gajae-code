@@ -110,11 +110,22 @@ existing command path. File-versus-directory conflicts between planned command
 paths are reported before writing; `--force` does not delete an existing command
 subtree to resolve them.
 Instruction and command writes refuse to follow symlinked destination directories.
-Codex prompts are imported as slash commands, not skills. Claude Code subagents,
-extensions, Claude Code/Codex hooks and settings (model, permissions, and
-environment), and optional session history are not imported by this command and
-still need manual migration. This is not a replacement for the all-surface
-`/extensions` preview.
+Codex prompts are imported as slash commands, not skills.
+
+Claude Code subagents (`CLAUDE.md`-era `.claude/agents/*.md`) are imported as
+GJC agents under the selected scope's `agents/` directory, one `<name>.md` per
+agent. Their tool list is translated to GJC tool names (`Read`→`read`,
+`Write`/`Edit`/`MultiEdit`→`edit`, `Bash`→`bash`, `Grep`→`grep`, `Glob`→`glob`,
+`Task`→`task`, `WebFetch`/`WebSearch`→`web_search`); tools with no GJC
+equivalent (`NotebookEdit`, `TodoWrite`, `ExitPlanMode`, …) are dropped and
+reported. An agent whose name collides with a bundled role (`executor`,
+`architect`, `planner`, `critic`) is imported as `<source>-<name>` so the
+bundled role stays authoritative. Frontmatter other than `name`, `description`,
+and `tools` — including Claude's `model` — is not translated.
+
+Still manual: extensions, Claude Code/Codex hooks and settings (model,
+permissions, and environment), and optional session history. This is not a
+replacement for the all-surface `/extensions` preview.
 Direct native MCP registration uses `gjc mcp add`; see the linked MCP reference.
 
 ### Effective runtime precedence

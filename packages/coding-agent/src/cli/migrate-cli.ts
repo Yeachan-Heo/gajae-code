@@ -56,8 +56,9 @@ function resolveDestinations(project: boolean, cwd: string): MigrateDestinations
 	const agentDir = project ? getProjectAgentDir(cwd) : getAgentDir();
 	const skillsDir = path.join(agentDir, "skills");
 	const commandsDir = path.join(agentDir, "commands");
+	const agentsDir = path.join(agentDir, "agents");
 	const instructionsPath = path.join(agentDir, "AGENTS.md");
-	return { mcpConfigPath: getMCPConfigPath(scope, cwd), skillsDir, commandsDir, instructionsPath };
+	return { mcpConfigPath: getMCPConfigPath(scope, cwd), skillsDir, commandsDir, agentsDir, instructionsPath };
 }
 
 /** Run the migration and return the report (does not set process.exitCode). */

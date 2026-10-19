@@ -7,10 +7,12 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
+import { YAML } from "bun";
 import { normalizeSkill } from "../skill-normalizer";
 import type {
 	AdapterResult,
+	AgentCandidate,
 	InstructionCandidate,
 	MigrateSource,
 	SkillCandidate,
@@ -217,6 +219,139 @@ export async function collectMarkdownPrompts(
 				message: `failed to convert prompt ${promptFile}: ${(error as Error).message}`,
 			});
 		}
+	}
+	return { candidates, diagnostics };
+}
+
+/**
+ * Foreign subagent tools map onto the GJC tool surfaces that carry the same
+ * capability. Anything without an equivalent is dropped from the tool list (and
+ * reported) rather than written into an agent that cannot be loaded.
+ */
+const AGENT_TOOL_EQUIVALENTS: Readonly<Record<string, string | undefined>> = {
+	read: "read",
+	write: "edit",
+	edit: "edit",
+	multiedit: "edit",
+	notebookedit: undefined,
+	bash: "bash",
+	bashoutput: undefined,
+	killbash: undefined,
+	grep: "grep",
+	glob: "glob",
+	ls: undefined,
+	task: "task",
+	agent: "task",
+	webfetch: "web_search",
+	websearch: "web_search",
+	todowrite: undefined,
+	todoread: undefined,
+	exitplanmode: undefined,
+};
+
+/** Bundled agent names an imported agent must never shadow. */
+export const PROTECTED_AGENT_NAMES: ReadonlySet<string> = new Set(["executor", "architect", "planner", "critic"]);
+
+const AGENT_NAME_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function importedAgentTools(raw: unknown, warnings: string[]): string[] | undefined {
+	const list =
+		typeof raw === "string"
+			? raw.split(",")
+			: Array.isArray(raw)
+				? raw.filter((entry): entry is string => typeof entry === "string")
+				: [];
+	const mapped: string[] = [];
+	for (const entry of list) {
+		const key = entry.trim().toLowerCase();
+		if (!key) continue;
+		if (!(key in AGENT_TOOL_EQUIVALENTS)) {
+			warnings.push(`dropped unsupported agent tool "${entry.trim()}"`);
+			continue;
+		}
+		const equivalent = AGENT_TOOL_EQUIVALENTS[key];
+		if (!equivalent) {
+			warnings.push(`dropped agent tool "${entry.trim()}" (no GJC equivalent)`);
+			continue;
+		}
+		if (!mapped.includes(equivalent)) mapped.push(equivalent);
+	}
+	return mapped.length > 0 ? mapped : undefined;
+}
+
+/**
+ * Collect subagents from a flat `<agentsDir>/*.md` directory. Frontmatter is
+ * rewritten so the loaded name matches the destination file name, and tool lists
+ * are translated to GJC tools.
+ */
+export async function collectMarkdownAgents(
+	dir: string,
+	source: MigrateSource,
+): Promise<{ candidates: AgentCandidate[]; diagnostics: SourceDiagnostic[] }> {
+	const candidates: AgentCandidate[] = [];
+	const diagnostics: SourceDiagnostic[] = [];
+	const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error: unknown) => {
+		if (isEnoent(error)) {
+			diagnostics.push({
+				source,
+				type: "agent",
+				status: "skipped_absent_source",
+				message: `no agents dir at ${dir}`,
+			});
+		} else {
+			diagnostics.push({
+				source,
+				type: "agent",
+				status: "failed_io",
+				message: `failed to read ${dir}: ${(error as Error).message}`,
+			});
+		}
+		return undefined;
+	});
+	if (!entries) return { candidates, diagnostics };
+
+	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+		if (entry.name.startsWith(".")) continue;
+		if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+		const entryPath = path.join(dir, entry.name);
+		const read = await readSourceText(entryPath, source, "agent");
+		if ("diagnostic" in read) {
+			diagnostics.push(read.diagnostic);
+			continue;
+		}
+
+		const warnings: string[] = [];
+		const { frontmatter, body } = parseFrontmatter(read.text, { location: entryPath, level: "off" });
+		const rawName = typeof frontmatter.name === "string" ? frontmatter.name.trim() : entry.name.slice(0, -3);
+		const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+		if (!AGENT_NAME_SEGMENT.test(rawName)) {
+			diagnostics.push({
+				source,
+				type: "agent",
+				status: "failed_invalid_source",
+				message: `unsupported agent name "${rawName}" in ${entry.name}; names must use letters, numbers, dots, underscores, or hyphens`,
+			});
+			continue;
+		}
+		if (!description || !body.trim()) {
+			diagnostics.push({
+				source,
+				type: "agent",
+				status: "failed_invalid_source",
+				message: `agent ${entry.name} needs both a description and a prompt body`,
+			});
+			continue;
+		}
+
+		const tools = importedAgentTools(frontmatter.tools, warnings);
+		const normalized: Record<string, unknown> = { name: rawName, description, ...(tools ? { tools } : {}) };
+		const yaml = YAML.stringify(normalized).trimEnd();
+		candidates.push({
+			source,
+			name: rawName,
+			content: `---\n${yaml}\n---\n\n${body.trim()}\n`,
+			warnings,
+		});
 	}
 	return { candidates, diagnostics };
 }

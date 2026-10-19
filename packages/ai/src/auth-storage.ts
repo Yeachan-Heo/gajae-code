@@ -1525,6 +1525,15 @@ type ConfigApiKeyOwnerFork = {
  * Reads from storage on reload(), manages round-robin credential selection,
  * usage limit tracking, and OAuth token refresh.
  */
+/** Tier names that denote a model family rather than a plan or quota tier. */
+const MODEL_FAMILY_TIERS: ReadonlySet<string> = new Set(["opus", "sonnet", "haiku"]);
+
+/** A recorded usage-limit backoff; `modelId` scopes it to one model or model family. */
+interface CredentialBackoffEntry {
+	untilMs: number;
+	modelId?: string;
+}
+
 export class AuthStorage {
 	static readonly #defaultBackoffMs = 60_000; // Default backoff when no reset time available
 
@@ -1566,7 +1575,7 @@ export class AuthStorage {
 	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
 	#sessionLastCredential: Map<string, Map<string, { type: AuthCredential["type"]; index: number }>> = new Map();
 	/** Maps provider:type -> credentialIndex -> blockedUntilMs for temporary backoff. */
-	#credentialBackoff: Map<string, Map<number, number>> = new Map();
+	#credentialBackoff: Map<string, Map<number, CredentialBackoffEntry[]>> = new Map();
 	#usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	#rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	#usageCache: UsageCache;
@@ -3050,32 +3059,60 @@ export class AuthStorage {
 		return order;
 	}
 
-	/** Returns block expiry timestamp for a credential, cleaning up expired entries. */
-	#getCredentialBlockedUntil(providerKey: string, credentialIndex: number): number | undefined {
+	/**
+	 * Returns the block expiry for a credential, cleaning up expired entries.
+	 * A block recorded for one model only applies to that model; a block without a
+	 * model applies to the whole credential. `modelId` is the requested model, so
+	 * omitting it asks only about credential-wide blocks.
+	 */
+	#getCredentialBlockedUntil(providerKey: string, credentialIndex: number, modelId?: string): number | undefined {
 		const backoffMap = this.#credentialBackoff.get(providerKey);
 		if (!backoffMap) return undefined;
-		const blockedUntil = backoffMap.get(credentialIndex);
-		if (!blockedUntil) return undefined;
-		if (blockedUntil <= Date.now()) {
-			backoffMap.delete(credentialIndex);
-			if (backoffMap.size === 0) {
-				this.#credentialBackoff.delete(providerKey);
-			}
-			return undefined;
+		const entries = backoffMap.get(credentialIndex);
+		if (!entries || entries.length === 0) return undefined;
+		const now = Date.now();
+		const live = entries.filter(entry => entry.untilMs > now);
+		if (live.length !== entries.length) {
+			if (live.length > 0) backoffMap.set(credentialIndex, live);
+			else backoffMap.delete(credentialIndex);
+			if (backoffMap.size === 0) this.#credentialBackoff.delete(providerKey);
+		}
+		let blockedUntil: number | undefined;
+		const wanted = modelId?.trim().toLowerCase();
+		// A recorded scope may name a model or a model-family tier, so match a tier
+		// against the requested model id the same way limit scoping does.
+		const entryApplies = (entryModel: string): boolean => {
+			if (wanted === undefined) return false;
+			const scope = entryModel.toLowerCase();
+			if (scope === wanted) return true;
+			return MODEL_FAMILY_TIERS.has(scope) && wanted.includes(scope);
+		};
+		for (const entry of live) {
+			if (entry.modelId !== undefined && !entryApplies(entry.modelId)) continue;
+			if (blockedUntil === undefined || entry.untilMs > blockedUntil) blockedUntil = entry.untilMs;
 		}
 		return blockedUntil;
 	}
 
 	/** Checks if a credential is temporarily blocked due to usage limits. */
-	#isCredentialBlocked(providerKey: string, credentialIndex: number): boolean {
-		return this.#getCredentialBlockedUntil(providerKey, credentialIndex) !== undefined;
+	#isCredentialBlocked(providerKey: string, credentialIndex: number, modelId?: string): boolean {
+		return this.#getCredentialBlockedUntil(providerKey, credentialIndex, modelId) !== undefined;
 	}
 
-	/** Marks a credential as blocked until the specified time. */
-	#markCredentialBlocked(providerKey: string, credentialIndex: number, blockedUntilMs: number): void {
-		const backoffMap = this.#credentialBackoff.get(providerKey) ?? new Map<number, number>();
-		const existing = backoffMap.get(credentialIndex) ?? 0;
-		backoffMap.set(credentialIndex, Math.max(existing, blockedUntilMs));
+	/** Marks a credential as blocked until the specified time, optionally for one model. */
+	#markCredentialBlocked(
+		providerKey: string,
+		credentialIndex: number,
+		blockedUntilMs: number,
+		modelId?: string,
+	): void {
+		const scoped = modelId?.trim() || undefined;
+		const backoffMap = this.#credentialBackoff.get(providerKey) ?? new Map<number, CredentialBackoffEntry[]>();
+		const entries = backoffMap.get(credentialIndex) ?? [];
+		const existing = entries.find(entry => entry.modelId === scoped);
+		if (existing) existing.untilMs = Math.max(existing.untilMs, blockedUntilMs);
+		else entries.push({ untilMs: blockedUntilMs, modelId: scoped });
+		backoffMap.set(credentialIndex, entries);
 		this.#credentialBackoff.set(providerKey, backoffMap);
 	}
 
@@ -5125,15 +5162,40 @@ export class AuthStorage {
 	}
 
 	/** Returns true if usage indicates rate limit has been reached. */
-	#isUsageLimitReached(report: UsageReport): boolean {
-		return report.limits.some(limit => this.#isUsageLimitExhausted(limit));
+	/**
+	 * True when an exhausted limit applies to `modelId`. A limit scoped to one
+	 * model (or one tier's model entry) does not exhaust the credential for other
+	 * models; a limit with no model scope and not marked shared-blocking applies to
+	 * every model.
+	 */
+	#isUsageLimitReached(report: UsageReport, modelId?: string): boolean {
+		return report.limits.some(
+			limit => this.#limitAppliesToModel(limit, modelId) && this.#isUsageLimitExhausted(limit),
+		);
+	}
+
+	/**
+	 * Whether a usage limit constrains the requested model. Only model-family
+	 * tiers are treated as model scoping: `scope.tier` also carries plans
+	 * (Codex/Copilot) and quota tiers (Gemini), which apply to every model.
+	 */
+	#limitAppliesToModel(limit: UsageLimit, modelId?: string): boolean {
+		const wanted = modelId?.trim();
+		// Without a requested model, every limit applies: callers that do not know
+		// the model keep today's conservative "any exhausted limit blocks".
+		if (wanted === undefined) return true;
+		const scopedModel = limit.scope?.modelId?.trim();
+		if (scopedModel) return wanted === scopedModel;
+		const tier = limit.scope?.tier?.trim().toLowerCase();
+		if (tier && MODEL_FAMILY_TIERS.has(tier)) return wanted.toLowerCase().includes(tier);
+		return true;
 	}
 
 	/** Extracts the earliest reset timestamp from exhausted windows (in ms). */
-	#getUsageResetAtMs(report: UsageReport, nowMs: number): number | undefined {
+	#getUsageResetAtMs(report: UsageReport, nowMs: number, modelId?: string): number | undefined {
 		const candidates: number[] = [];
 		for (const limit of report.limits) {
-			if (!this.#isUsageLimitExhausted(limit)) continue;
+			if (!this.#limitAppliesToModel(limit, modelId) || !this.#isUsageLimitExhausted(limit)) continue;
 			const window = limit.window;
 			if (window?.resetsAt && window.resetsAt > nowMs) {
 				candidates.push(window.resetsAt);
@@ -5141,6 +5203,33 @@ export class AuthStorage {
 		}
 		if (candidates.length === 0) return undefined;
 		return Math.min(...candidates);
+	}
+
+	/**
+	 * Backoff targets implied by an exhausted usage report: a credential-wide
+	 * until for limits that are not model-scoped, plus one entry per exhausted
+	 * model-scoped limit. A model-scoped limit must not take the whole credential
+	 * out of rotation for other models.
+	 */
+	#exhaustedLimitBlockTargets(
+		report: UsageReport,
+		nowMs: number,
+	): { wideUntil?: number; scoped: Array<{ modelId: string; untilMs: number }> } {
+		let wideUntil: number | undefined;
+		const scoped: Array<{ modelId: string; untilMs: number }> = [];
+		for (const limit of report.limits) {
+			if (!this.#isUsageLimitExhausted(limit)) continue;
+			const resetsAt = limit.window?.resetsAt;
+			if (!resetsAt || resetsAt <= nowMs) continue;
+			const scopeModel = limit.scope?.modelId?.trim();
+			const tier = limit.scope?.tier?.trim().toLowerCase();
+			if (!scopeModel && !(tier && MODEL_FAMILY_TIERS.has(tier))) {
+				wideUntil = wideUntil === undefined ? resetsAt : Math.min(wideUntil, resetsAt);
+				continue;
+			}
+			scoped.push({ modelId: scopeModel ?? tier!, untilMs: resetsAt });
+		}
+		return wideUntil === undefined ? { scoped } : { wideUntil, scoped };
 	}
 
 	async #getUsageReport(
@@ -5671,7 +5760,15 @@ export class AuthStorage {
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object; rowId?: number },
+		options?: {
+			retryAfterMs?: number;
+			baseUrl?: string;
+			signal?: AbortSignal;
+			owner?: object;
+			rowId?: number;
+			/** Scope the block to one model; other models keep using the credential. */
+			modelId?: string;
+		},
 	): Promise<UsageLimitMarkResult> {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
@@ -5692,11 +5789,19 @@ export class AuthStorage {
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
+		// Model-scoped exhausted limits only constrain their own model; an
+		// unscoped or shared limit raises the credential-wide backoff.
+		let scopedBlocks: Array<{ modelId: string; untilMs: number }> = [];
+		let reportHasWideLimit = false;
 		if (initial.credential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
 			const report = await this.#getUsageReport(provider, initial.credential, options);
-			if (report && this.#isUsageLimitReached(report)) {
-				const resetAtMs = this.#getUsageResetAtMs(report, Date.now());
-				if (resetAtMs && resetAtMs > blockedUntil) blockedUntil = resetAtMs;
+			if (report) {
+				const targets = this.#exhaustedLimitBlockTargets(report, Date.now());
+				if (targets.wideUntil !== undefined) {
+					reportHasWideLimit = true;
+					if (targets.wideUntil > blockedUntil) blockedUntil = targets.wideUntil;
+				}
+				scopedBlocks = targets.scoped;
 			}
 		}
 
@@ -5714,7 +5819,11 @@ export class AuthStorage {
 						candidate.entry.credential.type === credentialKind &&
 						candidate.entry.id !== failedRowId &&
 						(!enabledIds || enabledIds.has(candidate.entry.id)) &&
-						!this.#isCredentialBlocked(this.#getProviderTypeKey(provider, credentialKind), candidate.index),
+						!this.#isCredentialBlocked(
+							this.#getProviderTypeKey(provider, credentialKind),
+							candidate.index,
+							options?.modelId,
+						),
 				)
 				.map(candidate => candidate.entry.id);
 		};
@@ -5727,7 +5836,15 @@ export class AuthStorage {
 			};
 		}
 		const providerKey = this.#getProviderTypeKey(provider, credentialKind);
-		this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
+		// A report whose only exhausted limits are model-scoped must not take the
+		// whole credential out of rotation; the caller's retry-after backoff applies
+		// to those models instead.
+		if (!(scopedBlocks.length > 0 && !reportHasWideLimit)) {
+			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil, options?.modelId);
+		}
+		for (const scoped of scopedBlocks) {
+			this.#markCredentialBlocked(providerKey, targetIndex, scoped.untilMs, scoped.modelId);
+		}
 		return {
 			state: "marked",
 			failedRowId,
@@ -5892,7 +6009,11 @@ export class AuthStorage {
 			args.order.map(async idx => {
 				const selection = args.credentials[idx];
 				if (!selection) return null;
-				const blockedUntil = this.#getCredentialBlockedUntil(args.providerKey, selection.index);
+				const blockedUntil = this.#getCredentialBlockedUntil(
+					args.providerKey,
+					selection.index,
+					args.options?.modelId,
+				);
 				if (blockedUntil !== undefined) return { selection, usage: null, usageChecked: false, blockedUntil };
 				const usage = await this.#getUsageReport(args.provider, selection.credential, {
 					baseUrl: args.options?.baseUrl,
@@ -5930,13 +6051,29 @@ export class AuthStorage {
 			const { selection, usage, usageChecked } = result;
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
-			if (!blocked && usage && this.#isUsageLimitReached(usage)) {
-				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs);
+			if (!blocked && usage && this.#isUsageLimitReached(usage, args.options?.modelId)) {
+				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs, args.options?.modelId);
 				blockedUntil = resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs;
-				this.#markCredentialBlocked(args.providerKey, selection.index, blockedUntil);
+				const targets = this.#exhaustedLimitBlockTargets(usage, nowMs);
+				if (targets.wideUntil === undefined && targets.scoped.length > 0) {
+					for (const scoped of targets.scoped) {
+						this.#markCredentialBlocked(args.providerKey, selection.index, scoped.untilMs, scoped.modelId);
+					}
+				} else {
+					this.#markCredentialBlocked(args.providerKey, selection.index, blockedUntil);
+				}
 				blocked = true;
 			}
-			const windows = usage ? strategy.findWindowLimits(usage) : undefined;
+			// Rank on the windows that apply to the requested model so a limit scoped
+			// to another model does not depress this credential's drain metrics.
+			const scopedUsage =
+				usage && args.options?.modelId
+					? {
+							...usage,
+							limits: usage.limits.filter(limit => this.#limitAppliesToModel(limit, args.options?.modelId)),
+						}
+					: usage;
+			const windows = scopedUsage ? strategy.findWindowLimits(scopedUsage) : undefined;
 			const primary = windows?.primary;
 			const secondary = windows?.secondary;
 			const secondaryTarget = secondary ?? primary;
@@ -6063,7 +6200,8 @@ export class AuthStorage {
 		// (no preference) and sessions whose preferred is blocked still rank, so we pick the account
 		// with the most headroom proactively and fall back intelligently when rate-limited.
 		const sessionPreferredIsAvailable =
-			sessionPreferredIndex !== undefined && !this.#isCredentialBlocked(providerKey, sessionPreferredIndex);
+			sessionPreferredIndex !== undefined &&
+			!this.#isCredentialBlocked(providerKey, sessionPreferredIndex, options?.modelId);
 		const shouldRank = !selectedCredential && checkUsage && !sessionPreferredIsAvailable;
 		const candidates = shouldRank
 			? await this.#rankOAuthSelections({ providerKey, provider, order, credentials, options, strategy: strategy! })
@@ -6103,7 +6241,7 @@ export class AuthStorage {
 		if (!selectedCredential && sessionPreferredIndex !== undefined) {
 			const sessionPreferredCandidate = candidates.findIndex(
 				candidate =>
-					!this.#isCredentialBlocked(providerKey, candidate.selection.index) &&
+					!this.#isCredentialBlocked(providerKey, candidate.selection.index, options?.modelId) &&
 					candidate.selection.index === sessionPreferredIndex,
 			);
 			if (sessionPreferredCandidate > 0) {
@@ -6169,7 +6307,7 @@ export class AuthStorage {
 			if (resolved) return resolved;
 		}
 
-		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index)) {
+		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index, options?.modelId)) {
 			return this.#tryOAuthCredential(
 				provider,
 				fallback.selection,
@@ -6566,7 +6704,7 @@ export class AuthStorage {
 	): Promise<OAuthResolutionResult | undefined> {
 		const { checkUsage, allowBlocked, prefetchedUsage = null, usagePrechecked = false } = usageOptions;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
-		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
+		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index, options?.modelId)) {
 			return undefined;
 		}
 
@@ -6588,8 +6726,8 @@ export class AuthStorage {
 				});
 				usageChecked = true;
 			}
-			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
-				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
+			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
+				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
 				this.#markCredentialBlocked(
 					providerKey,
 					selection.index,
@@ -6670,8 +6808,8 @@ export class AuthStorage {
 					});
 					usageChecked = true;
 				}
-				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
-					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
+				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
+					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
 					this.#markCredentialBlocked(
 						providerKey,
 						selection.index,

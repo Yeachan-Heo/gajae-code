@@ -126,6 +126,39 @@ async function writeInstructionFileNoFollow(destination: string, content: string
 	}
 }
 
+async function writeAgentFileNoFollow(
+	destination: string,
+	content: string,
+	project: boolean,
+	createOnly: boolean,
+): Promise<void> {
+	const destinationDirectory = path.dirname(destination);
+	if (project) {
+		const agentsRoot = path.dirname(destinationDirectory);
+		const agentRoot = path.dirname(agentsRoot);
+		await ensureRealDirectoryPathNoFollow(agentRoot, path.dirname(agentRoot), "agent destination", true, 0o700);
+		await ensureRealDirectoryPathNoFollow(agentsRoot, agentRoot, "agent destination", true, 0o700);
+		await ensureRealDirectoryPathNoFollow(destinationDirectory, agentsRoot, "agent destination", true, 0o700);
+	} else {
+		await ensureInstructionDirectory(destinationDirectory, false, "agent destination");
+	}
+	const handle = await fs.open(
+		destination,
+		createOnly
+			? fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_NOFOLLOW
+			: fsSync.constants.O_WRONLY |
+					fsSync.constants.O_CREAT |
+					fsSync.constants.O_TRUNC |
+					fsSync.constants.O_NOFOLLOW,
+		0o666,
+	);
+	try {
+		await handle.writeFile(content, "utf-8");
+	} finally {
+		await handle.close();
+	}
+}
+
 async function writeCommandFileNoFollow(
 	destination: string,
 	content: string,
@@ -211,6 +244,14 @@ export async function executeActions(
 					options?.project ?? false,
 				);
 				out.push(action);
+			} else if (action.type === "agent" && action.agent && action.destination) {
+				await writeAgentFileNoFollow(
+					action.destination,
+					action.agent.content,
+					options?.project ?? false,
+					action.operation === "create",
+				);
+				out.push(action);
 			} else if (action.type === "command" && action.command && action.destination && action.name) {
 				await writeCommandFileNoFollow(
 					action.destination,
@@ -225,7 +266,7 @@ export async function executeActions(
 			}
 		} catch (error) {
 			if (
-				action.type === "command" &&
+				(action.type === "command" || action.type === "agent") &&
 				action.operation === "create" &&
 				(error as NodeJS.ErrnoException).code === "EEXIST"
 			) {

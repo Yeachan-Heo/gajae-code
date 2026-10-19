@@ -22,6 +22,7 @@ export const opencodeAdapter: Adapter = {
 			mcpCandidates: [],
 			skillCandidates: [],
 			slashCommandCandidates: [],
+			agentCandidates: [],
 			instructionCandidates: [],
 			diagnostics: [],
 		};

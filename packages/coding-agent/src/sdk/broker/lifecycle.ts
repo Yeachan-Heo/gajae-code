@@ -951,6 +951,14 @@ type SessionLaunch = {
 	modelId?: string;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
+	/**
+	 * Per-session environment for the hosted session (#6735). Applied to the
+	 * session host's spawn environment (and therefore inherited by its Bash
+	 * executor) on top of the broker's own environment, after `unsetEnv` has
+	 * removed inherited names. Broker-reserved `GJC_*` names are rejected.
+	 */
+	env?: Record<string, string>;
+	unsetEnv?: string[];
 	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
 	coordinatorStateDir?: string;
 	coordinatorSessionId?: string;
@@ -963,6 +971,85 @@ type SessionLaunch = {
 };
 
 const CREDENTIAL_NAME_PATTERN = /(?:token|secret|password|credential|api[_-]?key|auth|cookie)/iu;
+const SESSION_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+const SESSION_ENV_MAX_ENTRIES = 256;
+const SESSION_ENV_MAX_VALUE_LENGTH = 131_072;
+
+function isSessionEnvName(name: unknown): name is string {
+	return (
+		typeof name === "string" &&
+		name.length <= 256 &&
+		SESSION_ENV_NAME_PATTERN.test(name) &&
+		// GJC_* carries broker-issued launch authority (request, effect marker,
+		// state root, coordinator correlation); a caller must not shadow it.
+		!name.toUpperCase().startsWith("GJC_")
+	);
+}
+
+const sessionEnvKey = (name: string): string => (process.platform === "win32" ? name.toUpperCase() : name);
+
+/**
+ * Validates the optional per-session `env`/`unsetEnv` pair (#6735). Returns
+ * null when either is malformed so the caller fails the launch closed.
+ */
+export function lifecycleSessionEnv(input: {
+	env?: unknown;
+	unsetEnv?: unknown;
+}): { env?: Record<string, string>; unsetEnv?: string[] } | null {
+	let env: Record<string, string> | undefined;
+	if (input.env !== undefined) {
+		if (input.env === null || typeof input.env !== "object" || Array.isArray(input.env)) return null;
+		const entries = Object.entries(input.env as Record<string, unknown>);
+		if (entries.length > SESSION_ENV_MAX_ENTRIES) return null;
+		const seen = new Set<string>();
+		for (const [name, value] of entries) {
+			if (
+				!isSessionEnvName(name) ||
+				typeof value !== "string" ||
+				value.length > SESSION_ENV_MAX_VALUE_LENGTH ||
+				value.includes("\0") ||
+				seen.has(sessionEnvKey(name))
+			)
+				return null;
+			seen.add(sessionEnvKey(name));
+		}
+		env = Object.fromEntries(entries) as Record<string, string>;
+	}
+	let unsetEnv: string[] | undefined;
+	if (input.unsetEnv !== undefined) {
+		if (!Array.isArray(input.unsetEnv) || input.unsetEnv.length > SESSION_ENV_MAX_ENTRIES) return null;
+		const keys = new Set<string>();
+		for (const name of input.unsetEnv) {
+			if (!isSessionEnvName(name) || keys.has(sessionEnvKey(name))) return null;
+			keys.add(sessionEnvKey(name));
+		}
+		// Setting and unsetting the same name is contradictory, not a precedence question.
+		if (env && Object.keys(env).some(name => keys.has(sessionEnvKey(name)))) return null;
+		unsetEnv = [...(input.unsetEnv as string[])];
+	}
+	return { ...(env ? { env } : {}), ...(unsetEnv ? { unsetEnv } : {}) };
+}
+
+/**
+ * Composes the inherited part of a lifecycle session host's environment:
+ * drops the process-local master capability, every `unsetEnv` name, and any
+ * inherited name an explicit per-session `env` entry replaces (case-folded on
+ * Windows so `Path` and `PATH` never both reach the child), then layers the
+ * per-session `env` on top. Broker-issued `GJC_*` keys are applied after this.
+ */
+export function lifecycleSessionHostBaseEnv(
+	inherited: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>,
+	launch: { env?: Readonly<Record<string, string>>; unsetEnv?: readonly string[] },
+): Record<string, string> {
+	const removed = new Set([...(launch.unsetEnv ?? []), ...Object.keys(launch.env ?? {})].map(sessionEnvKey));
+	// Valid names like `__proto__` must remain own environment entries.
+	const base = Object.create(null) as Record<string, string>;
+	for (const [name, value] of Object.entries(inherited)) {
+		if (name === "GJC_MASTER_CAPABILITY" || typeof value !== "string" || removed.has(sessionEnvKey(name))) continue;
+		base[name] = value;
+	}
+	return { ...base, ...launch.env };
+}
 
 function lifecycleLaunchKnownSecrets(launch: SessionLaunch): string[] {
 	const secrets = [
@@ -985,6 +1072,9 @@ function lifecycleLaunchKnownSecrets(launch: SessionLaunch): string[] {
 				.filter(([name, value]) => value && CREDENTIAL_NAME_PATTERN.test(name))
 				.map(([, value]) => value);
 		}),
+		...Object.entries(launch.env ?? {})
+			.filter(([name, value]) => value && CREDENTIAL_NAME_PATTERN.test(name))
+			.map(([, value]) => value),
 	];
 	return [...new Set(secrets.filter(secret => typeof secret === "string" && secret.length > 0))];
 }
@@ -5998,6 +6088,12 @@ async function launchInput(
 	if (input.mcpServers !== undefined && !isSessionLifecycleMcpServers(input.mcpServers))
 		return fail("invalid_input", "mcpServers must contain unique valid stdio, HTTP, or SSE server definitions.");
 	const mcpServers = input.mcpServers as SessionLifecycleMcpServer[] | undefined;
+	const sessionEnv = lifecycleSessionEnv(input);
+	if (!sessionEnv)
+		return fail(
+			"invalid_input",
+			"env must map valid non-GJC_ variable names to strings, and unsetEnv must list distinct valid names not also set in env.",
+		);
 
 	/**
 	 * Prepared readiness is an explicit creation-only intent. Only the two exact
@@ -6047,6 +6143,7 @@ async function launchInput(
 			modelId,
 			modelPreset,
 			mcpServers,
+			...sessionEnv,
 			worktree,
 			worktreePlan,
 			...(readiness ? { readiness } : {}),
@@ -6070,6 +6167,7 @@ async function launchInput(
 			sessionIdentity: saved.identity,
 			modelPreset,
 			mcpServers,
+			...sessionEnv,
 			worktree,
 			worktreePlan,
 			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
@@ -6104,6 +6202,7 @@ async function launchInput(
 		modelId,
 		modelPreset,
 		mcpServers,
+		...sessionEnv,
 		worktree,
 		worktreePlan,
 		...(coordinatorStateDir ? { coordinatorStateDir } : {}),
@@ -7160,12 +7259,9 @@ async function executeLifecycleResponse(
 					stdio: ["ignore", "ignore", childStderrSink?.drainer.stdin ?? "ignore"],
 					env: {
 						// Master capability is process-local to direct Bash children and must
-						// never cross a broker lifecycle launch boundary.
-						...Object.fromEntries(
-							Object.entries("kind" in cmd ? cmd.env : process.env).filter(
-								([key]) => key !== "GJC_MASTER_CAPABILITY",
-							),
-						),
+						// never cross a broker lifecycle launch boundary. Per-session env
+						// (#6735) is layered here, below the broker-issued GJC_* keys.
+						...lifecycleSessionHostBaseEnv("kind" in cmd ? cmd.env : process.env, launch),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,

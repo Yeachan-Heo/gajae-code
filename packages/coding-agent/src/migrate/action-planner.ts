@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { FileType, glob } from "@gajae-code/natives";
 import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
 import { readMCPConfigFile, validateServerName } from "../runtime-mcp/config-writer";
+import { PROTECTED_AGENT_NAMES } from "./adapters";
 import { mapMcpEntry } from "./mcp-mapper";
 import { slugify } from "./skill-normalizer";
 import type { AdapterResult, MigrateAction, MigrateDestinations, MigrateWarning } from "./types";
@@ -729,6 +730,94 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				});
 			}
 			plannedCommands.set(collisionKey, { name: effectiveName, destination, segments: destinationSegments });
+		}
+	}
+
+	// 6. Subagents — one flat `<name>.md` per agent. An imported agent must never
+	// shadow a bundled role, so a colliding name is namespaced under its source.
+	const plannedAgents = new Map<string, { name: string; destination: string }>();
+	const validAgentName = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+	for (const result of input.results) {
+		for (const candidate of result.agentCandidates) {
+			const warnings = [...candidate.warnings];
+			let name = candidate.name;
+			if (PROTECTED_AGENT_NAMES.has(name.toLowerCase())) {
+				name = `${candidate.source}-${name}`;
+				warnings.push(
+					`renamed agent "${candidate.name}" to "${name}" so the bundled ${candidate.name} role stays authoritative`,
+				);
+			}
+			if (!validAgentName.test(name)) {
+				actions.push({
+					source: candidate.source,
+					type: "agent",
+					name,
+					operation: "fail",
+					status: "failed_invalid_source",
+					reason: "agent name must use letters, numbers, dots, underscores, or hyphens",
+				});
+				continue;
+			}
+
+			const destination = path.join(input.destinations.agentsDir, `${name}.md`);
+			const collisionKey = path.resolve(destination).toLowerCase();
+			const base = {
+				source: candidate.source,
+				type: "agent" as const,
+				name,
+				destination,
+				...(warnings.length > 0 ? { warnings } : {}),
+			};
+			const planned = plannedAgents.get(collisionKey);
+			if (planned) {
+				actions.push({
+					...base,
+					operation: input.force ? "update" : "skip",
+					status: input.force ? "updated" : "skipped_exists",
+					reason: `duplicate agent destination with "${planned.name}"`,
+					...(input.force ? { agent: { content: candidate.content } } : {}),
+				});
+				continue;
+			}
+
+			let exists = false;
+			try {
+				const stat = await fs.lstat(destination);
+				exists = true;
+				if (!stat.isFile() || stat.isSymbolicLink()) {
+					actions.push({
+						...base,
+						operation: input.force ? "fail" : "skip",
+						status: input.force ? "failed_invalid_destination" : "skipped_exists",
+						reason: "destination is not a regular file; refusing to replace it",
+					});
+					plannedAgents.set(collisionKey, { name, destination });
+					continue;
+				}
+			} catch (error) {
+				if (!isEnoent(error)) {
+					actions.push({
+						...base,
+						operation: "fail",
+						status: "failed_io",
+						reason: `failed to inspect destination: ${(error as Error).message}`,
+					});
+					plannedAgents.set(collisionKey, { name, destination });
+					continue;
+				}
+			}
+
+			if (exists && !input.force) {
+				actions.push({ ...base, operation: "skip", status: "skipped_exists" });
+			} else {
+				actions.push({
+					...base,
+					operation: exists ? "update" : "create",
+					status: exists ? "updated" : "imported",
+					agent: { content: candidate.content },
+				});
+			}
+			plannedAgents.set(collisionKey, { name, destination });
 		}
 	}
 

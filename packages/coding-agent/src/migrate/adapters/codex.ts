@@ -52,6 +52,7 @@ export const codexAdapter: Adapter = {
 			mcpCandidates: [],
 			skillCandidates: [],
 			slashCommandCandidates: [],
+			agentCandidates: [],
 			instructionCandidates: [],
 			diagnostics: [],
 		};

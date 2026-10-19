@@ -202,14 +202,24 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 }
 
 /** Build the filesystem authority for a provider read. */
-export function getReadOptions(
-	ctx: Pick<
-		LoadContext,
-		"home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity" | "bypassCache"
-	>,
-	scope: ReadScope,
-): ReadFileOptions | undefined {
-	if (!ctx.isolatedHome) return ctx.bypassCache ? { bypassCache: true } : undefined;
+type DiscoveryReadContext = Pick<
+	LoadContext,
+	"home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity" | "bypassCache"
+> & {
+	repoRoot?: string | null;
+	cwd?: string;
+};
+
+export function getReadOptions(ctx: DiscoveryReadContext, scope: ReadScope): ReadFileOptions | undefined {
+	if (!ctx.isolatedHome) {
+		const boundary = scope === "project" ? (ctx.repoRoot ?? ctx.cwd) : undefined;
+		if (!boundary) return ctx.bypassCache ? { bypassCache: true } : undefined;
+		return {
+			...(ctx.bypassCache ? { bypassCache: true as const } : {}),
+			containmentRoot: boundary,
+			scope,
+		};
+	}
 	return {
 		isolatedHome: true,
 		home: ctx.home,
@@ -222,15 +232,14 @@ export function getReadOptions(
 }
 
 export async function getReadOptionsForContainment(
-	ctx: Pick<
-		LoadContext,
-		"home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity" | "bypassCache"
-	>,
+	ctx: DiscoveryReadContext,
 	scope: ReadScope,
 	containmentRoot?: string,
 ): Promise<ReadFileOptions | undefined> {
 	const options = getReadOptions(ctx, scope);
-	if (!options || !containmentRoot) return options;
+	// Ordinary reads keep the repository boundary from getReadOptions. The extra
+	// root is an isolated-home constraint and was not applied on this path before.
+	if (!ctx.isolatedHome || !options || !containmentRoot) return options;
 	const containmentRootIdentity = await capturePathIdentity(containmentRoot);
 	if (!containmentRootIdentity) return undefined;
 	return { ...options, containmentRoot, containmentRootIdentity };

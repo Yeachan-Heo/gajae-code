@@ -1,6 +1,6 @@
 /**
  * Claude Code adapter: reads MCP servers, user skills, selected-scope commands,
- * and the selected scope's `CLAUDE.md`.
+ * selected-scope subagents, and the selected scope's `CLAUDE.md`.
  */
 import * as path from "node:path";
 import type { AdapterResult, McpCandidate } from "../types";
@@ -8,6 +8,7 @@ import {
 	type Adapter,
 	type AdapterOptions,
 	collectInstructionFile,
+	collectMarkdownAgents,
 	collectMarkdownCommands,
 	collectSkillDir,
 	parseSourceJson,
@@ -23,6 +24,7 @@ export const claudeCodeAdapter: Adapter = {
 			mcpCandidates: [],
 			skillCandidates: [],
 			slashCommandCandidates: [],
+			agentCandidates: [],
 			instructionCandidates: [],
 			diagnostics: [],
 		};
@@ -54,6 +56,12 @@ export const claudeCodeAdapter: Adapter = {
 		const commands = await collectMarkdownCommands(commandsDir, SOURCE, { recursive: true });
 		result.slashCommandCandidates.push(...commands.candidates);
 		result.diagnostics.push(...commands.diagnostics);
+
+		const agentsDir =
+			scope === "project" ? path.join(cwd, ".claude", "agents") : path.join(homeDir, ".claude", "agents");
+		const agents = await collectMarkdownAgents(agentsDir, SOURCE);
+		result.agentCandidates.push(...agents.candidates);
+		result.diagnostics.push(...agents.diagnostics);
 
 		const instructionsPath =
 			scope === "project" ? path.join(cwd, "CLAUDE.md") : path.join(homeDir, ".claude", "CLAUDE.md");

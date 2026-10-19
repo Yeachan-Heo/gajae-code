@@ -101,6 +101,10 @@ export type SessionCreateTarget = SessionLifecycleCoordinatorTarget & {
 	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
+	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
+	readonly env?: Readonly<Record<string, string>>;
+	/** Inherited broker environment names removed from the hosted session (#6735). */
+	readonly unsetEnv?: readonly string[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readiness?: "immediate" | "deferred";
 	readonly readinessTimeoutMs?: number;
@@ -115,6 +119,10 @@ export type SessionForkTarget = SessionLifecycleCoordinatorTarget & {
 	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
+	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
+	readonly env?: Readonly<Record<string, string>>;
+	/** Inherited broker environment names removed from the hosted session (#6735). */
+	readonly unsetEnv?: readonly string[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readinessTimeoutMs?: number;
 };
@@ -128,6 +136,10 @@ export type SessionResumeTarget = SessionLifecycleCoordinatorTarget & {
 	readonly body?: string;
 	readonly modelPreset?: string;
 	readonly mcpServers?: readonly Record<string, unknown>[];
+	/** Per-session environment for the hosted session; `GJC_*` names are reserved (#6735). */
+	readonly env?: Readonly<Record<string, string>>;
+	/** Inherited broker environment names removed from the hosted session (#6735). */
+	readonly unsetEnv?: readonly string[];
 	readonly worktree?: SessionLifecycleWorktreeTarget;
 	readonly readinessTimeoutMs?: number;
 };

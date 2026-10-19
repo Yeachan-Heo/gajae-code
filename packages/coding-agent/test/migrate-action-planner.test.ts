@@ -21,6 +21,7 @@ beforeEach(async () => {
 		mcpConfigPath: path.join(tmp, "mcp.json"),
 		skillsDir: path.join(tmp, "skills"),
 		commandsDir: path.join(tmp, ".gjc", "commands"),
+		agentsDir: path.join(tmp, ".gjc", "agents"),
 		instructionsPath: path.join(tmp, "AGENTS.md"),
 	};
 });
@@ -46,6 +47,7 @@ function result(partial: Partial<AdapterResult>): AdapterResult {
 		mcpCandidates: [],
 		skillCandidates: [],
 		slashCommandCandidates: [],
+		agentCandidates: [],
 		instructionCandidates: [],
 		diagnostics: [],
 		...partial,

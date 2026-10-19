@@ -16,7 +16,7 @@ export const MIGRATE_SOURCES: readonly MigrateSource[] = ["claude-code", "codex"
 export const CANONICAL_SOURCE_ORDER: readonly MigrateSource[] = MIGRATE_SOURCES;
 
 /** What kind of thing an action/coverage row is about. */
-export type MigrateItemType = "mcp" | "skill" | "command" | "instruction" | "source";
+export type MigrateItemType = "mcp" | "skill" | "command" | "agent" | "instruction" | "source";
 
 /**
  * Per-item outcome taxonomy.
@@ -84,6 +84,16 @@ export interface InstructionCandidate {
 	content: string;
 }
 
+/** A Markdown subagent collected from a foreign coding-agent setup. */
+export interface AgentCandidate {
+	source: MigrateSource;
+	/** Agent name exactly as it will be loaded from `<agentsDir>/<name>.md`. */
+	name: string;
+	/** Full Markdown content with normalized GJC frontmatter. */
+	content: string;
+	warnings: string[];
+}
+
 /** A Markdown slash command collected from a foreign coding-agent setup. */
 export interface SlashCommandCandidate {
 	source: MigrateSource;
@@ -109,6 +119,7 @@ export interface AdapterResult {
 	mcpCandidates: McpCandidate[];
 	skillCandidates: SkillCandidate[];
 	slashCommandCandidates: SlashCommandCandidate[];
+	agentCandidates: AgentCandidate[];
 	instructionCandidates: InstructionCandidate[];
 	diagnostics: SourceDiagnostic[];
 }
@@ -130,6 +141,7 @@ export interface MigrateAction {
 	mcp?: { config: MCPServerConfig; force: boolean };
 	skill?: { content: string };
 	command?: { content: string };
+	agent?: { content: string };
 	instruction?: { content: string };
 }
 
@@ -146,6 +158,7 @@ export interface MigrateDestinations {
 	mcpConfigPath: string;
 	skillsDir: string;
 	commandsDir: string;
+	agentsDir: string;
 	instructionsPath: string;
 }
 
@@ -163,6 +176,7 @@ export interface MigrateReport {
 			mcp: StatusCounts;
 			skill: StatusCounts;
 			command: StatusCounts;
+			agent: StatusCounts;
 			instruction: StatusCounts;
 			source: StatusCounts;
 		};
