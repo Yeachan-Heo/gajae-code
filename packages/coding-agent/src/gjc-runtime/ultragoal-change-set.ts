@@ -226,6 +226,12 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 			if (!best || ahead < best.ahead) best = { ref: candidate, ahead };
 		}
 		if (best) return best.ref;
+		// A standalone fixture or freshly cloned repository may have only its
+		// checked-out `main` ref. It is the authoritative baseline in that shape;
+		// retain the exclusion above whenever another integration ref exists.
+		if (currentBranch.ok && ["refs/heads/main", "refs/heads/master"].includes(currentBranch.stdout.trim())) {
+			return currentBranch.stdout.trim().slice("refs/heads/".length);
+		}
 	}
 	throw new Error("unable to resolve an authoritative integration base");
 }
