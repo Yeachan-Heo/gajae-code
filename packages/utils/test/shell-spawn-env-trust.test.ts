@@ -17,6 +17,16 @@ const PROBE = path.join(import.meta.dir, "fixtures", "shell-spawn-env-probe.ts")
 const HOOK_KEYS = [
 	"BASH_ENV",
 	"BUN_OPTIONS",
+	"PERLLIB",
+	"_JAVA_OPTIONS",
+	"NPM_CONFIG_NODE_OPTIONS",
+	"RIPGREP_CONFIG_PATH",
+	"TAR_OPTIONS",
+	"RSYNC_RSH",
+	"MAKEFLAGS",
+	"MAKEFILES",
+	"SHELLOPTS",
+	"PS4",
 	"NODE_OPTIONS",
 	"PYTHONPATH",
 	"PYTHONUSERBASE",
@@ -56,6 +66,7 @@ type Probe = Record<
 > & {
 	PROJECT_DYNAMIC_BASH_ENV: boolean;
 	PROJECT_HAS_BASH_ENV_VALUE: boolean;
+	NPM_NODE_OPTIONS_NAMES: string[];
 };
 
 const tempDirs: string[] = [];
@@ -287,5 +298,68 @@ describe("bash spawn env interpreter injection", () => {
 			JDK_JAVA_OPTIONS: "-XX:+UseContainerSupport",
 			LD_LIBRARY_PATH: "/opt/cuda/lib64",
 		});
+	});
+});
+
+describe("bash spawn env tool configuration programs", () => {
+	for (const autoload of [true, false]) {
+		it(`drops project tool-config and sibling injection declarations (autoload=${autoload})`, async () => {
+			const probe = await probeIn(
+				tempDir(
+					[
+						"PERLLIB=./lib",
+						"_JAVA_OPTIONS=-javaagent:./a.jar",
+						"NPM_CONFIG_NODE_OPTIONS=--require ./r.js",
+						"RIPGREP_CONFIG_PATH=./rgconfig",
+						"TAR_OPTIONS=--use-compress-program=./x.sh",
+						"RSYNC_RSH=./x.sh",
+						"MAKEFLAGS=SHELL=./x.sh",
+						"MAKEFILES=./inc.mk",
+						"SHELLOPTS=xtrace",
+						"PS4='$(./x.sh)'",
+						"",
+					].join("\n"),
+				),
+				autoload,
+			);
+			expect(probe).toMatchObject({
+				PERLLIB: null,
+				_JAVA_OPTIONS: null,
+				NPM_CONFIG_NODE_OPTIONS: null,
+				RIPGREP_CONFIG_PATH: null,
+				TAR_OPTIONS: null,
+				RSYNC_RSH: null,
+				MAKEFLAGS: null,
+				MAKEFILES: null,
+				SHELLOPTS: null,
+				PS4: null,
+			});
+		});
+	}
+
+	// npm reads `npm_config_*` in any case and treats `-` like `_`, so every
+	// spelling a dotenv file can declare must be dropped, not just the two
+	// canonical ones.
+	for (const name of [
+		"npm_config_Node_Options",
+		"Npm_Config_Node_Options",
+		"npm_config_node-options",
+		"npm_config_script_shell",
+		"NPM_CONFIG_SCRIPT-SHELL",
+	]) {
+		for (const autoload of [true, false]) {
+			it(`drops a project ${name} declaration (autoload=${autoload})`, async () => {
+				const probe = await probeIn(tempDir(`${name}=./planted\n`), autoload);
+				expect(probe.NPM_NODE_OPTIONS_NAMES).toEqual([]);
+			});
+		}
+	}
+
+	it("keeps tool configuration the launching shell exported", async () => {
+		const probe = await probeIn(tempDir("RIPGREP_CONFIG_PATH=./rgconfig\nMAKEFLAGS=SHELL=./x.sh\n"), true, {
+			RIPGREP_CONFIG_PATH: "/home/operator/.ripgreprc",
+			MAKEFLAGS: "-j8",
+		});
+		expect(probe).toMatchObject({ RIPGREP_CONFIG_PATH: "/home/operator/.ripgreprc", MAKEFLAGS: "-j8" });
 	});
 });

@@ -16,6 +16,16 @@ import * as path from "node:path";
 const PROBE = path.join(import.meta.dir, "fixtures", "bash-project-hook-probe.ts");
 const HOOK_KEYS = [
 	"BASH_ENV",
+	"PERLLIB",
+	"_JAVA_OPTIONS",
+	"npm_config_node_options",
+	"RIPGREP_CONFIG_PATH",
+	"TAR_OPTIONS",
+	"RSYNC_RSH",
+	"MAKEFLAGS",
+	"MAKEFILES",
+	"SHELLOPTS",
+	"PS4",
 	"NODE_OPTIONS",
 	"PYTHONPATH",
 	"PYTHONUSERBASE",
@@ -230,6 +240,80 @@ describe.skipIf(process.platform === "win32")("bash tool ignores project .env ho
 				);
 				return `PERL5OPT=-MPlanted\nPERL5LIB=${cwd}\n`;
 			},
+		},
+		{
+			name: "PERLLIB",
+			binary: "perl",
+			command: "perl -e 'use strict; 1'",
+			plant: ({ cwd, marker }) => {
+				const lib = path.join(cwd, "perllib");
+				fs.mkdirSync(lib);
+				fs.writeFileSync(
+					path.join(lib, "strict.pm"),
+					`open(my $f, ">", ${JSON.stringify(marker)}); close $f; package strict; sub import {} 1;\n`,
+				);
+				return `PERLLIB=${lib}\n`;
+			},
+		},
+		{
+			name: "RIPGREP_CONFIG_PATH",
+			binary: "rg",
+			command: "rg needle needle.txt",
+			plant: ({ cwd, hook }) => {
+				fs.writeFileSync(path.join(cwd, "needle.txt"), "needle\n");
+				fs.writeFileSync(path.join(cwd, "rgconfig"), `--pre=${hook}\n`);
+				return `RIPGREP_CONFIG_PATH=${path.join(cwd, "rgconfig")}\n`;
+			},
+		},
+		{
+			name: "TAR_OPTIONS",
+			binary: "tar",
+			command: "tar tf archive.tar",
+			plant: ({ cwd, hook }) => {
+				fs.writeFileSync(path.join(cwd, "member.txt"), "x\n");
+				const tar = Bun.spawnSync(["tar", "cf", "archive.tar", "member.txt"], { cwd });
+				if (tar.exitCode !== 0) throw new Error(`tar failed: ${tar.stderr.toString()}`);
+				return `TAR_OPTIONS=--use-compress-program=${hook}\n`;
+			},
+		},
+		{
+			name: "RSYNC_RSH",
+			binary: "rsync",
+			command: "rsync member.txt remote:/tmp/",
+			plant: ({ cwd, hook }) => {
+				fs.writeFileSync(path.join(cwd, "member.txt"), "x\n");
+				return `RSYNC_RSH=${hook}\n`;
+			},
+		},
+		{
+			name: "MAKEFLAGS",
+			binary: "make",
+			command: "make",
+			plant: ({ cwd, hook }) => {
+				fs.writeFileSync(path.join(cwd, "Makefile"), "all:\n\t@true\n");
+				return `MAKEFLAGS=SHELL=${hook}\n`;
+			},
+		},
+		{
+			// npm reads `npm_config_*` in any case and treats `-` like `_`; the
+			// mixed-case, dashed spelling reaches lifecycle scripts through npm.
+			name: "npm_config_Script-Shell",
+			binary: "npm",
+			command: "npm run -s probe",
+			plant: ({ cwd, hook }) => {
+				fs.writeFileSync(
+					path.join(cwd, "package.json"),
+					JSON.stringify({ name: "probe", version: "1.0.0", scripts: { probe: "true" } }),
+				);
+				return `npm_config_Script-Shell=${hook}\n`;
+			},
+		},
+		{
+			name: "SHELLOPTS",
+			binary: "bash",
+			command: "bash -c true",
+			// Single quotes keep the dotenv value literal: bash, not dotenv, expands it.
+			plant: ({ hook }) => `SHELLOPTS=xtrace\nPS4='$(${hook})'\n`,
 		},
 	];
 	for (const vector of RUNTIME_VECTORS) {

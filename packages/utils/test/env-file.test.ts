@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseEnvFileContent, projectEnvSnapshot } from "../src/env-file";
+import { canonicalEnvKey, parseEnvFileContent, projectEnvSnapshot } from "../src/env-file";
 
 const tempDirs: string[] = [];
 
@@ -105,6 +105,92 @@ describe("parseEnvFileContent dotenv comment properties", () => {
 		const expected = Object.fromEntries(cases.map(({ key, expected }) => [key, expected]));
 		expect(parseEnvFileContent(dotenv), `seed ${seed}`).toEqual(expected);
 		expect(bunValues, `seed ${seed}`).toEqual(expected);
+	}, 15_000);
+});
+
+describe("projectEnvSnapshot non-identifier declaration properties", () => {
+	test("marks seeded Bun-loaded npm key variants dynamic across dotenv layers", async () => {
+		const seed = 0x5eedc0de;
+		const random = seededRandom(seed);
+		const separators = ["_", "-", "."];
+		const layerFiles = [".env", ".env.development", ".env.local", ".env.development.local"];
+		const declarationsByLayer: Record<string, string[]> = Object.fromEntries(layerFiles.map(file => [file, []]));
+		const cases: Array<{ key: string; value: string }> = [];
+
+		for (let caseIndex = 0; caseIndex < 64; caseIndex++) {
+			const words =
+				caseIndex % 2 === 0 ? ["npm", "config", "node", "options"] : ["npm", "config", "script", "shell"];
+			const casedWords = words.map(word =>
+				[...word].map(letter => (random() < 0.5 ? letter.toUpperCase() : letter)).join(""),
+			);
+			const prefixSeparator = separators[caseIndex % separators.length] ?? "_";
+			const optionSeparator = caseIndex % 2 === 0 ? "-" : ".";
+			const key = `${casedWords[0]}${prefixSeparator}${casedWords[1]}_${casedWords[2]}${optionSeparator}${casedWords[3]}`;
+			const value = `GJC_DOTENV_NON_IDENTIFIER_${caseIndex}`;
+			const declaration =
+				caseIndex % 3 === 0
+					? `${key}=${value}`
+					: caseIndex % 3 === 1
+						? `export ${key} = ${value}`
+						: `${key} : ${value}`;
+			const layer = layerFiles[caseIndex % layerFiles.length] ?? ".env";
+			declarationsByLayer[layer]?.push(declaration);
+			cases.push({ key, value });
+		}
+
+		expect(new Set(cases.map(({ key }) => key)).size).toBe(cases.length);
+
+		const cwd = tempDir("gjc-env-nonidentifier-property-");
+		const home = tempDir("gjc-env-nonidentifier-property-home-");
+		for (const [file, declarations] of Object.entries(declarationsByLayer)) {
+			fs.writeFileSync(path.join(cwd, file), `${declarations.join("\n")}\n`);
+		}
+
+		const keys = cases.map(({ key }) => key);
+		const envFileSource = path.resolve(import.meta.dir, "../src/env-file.ts");
+		const probe = path.join(cwd, "dotenv-nonidentifier-probe.ts");
+		await Bun.write(
+			probe,
+			`import { canonicalEnvKey, projectEnvSnapshot } from ${JSON.stringify(envFileSource)};\n` +
+				`const keys = ${JSON.stringify(keys)};\n` +
+				`const snapshot = projectEnvSnapshot(process.cwd());\n` +
+				`console.log(JSON.stringify({\n` +
+				`  loaded: keys.map(key => process.env[key] ?? null),\n` +
+				`  snapshotHas: keys.map(key => Object.hasOwn(snapshot.values, canonicalEnvKey(key))),\n` +
+				`  dynamic: keys.map(key => snapshot.dynamic.has(canonicalEnvKey(key))),\n` +
+				`}));\n`,
+		);
+
+		const generatedKeys = new Set(keys.map(canonicalEnvKey));
+		const childEnv: Record<string, string | undefined> = { ...process.env, HOME: home, NODE_ENV: "development" };
+		for (const inheritedKey of Object.keys(childEnv)) {
+			if (generatedKeys.has(canonicalEnvKey(inheritedKey))) delete childEnv[inheritedKey];
+		}
+		const proc = Bun.spawn([process.execPath, probe], {
+			cwd,
+			env: childEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 10_000,
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, stderr).toBe(0);
+
+		const result = JSON.parse(stdout.trim()) as {
+			loaded: Array<string | null>;
+			snapshotHas: boolean[];
+			dynamic: boolean[];
+		};
+		for (const [caseIndex, { key, value }] of cases.entries()) {
+			const context = `seed ${seed}, case ${caseIndex}, key ${key}`;
+			expect(result.loaded[caseIndex], context).toBe(value);
+			expect(result.snapshotHas[caseIndex], context).toBe(true);
+			expect(result.dynamic[caseIndex], context).toBe(true);
+		}
 	}, 15_000);
 });
 

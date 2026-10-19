@@ -9337,7 +9337,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness?.stop();
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+		// Real timers plus a reconciliation claim exceed the default 5s on a loaded shard.
+	}, 20_000);
 
 	test("a sibling publication failure does not hide the expiring correlation's end", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-sibling-publication-"));

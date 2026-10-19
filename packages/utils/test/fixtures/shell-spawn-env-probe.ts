@@ -19,6 +19,16 @@ try {
 const keys = [
 	"BASH_ENV",
 	"BUN_OPTIONS",
+	"PERLLIB",
+	"_JAVA_OPTIONS",
+	"NPM_CONFIG_NODE_OPTIONS",
+	"RIPGREP_CONFIG_PATH",
+	"TAR_OPTIONS",
+	"RSYNC_RSH",
+	"MAKEFLAGS",
+	"MAKEFILES",
+	"SHELLOPTS",
+	"PS4",
 	"NODE_OPTIONS",
 	"PYTHONPATH",
 	"PYTHONUSERBASE",
@@ -54,6 +64,9 @@ const keys = [
 console.log(
 	JSON.stringify({
 		...Object.fromEntries(keys.map(key => [key, env[key] ?? null])),
+		NPM_NODE_OPTIONS_NAMES: Object.keys(env).filter(key =>
+			/^npm_config_(?:node[_-]options|script[_-]shell)$/i.test(key),
+		),
 		LIVE_BASH_ENV: Bun.env.BASH_ENV ?? null,
 		PROJECT_DYNAMIC_BASH_ENV: projectEnv.dynamic.has("BASH_ENV"),
 		PROJECT_HAS_BASH_ENV_VALUE: Object.hasOwn(projectEnv.values, "BASH_ENV"),
