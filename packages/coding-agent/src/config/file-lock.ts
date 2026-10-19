@@ -1209,6 +1209,28 @@ async function adoptOrphanedFileLockRemovalTransition(
 	}
 }
 
+/**
+ * Whether an abandoned transition's captured tree is safe to adopt: the root is
+ * the transition directory, `info` is the only file, and every other entry is a
+ * directory or an empty file. Any other payload means adoption refuses the
+ * generation, so it must be reported as a block instead of a silent retry.
+ */
+function abandonedTransitionPayloadIsAdoptable(snapshot: NativeDirectoryTreeSnapshot): boolean {
+	const root = snapshot.entries.find(entry => entry.relativePath === "");
+	const infoEntry = snapshot.entries.find(entry => entry.relativePath === "info");
+	return (
+		root?.kind === "directory" &&
+		infoEntry?.kind === "file" &&
+		!snapshot.entries.some(
+			entry =>
+				entry.relativePath !== "" &&
+				entry.relativePath !== "info" &&
+				entry.kind !== "directory" &&
+				(entry.kind !== "file" || entry.size !== "0"),
+		)
+	);
+}
+
 async function adoptAbandonedFileLockRemovalTransition(
 	lockPath: string,
 	ownerHostId?: string,
@@ -1230,20 +1252,9 @@ async function adoptAbandonedFileLockRemovalTransition(
 	}
 	if (!captured.ok || !captured.snapshot) return false;
 	const snapshot = captured.snapshot;
-	const root = snapshot.entries.find(entry => entry.relativePath === "");
+	if (!abandonedTransitionPayloadIsAdoptable(snapshot)) return false;
 	const infoEntry = snapshot.entries.find(entry => entry.relativePath === "info");
-	if (
-		root?.kind !== "directory" ||
-		infoEntry?.kind !== "file" ||
-		snapshot.entries.some(
-			entry =>
-				entry.relativePath !== "" &&
-				entry.relativePath !== "info" &&
-				entry.kind !== "directory" &&
-				(entry.kind !== "file" || entry.size !== "0"),
-		)
-	)
-		return false;
+	if (infoEntry?.kind !== "file") return false;
 	const currentIdentity = await captureFileLockDirIdentity(transitionPath);
 	if (!currentIdentity || !sameStableFileLockIdentity(currentIdentity, stale.identity)) return false;
 	if (
@@ -3108,6 +3119,63 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		transitionPath,
 		await staleRemovalFailureForCurrentGeneration(lockPath, staleRemovalFailure),
 	);
+}
+/**
+ * Describes the retained removal transition blocking `filePath`, if one exists.
+ *
+ * `acquireFileLock` reports this on exhaustion, but a caller whose own budget
+ * aborts the acquisition first would otherwise never learn that a stale
+ * transition — not ordinary contention — is what blocked it. Such a caller can
+ * ask directly after an abort so the block is surfaced instead of swallowed.
+ */
+export async function describeRetainedLockTransition(
+	filePath: string,
+	options: FileLockOptions = {},
+): Promise<FileLockAcquireError | undefined> {
+	const opts = { ...DEFAULT_OPTIONS, ...options };
+	const orphanTransitionAgeMs = options.orphanTransitionAgeMs ?? options.staleMs ?? DEFAULT_OPTIONS.staleMs;
+	const lockPath = getLockPath(filePath);
+	const previousOwnerHostIds = opts.previousOwnerHostIds ?? [];
+	const transitionState = await classifyFileLockRemovalTransition(
+		lockPath,
+		orphanTransitionAgeMs,
+		opts.ownerHostId,
+		previousOwnerHostIds,
+	);
+	const reportsOrphanTransition = transitionState === "orphan_transition";
+	// An abandoned generation with payload outside the adoption shape is never
+	// reclaimable by this path, so it blocks renewal exactly like a retained orphan
+	// transition. Reporting only `orphan_transition` would leave that case idle.
+	const reportsUnadoptableAbandoned =
+		transitionState === "abandoned" && (await abandonedTransitionIsUnadoptable(lockPath));
+	if (!reportsOrphanTransition && !reportsUnadoptableAbandoned) return undefined;
+	const holder = await lockHolderDescription(lockPath, orphanTransitionAgeMs, opts.ownerHostId, previousOwnerHostIds);
+	return new FileLockAcquireError(
+		filePath,
+		lockPath,
+		opts.retries,
+		holder,
+		"orphan_transition",
+		fileLockRemovalTransitionPath(lockPath),
+	);
+}
+
+/** A proven-dead abandoned generation whose payload adoption refuses on sight. */
+async function abandonedTransitionIsUnadoptable(lockPath: string): Promise<boolean> {
+	const transitionPath = fileLockRemovalTransitionPath(lockPath);
+	if (await readRemovalTransitionOwnerRecord(transitionPath)) return false;
+	if (!(await isNativeExactRemovalUsable())) return false;
+	let captured: NativeDirectoryTreeResult;
+	try {
+		captured = nativeFileLockBindings().snapshotDirectoryTree(transitionPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (!captured.ok || !captured.snapshot) return false;
+	// A shape adoption accepts is retried by the ordinary remover; only a refused
+	// payload is a permanent block.
+	return !abandonedTransitionPayloadIsAdoptable(captured.snapshot);
 }
 
 /**

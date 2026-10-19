@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	acquireFileLock,
+	describeRetainedLockTransition,
 	FileLockAcquireError,
 	FileLockTestHooks,
 	fileLockStagingOwnerPid,
@@ -1171,6 +1172,26 @@ describe.skipIf(process.platform === "win32")("file lock abandoned removal recov
 		});
 		expect(treeSnapshot(transition)).toEqual(retained);
 		expect(await Bun.file(path.join(transition, "payload")).text()).toBe("must survive");
+	});
+	test("reports an abandoned transition whose payload adoption refuses", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "host-a"));
+		await Bun.write(path.join(transition, "payload"), "must survive");
+
+		const blocked = await describeRetainedLockTransition(file, { ownerHostId: "host-a" });
+		expect(blocked).toBeInstanceOf(FileLockAcquireError);
+		expect(blocked).toMatchObject({ code: "orphan_transition", orphanPath: transition });
+	});
+
+	test("does not report an adoptable abandoned transition as blocked", async () => {
+		const { file, lock } = await makeFixture();
+		const transition = `${lock}.removing`;
+		await fs.mkdir(transition);
+		await Bun.write(path.join(transition, "info"), removalInfo(await deadPid(), "host-a"));
+
+		await expect(describeRetainedLockTransition(file, { ownerHostId: "host-a" })).resolves.toBeUndefined();
 	});
 
 	test("adopts a host-less abandoned transition and acquires", async () => {

@@ -7,9 +7,18 @@ import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { BrokerHopMessage } from "./ensure";
 
+/** Handoff protocol frames written to the trampoline's stdin. */
 export const BROKER_HANDOFF_ACKNOWLEDGEMENT = "GJC_BROKER_HANDOFF_ACK\n";
 export const BROKER_HANDOFF_COMMIT = "GJC_BROKER_HANDOFF_COMMIT\n";
 export const BROKER_HANDOFF_ABORT = "GJC_BROKER_HANDOFF_ABORT\n";
+/**
+ * Backstop for a retained trampoline whose parent never sends a decision. It must
+ * outlive the parent's own broker discovery deadline (which is derived from the
+ * publication budget and can double across a guarded retry), otherwise the
+ * trampoline reaps the broker first and the parent misreports its own discovery
+ * timeout as an "exited before discovery" startup failure.
+ */
+export const BROKER_HANDOFF_DECISION_TIMEOUT_MS = 120_000;
 
 /**
  * Windows broker hop: spawns the real broker with detached:true and reports its pid.
@@ -165,7 +174,10 @@ export function waitForBrokerHandoffAcknowledgement(input: stream.Readable): Pro
 }
 
 /** Wait for a validated identity ACK followed by the parent's publication decision. */
-export function waitForBrokerHandoffDecision(input: stream.Readable, timeoutMs = 30_000): Promise<"commit" | "abort"> {
+export function waitForBrokerHandoffDecision(
+	input: stream.Readable,
+	timeoutMs = BROKER_HANDOFF_DECISION_TIMEOUT_MS,
+): Promise<"commit" | "abort"> {
 	const decision = Promise.withResolvers<"commit" | "abort">();
 	let received = "";
 	let settled = false;

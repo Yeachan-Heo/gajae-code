@@ -2906,7 +2906,6 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 	const settings = {
 		get: (key: string) =>
 			key === "sdk.promptDeadlineMs" ? deadlineMs : key === "sdk.promptMaxRuntimeMs" ? 5_000 : undefined,
-		getAgentDir: () => cwd,
 	} as unknown as Settings;
 	const abortHandles: string[] = [];
 	const abortAttempts: Array<{ handle: string; activeHandle: string; hasLiveDomain: boolean }> = [];
@@ -3195,13 +3194,12 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 			result: { status: "failed", error: { code: "prompt_deadline_exceeded" } },
 		});
 	} finally {
-		try {
-			predecessorDispatchReady.resolve();
-			settleSubmissions();
-			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-		} finally {
-			leaseClock.mockRestore();
-		}
+		// Restore the fake lease clock before awaited teardown: if shutdown
+		// throws, an active Date.now spy would leak into every later test.
+		leaseClock.mockRestore();
+		predecessorDispatchReady.resolve();
+		settleSubmissions();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
 });
 
@@ -8137,8 +8135,10 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	const publications: Array<Record<string, unknown>> = [];
 	const retired: Array<{ actionId: string; registrationEpoch: number }> = [];
 	let failures = 1;
+	let registrations = 0;
 	const server = {
 		registerArbitratedAsk(json: string) {
+			registrations += 1;
 			const action = JSON.parse(json) as Record<string, unknown>;
 			if (failures > 0) {
 				failures -= 1;
@@ -8167,7 +8167,8 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	});
 	arbiter.retain(gate("ordinary", false, 1));
 	arbiter.retain(gate("workflow-first", true, 0));
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs + 10);
+	await waitFor(() => publications.length === 1, "retry publication after the rejected registration");
+	expect(registrations).toBe(2);
 	expect(publications.map(action => action.workflowGateId)).toEqual([undefined]);
 	expect(publications[0]).toMatchObject({ options: ["one", "two"], recommendedIndex: 1 });
 	arbiter.complete("ordinary");
@@ -8988,11 +8989,15 @@ test("PresentationArbiter rejects claimed or stale retirement as terminal proof 
 
 test("PresentationArbiter fences an exhausted ordinary interactive head until explicit cancellation", async () => {
 	let registrationsFail = false;
+	let failedRegistrations = 0;
 	const published: string[] = [];
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
-				if (registrationsFail) throw new Error("unavailable");
+				if (registrationsFail) {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				const action = JSON.parse(json) as { id: string };
 				published.push(action.id);
 				return { actionId: action.id, registrationEpoch: published.length };
@@ -9045,9 +9050,14 @@ test("PresentationArbiter fences an exhausted ordinary interactive head until ex
 	});
 	registrationsFail = true;
 	arbiter.reissueAfterFailure(first);
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	// Observe the exhausted retry chain instead of sleeping past its backoff:
+	// the head is fenced only once every registration attempt has failed.
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	registrationsFail = false;
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs);
+	expect(failedRegistrations).toBe(PresentationArbiter.maxRegistrationAttempts);
 	expect(arbiter.routeFor(first)).toBeUndefined();
 	expect(pendingInteractive.size).toBe(1);
 	expect(settles).toBe(0);
@@ -9064,11 +9074,15 @@ test("PresentationArbiter fences an exhausted ordinary interactive head until ex
 
 test("PresentationArbiter terminally cancels an exhausted ordinary head exactly once before promotion", async () => {
 	const publications: string[] = [];
+	let failedRegistrations = 0;
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
 				const action = JSON.parse(json) as { id: string; question: string };
-				if (action.question === "Unavailable?") throw new Error("unavailable");
+				if (action.question === "Unavailable?") {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				publications.push(action.id);
 				return { actionId: action.id, registrationEpoch: publications.length };
 			},
@@ -9103,7 +9117,10 @@ test("PresentationArbiter terminally cancels an exhausted ordinary head exactly 
 		selectedOptions: [],
 	});
 
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	expect(publications).toEqual([]);
 	expect(closes).toBe(0);
 
@@ -9118,10 +9135,14 @@ test("PresentationArbiter terminally cancels an exhausted ordinary head exactly 
 test("PresentationArbiter fences already-terminal direct controls and resets exhausted head recovery", async () => {
 	const publications: string[] = [];
 	let registrationsFail = true;
+	let failedRegistrations = 0;
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
-				if (registrationsFail) throw new Error("unavailable");
+				if (registrationsFail) {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				const action = JSON.parse(json) as { id: string };
 				publications.push(action.id);
 				return { actionId: action.id, registrationEpoch: publications.length };
@@ -9141,7 +9162,10 @@ test("PresentationArbiter fences already-terminal direct controls and resets exh
 		allowEmpty: false,
 		selectedOptions: [],
 	});
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	registrationsFail = false;
 	arbiter.recover();
 	expect(publications).toHaveLength(1);

@@ -4,6 +4,7 @@ import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import {
+	describeRetainedLockTransition,
 	FILE_LOCK_ORPHAN_TRANSITION_ADOPTION_AGE_MS,
 	type FileLockOptions,
 	isFileLockAcquireTimeout,
@@ -848,7 +849,7 @@ const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
  */
 const SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS = 4;
 /** One elapsed budget for queueing, probing and every reacquisition in a pass. */
-const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
+export const SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS = 15_000;
 const STALE_OBSERVATION: unique symbol = Symbol("stale-heartbeat-observation");
 /** Maximum distinct live identity probes admitted by one public status query. */
 const SESSION_GENERATION_PROBE_LIMIT = 32;
@@ -2445,7 +2446,17 @@ export class SessionIndex {
 			// so startup readiness never overtakes lock release.
 			return await checkpoint();
 		} catch (error) {
-			if (signal.aborted && error === signal.reason) return 0;
+			if (signal.aborted && error === signal.reason) {
+				// The budget abort can beat the lock layer's own exhaustion. Asking
+				// directly keeps a retained removal transition from being reported as
+				// an idle cycle: the blocked-renewal caller needs the reason and path.
+				const blocked = await describeRetainedLockTransition(
+					path.resolve(logFor(this.#agentDir)),
+					SESSION_INDEX_LOCK_OPTIONS,
+				);
+				if (blocked) throw blocked;
+				return 0;
+			}
 			if (
 				performance.now() >= deadline &&
 				isFileLockAcquireTimeout(error) &&
