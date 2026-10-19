@@ -5,17 +5,14 @@
  *
  *     ESC ] 777 ; notify;Terax;gjc;<event> BEL
  *
- * A terminal that understands the sequence (Terax reads it to drive its per-tab
- * agent status and header bell) reacts; every other terminal discards the OSC
- * as unknown, exactly like the OSC 133 prompt marks and OSC 7 cwd reports that
- * shells emit unconditionally.
- *
- * The sequence is only emitted inside a Terax-hosted terminal, which announces
- * itself with `TERAX_TERMINAL=1` in the environment of every shell it spawns.
+ * Terax reads the sequence to drive its per-tab agent status and header bell.
+ * The marker is only emitted inside a Terax-hosted terminal, which announces
+ * itself with a non-empty `TERAX_TERMINAL` in the environment of every shell
+ * it spawns.
  * That gate matters because OSC 777 `notify;` is the rxvt extension, and
  * terminals that implement it (Ghostty among them) turn it into a desktop
- * notification rather than discarding it. Emitting the marker unconditionally
- * made every other host show a "Terax" notification on every turn.
+ * notification instead of discarding it. Emitting the marker unconditionally
+ * made every non-Terax host show a "Terax" notification on every turn.
  *
  * `notify;Terax;` is the wire identifier of the only protocol that currently
  * carries per-turn agent state, not a host check - the payload names gjc as the
