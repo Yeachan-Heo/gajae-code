@@ -349,6 +349,31 @@ describe("ultragoal change-set extraction", () => {
 		expect(result.stdout).toBe("hash-object payload");
 	});
 
+	it("times out instead of hanging when the child never reads stdin", async () => {
+		// A payload larger than the pipe buffer, sent to a child that ignores
+		// stdin: the write cannot complete, so only the timeout can end the run.
+		const payload = "x".repeat(4 * 1024 * 1024);
+		const started = Date.now();
+		const result = await spawnText([process.execPath, "-e", "setTimeout(() => {}, 30000)"], {
+			cwd: process.cwd(),
+			stdin: payload,
+			timeoutMs: 2000,
+		});
+		expect(result.ok).toBe(false);
+		expect(Date.now() - started).toBeLessThan(20_000);
+	});
+
+	it("times out instead of deadlocking when the child fills stdout before draining stdin", async () => {
+		const payload = "x".repeat(4 * 1024 * 1024);
+		const started = Date.now();
+		const result = await spawnText(
+			[process.execPath, "-e", "process.stdout.write('y'.repeat(4 * 1024 * 1024)); setTimeout(() => {}, 30000)"],
+			{ cwd: process.cwd(), stdin: payload, timeoutMs: 2000 },
+		);
+		expect(result.ok).toBe(false);
+		expect(Date.now() - started).toBeLessThan(20_000);
+	});
+
 	it("derives the empty tree id from the repository object format", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-empty-tree-"));
 		try {

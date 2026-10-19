@@ -137,17 +137,30 @@ export async function spawnText(
 			stderr: "pipe",
 			stdin: options.stdin === undefined ? "ignore" : "pipe",
 		});
-		const stdin = proc.stdin;
-		const input = options.stdin;
-		if (stdin && input !== undefined) {
-			stdin.write(input);
-			await stdin.end();
-		}
+		// The timeout has to exist before anything that can block. Writing a
+		// payload larger than the pipe buffer to a child that never reads stdin
+		// blocks the write, and a child that fills stdout before draining stdin
+		// blocks the read: both hang forever without an armed timer.
 		const timeout = setTimeout(() => proc.kill(), options.timeoutMs ?? 5000);
+		const stdoutBuffer = new Response(proc.stdout).arrayBuffer();
+		const stderrBuffer = new Response(proc.stderr).arrayBuffer();
+		const stdinWrite = (async () => {
+			const stdin = proc.stdin;
+			const input = options.stdin;
+			if (!stdin || input === undefined) return;
+			try {
+				stdin.write(input);
+				await stdin.end();
+			} catch {
+				// The child closed stdin or the timer killed it; the exit code
+				// already reports the failure.
+			}
+		})();
 		const [stdoutBytes, stderrBytes, exitCode] = await Promise.all([
-			new Response(proc.stdout).arrayBuffer(),
-			new Response(proc.stderr).arrayBuffer(),
+			stdoutBuffer,
+			stderrBuffer,
 			proc.exited,
+			stdinWrite,
 		]);
 		clearTimeout(timeout);
 		let stdout: string;
