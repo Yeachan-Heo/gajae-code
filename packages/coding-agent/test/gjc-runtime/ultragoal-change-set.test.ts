@@ -74,11 +74,18 @@ describe("ultragoal Git integration base resolution", () => {
 		});
 	});
 
-	it("fails closed when checked-out develop is the only integration ref", async () => {
-		await withIntegrationFixture(async root => {
-			await commitFixtureFile(root, "feature.txt");
-			await expect(resolveGitBase(root)).rejects.toThrow("authoritative integration base");
-			await expect(computeCheckpointChangeSet(root)).rejects.toThrow("authoritative integration base");
+	it("falls back to the checked-out branch when it is the only integration ref", async () => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await Bun.write(path.join(root, "feature.txt"), "feature.txt\n");
+			expect(await resolveGitBase(root)).toBe("develop");
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.baseRef).toBe("develop");
+			// On-trunk work has no committed range beyond the base: the change set is
+			// exactly the working-tree diff.
+			expect(changeSet?.mergeBase).toBe(baseline);
+			expect(changeSet?.paths).toEqual([{ path: "feature.txt", status: "added", category: "other" }]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+			expect(computeUltragoalReviewSourceHash(changeSet)).toMatch(/^sha256:[0-9a-f]{64}$/);
 		});
 	});
 
