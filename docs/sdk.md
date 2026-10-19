@@ -490,7 +490,7 @@ private SDK's **256 KiB frame limit**. These are internal GJC SDK controls, not
 standard ACP methods, MCP tools, or a new public image capability. Attach through
 the Router as usual; do not discover endpoints or credentials yourself.
 
-When installed, `capabilities.get` lists `turn.image.begin`, `turn.image.append`,
+When installed, `runtime.capabilities` lists `turn.image.begin`, `turn.image.append`,
 `turn.image.finish`, and `turn.image.discard`. A custom host transport must provide
 authoritative live-connection membership and the host's internal read-only exact-run
 settlement observer; otherwise the controls are not installed.
