@@ -73,10 +73,32 @@ function hasUsablePromptImage(value: unknown): boolean {
 	);
 }
 
+function hasValidStagedPromptImages(value: unknown): boolean {
+	if (!Array.isArray(value) || value.length === 0 || value.length > 16) return false;
+	const ids = new Set<string>();
+	return value.every(descriptor => {
+		if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)) return false;
+		const image = descriptor as Record<string, unknown>;
+		if (Object.keys(image).some(key => key !== "id") || typeof image.id !== "string" || image.id.trim().length === 0)
+			return false;
+		if (ids.has(image.id)) return false;
+		ids.add(image.id);
+		return true;
+	});
+}
+
 /** Rejects instruction-bearing controls before correlation or provider work. */
 export function validateRequiredPromptText(operation: string, input: Input): AdapterValidationError | undefined {
+	if (operation === "turn.prompt" && input.stagedImages !== undefined) {
+		if (input.images !== undefined)
+			return { code: "invalid_input", message: "Direct and staged images cannot be mixed." };
+		if (!hasValidStagedPromptImages(input.stagedImages))
+			return { code: "invalid_input", message: "stagedImages must contain 1–16 valid image IDs." };
+	}
 	const hasUsableImage =
-		operation === "turn.prompt" && Array.isArray(input.images) && input.images.some(hasUsablePromptImage);
+		operation === "turn.prompt" &&
+		((Array.isArray(input.images) && input.images.some(hasUsablePromptImage)) ||
+			hasValidStagedPromptImages(input.stagedImages));
 	if (
 		PROMPT_OPERATIONS.has(operation) &&
 		(typeof input.text !== "string" || (input.text.trim().length === 0 && !hasUsableImage))

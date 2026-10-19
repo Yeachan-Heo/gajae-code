@@ -5,7 +5,7 @@ import {
 	redactBrokerRuntimeCapabilities,
 	setBrokerRuntimeAbortCapabilityForTest,
 } from "../src/sdk/host/control/runtime-gate";
-import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import { adapterDispositionError, OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
 const methodByOperation: Record<string, string> = {
 	"turn.prompt": "prompt",
@@ -13,6 +13,10 @@ const methodByOperation: Record<string, string> = {
 	"turn.follow_up": "followUp",
 	"turn.abort": "abort",
 	"turn.abort_and_prompt": "abortAndPrompt",
+	"turn.image.begin": "imageBegin",
+	"turn.image.append": "imageAppend",
+	"turn.image.finish": "imageFinish",
+	"turn.image.discard": "imageDiscard",
 	"ask.answer": "answerAsk",
 	"workflow.gate_answer": "answerGate",
 	"workflow.plan_approve": "approvePlan",
@@ -136,6 +140,96 @@ test("dispatches every control registry operation to its ControlSurface method",
 		expect(response).toEqual({ id: row.id, ok: true, result: methodByOperation[row.sdkId] });
 	}
 	expect(calls).toEqual(rows.map(row => methodByOperation[row.sdkId]));
+});
+
+test("dispatches image staging controls and keeps them private to machine SDK clients", async () => {
+	const inputs = [
+		{ mimeType: "image/png", byteLength: 3, sha256: "a".repeat(64) },
+		{ id: "upload", sequence: 0, data: "YWJj" },
+		{ id: "upload" },
+		{ id: "upload" },
+	];
+	const calls: Array<{ operation: string; input: unknown }> = [];
+	const surface = Object.fromEntries(
+		["imageBegin", "imageAppend", "imageFinish", "imageDiscard"].map(method => [
+			method,
+			(input: unknown) => {
+				calls.push({ operation: method, input });
+				return method;
+			},
+		]),
+	) as unknown as ControlSurface;
+	const operationIds = ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"];
+	for (const [index, operation] of operationIds.entries()) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		const response = await dispatchControl(surface, row, { ...request(row), input: inputs[index] });
+		expect(response).toEqual({
+			id: row.id,
+			ok: true,
+			result: ["imageBegin", "imageAppend", "imageFinish", "imageDiscard"][index],
+		});
+	}
+	expect(calls).toEqual([
+		{ operation: "imageBegin", input: inputs[0] },
+		{ operation: "imageAppend", input: inputs[1] },
+		{ operation: "imageFinish", input: inputs[2] },
+		{ operation: "imageDiscard", input: inputs[3] },
+	]);
+	for (const operation of operationIds) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		expect(row.adapterDispositions.mcp).toBe("prohibited");
+		expect(row.adapterDispositions.acp).toBe("prohibited");
+		expect(row.adapterDispositions.daemonCli).toBe("machine_only");
+		expect(adapterDispositionError("mcp", "control", operation)?.code).toBe("adapter_operation_prohibited");
+		expect(adapterDispositionError("acp", "control", operation)?.code).toBe("adapter_operation_prohibited");
+		expect(adapterDispositionError("daemonCli", "control", operation, true)?.code).toBe("adapter_machine_only");
+	}
+});
+
+test("rejects image staging controls when the current surface has no image store", async () => {
+	for (const operation of ["turn.image.begin", "turn.image.append", "turn.image.finish", "turn.image.discard"]) {
+		const row = OPERATIONS.find(candidate => candidate.sdkId === operation)!;
+		const response = await dispatchControl({} as ControlSurface, row, { ...request(row), input: {} });
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+});
+
+test("accepts textless staged-image prompts and rejects empty, invalid, or mixed image descriptors", async () => {
+	const prompt = OPERATIONS.find(row => row.sdkId === "turn.prompt")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		prompt: (...args: unknown[]) => {
+			calls.push(args);
+			return "prompted";
+		},
+	} as unknown as ControlSurface;
+	const stagedImages = [{ id: "upload-1" }, { id: "upload-2" }];
+	const accepted = await dispatchControl(surface, prompt, {
+		...request(prompt),
+		input: { text: "  ", stagedImages },
+	});
+	expect(accepted).toEqual({ id: prompt.id, ok: true, result: "prompted" });
+	expect(calls).toEqual([["  ", undefined, undefined, stagedImages]]);
+
+	for (const invalidStagedImages of [
+		[],
+		[{}],
+		[{ id: "" }],
+		[{ id: "same" }, { id: "same" }],
+		[{ id: "valid", extra: true }],
+	]) {
+		const rejected = await dispatchControl(surface, prompt, {
+			...request(prompt),
+			input: { text: "nonempty text", stagedImages: invalidStagedImages },
+		});
+		expect(rejected).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	}
+	const mixed = await dispatchControl(surface, prompt, {
+		...request(prompt),
+		input: { text: "nonempty text", images: [], stagedImages },
+	});
+	expect(mixed).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	expect(calls).toHaveLength(1);
 });
 
 test("forwards expectedSessionId only to durable workflow controls", async () => {

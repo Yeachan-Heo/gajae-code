@@ -33,7 +33,8 @@ import {
 import { fileHyperlink, renderCodeCell, renderMarkdownCell, renderStatusLine, tryResolveInternalUrlSync } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import { ImageInputTooLargeError, loadImageInput, MAX_IMAGE_INPUT_BYTES } from "../utils/image-loading";
+import { MAX_IMAGE_INPUT_BYTES } from "../utils/image-limits";
+import { ImageInputTooLargeError, loadImageInput } from "../utils/image-loading";
 import { convertFileWithMarkit } from "../utils/markit";
 import { buildDirectoryTree, type DirectoryTree } from "../workspace-tree";
 import { type ArchiveReader, openArchive, parseArchivePathCandidates } from "./archive-reader";

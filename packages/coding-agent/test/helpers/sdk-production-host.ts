@@ -70,6 +70,18 @@ export async function startProductionSdkHost(
 						api =>
 							createNotificationsExtension(api, {
 								settings,
+								terminalAbortSeams: {
+									getTerminalRunOwnerForEvent: event => session.getTerminalRunOwnerForEvent(event),
+									getRunOwnerDomain: handle => session.getRunOwnerDomain(handle),
+									getTerminalTurnEpoch: () => session.getTerminalTurnEpoch(),
+									cancelPendingPreflightForTerminalAbort: () =>
+										session.cancelPendingPreflightForTerminalAbort(),
+									abortPromptAndWaitWithTerminal: (handle, seamOptions) =>
+										session.abortPromptAndWait(handle, seamOptions),
+									pendingToolExecutions: handle => session.pendingToolExecutions(handle),
+									getRunSettlementProof: handle =>
+										session.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 }),
+								},
 								onSdkRequest: (kind, _connectionId, frame) => {
 									const operation = kind === "control" ? frame.operation : frame.query;
 									if (typeof operation === "string") observed.push({ kind, operation });

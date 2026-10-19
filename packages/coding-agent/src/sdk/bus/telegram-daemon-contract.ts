@@ -307,8 +307,10 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * children of a recycled PID. Generation 206 verifies macOS descendant
  * identities and parentage before retaining PTY termination authority, and
  * reaps adopted Linux PTY descendants when GJC is a child reaper.
+ * Generation 209 installs connection-owned private SDK image staging with
+ * execution-owned reservations, replacing hosts without that lifecycle contract.
  */
-export const DAEMON_GENERATION = 208;
+export const DAEMON_GENERATION = 209;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

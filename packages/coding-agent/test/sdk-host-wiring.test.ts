@@ -1,9 +1,11 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { deflateSync } from "node:zlib";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import {
 	Agent,
@@ -88,6 +90,7 @@ import {
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	SessionSdkHost,
 } from "../src/sdk/host";
+import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
@@ -336,7 +339,9 @@ function start(
 	if (lifecycle) attachLifecycleStartupCapability(api, lifecycle.startupCapability);
 	const effectiveSettings =
 		settings ??
-		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
+		(lifecycle || typeof ctx.getRunSettlementProof === "function"
+			? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings)
+			: undefined);
 	createOrchestrationNotificationsExtension(
 		api,
 		effectiveSettings
@@ -346,18 +351,32 @@ function start(
 					ensureProviderDaemon,
 					controller,
 					terminalAbortSeams: {
-						getTerminalRunOwnerForEvent: event =>
-							(
-								ctx as {
-									getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
+						...(typeof ctx.getRunSettlementProof === "function"
+							? {
+									getRunSettlementProof: (handle: string) =>
+										(ctx.getRunSettlementProof as (handle: string) => Promise<RunSettlementProof>)(handle),
 								}
-							).getTerminalRunOwnerForEvent?.(event),
-						getRunOwnerDomain: handle =>
-							(
-								ctx as {
-									getRunOwnerDomain?: (handle: string) => AgentTerminalOwnerContext["domain"] | undefined;
+							: {}),
+						...(typeof ctx.getTerminalRunOwnerForEvent === "function"
+							? {
+									getTerminalRunOwnerForEvent: (event: object) =>
+										(
+											ctx.getTerminalRunOwnerForEvent as (
+												event: object,
+											) => AgentTerminalOwnerContext | undefined
+										)(event),
 								}
-							).getRunOwnerDomain?.(handle),
+							: {}),
+						...(typeof ctx.getRunOwnerDomain === "function"
+							? {
+									getRunOwnerDomain: (handle: string) =>
+										(
+											ctx.getRunOwnerDomain as (
+												handle: string,
+											) => AgentTerminalOwnerContext["domain"] | undefined
+										)(handle),
+								}
+							: {}),
 						getTerminalTurnEpoch: () =>
 							(ctx as { getTerminalTurnEpoch?: () => number | undefined }).getTerminalTurnEpoch?.(),
 						cancelPendingPreflightForTerminalAbort: () =>
@@ -2534,6 +2553,372 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 			},
 		],
 	]);
+});
+
+const STAGED_TEST_PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function stagedTestPngCrc32(bytes: Uint8Array): number {
+	let crc = 0xffffffff;
+	for (const byte of bytes) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function stagedTestPngChunk(type: string, data: Uint8Array): Buffer {
+	const typeBytes = Buffer.from(type, "ascii");
+	const payload = Buffer.from(data);
+	const chunk = Buffer.alloc(12 + payload.length);
+	chunk.writeUInt32BE(payload.length, 0);
+	typeBytes.copy(chunk, 4);
+	payload.copy(chunk, 8);
+	chunk.writeUInt32BE(stagedTestPngCrc32(Buffer.concat([typeBytes, payload])), 8 + payload.length);
+	return chunk;
+}
+
+function makeStagedTestPng(): Buffer {
+	const width = 300;
+	const height = 300;
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 6;
+	const stride = 1 + width * 4;
+	const pixels = Buffer.alloc(stride * height);
+	let state = 0x12345678;
+	for (let y = 0; y < height; y++) {
+		const row = y * stride;
+		for (let x = 0; x < width; x++) {
+			const pixel = row + 1 + x * 4;
+			for (let channel = 0; channel < 3; channel++) {
+				state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+				pixels[pixel + channel] = state >>> 24;
+			}
+			pixels[pixel + 3] = 255;
+		}
+	}
+	return Buffer.concat([
+		STAGED_TEST_PNG_SIGNATURE,
+		stagedTestPngChunk("IHDR", ihdr),
+		stagedTestPngChunk("IDAT", deflateSync(pixels, { level: 0 })),
+		stagedTestPngChunk("IEND", Buffer.alloc(0)),
+	]);
+}
+
+async function stageOverSdkClient(client: SdkClient, bytes: Buffer, finish = true): Promise<string> {
+	const begin = (await client.control("turn.image.begin", {
+		mimeType: "image/png",
+		byteLength: bytes.length,
+		sha256: createHash("sha256").update(bytes).digest("hex"),
+	})) as { ok?: boolean; result?: { id?: unknown } };
+	expect(begin.ok).toBe(true);
+	const id = begin.result?.id;
+	if (typeof id !== "string") throw new Error("SDK host did not return a staged image ID.");
+	let sequence = 0;
+	for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+		const data = bytes.subarray(offset, offset + 96 * 1024).toString("base64");
+		expect(Buffer.byteLength(JSON.stringify({ id, sequence, data }))).toBeLessThan(256 * 1024);
+		expect(await client.control("turn.image.append", { id, sequence, data })).toMatchObject({ ok: true });
+		sequence++;
+	}
+	if (finish) expect(await client.control("turn.image.finish", { id })).toMatchObject({ ok: true });
+	return id;
+}
+
+test("SDK host privately stages large images with authenticated connection ownership", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-staged-image-wire-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-staged-image-${Date.now()}`;
+	const bytes = makeStagedTestPng();
+	expect(bytes.length).toBeGreaterThan(256 * 1024);
+	const sent: CapturedSendCall[] = [];
+	const ledger = createRunResourceLedger();
+	const domain = ledger.open("image-wire-run");
+	if (!domain) throw new Error("Image wire run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getActivePromptHandle: () => "image-wire-run",
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => ({ resourceRunId: "image-wire-run", domain }),
+		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+	};
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, args[0], args[1]));
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const clients: SdkClient[] = [];
+	const baseAttachedClients = sessionHostAttachedClients() ?? 0;
+	const finishEntered = Promise.withResolvers<void>();
+	const releaseFinish = Promise.withResolvers<void>();
+	const finishHandlerSettled = Promise.withResolvers<void>();
+	const originalFinish = PromptImageUploadStore.prototype.finish;
+	let holdNextFinish = false;
+	let finishStarted = false;
+	const finishSpy = spyOn(PromptImageUploadStore.prototype, "finish").mockImplementation(async function (
+		this: PromptImageUploadStore,
+		owner,
+		input,
+	) {
+		if (!holdNextFinish) return await originalFinish.call(this, owner, input);
+		holdNextFinish = false;
+		finishStarted = true;
+		finishEntered.resolve();
+		try {
+			await releaseFinish.promise;
+			return await originalFinish.call(this, owner, input);
+		} finally {
+			finishHandlerSettled.resolve();
+		}
+	});
+	try {
+		const owner = await SdkClient.connect(endpoint.url, endpoint.token);
+		const observer = await SdkClient.connect(endpoint.url, endpoint.token);
+		clients.push(owner, observer);
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients + 2,
+			"staged image client connections",
+		);
+		if (!owner.connectionId || !observer.connectionId)
+			throw new Error("SDK clients did not receive authenticated IDs.");
+		expect(owner.connectionId).not.toBe(observer.connectionId);
+
+		const id = await stageOverSdkClient(owner, bytes);
+		await expect(
+			observer.control("turn.prompt", {
+				text: "Cross-connection redemption is forbidden.",
+				stagedImages: [{ id }],
+			}),
+		).rejects.toMatchObject({ code: "resource_gone" });
+		await expect(
+			owner.control("turn.prompt", {
+				text: "Direct and staged image inputs cannot be combined.",
+				images: [{ data: "cG5n", mimeType: "image/png" }],
+				stagedImages: [{ id }],
+			}),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		expect(
+			await owner.control("turn.prompt", { text: "Use the staged image once.", stagedImages: [{ id }] }),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await waitFor(() => sent.length === 1, "staged prompt dispatch");
+		expect(sent[0]?.[0]).toEqual([
+			{ type: "text", text: "Use the staged image once." },
+			{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" },
+		]);
+		await expect(
+			owner.control("turn.prompt", { text: "The staged descriptor is one-shot.", stagedImages: [{ id }] }),
+		).rejects.toMatchObject({ code: "resource_gone" });
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		ledger.seal("image-wire-run");
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+
+		const disconnectedId = await stageOverSdkClient(owner, bytes, false);
+		holdNextFinish = true;
+		const finishing = owner.control("turn.image.finish", { id: disconnectedId }).then(
+			() => undefined,
+			error => error,
+		);
+		await finishEntered.promise;
+		await owner.close();
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients + 1,
+			"staged image owner disconnect",
+		);
+		// The frame reached the host before disconnection. The client must not
+		// report a retryable pre-send failure or replay that ordered operation.
+		expect(await finishing).toMatchObject({ code: "uncertain_after_send" });
+		releaseFinish.resolve();
+		await finishHandlerSettled.promise;
+		await expect(
+			observer.control("turn.prompt", {
+				text: "A disconnected owner cannot transfer an unfinished lease.",
+				stagedImages: [{ id: disconnectedId }],
+			}),
+		).rejects.toMatchObject({ code: "resource_gone" });
+	} finally {
+		releaseFinish.resolve();
+		if (finishStarted) await finishHandlerSettled.promise;
+		finishSpy.mockRestore();
+		await Promise.all(clients.map(client => client.close()));
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+});
+
+test.each([
+	"settlement",
+	"domain",
+	"terminal",
+] as const)("bus omits private image controls without ownership authority (%s)", async missing => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-authority-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-authority-${missing}-${Date.now()}`;
+	const ledger = createRunResourceLedger();
+	const domain = ledger.open("image-run");
+	if (!domain) throw new Error("Image authority run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getRunSettlementProof:
+			missing === "settlement" ? undefined : (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		getRunOwnerDomain: missing === "domain" ? undefined : (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: missing === "terminal" ? undefined : () => ({ resourceRunId: "image-run", domain }),
+	};
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(sessionContext, settings);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "image authority endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const capabilities = await client.query("runtime.capabilities", {});
+		const operations = (capabilities as unknown as { page?: { items?: Array<{ operations?: string[] }> } }).page
+			?.items?.[0]?.operations;
+		expect(operations?.some(operation => operation.startsWith("turn.image."))).toBe(false);
+		await expect(client.control("turn.image.begin", {})).rejects.toMatchObject({
+			code: "operation_not_session_owned",
+		});
+	} finally {
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+});
+
+test.each([
+	"settled",
+	"pending",
+	"quarantined",
+	"missing-handle-pending",
+	"missing-handle-quarantined",
+	"missing-domain-pending",
+	"missing-domain-quarantined",
+] as const)("bus staged-image capacity survives disconnect and an unrelated run terminal (%s)", async mode => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-domain-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-domain-${Date.now()}`;
+	const missingOwner = mode.startsWith("missing-");
+	const live = { idle: true, handle: "image-run" };
+	const ledger = createRunResourceLedger();
+	const domain = ledger.open("image-run");
+	const otherDomain = ledger.open("other-run");
+	if (!domain || !otherDomain) throw new Error("Image test domains could not open.");
+	const tool = Promise.withResolvers<void>();
+	if (mode !== "settled") ledger.track("image-run", "tool", "abort-ignoring-tool", tool.promise);
+	const cleanupReservations: Array<() => void> = [];
+	const owners = new WeakMap<object, AgentTerminalOwnerContext>();
+	const sessionContext = {
+		...context(cwd, sessionId, "main", live),
+		getActivePromptHandle: () => (mode.startsWith("missing-handle") ? undefined : live.handle),
+		getTerminalTurnEpoch: () => 1,
+		getRunOwnerDomain: (handle: string) =>
+			mode.startsWith("missing-domain") ? undefined : ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: (event: object) => owners.get(event),
+		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		abortPromptAndWait: async () => {
+			throw new Error("The image producer is held until its exact terminal.");
+		},
+	};
+	let releases = 0;
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const releaseRun = Promise.withResolvers<void>();
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+			options?.onQueuedPromoted?.({ startsOwnRun: true });
+			await releaseRun.promise;
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "image domain endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		const accepted = await client.control("turn.prompt", { text: "hold the image owner", stagedImages: [{ id }] });
+		const result = (accepted as { result: { commandId?: unknown; turnId?: unknown } }).result;
+		const correlation = { commandId: result.commandId, turnId: result.turnId };
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(typeof correlation.commandId).toBe("string");
+		expect(typeof correlation.turnId).toBe("string");
+		live.idle = false;
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(releases).toBe(0);
+		if (missingOwner) {
+			const failed = Promise.withResolvers<void>();
+			const removeObserver = client.onFrame(frame => {
+				if (
+					frame.type === "agent_failed" &&
+					frame.commandId === correlation.commandId &&
+					frame.turnId === correlation.turnId
+				)
+					failed.resolve();
+			});
+			releaseRun.reject(new Error("Image producer failed after adopting an unbound execution."));
+			await failed.promise;
+			removeObserver();
+			expect(releases).toBe(0);
+		}
+		await client.close();
+		const unrelated = { type: "agent_end" };
+		owners.set(unrelated, { resourceRunId: "other-run", domain: otherDomain });
+		await handlers.get("agent_end")?.(unrelated, sessionContext);
+		expect(releases).toBe(0);
+		const ended = { type: "agent_end", stopReason: mode === "settled" ? "completed" : "cancelled" };
+		owners.set(ended, { resourceRunId: "image-run", domain });
+		ledger.seal("image-run");
+		if (mode.endsWith("quarantined")) ledger.quarantine("image-run");
+		await handlers.get("agent_end")?.(ended, sessionContext);
+		if (mode !== "settled") {
+			await Bun.sleep(150);
+			expect(releases).toBe(0);
+			tool.resolve();
+		}
+		if (mode.endsWith("quarantined") || missingOwner) {
+			releaseRun.resolve();
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+			await Bun.sleep(150);
+			expect(releases).toBe(0);
+			expect(await ledger.waitForSettlement("image-run", { graceMs: 0 })).toMatchObject(
+				mode.endsWith("quarantined") ? { status: "unfenced", reason: "quarantined" } : { status: "settled" },
+			);
+			return;
+		}
+		await waitFor(() => releases === 1, "exact image resource settlement");
+		expect(releases).toBe(1);
+		releaseRun.resolve();
+		await handlers.get("agent_end")?.(ended, sessionContext);
+		expect(releases).toBe(1);
+	} finally {
+		tool.resolve();
+		releaseRun.resolve();
+		try {
+			await client?.close();
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		} finally {
+			redeemSpy.mockRestore();
+			for (const release of cleanupReservations) release();
+		}
+	}
 });
 
 test.each([
@@ -7184,6 +7569,10 @@ test("Q17 returns empty observation without readable assistant text and reads a 
 		() => frames.some(frame => frame.type === "control_response" && frame.id === "completed-turn"),
 		"completed turn acknowledgement",
 	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "completed-turn")).toMatchObject({
+		ok: true,
+		result: { accepted: true },
+	});
 	await agentSession.waitForIdle();
 	await sessionManager.flush();
 	expect(sessionManager.getBranch()).toEqual(

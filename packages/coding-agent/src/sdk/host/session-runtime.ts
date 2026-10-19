@@ -4,7 +4,12 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { isContinuingMidRunMaintenanceOutcome, isNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	isContinuingMidRunMaintenanceOutcome,
+	isNonDispatchedToolEvent,
+	type RunSettlementProof,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
 
@@ -125,6 +130,7 @@ import {
 	TURN_STREAM_CAPABILITY,
 } from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
+import { PromptImageUploadStore, retirePromptImageReservation } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import { createSdkRunCapability } from "./sdk-run-capability";
 import {
@@ -350,6 +356,8 @@ export interface SessionSdkTransport {
 	stop(): Promise<void>;
 	broadcastFrame?(frame: SdkFrame): void;
 	onConnectionClose?(handler: (connectionId: string) => void): undefined | (() => void);
+	/** Authoritative live socket membership, not a cache of previously observed frames. */
+	isConnectionOpen?(connectionId: string): boolean;
 	onNegotiatedCapabilities?(
 		handler: (connectionId: string, capabilities: readonly string[]) => void,
 	): undefined | (() => void);
@@ -357,6 +365,7 @@ export interface SessionSdkTransport {
 
 export interface SessionSdkRuntimeOptions
 	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame"> {
+	onDisconnected?: (connectionId: string) => void;
 	transport: SessionSdkTransport;
 	/** Session settings; enables `config.patch` application on this runtime. */
 	settings?: Settings;
@@ -443,6 +452,8 @@ export interface SdkOnlyReconciliationStore {
 }
 
 export interface SdkOnlyTerminalAbortSeams {
+	/** Pure observation: never abort, seal or quarantine an execution to reclaim images. */
+	getRunSettlementProof?: (handle: string) => Promise<RunSettlementProof>;
 	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
 	getTerminalTurnEpoch: () => number | undefined;
 	getActivePromptHandle: () => string | undefined;
@@ -571,6 +582,7 @@ export class SessionSdkSessionRuntime {
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
 			this.#connectionIds.delete(connectionId);
 			this.#connectionCapabilities.delete(connectionId);
+			options.onDisconnected?.(connectionId);
 			this.host.handleDisconnect(connectionId);
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
@@ -2232,6 +2244,8 @@ export interface SdkSurfaceFactoryOptions {
 	api: ExtensionAPI;
 	/** Startup surface that owns host-level permission and lifecycle authority. */
 	primaryControlSurface?: "cli" | "sdk";
+	/** Private staging controls are advertised only with authoritative transport liveness. */
+	imageUploadsAvailable?: boolean;
 	policy?: SdkSurfacePolicy;
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
@@ -2740,7 +2754,11 @@ export function createSdkSurfaceFactory(
 ): SdkSurfaceFactory {
 	const policy =
 		options.policy ??
-		createSdkSurfacePolicyForContext(options.ctx, hasSdkWorkflowGateCapability(options.ctx.workflowGate));
+		createSdkSurfacePolicyForContext(
+			options.ctx,
+			hasSdkWorkflowGateCapability(options.ctx.workflowGate),
+			options.imageUploadsAvailable,
+		);
 	const reconciliation =
 		options.reconciliation ??
 		createInvocationReconciliation({
@@ -3126,6 +3144,7 @@ function createControlSurface(
 	) => void,
 	armPromptDeadline: (correlation: InvocationCorrelation) => void,
 	steerReconciliation: KindAwareReconciliation,
+	imageUploads: PromptImageUploadStore | undefined,
 	onPromotedTurn?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -3153,6 +3172,8 @@ function createControlSurface(
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	publishLifecycleFrame?: (frame: SdkFrame) => void,
+	retainAcceptedImage?: (correlation: InvocationCorrelation, release: () => void) => void,
+	releaseAcceptedImage?: (correlation: InvocationCorrelation) => void,
 	acceptedQueueCancellations: Map<string, AcceptedQueueCancellation> = new Map(),
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
@@ -3332,6 +3353,7 @@ function createControlSurface(
 		acceptedFields?: () => Record<string, unknown>,
 		allowCompletionFallback = false,
 		alwaysQueued = false,
+		onCreated?: (correlation: InvocationCorrelation) => void,
 	): Promise<unknown> => {
 		// Capture the REQUESTING connection at admission: a terminal abort from
 		// another SDK connection must never stop the prompt this one accepts
@@ -3340,9 +3362,11 @@ function createControlSurface(
 		const retainedClientRef = normalizeClientRef(clientRef);
 		reconciliation.admit(kind, retainedClientRef);
 		const correlation = newCorrelation();
+		onCreated?.(correlation);
 		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
 		const sdkRunCapability = createSdkRunCapability(sdkRunToken);
 		const publishTerminal = (outcome: InvocationOutcome): void => {
+			releaseAcceptedImage?.(correlation);
 			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 			publishLifecycleFrame?.({
 				type: "agent_end",
@@ -3580,6 +3604,7 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
+						releaseAcceptedImage?.(correlation);
 						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 						// The submission promise rejects after preflight acceptance only when the
 						// work itself is over (provider stream interrupt, abort, queue failure).
@@ -3701,6 +3726,8 @@ function createControlSurface(
 				...(acceptedFields?.() ?? {}),
 			};
 		} catch (error) {
+			if (!accepted) preflightController.abort();
+			releaseAcceptedImage?.(correlation);
 			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
 			throw error;
@@ -4619,28 +4646,56 @@ function createControlSurface(
 		}
 	};
 	return {
-		prompt: async (text, images, clientRef) => {
-			const invalid = validateRequiredPromptText("turn.prompt", { text, images });
+		prompt: async (text, images, clientRef, stagedImages) => {
+			const invalid = validateRequiredPromptText("turn.prompt", { text, images, stagedImages });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
-			return await submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunCapability, ...options }) =>
-				sendSdkUserMessage(
-					typeof images === "undefined"
-						? text
-						: ([{ type: "text", text }, ...normalizePromptImages(images)] as [
-								{ type: "text"; text: string },
-								...ImageContent[],
-							]),
-					{
-						...options,
-						sdkRunCapability,
-						// ACP terminal settlement is owned by the correlated agent_end
-						// publication. Post-prompt recovery may include independent
-						// subagent work and must not hold that client-facing boundary.
-						...(queuedAtDispatch ? { queuedAtDispatch: true } : {}),
+			if (stagedImages !== undefined && images !== undefined)
+				throw Object.assign(new Error("Direct and staged images cannot be mixed."), { code: "invalid_input" });
+			if (stagedImages !== undefined && !imageUploads)
+				throw Object.assign(new Error("Image uploads are unavailable."), { code: "operation_prohibited" });
+			const reservation =
+				stagedImages === undefined
+					? undefined
+					: imageUploads!.redeem(sdkControlRequesterContext.getStore(), stagedImages);
+			let imageCorrelation: InvocationCorrelation | undefined;
+			try {
+				return await submit(
+					"prompt",
+					clientRef,
+					({ queuedAtDispatch, sdkRunCapability, ...options }) =>
+						sendSdkUserMessage(
+							typeof images === "undefined" && !reservation
+								? text
+								: ([{ type: "text", text }, ...(reservation?.images ?? normalizePromptImages(images))] as [
+										{ type: "text"; text: string },
+										...ImageContent[],
+									]),
+							{ ...options, sdkRunCapability, ...(queuedAtDispatch ? { queuedAtDispatch: true } : {}) },
+						),
+					undefined,
+					false,
+					false,
+					correlation => {
+						if (reservation && retainAcceptedImage) {
+							retainAcceptedImage(correlation, reservation.release);
+							imageCorrelation = correlation;
+						}
 					},
-				),
-			);
+				);
+			} catch (error) {
+				if (imageCorrelation) releaseAcceptedImage?.(imageCorrelation);
+				else reservation?.release();
+				throw error;
+			}
 		},
+		...(imageUploads
+			? {
+					imageBegin: (input: unknown) => imageUploads.begin(sdkControlRequesterContext.getStore(), input),
+					imageAppend: (input: unknown) => imageUploads.append(sdkControlRequesterContext.getStore(), input),
+					imageFinish: (input: unknown) => imageUploads.finish(sdkControlRequesterContext.getStore(), input),
+					imageDiscard: (input: unknown) => imageUploads.discard(sdkControlRequesterContext.getStore(), input),
+				}
+			: {}),
 		steer: async (text, clientRef, expectedSdkRunToken) => {
 			const invalid = validateRequiredPromptText("turn.steer", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
@@ -4895,7 +4950,9 @@ function createControlSurface(
 		retryLast: () => typed("retry.last"),
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
-		installedOperations: surfacePolicy.installedControls,
+		installedOperations: imageUploads
+			? surfacePolicy.installedControls
+			: new Set([...surfacePolicy.installedControls].filter(operation => !operation.startsWith("turn.image."))),
 		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
 }
@@ -5045,6 +5102,64 @@ function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown>
 
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
+	const acceptedImages = new Map<
+		string,
+		{
+			store: PromptImageUploadStore;
+			release: () => void;
+			handle?: string;
+			executionStarted?: boolean;
+			retiring?: boolean;
+		}
+	>();
+	const imageKey = (correlation: InvocationCorrelation): string => `${correlation.commandId}:${correlation.turnId}`;
+	const retireAcceptedImage = (key: string): void => {
+		const reservation = acceptedImages.get(key);
+		if (!reservation || reservation.retiring) return;
+		const release = (): void => {
+			if (acceptedImages.get(key) !== reservation) return;
+			acceptedImages.delete(key);
+			reservation.release();
+		};
+		if (!reservation.handle) {
+			if (reservation.executionStarted) {
+				reservation.retiring = true;
+				logger.warn("SDK image capacity retained for execution without an exact resource handle");
+				return;
+			}
+			release();
+			return;
+		}
+		const getProof = options.terminalAbortSeams?.getRunSettlementProof;
+		if (!getProof) return;
+		reservation.retiring = true;
+		retirePromptImageReservation(
+			reservation.handle,
+			getProof,
+			() => acceptedImages.get(key) === reservation,
+			release,
+		);
+	};
+	const releaseAcceptedImage = (correlation: InvocationCorrelation): void =>
+		retireAcceptedImage(imageKey(correlation));
+	const bindAcceptedImage = (correlation: InvocationCorrelation, handle: string | undefined): void => {
+		const reservation = acceptedImages.get(imageKey(correlation));
+		if (!reservation) return;
+		reservation.executionStarted = true;
+		if (handle && reservation.handle === undefined) reservation.handle = handle;
+	};
+	const releaseImagesForStore = (store: PromptImageUploadStore | undefined): void => {
+		for (const [key, reservation] of acceptedImages) {
+			if (reservation.store !== store) continue;
+			retireAcceptedImage(key);
+		}
+	};
+	const pendingImageCleanups = new Set<PromptImageUploadStore>();
+	const completeImageCleanups = (): void => {
+		for (const store of pendingImageCleanups) releaseImagesForStore(store);
+		pendingImageCleanups.clear();
+	};
+	let currentImageUploads: PromptImageUploadStore | undefined;
 	const acceptedQueueCancellations = new Map<string, AcceptedQueueCancellation>();
 	const disposeAcceptedQueueCancellations = async (): Promise<void> => {
 		const cancellations = [...acceptedQueueCancellations.values()];
@@ -5575,6 +5690,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	): Promise<void> => {
 		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
+		const imageRunHandle =
+			type === "agent_start" && acceptedImages.size > 0
+				? options.terminalAbortSeams?.getActivePromptHandle()
+				: undefined;
 		const failureBatch = lifecycleOwner?.batch;
 		const adoptLifecycleBatch = (batch: LifecycleBatch | undefined): void => {
 			current.activeInvocation = batch?.invocations[0];
@@ -5692,6 +5811,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			adoptLifecycleBatch(batch);
 			for (const entry of drained) {
 				if (entry.kind !== "prompt") continue;
+				bindAcceptedImage(entry.correlation, imageRunHandle);
 				if (current.deadlineManager.isExpiring(entry.correlation))
 					current.deadlineManager.captureExpiringRun(entry.correlation);
 				else current.deadlineManager.onRunStarted(entry.correlation);
@@ -6201,8 +6321,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
-			for (const invocation of transitions)
+			for (const invocation of transitions) {
+				// A deadline can capture this event while the exact run still owns
+				// pending tools. Its settlement owner, not event capture, releases quota.
+				if (!current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation))
+					releaseAcceptedImage(invocation.correlation);
 				retireAcceptedQueueCancellation(acceptedQueueCancellations, invocation.correlation);
+			}
 			if (current.lifecycleEpoch !== eventLifecycleEpoch) {
 				// A successor agent_start won the lifecycle race while this event's
 				// durable transitions were awaiting persistence. Retire the ended
@@ -6622,6 +6747,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
 		if (active) return;
 		if (acceptedQueueCancellations.size > 0) await disposeAcceptedQueueCancellations();
+		completeImageCleanups();
 		if (active) return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
@@ -6973,6 +7099,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				await autosaveWorktreeOnPromptDeadline(ctx.cwd, options.settings, { isCurrent, signal });
 			},
 			onExpired: correlation => {
+				// The manager invokes retirement only after confirmed settlement and
+				// durable terminalization (including recovered queue removals), never
+				// merely because an inactivity timer fired or execution is uncertain.
+				releaseAcceptedImage(correlation);
 				retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation, true);
 				const owner = lifecycleOwnerHolder.state;
 				if (owner) {
@@ -7037,6 +7167,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			ctx,
 			id: sessionId,
 			api,
+			imageUploadsAvailable:
+				typeof transport.isConnectionOpen === "function" &&
+				typeof options.terminalAbortSeams?.getRunSettlementProof === "function",
 			reconciliation,
 			turnResultLookup: selector => reconciliation.lookupResult(selector.kind, selector),
 			steerStatusLookup: selector => steerReconciliation.lookupSteer(selector),
@@ -7167,7 +7300,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					});
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
-					if (kind === "prompt") retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
+					if (kind === "prompt") {
+						releaseAcceptedImage(correlation);
+						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
+					}
 					return true;
 				} catch (transitionError) {
 					// Keep prompt recovery leased; skill recovery has no prompt lease.
@@ -7185,6 +7321,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			return attempt(3);
 		};
 
+		// This is a private SDK transport facility. A frame-observer cache cannot
+		// establish that the authenticated connection still exists at redemption.
+		const imageUploads =
+			typeof transport.isConnectionOpen === "function" &&
+			typeof options.terminalAbortSeams?.getRunSettlementProof === "function"
+				? new PromptImageUploadStore(connectionId => transport.isConnectionOpen?.(connectionId) === true)
+				: undefined;
+		currentImageUploads = imageUploads;
 		const controlSurface = createControlSurface(
 			ctx,
 			api,
@@ -7221,6 +7365,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			correlation => deadlineManager.onAccepted(correlation),
 			steerReconciliation,
+			imageUploads,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
 					const owner = lifecycleOwnerHolder.state;
@@ -7277,6 +7422,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// with it.
 				const current = active;
 				if (current?.lifecycleActive) {
+					bindAcceptedImage(correlation, options.terminalAbortSeams?.getActivePromptHandle());
 					// If this correlation was already admitted as own-run via the
 					// idle snapshot (onAccepted -> pending) but later diverted to
 					// steering and consumed in-run, move it from pending to the
@@ -7437,6 +7583,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					throw error;
 				}
 			},
+			(correlation, release) => {
+				if (imageUploads) acceptedImages.set(imageKey(correlation), { store: imageUploads, release });
+			},
+			releaseAcceptedImage,
 			acceptedQueueCancellations,
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
@@ -7505,6 +7655,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			onDisconnected: connectionId => imageUploads?.disconnect(connectionId),
 			eventRevision: () =>
 				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function"
 					? ctx.getTranscript().length
@@ -7955,6 +8106,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		} catch (error) {
 			runtimeOwner.quiesceInput();
 			runtimeOwner.fenceGateResolutions();
+			imageUploads?.close();
 			active = undefined;
 			let queueCancellationFailure: unknown;
 			try {
@@ -8013,7 +8165,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 			cursors.close();
 			await revisions.close().catch(() => undefined);
-			if (queueCancellationFailure !== undefined)
+			if (queueCancellationFailure !== undefined) {
+				if (imageUploads) pendingImageCleanups.add(imageUploads);
 				throw Object.assign(
 					new AggregateError(
 						[error, queueCancellationFailure],
@@ -8021,14 +8174,25 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					),
 					{ code: "sdk_reconciliation_teardown_failed" },
 				);
+			}
+			if (currentImageUploads === imageUploads) currentImageUploads = undefined;
+			releaseImagesForStore(imageUploads);
 			throw error;
 		}
 	};
 	const stopActive = async (cancelSkillRecovery = false, unregisterReason?: "detached_idle"): Promise<void> => {
 		const current = active;
-		if (!current) return;
+		if (!current) {
+			if (pendingImageCleanups.size > 0) {
+				await disposeAcceptedQueueCancellations();
+				completeImageCleanups();
+			}
+			return;
+		}
 		current.quiesceInput();
 		current.fenceGateResolutions();
+		const imageUploads = currentImageUploads;
+		imageUploads?.close();
 		let queueCancellationFailure: unknown;
 		try {
 			await disposeAcceptedQueueCancellations();
@@ -8094,6 +8258,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				allowLockContention: cancelSkillRecovery,
 				...(unregisterReason === undefined ? {} : { unregisterReason }),
 			});
+			if (queueCancellationFailure === undefined) {
+				if (currentImageUploads === imageUploads) currentImageUploads = undefined;
+				releaseImagesForStore(imageUploads);
+			} else if (imageUploads) pendingImageCleanups.add(imageUploads);
 		} catch (error) {
 			// Keep the immutable owner available for a retry when transport teardown
 			// fails after quiescing. Clearing `active` before stop prevents a second
