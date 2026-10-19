@@ -1133,7 +1133,7 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 			// Explicitly disable thinking when reasoning is not specified or model doesn't support it
-			const reasoning = options?.reasoning;
+			const reasoning = options?.disableReasoning ? undefined : options?.reasoning;
 			if (!reasoning || !model.reasoning) {
 				return castApi<"anthropic-messages">({
 					...base,
@@ -1144,7 +1144,7 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 
-			let thinkingBudget = options.thinkingBudgets?.[reasoning] ?? ANTHROPIC_THINKING[reasoning];
+			let thinkingBudget = options?.thinkingBudgets?.[reasoning] ?? ANTHROPIC_THINKING[reasoning];
 			if (thinkingBudget <= 0) {
 				return castApi<"anthropic-messages">({
 					...base,

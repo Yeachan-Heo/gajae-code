@@ -26,6 +26,7 @@ export type BrokerExitReason =
 	| "restart-committed"
 	| "shutdown-request"
 	| "startup-failure"
+	| "abandoned"
 	| "signal";
 
 export type BrokerStopRequest =
@@ -80,6 +81,7 @@ const EXIT_REASONS = new Set<BrokerExitReason>([
 	"restart-committed",
 	"shutdown-request",
 	"startup-failure",
+	"abandoned",
 	"signal",
 ]);
 

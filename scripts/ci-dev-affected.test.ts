@@ -263,7 +263,14 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-empty-dir.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/doctor-plugin-restore.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/file-lock-signed-identity.test.ts");
+		expect(windowsJob).toContain(
+			"cargo test -p pi-natives generic_removal_does_not_reserve_the_lock_retirement_name",
+		);
+		expect(windowsJob).toContain("crates/pi-natives/src/path_identity.rs");
+		expect(windowsJob).toContain("bun test ./packages/natives/test/path-identity-windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/natives/test/windows-runtime-install.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
@@ -271,7 +278,11 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/natives/test/walker-pool-unavailable.windows.test.ts");
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
 		expect(requiredLines.length).toBe(2);
-		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
+		for (const line of requiredLines) {
+			expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
+			expect(line).toContain("packages/coding-agent/test/file-lock-empty-dir.test.ts");
+			expect(line).toContain("crates/pi-natives/src/path_identity.rs");
+		}
 	});
 
 	describe("detached evidence subprocess contract", () => {
@@ -1153,6 +1164,8 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/other/index.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
 		"packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
+		"packages/coding-agent/test/tools/tool-catalog.test.ts",
+		"packages/coding-agent/test/tools/discoverable-description-stable.test.ts",
 		"packages/coding-agent/test/session/session-memory-integration.test.ts",
 	];
 
@@ -1392,6 +1405,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
 
+	test("routes Windows lock retirement and marketplace restore changes to Windows", () => {
+		for (const changedPath of [
+			"packages/coding-agent/test/file-lock-empty-dir.test.ts",
+			"packages/coding-agent/src/extensibility/plugins/marketplace/manager.ts",
+			"packages/coding-agent/test/doctor-plugin-restore.test.ts",
+			"crates/pi-natives/src/path_identity.rs",
+		]) {
+			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
+			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
+		}
+	});
+
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
 		const tasks = targeted(["packages/coding-agent/test/edit/deleted.test.ts"]);
 		const keys = tasks.map(task => task.key);
@@ -1489,6 +1514,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			const tasks = targeted([source]);
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
+	});
+	test("tool catalog changes schedule freshness and discoverable-description regressions", () => {
+		const keys = targeted(["packages/coding-agent/src/tools/tool-catalog.generated.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/tools/tool-catalog.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/tools/discoverable-description-stable.test.ts");
 	});
 
 	test("model-registry changes schedule the availability-split regression suite", () => {

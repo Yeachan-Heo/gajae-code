@@ -190,6 +190,22 @@ test("reaps a legacy staging name after its PID is proven dead", async () => {
 	expect(await fs.exists(legacyStaging)).toBe(false);
 });
 
+test("reaps bounded staging names for long lock basenames", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "staging-orphan-long-name-"));
+	roots.push(root);
+	const file = path.join(root, "x".repeat(220));
+	const lockPath = `${file}.lock`;
+	const basenameHash = crypto.createHash("sha256").update(path.basename(lockPath)).digest("hex");
+	const staging = path.join(root, `.gjc-lock-${basenameHash}.pending.${DEAD_PID}.${uuid}`);
+	await fs.mkdir(staging);
+	deadPid();
+
+	const summary = await reapOrphanedLockStagingDirs(lockPath);
+	expect(summary.removed).toEqual([staging]);
+	expect(summary.retained).toEqual([]);
+	expect(await fs.exists(staging)).toBe(false);
+});
+
 test("symlink candidate and malformed names are untouched", async () => {
 	const { root, file, staging } = await fixture();
 	const target = path.join(root, "target");

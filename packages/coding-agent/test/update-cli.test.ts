@@ -17,6 +17,7 @@ import {
 import { offerMacosCommunityApp } from "../src/cli/macos-community-app";
 import type { BinaryReplacementOptions, BinaryUpdateFlow, UpdateCommandDependencies } from "../src/cli/update-cli";
 import {
+	ActivationRetryCandidateRepointError,
 	assertSupportedLinuxLibcForTest,
 	buildReleaseBinaryUrlForTest,
 	compareVersionsForTest,
@@ -30,6 +31,8 @@ import {
 	hasManagedNotifySetup,
 	InstallationAccessDeniedError,
 	isProtectedSourcePathForTest,
+	isUpdateBackupNameForTest,
+	isUpdateStagingNameForTest,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
 	recoverWindowsUpdateJournal,
@@ -44,6 +47,7 @@ import {
 	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
 	sanitizeVerificationOutputForTest,
+	smokeTestPinnedCandidate,
 	verifyInstalledVersionForTest,
 	verifyMigrationTargetAdapterForTest,
 	verifyMigrationTargetForTest,
@@ -66,6 +70,23 @@ async function makeTempDir(): Promise<string> {
 async function writeFixtureFile(filePath: string, content: string | Uint8Array, mode = 0o755): Promise<void> {
 	await fs.writeFile(filePath, content, { mode });
 	await fs.chmod(filePath, mode);
+}
+
+function seededRandom(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+		return state / 0x1_0000_0000;
+	};
+}
+
+function generatedHex(random: () => number, length: number): string {
+	const digits = "0123456789abcdef";
+	return Array.from({ length }, () => digits.charAt(Math.floor(random() * digits.length))).join("");
+}
+
+function generatedUpdateId(random: () => number): string {
+	return `${generatedHex(random, 8)}-${generatedHex(random, 4)}-${generatedHex(random, 4)}-${generatedHex(random, 4)}-${generatedHex(random, 12)}`;
 }
 
 afterEach(async () => {
@@ -2780,6 +2801,48 @@ describe("update-cli download durability", () => {
 	});
 });
 
+describe("update artifact filename recognition", () => {
+	it("recognizes generated names only for their target and exact extension", () => {
+		const targetPath = path.join("/install", "gjc");
+		const extendedTargetPath = path.join("/install", "gjc.exe");
+		const random = seededRandom(0x6866cafe);
+
+		for (let index = 0; index < 64; index++) {
+			const id = generatedUpdateId(random);
+			const version = `${1 + Math.floor(random() * 9)}.${Math.floor(random() * 100)}.${Math.floor(random() * 100)}-rc.${index}+build.${generatedHex(random, 4)}`;
+			const timestamp = `${generatedHex(random, 8)}_${index}Z`;
+
+			expect(isUpdateStagingNameForTest(targetPath, `gjc.new.${id}`)).toBe(true);
+			expect(isUpdateStagingNameForTest(targetPath, `other.new.${id}`)).toBe(false);
+			expect(isUpdateStagingNameForTest(targetPath, `gjc.new.${id}.exe`)).toBe(false);
+			expect(isUpdateStagingNameForTest(extendedTargetPath, `gjc.new.${id}.exe`)).toBe(true);
+			expect(isUpdateStagingNameForTest(extendedTargetPath, `gjc.new.${id}`)).toBe(false);
+			expect(isUpdateStagingNameForTest(extendedTargetPath, `other.new.${id}.exe`)).toBe(false);
+
+			expect(isUpdateBackupNameForTest(targetPath, `gjc.bak.${id}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `gjc.exe.bak.${id}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(targetPath, `other.bak.${id}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `other.exe.bak.${id}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc.bak.${id}.exe`)).toBe(false);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `gjc.bak.${id}`)).toBe(false);
+
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-${version}.bak.${timestamp}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(extendedTargetPath, `gjc.exe-${version}.bak.${timestamp}`)).toBe(true);
+			expect(isUpdateBackupNameForTest(targetPath, `other-${version}.bak.${timestamp}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-${version}.old.${timestamp}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc.backup.${id}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-not-a-version.bak.${timestamp}`)).toBe(false);
+			expect(isUpdateBackupNameForTest(targetPath, `gjc-${version}.bak.${timestamp}!`)).toBe(false);
+
+			const malformedIds = [id.slice(1), id.replaceAll("-", ""), `${id.slice(0, -1)}g`, id.toUpperCase()];
+			for (const malformedId of malformedIds) {
+				expect(isUpdateStagingNameForTest(targetPath, `gjc.new.${malformedId}`)).toBe(false);
+				expect(isUpdateBackupNameForTest(targetPath, `gjc.bak.${malformedId}`)).toBe(false);
+			}
+		}
+	});
+});
+
 describe("update-cli binary update flow", () => {
 	it("keeps the executable extension on a Windows staging path", async () => {
 		const targetPath = path.join(await makeTempDir(), "gjc.exe");
@@ -2832,12 +2895,159 @@ describe("update-cli binary update flow", () => {
 		expect(calls.some(call => call.startsWith("removeTemp "))).toBe(false);
 	});
 
+	it("reclaims staging and exact-replace placeholders while retaining only the verified rollback baseline", async () => {
+		const home = await makeTempDir();
+		const bin = path.join(home, ".local", "bin");
+		await fs.mkdir(bin, { recursive: true });
+		const targetPath = path.join(bin, "gjc");
+		const fixture = (version: string) =>
+			`#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'gjc/${version}\\n'; exit 0; fi\nexit 0\n`;
+		await writeFixtureFile(targetPath, fixture("1.0.0"));
+		const oldStagingPath = path.join(bin, "gjc.new.00000000-0000-4000-8000-000000000001");
+		const oldBackupPath = path.join(bin, "gjc.bak.00000000-0000-4000-8000-000000000002");
+		const oldVersionedBackupPath = path.join(bin, "gjc-0.17.1.bak.20260929T123456Z");
+		await writeFixtureFile(oldStagingPath, "partial stage");
+		await writeFixtureFile(oldBackupPath, "unreferenced backup");
+		await writeFixtureFile(oldVersionedBackupPath, "legacy unreferenced backup");
+		const placeholderSeed = path.join(bin, "placeholder-seed");
+		await writeFixtureFile(placeholderSeed, "", 0o600);
+		const placeholderInode = (await fs.stat(placeholderSeed, { bigint: true })).ino.toString(16);
+		const oldPlaceholderPath = path.join(bin, `.gjc-exact-replace-destination-${placeholderInode}-0`);
+		await fs.rename(placeholderSeed, oldPlaceholderPath);
+		const oldTime = new Date(Date.now() - 60 * 60 * 1000);
+		await fs.utimes(oldPlaceholderPath, oldTime, oldTime);
+
+		for (const version of ["1.0.1", "1.0.2"]) {
+			await runBinaryUpdateFlow(targetPath, "unused", version, {
+				download: async (_url, tempPath) => writeFixtureFile(tempPath, fixture(version)),
+				fsync: fsyncFileForTest,
+				replace: replaceBinaryForUpdate,
+				verifyInstalledVersion: async expected => {
+					await smokeTestPinnedCandidate({ version: expected }, targetPath);
+					return { ok: true, actual: expected, path: targetPath };
+				},
+			});
+
+			const activation = await readActivationRecord(targetPath);
+			expect(activation.status).toBe("valid");
+			if (activation.status !== "valid") throw new Error("expected verified activation record");
+			expect(activation.record.phase).toBe("verified");
+			const names = await fs.readdir(bin);
+			expect(names.filter(name => name.startsWith("gjc.new."))).toEqual([]);
+			expect(names.filter(name => name.startsWith(".gjc-exact-replace-destination-"))).toEqual([]);
+			expect(names).not.toContain(path.basename(oldBackupPath));
+			expect(names).not.toContain(path.basename(oldVersionedBackupPath));
+			const backups = names.filter(name => /^gjc\.bak\./u.test(name));
+			expect(backups).toEqual([activation.record.backupName]);
+			expect(await Bun.file(path.join(bin, activation.record.backupName)).exists()).toBe(true);
+		}
+	});
+
+	it("preserves a journal-owned stage when a denied promotion remains pending", async () => {
+		const home = await makeTempDir();
+		const bin = path.join(home, ".local", "bin");
+		await fs.mkdir(bin, { recursive: true });
+		const targetPath = path.join(bin, "gjc.exe");
+		const fixture = (version: string) =>
+			`#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'gjc/${version}\\n'; exit 0; fi\nexit 0\n`;
+		await writeFixtureFile(targetPath, fixture("1.0.0"));
+		await writeFixtureFile(path.join(bin, "gjc.exe.bak.00000000-0000-4000-8000-000000000003"), "old backup");
+		const replaceSpy = vi.spyOn(native, "exactReplaceRetained").mockImplementation(() => {
+			return { ok: false, code: "access_denied", windowsErrorCode: "0xC0000022" };
+		});
+		try {
+			await expect(
+				runBinaryUpdateFlow(targetPath, "unused", "1.0.1", {
+					download: async (_url, tempPath) => writeFixtureFile(tempPath, fixture("1.0.1")),
+					fsync: fsyncFileForTest,
+					replace: replaceBinaryForUpdate,
+					verifyInstalledVersion: async expected => ({ ok: true, actual: expected, path: targetPath }),
+				}),
+			).rejects.toThrow("access_denied");
+
+			const activation = await readActivationRecord(targetPath);
+			expect(activation.status).toBe("valid");
+			if (activation.status !== "valid") throw new Error("expected pending activation record");
+			expect(activation.record.phase).toBe("pending_activation");
+			expect(await Bun.file(activation.record.stagingPath).exists()).toBe(true);
+			expect((await fs.readdir(bin)).filter(name => name.startsWith("gjc.exe.bak."))).toEqual([]);
+			expect(replaceSpy).toHaveBeenCalled();
+		} finally {
+			replaceSpy.mockRestore();
+		}
+	});
+
+	it("preserves a retry candidate when activation-record repointing fails", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const recordedStage = path.join(dir, "gjc.new.recorded.exe");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(recordedStage, "new binary");
+		const target = (await snapshotRegularFile(targetPath))!;
+		const stage = (await snapshotRegularFile(recordedStage))!;
+		const parent = (await snapshotDirectory(dir))!;
+		await createActivationRecordFile({
+			...buildActivationRecord({
+				targetPath,
+				targetIdentity: target.identity,
+				parentIdentity: parent,
+				baselineDigest: target.identity.sha256,
+				stagingPath: recordedStage,
+				stagingIdentity: stage.identity,
+				candidate: { digest: stage.identity.sha256, version: "15.1.8" },
+			}),
+			phase: "pending_activation",
+		});
+		await fs.unlink(recordedStage);
+
+		const recordSpy = vi.spyOn(installActivation, "updateActivationRecordFile").mockImplementation(async () => {
+			throw new Error("activation_record_compare_and_swap_failed");
+		});
+		try {
+			let failure: unknown;
+			let downloadedStage: string | undefined;
+			try {
+				await runBinaryUpdateFlow(targetPath, "unused", "15.1.8", {
+					download: async (_url, tempPath) => {
+						downloadedStage = tempPath;
+						await writeFixtureFile(tempPath, "new binary");
+					},
+					fsync: fsyncFileForTest,
+					replace: options => replaceBinaryForUpdate({ ...options, verifyStagedVersion: async () => {} }),
+					verifyInstalledVersion: async expected => ({ ok: true, actual: expected, path: targetPath }),
+				});
+			} catch (error) {
+				failure = error;
+			}
+
+			expect(failure).toBeInstanceOf(ActivationRetryCandidateRepointError);
+			if (!(failure instanceof ActivationRetryCandidateRepointError)) {
+				throw new Error("expected activation retry candidate repoint error");
+			}
+			if (!downloadedStage) throw new Error("expected a downloaded retry candidate");
+			expect(failure.candidatePath).toBe(downloadedStage);
+			expect(await Bun.file(failure.candidatePath).text()).toBe("new binary");
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+			const pending = await readActivationRecord(targetPath);
+			expect(pending.status).toBe("valid");
+			if (pending.status === "valid") {
+				expect(pending.record.phase).toBe("pending_activation");
+				expect(pending.record.stagingPath).toBe(recordedStage);
+			}
+		} finally {
+			recordSpy.mockRestore();
+		}
+	});
+
 	it("aborts before replacement/verification when fsync fails", async () => {
 		const calls: string[] = [];
 		const targetPath = path.join(await makeTempDir(), "gjc");
+		let stagingPath: string | undefined;
 		const flow: BinaryUpdateFlow = {
 			download: async (_url, tempPath) => {
+				stagingPath = tempPath;
 				calls.push(`download ${tempPath}`);
+				await writeFixtureFile(tempPath, "partial candidate");
 			},
 			fsync: async () => {
 				calls.push("fsync");
@@ -2862,6 +3072,8 @@ describe("update-cli binary update flow", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls).not.toContain("replace");
 		expect(calls).not.toContain("verify");
+		expect(stagingPath).toBeDefined();
+		expect(await Bun.file(stagingPath!).exists()).toBe(false);
 	});
 });
 

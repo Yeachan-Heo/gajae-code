@@ -314,6 +314,78 @@ describe("anthropic stream envelope handling", () => {
 		]);
 	});
 
+	it("disables Haiku 5.5 thinking when Off is selected but leaves Haiku 4.5 omitted", async () => {
+		const requestedThinking: unknown[] = [];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(params => {
+			requestedThinking.push((params as { thinking?: unknown }).thinking);
+			return createMockRequest([
+				{
+					type: "message_start",
+					message: { id: "msg_thinking_off", usage: { input_tokens: 0, output_tokens: 0 } },
+				},
+				{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } },
+				{ type: "message_stop" },
+			]) as never;
+		});
+
+		const haiku55 = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		const haiku45 = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-4-5");
+		if (!haiku55 || !haiku45) throw new Error("Expected bundled Anthropic Haiku models");
+		for (const options of [
+			{ apiKey: "sk-ant-test" },
+			{ apiKey: "sk-ant-test", reasoning: Effort.High, disableReasoning: true },
+		] as const) {
+			const stream = streamSimple(haiku55, context, options);
+			for await (const _ of stream) {
+				// Drain the provider stream to inspect its request payload.
+			}
+		}
+		const legacyStream = streamSimple(haiku45, context, { apiKey: "sk-ant-test" });
+		for await (const _ of legacyStream) {
+			// Drain the provider stream to inspect its request payload.
+		}
+
+		expect(requestedThinking).toEqual([{ type: "disabled" }, { type: "disabled" }, undefined]);
+	});
+
+	it("requests summarized Haiku 5.5 thinking by default and preserves explicit omission", async () => {
+		const bundled = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!bundled) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		const requestedThinking: unknown[] = [];
+		const thinkingEvents: MockAnthropicEvent[] = [
+			{ type: "message_start", message: { id: "msg_haiku_summary", usage: { input_tokens: 0, output_tokens: 0 } } },
+			{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "summary" } },
+			{ type: "content_block_stop", index: 0 },
+			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(params => {
+			requestedThinking.push((params as { thinking?: unknown }).thinking);
+			return createMockRequest(thinkingEvents) as never;
+		});
+
+		const defaultEvents: AssistantMessageEvent[] = [];
+		const defaultStream = streamSimple(bundled, context, { apiKey: "sk-ant-test", reasoning: Effort.High });
+		for await (const event of defaultStream) defaultEvents.push(event);
+
+		const omittedEvents: AssistantMessageEvent[] = [];
+		const omittedStream = streamSimple(bundled, context, {
+			apiKey: "sk-ant-test",
+			reasoning: Effort.High,
+			hideThinkingSummary: true,
+		});
+		for await (const event of omittedStream) omittedEvents.push(event);
+
+		expect(requestedThinking).toEqual([
+			{ type: "adaptive", display: "summarized" },
+			{ type: "adaptive", display: "omitted" },
+		]);
+		expect(defaultEvents.filter(event => event.type === "reasoning_summary_delta")).toHaveLength(1);
+		expect(omittedEvents.filter(event => event.type === "reasoning_summary_delta")).toHaveLength(0);
+		expect(omittedEvents.filter(event => event.type === "thinking_delta")).toHaveLength(1);
+	});
+
 	it("keeps unsupported adaptive thinking raw when summarized display is omitted", async () => {
 		const unsupportedAdaptiveModel: Model<"anthropic-messages"> = {
 			...model,

@@ -12,6 +12,7 @@ import {
 	setBrokerExitWriterBarrierForTest,
 	writeBrokerExitRecord,
 } from "../src/sdk/broker/broker-exit";
+import { SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS } from "../src/sdk/broker/session-index";
 
 // A short TTL drives the publication watchdog at `ttl/3`, so the fence advances
 // in tens of milliseconds instead of the production five-second cadence.
@@ -180,7 +181,12 @@ test("a retained transition that blocks heartbeat renewal persists its reason an
 	const checkpoint = vi.spyOn(broker.index, "checkpointLiveHeartbeats");
 	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 	try {
-		expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 20)).toBe(true);
+		// The checkpoint pass keeps contending on the retained transition for its
+		// whole bounded budget before it reports the block, so the self-termination
+		// window is that budget plus watchdog slack, not one watchdog cadence.
+		expect(await completedWithin(broker, SESSION_HEARTBEAT_CHECKPOINT_BUDGET_MS + WATCHDOG_CADENCE_MS * 10)).toBe(
+			true,
+		);
 		expect(checkpoint).toHaveBeenCalled();
 
 		const record = await readBrokerExitRecord(broker.settings.agentDir);
@@ -200,7 +206,7 @@ test("a retained transition that blocks heartbeat renewal persists its reason an
 		checkpoint.mockRestore();
 		warn.mockRestore();
 	}
-}, 10_000);
+}, 30_000);
 
 test("a blocked heartbeat renewal does not replace a prior publication fence exit cause", async () => {
 	const broker = await startBroker();

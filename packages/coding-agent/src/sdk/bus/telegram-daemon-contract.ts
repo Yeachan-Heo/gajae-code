@@ -303,8 +303,12 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * before its terminal record is durable.
  * Generation 203 replaces owners that still treat a project `.gjc` file as an
  * explicit deadline-autosave opt-in for a primary checkout.
+ * Generation 205 replaces owners whose process descendant walk can adopt
+ * children of a recycled PID. Generation 206 verifies macOS descendant
+ * identities and parentage before retaining PTY termination authority, and
+ * reaps adopted Linux PTY descendants when GJC is a child reaper.
  */
-export const DAEMON_GENERATION = 205;
+export const DAEMON_GENERATION = 207;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

@@ -442,7 +442,8 @@ describe("workflow permission policy", () => {
 		expect(requestStep.env).toEqual({ REVIEWERS_JSON: "${{ steps.get-reviewers.outputs.result }}" });
 		expect(requestScript).toContain("JSON.parse(process.env.REVIEWERS_JSON)");
 		expect(requestScript).not.toContain("${{");
-		expect(requestScript).toContain("requested_reviewers/rerequest");
+		expect(requestScript).toContain("github.rest.pulls.requestReviewers");
+		expect(requestScript).not.toContain("requested_reviewers/rerequest");
 	});
 
 	test("documents the default-branch activation point for issue_comment workflows", async () => {
@@ -470,63 +471,78 @@ describe("workflow permission policy", () => {
 		expect(canRequestReviewer("none")).toBe(false);
 	});
 
-	test("re-requests a previously reviewing collaborator through GitHub's dedicated endpoint", async () => {
+	type ReviewRequestParams = { owner: string; repo: string; pull_number: number; reviewers: string[] };
+	type ReviewCommentParams = { owner: string; repo: string; issue_number: number; body: string };
+	async function loadRequestStep() {
 		const source = await parsedWorkflow(RE_REVIEW_WORKFLOW);
 		const jobs = documentRecord(source.jobs);
 		const steps = documentRecord(jobs["request-review-on-comment"]).steps as unknown[];
 		const requestStep = steps.map(documentRecord).find(step => step.id === "request-reviewers");
 		const requestScript = documentRecord(documentRecord(requestStep).with).script as string;
+		return new Function("github", "context", "process", `return (async () => { ${requestScript} })();`) as (
+			github: unknown,
+			ctx: unknown,
+			proc: unknown,
+		) => Promise<void>;
+	}
+	const requestContext = { repo: { owner: "Yeachan-Heo", repo: "gajae-code" }, issue: { number: 6599 } };
+	const requestProcess = { env: { REVIEWERS_JSON: '["previous-reviewer"]' } };
 
-		type RequestParams = {
-			owner: string;
-			repo: string;
-			pull_number: number;
-			reviewers: string[];
-			headers: { "X-GitHub-Api-Version": string };
-		};
-		type GithubStub = {
+	test("re-requests previous reviewers through the standard review-request endpoint", async () => {
+		const executeRequestStep = await loadRequestStep();
+		const requests: ReviewRequestParams[] = [];
+		const rawRoutes: string[] = [];
+		const github = {
 			rest: {
 				pulls: {
-					get: (params: { owner: string; repo: string; pull_number: number }) => Promise<{ data: { number: number } }>;
-				};
-			};
-			request: (route: string, params: RequestParams) => Promise<{ status: number }>;
-		};
-		const requests: Array<{ route: string; params: RequestParams }> = [];
-		const github: GithubStub = {
-			rest: {
-				pulls: {
-					get: async ({ pull_number }) => ({ data: { number: pull_number } }),
+					get: async ({ pull_number }: { pull_number: number }) => ({ data: { number: pull_number } }),
+					requestReviewers: async (params: ReviewRequestParams) => {
+						requests.push(params);
+						return { status: 201 };
+					},
 				},
+				issues: { createComment: async () => ({ status: 201 }) },
 			},
-			request: async (route, params) => {
-				requests.push({ route, params });
+			request: async (route: string) => {
+				rawRoutes.push(route);
 				return { status: 201 };
 			},
 		};
-		const context = { repo: { owner: "Yeachan-Heo", repo: "gajae-code" }, issue: { number: 6599 } };
-		const processStub = { env: { REVIEWERS_JSON: '["previous-reviewer"]' } };
-		const executeRequestStep = new Function(
-			"github",
-			"context",
-			"process",
-			`return (async () => { ${requestScript} })();`,
-		) as (github: GithubStub, ctx: typeof context, proc: typeof processStub) => Promise<void>;
 
-		await executeRequestStep(github, context, processStub);
+		await executeRequestStep(github, requestContext, requestProcess);
 
 		expect(requests).toEqual([
-			{
-				route: "POST /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers/rerequest",
-				params: {
-					owner: "Yeachan-Heo",
-					repo: "gajae-code",
-					pull_number: 6599,
-					reviewers: ["previous-reviewer"],
-					headers: { "X-GitHub-Api-Version": "2026-03-10" },
+			{ owner: "Yeachan-Heo", repo: "gajae-code", pull_number: 6599, reviewers: ["previous-reviewer"] },
+		]);
+		expect(rawRoutes).toEqual([]);
+	});
+
+	test("tells the commenter and fails the step when the review request is rejected", async () => {
+		const executeRequestStep = await loadRequestStep();
+		const comments: ReviewCommentParams[] = [];
+		const rejection = Object.assign(new Error("Reviews may only be requested from collaborators"), { status: 422 });
+		const github = {
+			rest: {
+				pulls: {
+					get: async ({ pull_number }: { pull_number: number }) => ({ data: { number: pull_number } }),
+					requestReviewers: async () => {
+						throw rejection;
+					},
+				},
+				issues: {
+					createComment: async (params: ReviewCommentParams) => {
+						comments.push(params);
+						return { status: 201 };
+					},
 				},
 			},
-		]);
+		};
+
+		await expect(executeRequestStep(github, requestContext, requestProcess)).rejects.toBe(rejection);
+		expect(comments).toHaveLength(1);
+		expect(comments[0].issue_number).toBe(6599);
+		expect(comments[0].body).toContain("Failed to re-request reviews");
+		expect(comments[0].body).toContain("Reviews may only be requested from collaborators");
 	});
 
 	test("detects if re-review.yml has workflow-level write permissions instead of job-level", async () => {

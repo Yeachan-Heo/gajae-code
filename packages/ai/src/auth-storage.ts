@@ -1210,7 +1210,7 @@ export function formatOAuthIdentityLabel(
 	return base ? `${base} (${organization})` : organization;
 }
 
-type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential };
+type OAuthResolutionResult = { apiKey: string; credential: OAuthCredential; credentialRowId: number };
 
 /**
  * Refreshed OAuth access plus identity metadata returned by
@@ -3366,12 +3366,14 @@ export class AuthStorage {
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a runtime API key override is active`,
 			);
 		}
-		if (this.#hasConfigOverride(provider, owner)) {
+		const selected = this.#findCredentialBySelector(provider, selector);
+		const configOverride = this.#configOverrideRegistration(provider, owner);
+		if (configOverride && !(configOverride.envSourced && selected?.credential.type === "api_key")) {
 			throw new Error(
 				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while a config API key override is active`,
 			);
 		}
-		if (!this.#findCredentialBySelector(provider, selector)) {
+		if (!selected) {
 			throw new Error(`No credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`);
 		}
 	}
@@ -5735,6 +5737,30 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Opaque stored row IDs for credentials whose resolved key matches `apiKey`.
+	 * Unlike the session's sticky row pointer, these remain tied to the actual key
+	 * when concurrent requests share a credential session ID.
+	 * A row that cannot be resolved is skipped so an unrelated resolver failure
+	 * cannot prevent callers from using already-known credential identity.
+	 */
+	async getCredentialRowIdsMatchingApiKey(provider: string, apiKey: string): Promise<number[]> {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const rowIds: number[] = [];
+		for (const entry of this.#getStoredCredentials(storageProvider)) {
+			try {
+				if (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey)) rowIds.push(entry.id);
+			} catch (error) {
+				logger.warn("Failed to resolve stored API key while matching credential rows", {
+					provider: storageProvider,
+					credentialId: entry.id,
+					errorType: error instanceof Error ? error.name : typeof error,
+				});
+			}
+		}
+		return rowIds;
+	}
+
+	/**
 	 * Mark the stored credential whose key matches `apiKey` usage-limited for
 	 * `retryAfterMs` (or the default backoff). Used when the caller knows
 	 * exactly which leased credential failed (e.g. the auth-gateway leases a
@@ -6657,7 +6683,7 @@ export class AuthStorage {
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 			if (!authCredentialEquals(selection.credential, updated)) return undefined;
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
-			return { apiKey: result.apiKey, credential: updated };
+			return { apiKey: result.apiKey, credential: updated, credentialRowId: selection.id };
 		} catch (error) {
 			if (options?.signal?.aborted) throw error;
 			if (isSqliteError(error)) throw error;
@@ -7000,6 +7026,31 @@ export class AuthStorage {
 	 * 10. Fallback resolver (models.yml custom providers, last-resort)
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
+		return this.#resolveApiKey(provider, sessionId, options);
+	}
+
+	/**
+	 * Resolve an API key and retain the selected stored row identity across token refreshes
+	 * and concurrent changes to the session's sticky credential pointer.
+	 */
+	async getApiKeyWithCredentialRowId(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+	): Promise<{ apiKey: string | undefined; credentialRowId: number | undefined }> {
+		let credentialRowId: number | undefined;
+		const apiKey = await this.#resolveApiKey(provider, sessionId, options, rowId => {
+			credentialRowId = rowId;
+		});
+		return { apiKey, credentialRowId };
+	}
+
+	async #resolveApiKey(
+		provider: string,
+		sessionId?: string,
+		options?: AuthApiKeyOptions,
+		onCredentialRowResolved?: (rowId: number) => void,
+	): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 
@@ -7021,7 +7072,12 @@ export class AuthStorage {
 			// (validated at login, rotated on 401), while the pointed-to env
 			// value can go stale with no recovery path — prefer the stored
 			// credential. Stored OAuth credentials still yield to the override.
-			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(provider, selectedCredential, sessionId);
+			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(
+				provider,
+				selectedCredential,
+				sessionId,
+				onCredentialRowResolved,
+			);
 			if (storedApiKey) return storedApiKey;
 			return configKey;
 		}
@@ -7036,14 +7092,19 @@ export class AuthStorage {
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
-			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
+			const apiKey = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
+			if (apiKey) onCredentialRowResolved?.(selectedCredential.id);
+			return apiKey;
 		}
 
 		let oauthAttempted = false;
 		if (!selectedCredential && this.#getSessionCredential(provider, sessionId)?.type === "oauth") {
 			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
 			oauthAttempted = true;
-			if (oauthResolved) return oauthResolved.apiKey;
+			if (oauthResolved) {
+				onCredentialRowResolved?.(oauthResolved.credentialRowId);
+				return oauthResolved.apiKey;
+			}
 		}
 
 		const attemptedApiKeyIndices = new Set<number>();
@@ -7055,6 +7116,7 @@ export class AuthStorage {
 				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 				if (resolved) {
 					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					onCredentialRowResolved?.(apiKeySelection.id);
 					return resolved;
 				}
 			}
@@ -7062,7 +7124,10 @@ export class AuthStorage {
 
 		if (!oauthAttempted) {
 			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
-			if (oauthResolved) return oauthResolved.apiKey;
+			if (oauthResolved) {
+				onCredentialRowResolved?.(oauthResolved.credentialRowId);
+				return oauthResolved.apiKey;
+			}
 		}
 
 		if (!selectedCredential) {
@@ -7073,6 +7138,7 @@ export class AuthStorage {
 				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 				if (resolved) {
 					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					onCredentialRowResolved?.(apiKeySelection.id);
 					return resolved;
 				}
 			}
@@ -7091,21 +7157,25 @@ export class AuthStorage {
 	/**
 	 * Resolve a stored api_key credential that outranks an env-sourced config
 	 * override (`apiKeyEnv`). Mirrors the api_key branches of {@link getApiKey}:
-	 * the selector-pinned credential first, then the round-robin/session pool.
-	 * Returns undefined when no stored api_key credential resolves, leaving the
-	 * env-sourced override in effect.
+	 * a selected credential must resolve or fail closed; unpinned resolution then
+	 * tries the round-robin/session pool. Returns undefined when no unpinned
+	 * stored api_key credential resolves, leaving the env-sourced override in
+	 * effect.
 	 */
 	async #resolveStoredApiKeyOverEnvConfig(
 		provider: string,
 		selectedCredential: ({ index: number } & StoredCredential) | undefined,
 		sessionId?: string,
+		onCredentialRowResolved?: (rowId: number) => void,
 	): Promise<string | undefined> {
 		if (selectedCredential?.credential.type === "api_key") {
 			const resolved = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 			if (resolved) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
+				onCredentialRowResolved?.(selectedCredential.id);
 				return resolved;
 			}
+			throw new Error(`Selected credential for ${provider} (id:${selectedCredential.id}) is unavailable`);
 		}
 		const attemptedApiKeyIndices = new Set<number>();
 		for (;;) {
@@ -7115,6 +7185,7 @@ export class AuthStorage {
 			const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
 			if (resolved) {
 				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+				onCredentialRowResolved?.(apiKeySelection.id);
 				return resolved;
 			}
 		}

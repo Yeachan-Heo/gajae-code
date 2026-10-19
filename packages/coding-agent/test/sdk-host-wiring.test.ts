@@ -134,6 +134,7 @@ function captureInternalSend(
 }
 
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { isolatedNotificationSettings } from "./helpers/notification-settings";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
@@ -1272,9 +1273,11 @@ test("replay capability claims cannot turn a demanding connection into an observ
 	const baseDemand = sessionHostAttachedClients() ?? 0;
 	const demanding = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
 	sockets.push(demanding);
+	const frames: Record<string, unknown>[] = [];
 	let connectionId: string | undefined;
 	demanding.addEventListener("message", event => {
-		const frame = JSON.parse(String((event as MessageEvent).data)) as { type?: unknown; connectionId?: unknown };
+		const frame = JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>;
+		frames.push(frame);
 		if (frame.type === "hello" && typeof frame.connectionId === "string") connectionId = frame.connectionId;
 	});
 	try {
@@ -1284,17 +1287,21 @@ test("replay capability claims cannot turn a demanding connection into an observ
 		});
 		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
 		await waitFor(() => sdkFrame !== undefined && connectionId !== undefined, "SDK callback wiring");
+		const replayId = "forged-observer";
 		sdkFrame!(null, {
 			connectionId: connectionId!,
 			json: JSON.stringify({
 				type: "event_replay",
-				id: "forged-observer",
+				id: replayId,
 				sinceGeneration: 1,
 				sinceSeq: 0,
 				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
 			}),
 		});
-		await Bun.sleep(20);
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === replayId),
+			"forged replay result",
+		);
 		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
 	} finally {
 		demanding.close();
@@ -1302,6 +1309,75 @@ test("replay capability claims cannot turn a demanding connection into an observ
 		sdkFrameHook.mockRestore();
 	}
 }, 60_000);
+
+for (const confirmNative of [false, true]) {
+	test(`replay observer demand waits for native confirmation: ${confirmNative ? "confirmed" : "forged"}`, async () => {
+		const delayedCallbacks: Array<() => void> = [];
+		const registerCapabilities = NotificationServer.prototype.onNegotiatedCapabilities;
+		const capabilitySpy = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(
+			function (this: NotificationServer, callback) {
+				return registerCapabilities.call(this, (error, connectionId, capabilities) => {
+					delayedCallbacks.push(() => callback(error, connectionId, capabilities));
+				});
+			},
+		);
+		let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+		const registerFrame = NotificationServer.prototype.onSdkFrame;
+		const frameSpy = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+			this: NotificationServer,
+			callback,
+		) {
+			sdkFrame = callback;
+			return registerFrame.call(this, callback);
+		});
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-native-observer-demand-"));
+		dirs.push(cwd);
+		try {
+			const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+			try {
+				const baseDemand = sessionHostAttachedClients() ?? 0;
+				const frames: Record<string, unknown>[] = [];
+				const socket = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+				sockets.push(socket);
+				socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+				await waitFor(() => frames.some(frame => frame.type === "hello"), "client hello");
+				await waitFor(() => sessionHostAttachedClients() === baseDemand + 1, "client demand");
+				const connectionId = frames.find(frame => frame.type === "hello")?.connectionId;
+				if (typeof connectionId !== "string" || !sdkFrame) throw new Error("Missing SDK callback wiring");
+				const replay = {
+					type: "event_replay",
+					id: "native-observer-demand",
+					capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+				};
+				if (confirmNative) {
+					// Exercise real native replay negotiation, but withhold its callback.
+					socket.send(JSON.stringify(replay));
+					await waitFor(() => delayedCallbacks.length > 0, "native replay snapshot");
+				} else {
+					// A forged bus frame never reaches native negotiation.
+					sdkFrame(null, { connectionId, json: JSON.stringify(replay) });
+				}
+				await waitFor(
+					() => frames.some(frame => frame.type === "event_replay_result" && frame.id === replay.id),
+					"replay processed before native confirmation",
+				);
+				expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+				expect(delayedCallbacks.length > 0).toBe(confirmNative);
+				for (const deliver of delayedCallbacks.splice(0)) deliver();
+				if (confirmNative) {
+					await waitFor(() => sessionHostAttachedClients() === baseDemand, "native-confirmed observer");
+				} else {
+					expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+				}
+			} finally {
+				await host.stop();
+			}
+		} finally {
+			capabilitySpy.mockRestore();
+			frameSpy.mockRestore();
+		}
+	}, 60_000);
+}
 
 test("a default ACP-shaped SessionRouter client remains demanding", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
@@ -1694,6 +1770,7 @@ test("interactive extension context advertises typed SDK controls and forwards p
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: {
 			extensionRunner: runner,
 			setSdkPermissionProvider: (provider: typeof installed) => {
@@ -1753,6 +1830,7 @@ test("interactive SDK control routes synthetic gajae-code selections to session-
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: {
 			extensionRunner: runner,
 			modelRegistry: {
@@ -1802,6 +1880,7 @@ test("interactive SDK controls reject Broker-owned session handoff", async () =>
 		},
 	};
 	const controller = new ExtensionUiController({
+		updateEditorChrome: () => {},
 		session: { extensionRunner: runner },
 	} as unknown as InteractiveModeContext);
 	controller.initializeHookRunner({} as ExtensionUIContext, false);
@@ -2898,7 +2977,6 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 	const settings = {
 		get: (key: string) =>
 			key === "sdk.promptDeadlineMs" ? deadlineMs : key === "sdk.promptMaxRuntimeMs" ? 5_000 : undefined,
-		getAgentDir: () => cwd,
 	} as unknown as Settings;
 	const abortHandles: string[] = [];
 	const abortAttempts: Array<{ handle: string; activeHandle: string; hasLiveDomain: boolean }> = [];
@@ -3187,13 +3265,12 @@ test("SDK host text-only stop/restart isolates late predecessor progress and ter
 			result: { status: "failed", error: { code: "prompt_deadline_exceeded" } },
 		});
 	} finally {
-		try {
-			predecessorDispatchReady.resolve();
-			settleSubmissions();
-			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-		} finally {
-			leaseClock.mockRestore();
-		}
+		// Restore the fake lease clock before awaited teardown: if shutdown
+		// throws, an active Date.now spy would leak into every later test.
+		leaseClock.mockRestore();
+		predecessorDispatchReady.resolve();
+		settleSubmissions();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
 });
 
@@ -6746,9 +6823,35 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
 	dirs.push(cwd);
-	const host = await startProductionSdkHost(cwd, { notificationsInitiallyEnabled: false });
-	const { sessionId, endpoint } = host;
+	const sessionId = `sdk-ui-provider-notify-priority-${Date.now()}`;
+	const sessionContext = {
+		...context(cwd, sessionId),
+		ui: { notify: () => {} },
+	};
+	const settings = isolatedNotificationSettings(path.join(cwd, ".gjc", "agent"), { "notifications.enabled": true });
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+	const previousNotifications = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "0";
+	let handlers: Map<string, (event: unknown, context: unknown) => unknown> | undefined;
 	try {
+		handlers = start(
+			sessionContext,
+			settings,
+			async () => {},
+			false,
+			commands,
+			undefined,
+			false,
+			undefined,
+			undefined,
+			async () => "attached",
+		);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = previousNotifications;
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 		expect(getAskAnswerSource(sessionId)).toBeUndefined();
 		const frames: Record<string, unknown>[] = [];
 		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
@@ -6776,7 +6879,9 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		const priorNotifications = process.env.GJC_NOTIFICATIONS;
 		process.env.GJC_NOTIFICATIONS = "1";
 		try {
-			await host.runCommand("/notify on");
+			const notify = commands.get("notify");
+			expect(notify).toBeDefined();
+			await notify!.handler("on", sessionContext);
 		} finally {
 			if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
 			else process.env.GJC_NOTIFICATIONS = priorNotifications;
@@ -6864,7 +6969,9 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 		expect(await fallbackAnswer).toBe("Continue");
 		expect(frames.filter(frame => frame.type === "reverse_request")).toHaveLength(1);
 	} finally {
-		await host.stop();
+		await handlers?.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = previousNotifications;
 	}
 });
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
@@ -8129,8 +8236,10 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	const publications: Array<Record<string, unknown>> = [];
 	const retired: Array<{ actionId: string; registrationEpoch: number }> = [];
 	let failures = 1;
+	let registrations = 0;
 	const server = {
 		registerArbitratedAsk(json: string) {
+			registrations += 1;
 			const action = JSON.parse(json) as Record<string, unknown>;
 			if (failures > 0) {
 				failures -= 1;
@@ -8159,7 +8268,8 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 	});
 	arbiter.retain(gate("ordinary", false, 1));
 	arbiter.retain(gate("workflow-first", true, 0));
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs + 10);
+	await waitFor(() => publications.length === 1, "retry publication after the rejected registration");
+	expect(registrations).toBe(2);
 	expect(publications.map(action => action.workflowGateId)).toEqual([undefined]);
 	expect(publications[0]).toMatchObject({ options: ["one", "two"], recommendedIndex: 1 });
 	arbiter.complete("ordinary");
@@ -8980,11 +9090,15 @@ test("PresentationArbiter rejects claimed or stale retirement as terminal proof 
 
 test("PresentationArbiter fences an exhausted ordinary interactive head until explicit cancellation", async () => {
 	let registrationsFail = false;
+	let failedRegistrations = 0;
 	const published: string[] = [];
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
-				if (registrationsFail) throw new Error("unavailable");
+				if (registrationsFail) {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				const action = JSON.parse(json) as { id: string };
 				published.push(action.id);
 				return { actionId: action.id, registrationEpoch: published.length };
@@ -9037,9 +9151,14 @@ test("PresentationArbiter fences an exhausted ordinary interactive head until ex
 	});
 	registrationsFail = true;
 	arbiter.reissueAfterFailure(first);
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	// Observe the exhausted retry chain instead of sleeping past its backoff:
+	// the head is fenced only once every registration attempt has failed.
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	registrationsFail = false;
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs);
+	expect(failedRegistrations).toBe(PresentationArbiter.maxRegistrationAttempts);
 	expect(arbiter.routeFor(first)).toBeUndefined();
 	expect(pendingInteractive.size).toBe(1);
 	expect(settles).toBe(0);
@@ -9056,11 +9175,15 @@ test("PresentationArbiter fences an exhausted ordinary interactive head until ex
 
 test("PresentationArbiter terminally cancels an exhausted ordinary head exactly once before promotion", async () => {
 	const publications: string[] = [];
+	let failedRegistrations = 0;
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
 				const action = JSON.parse(json) as { id: string; question: string };
-				if (action.question === "Unavailable?") throw new Error("unavailable");
+				if (action.question === "Unavailable?") {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				publications.push(action.id);
 				return { actionId: action.id, registrationEpoch: publications.length };
 			},
@@ -9095,7 +9218,10 @@ test("PresentationArbiter terminally cancels an exhausted ordinary head exactly 
 		selectedOptions: [],
 	});
 
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	expect(publications).toEqual([]);
 	expect(closes).toBe(0);
 
@@ -9110,10 +9236,14 @@ test("PresentationArbiter terminally cancels an exhausted ordinary head exactly 
 test("PresentationArbiter fences already-terminal direct controls and resets exhausted head recovery", async () => {
 	const publications: string[] = [];
 	let registrationsFail = true;
+	let failedRegistrations = 0;
 	const arbiter = new PresentationArbiter(
 		{
 			registerArbitratedAsk(json: string) {
-				if (registrationsFail) throw new Error("unavailable");
+				if (registrationsFail) {
+					failedRegistrations += 1;
+					throw new Error("unavailable");
+				}
 				const action = JSON.parse(json) as { id: string };
 				publications.push(action.id);
 				return { actionId: action.id, registrationEpoch: publications.length };
@@ -9133,7 +9263,10 @@ test("PresentationArbiter fences already-terminal direct controls and resets exh
 		allowEmpty: false,
 		selectedOptions: [],
 	});
-	await Bun.sleep(PresentationArbiter.retryBaseDelayMs * 4);
+	await waitFor(
+		() => failedRegistrations === PresentationArbiter.maxRegistrationAttempts,
+		"exhausted registration attempts",
+	);
 	registrationsFail = false;
 	arbiter.recover();
 	expect(publications).toHaveLength(1);

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +14,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/capability/rule";
 import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
 import { type TtsrInjectionRecord, TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
+import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { EditTool } from "../src/edit";
@@ -724,6 +725,150 @@ describe("TtsrManager.checkAstSnapshot", () => {
 		);
 	});
 
+	it("reports an invalid CSS astCondition once per rule and language", async () => {
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const manager = new TtsrManager();
+			const rule = defaultExportRule({ name: "css-important", astCondition: ["$P: $V !important"] });
+			manager.addRule(rule);
+
+			expect(
+				await manager.checkAstSnapshot(".button { color: red; }", toolContext("theme.scss", "write", "first")),
+			).toEqual([]);
+			expect(
+				await manager.checkAstSnapshot(".button { color: blue; }", toolContext("other.scss", "write", "second")),
+			).toEqual([]);
+			expect(
+				await manager.checkAstSnapshot(".button { color: red; }", toolContext("theme.css", "write", "third")),
+			).toEqual([]);
+
+			const parseWarnings = warning.mock.calls.filter(
+				([message]) => message === "TTSR astCondition pattern is invalid for target language",
+			);
+			expect(parseWarnings).toHaveLength(2);
+			expect(parseWarnings.map(([, context]) => context?.lang)).toEqual(["scss", "css"]);
+			const diagnostics = manager.getAstConditionDiagnostics();
+			expect(diagnostics.map(({ ruleName, lang, patterns }) => ({ ruleName, lang, patterns }))).toEqual([
+				{ ruleName: "css-important", lang: "scss", patterns: ["$P: $V !important"] },
+				{ ruleName: "css-important", lang: "css", patterns: ["$P: $V !important"] },
+			]);
+			expect(diagnostics[0]?.parseErrors[0]).toContain("pattern is not valid css on its own");
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("still matches a standalone CSS !important astCondition", async () => {
+		const manager = new TtsrManager();
+		const rule = defaultExportRule({ name: "css-important", astCondition: ["!important"] });
+		manager.addRule(rule);
+
+		expect(await manager.checkAstSnapshot(".button { color: red !important; }", toolContext("theme.scss"))).toEqual([
+			rule,
+		]);
+		expect(manager.getAstConditionDiagnostics()).toEqual([]);
+	});
+
+	it("does not report a target source parse error as an invalid pattern", async () => {
+		const manager = new TtsrManager();
+		const rule = defaultExportRule({ name: "css-declaration", astCondition: ["$P: $V;"] });
+		manager.addRule(rule);
+
+		expect(await manager.checkAstSnapshot(".button { color: red;", toolContext("theme.scss"))).toEqual([rule]);
+		expect(manager.getAstConditionDiagnostics()).toEqual([]);
+	});
+
+	it("holds seeded AST diagnostic deduplication and copy properties (seed 0x6853)", async () => {
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const manager = new TtsrManager();
+			const invalidRuleNames = ["invalid-a", "invalid-b", "invalid-c"];
+			const sourceOnlyRuleName = "source-only";
+			const ruleNames = [...invalidRuleNames, sourceOnlyRuleName];
+			const languages = ["scss", "css"] as const;
+			for (const ruleName of ruleNames) {
+				manager.addRule(
+					defaultExportRule({
+						name: ruleName,
+						astCondition: [ruleName === sourceOnlyRuleName ? "$P: $V;" : "$P: $V !important"],
+						scope: languages.map(lang => `tool:write(src/${ruleName}.${lang})`),
+					}),
+				);
+			}
+
+			let state = 0x6853;
+			const random = (): number => {
+				state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+				return state / 0x1_0000_0000;
+			};
+			type Event = { ruleName: string; lang: (typeof languages)[number]; sourceKind: "valid" | "malformed" };
+			const generatedEvents: Event[] = Array.from({ length: 24 }, () => {
+				const ruleName = ruleNames[Math.floor(random() * ruleNames.length)]!;
+				const lang = languages[Math.floor(random() * languages.length)]!;
+				return { ruleName, lang, sourceKind: random() < 0.5 ? "valid" : "malformed" };
+			});
+			const coverageEvents: Event[] = invalidRuleNames.flatMap(ruleName =>
+				languages.flatMap(lang => [
+					{ ruleName, lang, sourceKind: "malformed" as const },
+					{ ruleName, lang, sourceKind: "valid" as const },
+					{ ruleName, lang, sourceKind: "malformed" as const },
+				]),
+			);
+			const sourceOnlyEvents: Event[] = languages.map(lang => ({
+				ruleName: sourceOnlyRuleName,
+				lang,
+				sourceKind: "malformed",
+			}));
+			const events = [...generatedEvents, ...coverageEvents, ...sourceOnlyEvents];
+
+			for (const [eventIndex, event] of events.entries()) {
+				const source = event.sourceKind === "malformed" ? ".button { color: red;" : ".button { color: red; }";
+				await manager.checkAstSnapshot(source, {
+					source: "tool",
+					toolName: "write",
+					filePaths: [`src/${event.ruleName}.${event.lang}`],
+					streamKey: `generated-diagnostic-event-${eventIndex}`,
+				});
+			}
+
+			const expectedPairs = invalidRuleNames
+				.flatMap(ruleName => languages.map(lang => `${ruleName}:${lang}`))
+				.sort();
+			const diagnostics = manager.getAstConditionDiagnostics();
+			const diagnosticPairs = diagnostics.map(({ ruleName, lang }) => `${ruleName}:${lang}`).sort();
+			expect(diagnosticPairs).toEqual(expectedPairs);
+			expect(diagnostics).toHaveLength(expectedPairs.length);
+			expect(
+				diagnostics.every(
+					diagnostic =>
+						diagnostic.ruleName !== sourceOnlyRuleName &&
+						diagnostic.parseErrors.every(error => error !== "parse error (syntax tree contains error nodes)") &&
+						diagnostic.parseErrors.some(error => error.includes("pattern is not valid css on its own")),
+				),
+			).toBe(true);
+
+			const parseWarnings = warning.mock.calls.filter(
+				([message]) => message === "TTSR astCondition pattern is invalid for target language",
+			);
+			const warningPairs = parseWarnings
+				.map(([, context]) => `${String(context?.ruleName)}:${String(context?.lang)}`)
+				.sort();
+			expect(warningPairs).toEqual(expectedPairs);
+
+			const original = manager.getAstConditionDiagnostics();
+			const mutated = manager.getAstConditionDiagnostics();
+			const first = mutated[0];
+			if (!first) throw new Error("expected generated AST diagnostics");
+			first.ruleName = "mutated";
+			first.patterns.push("mutated");
+			first.parseErrors.push("mutated");
+			mutated.push({ ruleName: "mutated", lang: "css", patterns: [], parseErrors: [] });
+			expect(manager.getAstConditionDiagnostics()).toEqual(original);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
 	it("does not match unsupported or missing file extensions", async () => {
 		const manager = new TtsrManager();
 		manager.addRule(defaultExportRule());
@@ -1207,6 +1352,30 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		expect(triggered).toEqual([["css-tokens"]]);
 		expect(fs.existsSync(path.join(tempDir, "theme.scss"))).toBe(false);
 		expect(JSON.stringify(modelMessages[1])).toContain(cssContent);
+	});
+
+	it("allows a .scss write to proceed when its astCondition pattern is invalid", async () => {
+		const warning = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const { session, triggered, ttsrManager } = createSession(
+				[new WriteTool(createToolSession())],
+				[[writeCall("write-1", "theme.scss", ".button { color: red; }\n")]],
+				[makeRule({ name: "css-important", content: RULE_CONTENT, astCondition: ["$P: $V !important"] })],
+				{ interruptMode: "always" },
+			);
+			await run(session, "write it");
+
+			expect(fs.existsSync(path.join(tempDir, "theme.scss"))).toBe(true);
+			expect(triggered).toEqual([]);
+			expect(ttsrManager.getAstConditionDiagnostics()).toHaveLength(1);
+			expect(
+				warning.mock.calls.filter(
+					([message]) => message === "TTSR astCondition pattern is invalid for target language",
+				),
+			).toHaveLength(1);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	it.each([

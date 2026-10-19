@@ -716,7 +716,7 @@ export class EventController {
 	): Promise<void> {
 		this.ctx.showStatus(`Fallback model: ${event.from} → ${event.to}`);
 		this.ctx.statusLine.invalidate();
-		this.ctx.ui.requestRender();
+		this.ctx.updateEditorBorderColor();
 	}
 
 	async #handleNotice(event: Extract<AgentSessionEvent, { type: "notice" }>): Promise<void> {

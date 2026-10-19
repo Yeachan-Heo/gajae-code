@@ -29,6 +29,8 @@ import { logger, postmortem, TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import type { FileSlashCommand } from "../src/extensibility/slash-commands";
+import * as slashCommands from "../src/extensibility/slash-commands";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 
@@ -836,6 +838,52 @@ describe("interactive background activity indicator", () => {
 
 		expect(showSelector).not.toHaveBeenCalled();
 		expect(setAutocompleteProvider).not.toHaveBeenCalled();
+	});
+
+	it("keeps the latest slash-command projection when identity refreshes overlap", async () => {
+		const earlierLoad = Promise.withResolvers<FileSlashCommand[]>();
+		const laterLoad = Promise.withResolvers<FileSlashCommand[]>();
+		const earlierCommand: FileSlashCommand = {
+			name: "earlier-session-command",
+			description: "Earlier session command",
+			content: "earlier",
+			source: "test",
+		};
+		const laterCommand: FileSlashCommand = {
+			name: "later-session-command",
+			description: "Later session command",
+			content: "later",
+			source: "test",
+		};
+		const cwd = vi
+			.spyOn(mode.sessionManager, "getCwd")
+			.mockReturnValueOnce(path.join(tempDir.path(), "earlier-session"))
+			.mockReturnValueOnce(path.join(tempDir.path(), "later-session"));
+		const load = vi
+			.spyOn(slashCommands, "loadSlashCommands")
+			.mockImplementationOnce(() => earlierLoad.promise)
+			.mockImplementationOnce(() => laterLoad.promise);
+
+		try {
+			const earlierTransition = session.notifySessionIdentityChanged();
+			await waitFor(() => load.mock.calls.length === 1);
+			const laterTransition = session.notifySessionIdentityChanged();
+			await waitFor(() => load.mock.calls.length === 2);
+
+			laterLoad.resolve([laterCommand]);
+			await laterTransition;
+			earlierLoad.resolve([earlierCommand]);
+			await earlierTransition;
+
+			expect(mode.fileSlashCommands).toEqual(new Set(["later-session-command"]));
+			expect(mode.getSlashCommands().some(command => command.name === "later-session-command")).toBe(true);
+			expect(mode.getSlashCommands().some(command => command.name === "earlier-session-command")).toBe(false);
+		} finally {
+			earlierLoad.resolve([earlierCommand]);
+			laterLoad.resolve([laterCommand]);
+			load.mockRestore();
+			cwd.mockRestore();
+		}
 	});
 
 	it("does not finish initialization after final stop wins an awaited setup race", async () => {

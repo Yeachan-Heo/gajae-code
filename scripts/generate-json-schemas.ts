@@ -140,7 +140,7 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.minimum = 60_000;
 		schema.maximum = 86_400_000;
 	}
-	if (settingPath === "sdk.masterOrphanGraceMs") {
+	if (settingPath === "sdk.masterOrphanGraceMs" || settingPath === "sdk.brokerAbandonedGraceMs") {
 		schema.type = "integer";
 		schema.minimum = 60_000;
 		schema.maximum = 3_600_000;

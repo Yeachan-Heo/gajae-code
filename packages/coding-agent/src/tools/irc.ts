@@ -9,9 +9,11 @@
  * mirrors `/btw`: the recipient's current model, system prompt, and message
  * history are used to compute a reply without persisting it through the
  * normal stream path. After the reply is generated, both the incoming
- * message and the auto-reply are queued for injection into the recipient's
- * persisted history (deferred until the recipient is idle), so the model
- * sees the exchange on its next turn.
+ * message and the auto-reply are injected into the recipient's persisted
+ * history: an idle recipient gets them immediately, while a streaming recipient
+ * receives them at its next step boundary (the live run's next tool boundary)
+ * rather than at the end of its turn — an exchange admitted into a run that ends
+ * before that boundary is still appended to the outgoing session's history.
  *
  * This avoids the deadlock that arises when the recipient is blocked on a
  * long-running tool call: the side-channel call does not depend on the

@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.18.12] - 2026-10-16
+
+### Added
+
+- Render ```svg fenced code blocks as rasterized terminal images (Kitty, iTerm2, SIXEL). SVG figures stream inline with partial source repair, theme-aware token resolution through reserved `--gjc-<palette-key>` CSS variables, and automatic fallback to plain code blocks on rasterization failure. Ported from oh-my-pi.
+
+### Fixed
+
+- TUI no longer goes blank after stop/restart cycles: `#hardwareCursorRow` is now properly reset during `stop()` to prevent stale cursor position state from corrupting viewport calculations on the next `start()`.
+
+- With `clearOnShrink` enabled, a live block that shrinks after the transcript has scrolled into history no longer leaves blank spacer rows above the pinned composer until the next resize. The contraction now clears the screen and history and replays the frame, so the viewport is filled again and no row appears twice in history.
+
+- Scrub credentials from TUI render debug dumps and write them mode 0600 beside the debug log, without following a symlink at the dump path.
+
 ## [0.18.11] - 2026-10-12
 
 ### Fixed

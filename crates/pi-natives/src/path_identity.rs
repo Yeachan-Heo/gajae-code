@@ -3,6 +3,7 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	ffi::{OsStr, OsString},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Component, Path, PathBuf},
 	sync::{
@@ -1249,6 +1250,113 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 	hasher.finalize().into()
 }
 
+const DIRECTORY_TREE_TRANSITION_SUFFIX: &str = ".removing";
+const MAX_DIRECTORY_TREE_COMPONENT_BYTES: usize = 255;
+
+fn directory_tree_transition_name(original_basename: &OsStr) -> Option<OsString> {
+	let original_basename_bytes = original_basename.as_encoded_bytes();
+	if original_basename_bytes.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX.as_bytes()) {
+		return Some(original_basename.to_os_string());
+	}
+	let derived_length = original_basename_bytes
+		.len()
+		.checked_add(DIRECTORY_TREE_TRANSITION_SUFFIX.len())?;
+	if derived_length <= MAX_DIRECTORY_TREE_COMPONENT_BYTES {
+		let mut transition_name = original_basename.to_os_string();
+		transition_name.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		return Some(transition_name);
+	}
+
+	let mut hashed_name = String::with_capacity(10 + 64 + DIRECTORY_TREE_TRANSITION_SUFFIX.len());
+	hashed_name.push_str(".gjc-lock-");
+	for byte in sha256(original_basename_bytes) {
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+		hashed_name.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+	}
+	hashed_name.push_str(DIRECTORY_TREE_TRANSITION_SUFFIX);
+	Some(OsString::from(hashed_name))
+}
+
+#[cfg(test)]
+mod directory_tree_transition_name_tests {
+	use std::ffi::{OsStr, OsString};
+
+	use super::{
+		DIRECTORY_TREE_TRANSITION_SUFFIX, MAX_DIRECTORY_TREE_COMPONENT_BYTES,
+		directory_tree_transition_name, sha256,
+	};
+
+	#[test]
+	fn transition_name_preserves_short_names_and_uses_utf8_byte_lengths() {
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new("lock")),
+			Some(OsString::from("lock.removing")),
+		);
+
+		let unicode_at_limit = "é".repeat(123);
+		assert_eq!(unicode_at_limit.len() + DIRECTORY_TREE_TRANSITION_SUFFIX.len(), 255);
+		assert_eq!(
+			directory_tree_transition_name(OsStr::new(&unicode_at_limit)),
+			Some(OsString::from(format!("{unicode_at_limit}{DIRECTORY_TREE_TRANSITION_SUFFIX}"))),
+		);
+
+		let unicode_over_limit = "é".repeat(124);
+		assert_eq!(unicode_over_limit.len(), 248);
+		let hashed = directory_tree_transition_name(OsStr::new(&unicode_over_limit))
+			.expect("long UTF-8 basename should hash");
+		let hashed = hashed.to_str().expect("hash name is UTF-8");
+		assert!(hashed.starts_with(".gjc-lock-"));
+		assert!(hashed.ends_with(DIRECTORY_TREE_TRANSITION_SUFFIX));
+		assert!(hashed.len() <= MAX_DIRECTORY_TREE_COMPONENT_BYTES);
+	}
+
+	#[test]
+	fn basenames_of_255_bytes_get_deterministic_distinct_hashes() {
+		let first = "a".repeat(255);
+		let second = "b".repeat(255);
+		let first_name =
+			directory_tree_transition_name(OsStr::new(&first)).expect("255-byte basename should hash");
+		let repeated_first_name = directory_tree_transition_name(OsStr::new(&first))
+			.expect("same basename should hash deterministically");
+		let second_name = directory_tree_transition_name(OsStr::new(&second))
+			.expect("second 255-byte basename should hash");
+
+		assert_eq!(first_name, repeated_first_name);
+		assert_ne!(first_name, second_name);
+		let digest = sha256(first.as_bytes());
+		let expected_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+		let expected_name = format!(".gjc-lock-{expected_hash}{DIRECTORY_TREE_TRANSITION_SUFFIX}");
+		assert_eq!(first_name.to_str(), Some(expected_name.as_str()));
+		assert!(first_name.to_str().expect("hash name is UTF-8").len() <= 255);
+	}
+
+	#[test]
+	fn transition_name_is_idempotent_for_replay_inputs() {
+		let already_transition = OsStr::new(".gjc-lock-deadbeef.removing");
+		assert_eq!(
+			directory_tree_transition_name(already_transition),
+			Some(OsString::from(already_transition)),
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn transition_name_preserves_short_non_utf8_unix_names() {
+		use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+		let original = OsString::from_vec(vec![b'l', 0xff, b'k']);
+		let mut expected = original.clone();
+		expected.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		let derived = directory_tree_transition_name(&original).expect("short name should fit");
+		assert_eq!(derived.as_os_str().as_bytes(), b"l\xffk.removing");
+		assert_eq!(derived, expected);
+
+		let mut already_transitioned = original;
+		already_transitioned.push(DIRECTORY_TREE_TRANSITION_SUFFIX);
+		assert_eq!(directory_tree_transition_name(&already_transitioned), Some(already_transitioned),);
+	}
+}
+
 #[cfg(any(unix, test))]
 pub(crate) fn digest_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
 	let mut hasher = Sha256::new();
@@ -2083,10 +2191,11 @@ pub fn snapshot_empty_directory(path: String) -> NativeDirectoryTreeResult {
 
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
 #[cfg_attr(clippy, doc = "")]
-/// exactly equals the persisted snapshot. POSIX first no-replace detaches the
-/// verified root to its deterministic `.removing` sibling; the reopened
-/// detached descriptor remains authoritative throughout payload scrubbing and
-/// replay.
+/// exactly equals the persisted snapshot. POSIX removal no-replace detaches the
+/// verified root to its deterministic `.removing` sibling before scrubbing. On
+/// Windows, callers that need retirement semantics must request a detach-only
+/// pass, then replay exact removal at the returned sibling; ordinary Windows
+/// removal never vacates the caller's path before scrubbing completes.
 #[napi]
 pub fn exact_remove_directory_tree(
 	path: String,
@@ -2609,14 +2718,14 @@ pub(crate) mod platform {
 			fd::{AsRawFd, FromRawFd},
 			unix::ffi::OsStrExt,
 		},
-		path::{Component, Path},
+		path::{Component, Path, PathBuf},
 	};
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader, io_code,
-		security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativePermissionRepairResult, digest_reader,
+		directory_tree_transition_name, io_code, security_io_code, sha256,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -7747,7 +7856,6 @@ pub(crate) mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
 		let (parent, name) = match open_parent_no_follow(path) {
 			Ok(value) => value,
 			Err(result) => return *result,
@@ -7765,9 +7873,18 @@ pub(crate) mod platform {
 				return NativeExactUnlinkResult::failure("parent_mismatch");
 			}
 		}
-		let mut final_bytes = name.as_bytes().to_vec();
-		final_bytes.extend_from_slice(b".removing");
-		let Ok(final_name) = CString::new(final_bytes) else {
+		let input_is_final = name.as_bytes().ends_with(b".removing");
+		let Some(final_component) =
+			directory_tree_transition_name(std::ffi::OsStr::from_bytes(name.as_bytes()))
+		else {
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent) };
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let mut final_candidate = PathBuf::from(path);
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
+		let Ok(final_name) = CString::new(final_component.as_os_str().as_bytes()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent) };
 			return NativeExactUnlinkResult::failure("io_error");
@@ -7775,7 +7892,6 @@ pub(crate) mod platform {
 		// A crash after the final no-replace rename is replayed from the single,
 		// caller-derivable sibling. This is not a search fallback: it is the only
 		// alternate retained authority for this exact planned root.
-		let input_is_final = name.as_bytes().ends_with(b".removing");
 		let (fd, root_name, retained_path, already_final) = {
 			// SAFETY: the live descriptor, where used, and NUL-terminated path remain
 			// valid.
@@ -10951,10 +11067,10 @@ mod platform {
 		NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
 		NativePermissionRepairResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		exact_replace_open_error_code, is_retryable_exact_replace_status, native_windows_error_code,
-		ntstatus_code, open_with_transient_retry, publication_rename_error_code,
-		rename_with_transient_retry, retained_replace_error_code, sha256,
-		volume_case_sensitivity_from_flags,
+		directory_tree_transition_name, exact_replace_open_error_code,
+		is_retryable_exact_replace_status, native_windows_error_code, ntstatus_code,
+		open_with_transient_retry, publication_rename_error_code, rename_with_transient_retry,
+		retained_replace_error_code, sha256, volume_case_sensitivity_from_flags,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -13637,7 +13753,37 @@ mod platform {
 	}
 	#[cfg(test)]
 	mod tests {
-		use super::{FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, owner_only_ace_mask_is_safe};
+		use std::{
+			path::PathBuf,
+			sync::atomic::{AtomicU64, Ordering},
+		};
+
+		use super::{
+			FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, exact_remove_directory_tree_with_mode,
+			owner_only_ace_mask_is_safe, snapshot_directory_tree,
+		};
+
+		static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+		struct TempDir(PathBuf);
+
+		impl TempDir {
+			fn new() -> Self {
+				let path = std::env::temp_dir().join(format!(
+					"gjc-lock-retirement-collision-{}-{}",
+					std::process::id(),
+					NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+				));
+				std::fs::create_dir(&path).expect("create lock-retirement temp directory");
+				Self(path)
+			}
+		}
+
+		impl Drop for TempDir {
+			fn drop(&mut self) {
+				let _ = std::fs::remove_dir_all(&self.0);
+			}
+		}
 
 		#[test]
 		fn owner_only_ace_mask_accepts_legacy_and_current_full_access_masks() {
@@ -13649,6 +13795,57 @@ mod platform {
 		fn owner_only_ace_mask_rejects_partial_and_combined_masks() {
 			assert!(!owner_only_ace_mask_is_safe(FILE_ALL_ACCESS & !FILE_READ_DATA));
 			assert!(!owner_only_ace_mask_is_safe(GENERIC_ALL | FILE_READ_DATA));
+		}
+
+		#[test]
+		fn retirement_collision_preserves_canonical_owner_metadata() {
+			let root = TempDir::new();
+			let canonical = root.0.join("index.jsonl.lock");
+			let retired = root.0.join("index.jsonl.lock.removing");
+			std::fs::create_dir(&canonical).expect("create canonical lock");
+			std::fs::write(canonical.join("info"), b"canonical-owner").expect("write canonical owner");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("info"), b"predecessor-owner")
+				.expect("write predecessor owner");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot canonical lock");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, true);
+			assert!(!result.ok);
+			assert_eq!(result.code.as_deref(), Some("quarantine_collision"));
+			assert_eq!(
+				std::fs::read(canonical.join("info")).expect("canonical owner remains"),
+				b"canonical-owner"
+			);
+			assert_eq!(
+				std::fs::read(retired.join("info")).expect("predecessor owner remains"),
+				b"predecessor-owner"
+			);
+		}
+
+		#[test]
+		fn generic_removal_does_not_reserve_the_lock_retirement_name() {
+			let root = TempDir::new();
+			let canonical = root.0.join("plugin");
+			let retired = root.0.join("plugin.removing");
+			std::fs::create_dir(&canonical).expect("create generic tree");
+			std::fs::write(canonical.join("payload"), b"generic payload")
+				.expect("write generic payload");
+			std::fs::create_dir(&retired).expect("create occupied retirement path");
+			std::fs::write(retired.join("payload"), b"unrelated retirement")
+				.expect("write unrelated payload");
+
+			let snapshot = snapshot_directory_tree(&canonical)
+				.snapshot
+				.expect("snapshot generic tree");
+			let result = exact_remove_directory_tree_with_mode(&canonical, &snapshot, None, false);
+			assert!(result.ok);
+			assert!(!canonical.exists());
+			assert_eq!(
+				std::fs::read(retired.join("payload")).expect("unrelated payload remains"),
+				b"unrelated retirement"
+			);
 		}
 	}
 	fn hex_digest(digest: [u8; 32]) -> String {
@@ -14214,17 +14411,14 @@ mod platform {
 		detach_only: bool,
 	) -> NativeExactUnlinkResult {
 		let planned_path = path.to_string_lossy().into_owned();
-		let final_path = format!("{planned_path}.removing");
-		let final_name: Vec<u16> = match path.file_name() {
-			Some(name) => {
-				let mut value: Vec<u16> = name.encode_wide().collect();
-				value.extend(".removing".encode_utf16());
-				value
-			},
+		let final_component = match path.file_name().and_then(directory_tree_transition_name) {
+			Some(name) => name,
 			None => return NativeExactUnlinkResult::failure("io_error"),
 		};
+		let final_name: Vec<u16> = final_component.encode_wide().collect();
 		let mut final_candidate = PathBuf::from(path);
-		final_candidate.set_file_name(OsString::from_wide(&final_name));
+		final_candidate.set_file_name(&final_component);
+		let final_path = final_candidate.to_string_lossy().into_owned();
 		let input_is_final = planned_path.ends_with(".removing");
 		let (root, retained_path, already_final) = match open_exact(
 			path,
@@ -14321,20 +14515,23 @@ mod platform {
 				&identity,
 			);
 		}
-		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
-				Ok(()) => match tree_entry(root.target, String::new(), "directory") {
-					Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
-						match delete_handle(root.target) {
-							Ok(()) => NativeExactUnlinkResult::success(),
-							Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-						}
-					},
-					Ok(_) => NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path),
-					Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-				},
-				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
+		// Keep generic Windows removal at its caller-visible name if payload
+		// scrubbing fails. File-lock retirement requests detach_only first and
+		// replays this exact removal at `.removing` after the canonical name is
+		// safely vacant.
+		let retained_path = if already_final {
+			retained_path
+		} else {
+			planned_path
+		};
+		match tree_entry(root.target, String::new(), "directory") {
+			Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {},
+			Ok(_) => {
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 			},
+			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
+		}
+		match remove_tree_handle(root.target, "", &expected.entries) {
 			Ok(()) => match delete_handle(root.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
 				Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),

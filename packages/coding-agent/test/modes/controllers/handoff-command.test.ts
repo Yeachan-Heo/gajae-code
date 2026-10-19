@@ -26,7 +26,7 @@ describe("/handoff command", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("shows a cancellable loader while handoff generation is running", async () => {
+	it("shows a cancellable loader and preserves handoff UI behavior without refreshing metadata", async () => {
 		const handoffStarted = Promise.withResolvers<void>();
 		const handoffDone = Promise.withResolvers<{ document: string }>();
 		const originalOnEscape = vi.fn();
@@ -34,6 +34,7 @@ describe("/handoff command", () => {
 		const chatContainer = createContainer();
 		const abortHandoff = vi.fn();
 		const requestRender = vi.fn();
+		const refreshSlashCommandState = vi.fn(async () => {});
 		const ctx = {
 			sessionManager: {
 				getEntries: () => [{ type: "message" }, { type: "message" }],
@@ -59,6 +60,7 @@ describe("/handoff command", () => {
 			showWarning: vi.fn(),
 			showError: vi.fn(),
 			resetIrcSidebarSession: vi.fn(),
+			refreshSlashCommandState,
 		} as unknown as InteractiveModeContext;
 		const controller = new CommandController(ctx);
 
@@ -76,7 +78,42 @@ describe("/handoff command", () => {
 		expect(statusContainer.children).toHaveLength(0);
 		expect(ctx.editor.onEscape).toBe(originalOnEscape);
 		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests");
+		expect(refreshSlashCommandState).not.toHaveBeenCalled();
 		expect(ctx.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+		expect(ctx.rebuildChatFromMessages).toHaveBeenCalledWith("replace-identity");
+	});
+
+	it("reports a committed degraded handoff without refreshing metadata", async () => {
+		const refreshSlashCommandState = vi.fn(async () => {});
+		const showError = vi.fn();
+		const ctx = {
+			sessionManager: { getEntries: () => [{ type: "message" }, { type: "message" }] },
+			session: {
+				handoff: vi.fn(async () => {
+					throw Object.assign(new Error("Handoff committed but successor initialization was degraded."), {
+						code: "handoff_committed_degraded",
+					});
+				}),
+				abortHandoff: vi.fn(),
+			},
+			loadingAnimation: undefined,
+			statusContainer: createContainer(),
+			chatContainer: createContainer(),
+			ui: { requestRender: vi.fn() },
+			editor: { onEscape: vi.fn() },
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError,
+			refreshSlashCommandState,
+		} as unknown as InteractiveModeContext;
+		const controller = new CommandController(ctx);
+
+		await controller.handleHandoffCommand();
+
+		expect(refreshSlashCommandState).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledWith(
+			expect.stringContaining("Handoff committed but successor initialization was degraded"),
+		);
 	});
 
 	it("prepares contribution-pr artifacts without spawning a competing TUI worker", async () => {

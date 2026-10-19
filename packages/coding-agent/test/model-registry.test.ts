@@ -924,10 +924,14 @@ describe("ModelRegistry", () => {
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const opusVariants = registry.getCanonicalVariants("claude-opus-5-5");
-			const haikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
+			const haikuVariants = registry.getCanonicalVariants("claude-haiku-5-5");
+			const legacyHaikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
 
 			expect(opusVariants.some(variant => variant.selector === "demo/anthropic/claude-opus-latest")).toBe(true);
 			expect(haikuVariants.some(variant => variant.selector === "demo/anthropic/claude-haiku-latest")).toBe(true);
+			expect(legacyHaikuVariants.some(variant => variant.selector === "demo/anthropic/claude-haiku-latest")).toBe(
+				false,
+			);
 			expect(
 				registry
 					.getCanonicalVariants("claude-haiku-4-5-20251001-thinking")

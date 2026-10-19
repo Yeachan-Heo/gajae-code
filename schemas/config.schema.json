@@ -197,6 +197,13 @@
 					"default": 120000,
 					"minimum": 60000,
 					"maximum": 3600000
+				},
+				"brokerAbandonedGraceMs": {
+					"type": "integer",
+					"description": "Grace before a detached broker with no client connection, no live session host, and no open spawn authority exits on its own. A supervised `gjc sdk broker run` service never reaps itself.",
+					"default": 120000,
+					"minimum": 60000,
+					"maximum": 3600000
 				}
 			},
 			"additionalProperties": false

@@ -53,8 +53,9 @@ type ModelProfileActivationSession = Pick<
 > & {
 	credentialSessionId?: string;
 	setModelTemporary?: AgentSession["setModelTemporary"];
-	setActiveModelProfile?: (name: string | undefined) => void;
+	setActiveModelProfile?: (name: string | undefined, activatedByThisProcess?: boolean) => void;
 	getActiveModelProfile?: () => string | undefined;
+	getActivatedModelProfile?: () => string | undefined;
 	/** Record which runtime override keys this activation installed (session-scoped). */
 	noteProfileInstalledOverrides?: (
 		modelRoles: readonly string[],
@@ -69,6 +70,7 @@ type ModelProfileActivationSession = Pick<
 			agentModelOverrides: Readonly<Record<string, ModelSelectorValue>>;
 		},
 		manual?: { modelRoles: readonly string[]; agentModelOverrides: readonly string[] },
+		configuredDefaultChain?: readonly string[],
 	) => void;
 	/** Drop the recorded profile-installed override keys (e.g. after materialization). */
 	clearProfileInstalledOverrides?: () => void;
@@ -95,6 +97,7 @@ type ModelProfileActivationSession = Pick<
 		| "getSessionCanonicalVariant"
 		| "restoreSessionCanonicalVariant"
 		| "clearCanonicalVariant"
+		| "getModelProfile"
 		| "getAvailable"
 		| "lookupAliasExists"
 		| "resolveModelByLookupAlias"
@@ -120,6 +123,7 @@ type PublishedModelProfileActivationState = {
 	defaultChainState: ConfiguredModelChainState | undefined;
 	defaultFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
 	activeModelProfile: string | undefined;
+	activatedModelProfile: string | undefined;
 	profileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
 	sessionDefaultModel: string | undefined;
 	persistedModelRoles: Readonly<Record<string, ModelSelectorValue>> | undefined;
@@ -227,6 +231,7 @@ export interface PreparedModelProfileActivation {
 	manualModelRoleOverrides: ReadonlySet<string>;
 	manualAgentModelOverrides: ReadonlySet<string>;
 	previousActiveModelProfile: string | undefined;
+	previousActivatedModelProfile: string | undefined;
 	/**
 	 * The session resume default ("provider/id") captured BEFORE activation —
 	 * the model resume would restore prior to this profile. Snapshotted
@@ -260,6 +265,8 @@ export interface MaterializeModelProfileAssignmentOptions {
 		| "setConfiguredModelChain"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
+		| "getActivatedModelProfile"
+		| "getProfileInstalledOverrideState"
 		| "getDefaultFallbackRuntimeState"
 		| "restoreDefaultFallbackRuntimeState"
 		| "modelRegistry"
@@ -282,6 +289,8 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		| "setConfiguredModelChain"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
+		| "getActivatedModelProfile"
+		| "getProfileInstalledOverrideState"
 		| "getDefaultFallbackRuntimeState"
 		| "restoreDefaultFallbackRuntimeState"
 		| "modelRegistry"
@@ -310,9 +319,80 @@ function getMaterializedAssignments(
 	return result;
 }
 
-function materializeConfiguredDefaultChain(
-	session: Pick<ModelProfileActivationSession, "model" | "thinkingLevel" | "getConfiguredModelChain">,
+/**
+ * Resolve the profile a materialization may consume.
+ *
+ * Only a profile this process actually activated owns role-only materialization.
+ * A persisted profile whose activation failed or was only restored from history
+ * stays in place. An explicit default selection may supersede that durable profile.
+ */
+export function resolveMaterializationProfileIdentity(
+	activatedProfile: string | undefined,
+	durableProfile: string | undefined,
+	includesDefault: boolean,
+): string | undefined {
+	if (activatedProfile) return activatedProfile;
+	return includesDefault ? durableProfile : undefined;
+}
+
+function resolveMaterializationProfile(
+	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
+	includesDefault: boolean,
+): string | undefined {
+	return resolveMaterializationProfileIdentity(
+		options.session.getActivatedModelProfile?.(),
+		options.settings.get("modelProfile.default"),
+		includesDefault,
+	);
+}
+
+/** Resolve startup-override materialization in activated-chain, profile, then global-default order. */
+export function resolveMaterializedDefaultSelector(
+	activatedDefaultChain: readonly string[] | undefined,
+	profileDefault: ModelSelectorValue | undefined,
+	globalDefault: ModelSelectorValue | undefined,
 ): ModelSelectorValue | undefined {
+	if (activatedDefaultChain?.length) {
+		return activatedDefaultChain.length === 1 ? activatedDefaultChain[0] : [...activatedDefaultChain];
+	}
+	return profileDefault ?? globalDefault;
+}
+
+function modelRolesForMaterialization(
+	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
+): Record<string, ModelSelectorValue> {
+	const modelRoles = { ...options.settings.get("modelRoles") };
+	const defaultChain = options.session.getConfiguredModelChainState?.("default");
+	if (defaultChain?.origin !== "startup-override" || !defaultChain.entries[0]) return modelRoles;
+
+	// The merged runtime roles can still contain the CLI model; materialize the
+	// profile's default instead. Profile-derived defaults require an activated
+	// profile: a persisted profile that failed activation contributes nothing.
+	const activeProfile = options.session.getActivatedModelProfile?.();
+	let configuredDefault: ModelSelectorValue | undefined;
+	if (activeProfile) {
+		const activatedDefaultChain = options.session.getProfileInstalledOverrideState?.().configuredDefaultChain;
+		const profile = options.session.modelRegistry?.getModelProfile?.(activeProfile);
+		configuredDefault = resolveMaterializedDefaultSelector(
+			activatedDefaultChain,
+			profile ? resolveProfileBindings(profile).defaultSelector : undefined,
+			options.settings.getGlobal("modelRoles")?.default,
+		);
+	} else {
+		configuredDefault = options.settings.getGlobal("modelRoles")?.default;
+	}
+	if (configuredDefault === undefined) delete modelRoles.default;
+	else modelRoles.default = configuredDefault;
+	return modelRoles;
+}
+
+function materializeConfiguredDefaultChain(
+	session: Pick<
+		ModelProfileActivationSession,
+		"model" | "thinkingLevel" | "getConfiguredModelChain" | "getConfiguredModelChainState"
+	>,
+): ModelSelectorValue | undefined {
+	if (session.getConfiguredModelChainState?.("default")?.origin === "startup-override") return undefined;
 	if (!session.model) return undefined;
 	return formatModelSelectorValue(`${session.model.provider}/${session.model.id}`, session.thinkingLevel);
 }
@@ -368,6 +448,7 @@ function commitMaterializedProfileAssignments(
 	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
 	modelRoles: Record<string, ModelSelectorValue>,
 	agentModelOverrides: Record<string, ModelSelectorValue>,
+	preserveStartupOverrideChain = false,
 ): boolean {
 	const previousPersistedModelRoles = options.settings.getGlobal("modelRoles");
 	const previousPersistedAgentModelOverrides = options.settings.getGlobal("task.agentModelOverrides");
@@ -376,6 +457,7 @@ function commitMaterializedProfileAssignments(
 	const previousAgentModelOverridesOverride = options.settings.getOverride("task.agentModelOverrides");
 	const previousDefaultProfileOverride = options.settings.getOverride("modelProfile.default");
 	const previousActiveProfile = options.session.getActiveModelProfile?.();
+	const previousActivatedProfile = options.session.getActivatedModelProfile?.();
 	const previousChain = options.session.getConfiguredModelChainState?.("default");
 	const previousFallbackRuntimeState = options.session.getDefaultFallbackRuntimeState?.();
 	const previousCanonicalVariant = options.session.modelRegistry?.getSessionCanonicalVariant?.(
@@ -390,13 +472,17 @@ function commitMaterializedProfileAssignments(
 		options.settings.clearOverride("modelProfile.default");
 		options.settings.override("modelRoles", nextModelRoles);
 		options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
-		options.session.setConfiguredModelChain(
-			"default",
-			normalizeModelSelectorValue(nextModelRoles.default),
-			"modelRoles",
-			undefined,
-			true,
-		);
+		// Role-only materialization persists the profile default for future launches,
+		// but it must not replace the live run-scoped CLI model chain.
+		if (!preserveStartupOverrideChain || previousChain?.origin !== "startup-override") {
+			options.session.setConfiguredModelChain(
+				"default",
+				normalizeModelSelectorValue(nextModelRoles.default),
+				"modelRoles",
+				undefined,
+				true,
+			);
+		}
 		options.session.setActiveModelProfile?.(undefined);
 		return true;
 	} catch (error) {
@@ -461,7 +547,12 @@ function commitMaterializedProfileAssignments(
 				? options.settings.clearOverride("modelProfile.default")
 				: options.settings.override("modelProfile.default", previousDefaultProfileOverride),
 		);
-		restore(() => options.session.setActiveModelProfile?.(previousActiveProfile));
+		restore(() =>
+			options.session.setActiveModelProfile?.(
+				previousActiveProfile,
+				previousActivatedProfile === previousActiveProfile,
+			),
+		);
 		if (rollbackErrors.length > 0) {
 			throw new AggregateError(
 				[error, ...rollbackErrors],
@@ -473,10 +564,9 @@ function commitMaterializedProfileAssignments(
 }
 
 export function materializeActiveModelProfileAssignment(options: MaterializeModelProfileAssignmentOptions): boolean {
-	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
-	if (!activeProfile) return false;
+	if (!resolveMaterializationProfile(options, options.role === "default")) return false;
 
-	const nextModelRoles = { ...options.settings.get("modelRoles") };
+	const nextModelRoles = modelRolesForMaterialization(options);
 	const nextAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
 	const target = GJC_MODEL_ASSIGNMENT_TARGETS[options.role];
 
@@ -493,21 +583,24 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 		nextAgentModelOverrides[options.role] = options.selector;
 	}
 
-	const committed = commitMaterializedProfileAssignments(options, nextModelRoles, nextAgentModelOverrides);
+	const committed = commitMaterializedProfileAssignments(
+		options,
+		nextModelRoles,
+		nextAgentModelOverrides,
+		options.role !== "default",
+	);
 	if (committed) options.session.clearProfileInstalledOverrides?.();
 	return committed;
 }
 
 export function materializeActiveModelProfileAssignments(options: MaterializeModelProfileAssignmentsOptions): boolean {
-	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
-	if (!activeProfile) return false;
-
 	const materializedAssignments = getMaterializedAssignments(options.assignments);
+	const includesDefault = materializedAssignments.some(([role]) => role === "default");
+	if (!resolveMaterializationProfile(options, includesDefault)) return false;
 	if (materializedAssignments.length === 0) return true;
 
-	const nextModelRoles = { ...options.settings.get("modelRoles") };
+	const nextModelRoles = modelRolesForMaterialization(options);
 	const nextAgentModelOverrides = { ...options.settings.get("task.agentModelOverrides") };
-	const includesDefault = materializedAssignments.some(([role]) => role === "default");
 
 	if (!includesDefault && !nextModelRoles.default) {
 		const defaultChain = materializeConfiguredDefaultChain(options.session);
@@ -523,7 +616,12 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 		}
 	}
 
-	const committed = commitMaterializedProfileAssignments(options, nextModelRoles, nextAgentModelOverrides);
+	const committed = commitMaterializedProfileAssignments(
+		options,
+		nextModelRoles,
+		nextAgentModelOverrides,
+		!includesDefault,
+	);
 	if (committed) options.session.clearProfileInstalledOverrides?.();
 	return committed;
 }
@@ -1797,6 +1895,7 @@ export async function prepareModelProfileActivation(
 			manualModelRoleOverrides,
 			manualAgentModelOverrides,
 			previousActiveModelProfile: options.session.getActiveModelProfile?.(),
+			previousActivatedModelProfile: options.session.getActivatedModelProfile?.(),
 			previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
@@ -1898,6 +1997,7 @@ function capturePublishedModelProfileActivationState(
 		defaultChainState: prepared.session.getConfiguredModelChainState?.("default"),
 		defaultFallbackRuntimeState: prepared.session.getDefaultFallbackRuntimeState?.(),
 		activeModelProfile: prepared.session.getActiveModelProfile?.(),
+		activatedModelProfile: prepared.session.getActivatedModelProfile?.(),
 		profileInstalledOverrideState: prepared.session.getProfileInstalledOverrideState?.(),
 		sessionDefaultModel: prepared.session.getSessionDefaultModelSelector?.(),
 		persistedModelRoles: prepared.settings.getGlobal("modelRoles"),
@@ -1964,7 +2064,7 @@ export function publishPreparedModelProfileActivation(
 		...prepared.baseAgentModelOverrides,
 		...prepared.agentModelOverrides,
 	});
-	prepared.session.setActiveModelProfile?.(prepared.profileName);
+	prepared.session.setActiveModelProfile?.(prepared.profileName, true);
 	prepared.session.noteProfileInstalledOverrides?.(
 		Object.keys(prepared.modelRoles),
 		Object.keys(prepared.agentModelOverrides),
@@ -1975,6 +2075,7 @@ export function publishPreparedModelProfileActivation(
 			modelRoles: [...prepared.manualModelRoleOverrides],
 			agentModelOverrides: [...prepared.manualAgentModelOverrides],
 		},
+		prepared.defaultChain,
 	);
 	prepared.publishedState = capturePublishedModelProfileActivationState(prepared);
 }
@@ -2101,7 +2202,7 @@ export async function applyPreparedModelProfileActivation(
 		if (options.isCurrent && !options.isCurrent()) throw new ModelProfileActivationSupersededError();
 		if (!options.deferRuntimePublication) {
 			activationStage = "active profile marker";
-			prepared.session.setActiveModelProfile?.(prepared.profileName);
+			prepared.session.setActiveModelProfile?.(prepared.profileName, true);
 			activationStage = "installed role tracking";
 			prepared.session.noteProfileInstalledOverrides?.(
 				Object.keys(prepared.modelRoles),
@@ -2113,6 +2214,7 @@ export async function applyPreparedModelProfileActivation(
 					modelRoles: [...prepared.manualModelRoleOverrides],
 					agentModelOverrides: [...prepared.manualAgentModelOverrides],
 				},
+				prepared.defaultChain,
 			);
 			activatedProfileInstalledOverrideState = prepared.session.getProfileInstalledOverrideState?.();
 		}
@@ -2282,7 +2384,10 @@ export async function applyPreparedModelProfileActivation(
 		}
 		if (selectionIsCurrent()) {
 			restore("restore active profile", () =>
-				prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
+				prepared.session.setActiveModelProfile?.(
+					prepared.previousActiveModelProfile,
+					prepared.previousActivatedModelProfile === prepared.previousActiveModelProfile,
+				),
 			);
 		}
 		if (
@@ -2349,7 +2454,8 @@ export async function rollbackPreparedModelProfileActivation(
 	const canRollbackPublishedProfile = (): boolean =>
 		publishedState === undefined
 			? selectionIsCurrent()
-			: util.isDeepStrictEqual(prepared.session.getActiveModelProfile?.(), publishedState.activeModelProfile);
+			: util.isDeepStrictEqual(prepared.session.getActiveModelProfile?.(), publishedState.activeModelProfile) &&
+				util.isDeepStrictEqual(prepared.session.getActivatedModelProfile?.(), publishedState.activatedModelProfile);
 
 	if (options.persistDefault) {
 		if (
@@ -2536,7 +2642,10 @@ export async function rollbackPreparedModelProfileActivation(
 		canRestorePublishedState(prepared.session.getActiveModelProfile?.(), publishedState?.activeModelProfile)
 	) {
 		restore("restore active profile", () =>
-			prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
+			prepared.session.setActiveModelProfile?.(
+				prepared.previousActiveModelProfile,
+				prepared.previousActivatedModelProfile === prepared.previousActiveModelProfile,
+			),
 		);
 	}
 	if (
@@ -2583,6 +2692,7 @@ export interface MaterializeModelProfileForDeletionResult {
 	previousDefaultProfile: string | undefined;
 	previousPersistedDefaultProfile: string | undefined;
 	previousActiveModelProfile: string | undefined;
+	previousActivatedModelProfile: string | undefined;
 	previousDefaultChainState: ConfiguredModelChainState | undefined;
 	previousDefaultFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
 	previousProfileInstalledOverrideState: AgentSessionProfileInstalledOverrideState | undefined;
@@ -2714,7 +2824,12 @@ export async function materializeModelProfileForDeletion(
 				? prepared.settings.clearOverride("modelProfile.default")
 				: prepared.settings.override("modelProfile.default", prepared.previousDefaultProfileOverride),
 		);
-		restore(() => prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile));
+		restore(() =>
+			prepared.session.setActiveModelProfile?.(
+				prepared.previousActiveModelProfile,
+				prepared.previousActivatedModelProfile === prepared.previousActiveModelProfile,
+			),
+		);
 		if (prepared.previousProfileInstalledOverrideState) {
 			restore(() =>
 				prepared.session.restoreProfileInstalledOverrideState?.(prepared.previousProfileInstalledOverrideState!),
@@ -2747,6 +2862,7 @@ export async function materializeModelProfileForDeletion(
 		previousDefaultProfile,
 		previousPersistedDefaultProfile,
 		previousActiveModelProfile: prepared.previousActiveModelProfile,
+		previousActivatedModelProfile: prepared.previousActivatedModelProfile,
 		previousDefaultChainState: prepared.previousDefaultChainState,
 		previousDefaultFallbackRuntimeState: prepared.previousDefaultFallbackRuntimeState,
 		previousProfileInstalledOverrideState: prepared.previousProfileInstalledOverrideState,
@@ -2816,7 +2932,12 @@ export async function restoreMaterializedModelProfileForDeletion(options: {
 			? options.settings.clearOverride("modelProfile.default")
 			: options.settings.override("modelProfile.default", options.snapshot.previousDefaultProfileOverride),
 	);
-	restore(() => options.session.setActiveModelProfile?.(options.snapshot.previousActiveModelProfile));
+	restore(() =>
+		options.session.setActiveModelProfile?.(
+			options.snapshot.previousActiveModelProfile,
+			options.snapshot.previousActivatedModelProfile === options.snapshot.previousActiveModelProfile,
+		),
+	);
 	if (options.snapshot.previousProfileInstalledOverrideState) {
 		restore(() =>
 			options.session.restoreProfileInstalledOverrideState?.(
@@ -2863,6 +2984,7 @@ export async function applyModelProfileRuntimeBindings(
 	const previousModelRolesOverride = prepared.settings.getOverride("modelRoles");
 	const previousAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
 	const previousActiveModelProfile = prepared.session.getActiveModelProfile?.();
+	const previousActivatedModelProfile = prepared.session.getActivatedModelProfile?.();
 	const previousProfileInstalledOverrideState = prepared.session.getProfileInstalledOverrideState?.();
 	let activatedModelRolesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
 	let activatedAgentModelOverridesOverride: Readonly<Record<string, ModelSelectorValue>> | undefined;
@@ -2878,7 +3000,7 @@ export async function applyModelProfileRuntimeBindings(
 			...prepared.agentModelOverrides,
 		});
 		activatedAgentModelOverridesOverride = prepared.settings.getOverride("task.agentModelOverrides");
-		prepared.session.setActiveModelProfile?.(prepared.profileName);
+		prepared.session.setActiveModelProfile?.(prepared.profileName, true);
 		try {
 			await prepared.session.syncEagerDelegation?.();
 		} catch (error) {
@@ -2904,7 +3026,10 @@ export async function applyModelProfileRuntimeBindings(
 				prepared.settings.clearOverride("task.agentModelOverrides");
 			else prepared.settings.override("task.agentModelOverrides", restoredAgentModelOverridesOverride);
 			if (prepared.session.getActiveModelProfile?.() === prepared.profileName) {
-				prepared.session.setActiveModelProfile?.(previousActiveModelProfile);
+				prepared.session.setActiveModelProfile?.(
+					previousActiveModelProfile,
+					previousActivatedModelProfile === previousActiveModelProfile,
+				);
 			}
 			if (previousProfileInstalledOverrideState) {
 				prepared.session.restoreProfileInstalledOverrideState?.(previousProfileInstalledOverrideState);
@@ -2929,6 +3054,7 @@ export async function applyModelProfileRuntimeBindings(
 				modelRoles: [...prepared.manualModelRoleOverrides],
 				agentModelOverrides: [...prepared.manualAgentModelOverrides],
 			},
+			prepared.defaultChain,
 		);
 	} finally {
 		if (isCurrent && !isCurrent()) {
