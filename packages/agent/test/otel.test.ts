@@ -15,6 +15,7 @@ import {
 	type AgentTelemetryConfig,
 	type ChatUsageEvent,
 	detectGatewayFromHeaders,
+	finishChatSpan,
 	finishExecuteToolSpan,
 	GenAIAttr,
 	GenAIOperation,
@@ -27,7 +28,7 @@ import {
 	type TelemetryHookContext,
 } from "@gajae-code/agent-core/telemetry";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
+import type { AssistantMessage, Message } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type { EventStream } from "@gajae-code/ai/utils/event-stream";
@@ -212,6 +213,85 @@ describe("agent-loop OTEL instrumentation", () => {
 		const openAiChat = findSpan(exporter.getFinishedSpans(), "chat gpt-mock");
 		expect(openAiChat?.attributes[OpenAIAttr.RequestServiceTier]).toBe("priority");
 		expect(openAiChat?.attributes["gen_ai.request.service_tier"]).toBeUndefined();
+	});
+
+	it("reports ultrafast telemetry only when the model capability permits sending it", async () => {
+		for (const supportsUltrafastTier of [false, true]) {
+			exporter.reset();
+			const mock = createMockModel({
+				id: `gpt-mock-${supportsUltrafastTier}`,
+				provider: "openai",
+				responses: [{ content: ["ok"] }],
+			});
+			const model = { ...mock.model, compat: { supportsUltrafastTier } };
+			await runAndDrain(
+				agentLoop(
+					[createUserMessage("hi")],
+					{ systemPrompt: [], messages: [], tools: [] },
+					{
+						model,
+						convertToLlm: identityConverter,
+						serviceTier: "ultrafast",
+						telemetry: {},
+					},
+					undefined,
+					mock.stream,
+				),
+			);
+
+			const chat = findSpan(exporter.getFinishedSpans(), `chat ${model.id}`);
+			expect(chat?.attributes[OpenAIAttr.RequestServiceTier]).toBe(supportsUltrafastTier ? "ultrafast" : undefined);
+		}
+	});
+
+	it("uses the completed service tier for cost and usage callbacks", async () => {
+		const costTiers: Array<string | undefined> = [];
+		const usageTiers: Array<string | undefined> = [];
+		const telemetry = resolveTelemetry(
+			{
+				spans: false,
+				costEstimator: input => {
+					costTiers.push(input.serviceTier);
+					return { usd: 0.01 };
+				},
+				onChatUsage: event => {
+					usageTiers.push(event.serviceTier);
+				},
+			},
+			undefined,
+		);
+		const message: AssistantMessage = {
+			role: "assistant",
+			api: "openai-completions",
+			provider: "openai",
+			model: "gpt-test",
+			content: [],
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			serviceTier: "default",
+			timestamp: 0,
+		};
+
+		await finishChatSpan(telemetry, undefined, message, { stepNumber: 0, serviceTier: "ultrafast" });
+		await finishChatSpan(
+			telemetry,
+			undefined,
+			{ ...message, serviceTier: undefined },
+			{
+				stepNumber: 1,
+				serviceTier: "ultrafast",
+			},
+		);
+
+		expect(costTiers).toEqual(["default", undefined]);
+		expect(usageTiers).toEqual(["default", undefined]);
 	});
 
 	it("emits execute_tool spans parented to invoke_agent (not chat) per semconv", async () => {

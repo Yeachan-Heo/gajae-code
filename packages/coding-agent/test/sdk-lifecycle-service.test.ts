@@ -671,6 +671,35 @@ describe("SessionLifecycleService", () => {
 			ok: true,
 			result: { savedSessionOmission: { ...omission, detailCode: "cwd_not_directory" } },
 		});
+		const permissionDeniedScope = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSessionOmission: {
+					sessionId: "saved",
+					reason: "scope_unavailable",
+					detailCode: "permission_denied",
+				},
+			},
+		});
+		expect(
+			await permissionDeniedScope.service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo", resolveSessionId: "saved" },
+			}),
+		).toMatchObject({
+			ok: true,
+			result: {
+				savedSessionOmission: {
+					sessionId: "saved",
+					reason: "scope_unavailable",
+					detailCode: "permission_denied",
+				},
+			},
+		});
 
 		for (const savedSessionOmission of [
 			{ ...omission, detailCode: "/private/session.jsonl" },

@@ -9,6 +9,7 @@ import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as z from "zod/v4";
 import type { WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
+import { assertEditableFile, assertEditableFileContent } from "../../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
@@ -636,6 +637,7 @@ export async function executeReplaceSingle(
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
+	await assertEditableFile(absolutePath, path, session.settings);
 	return withEditPathMutation([absolutePath], () =>
 		executeReplaceSingleUnderLock({
 			session,
@@ -664,6 +666,7 @@ async function executeReplaceSingleUnderLock(
 	},
 ): Promise<AgentToolResult<EditToolDetails, typeof replaceEditEntrySchema>> {
 	const {
+		session,
 		path,
 		signal,
 		batchRequest,
@@ -678,6 +681,8 @@ async function executeReplaceSingleUnderLock(
 	} = options;
 
 	const rawContent = await readEditFileText(absolutePath, path);
+	assertEditableFileContent(rawContent, path, session.settings);
+	await assertEditableFile(absolutePath, path, session.settings);
 	const { bom, text: content } = stripBom(rawContent);
 	const originalEnding = detectLineEnding(content);
 	const normalizedContent = normalizeToLF(content);
@@ -738,6 +743,137 @@ async function executeReplaceSingleUnderLock(
 
 	return {
 		content: [{ type: "text", text: resultText }],
+		details: {
+			diff: diffResult.diff,
+			path: absolutePath,
+			firstChangedLine: diffResult.firstChangedLine,
+			diagnostics,
+			meta,
+			oldText: rawContent,
+			newText: finalContent,
+		},
+	};
+}
+
+export async function executeReplaceEntries(
+	options: Omit<ExecuteReplaceSingleOptions, "params"> & { edits: ReplaceEditEntry[] },
+): Promise<AgentToolResult<EditToolDetails, typeof replaceEditSchema>> {
+	if (options.edits.length <= 1) {
+		const only = options.edits[0];
+		if (!only) {
+			throw new ToolError("edits must not be empty.");
+		}
+		return executeReplaceSingle({ ...options, params: only });
+	}
+
+	const { session, path, edits } = options;
+	try {
+		enforcePlanModeWrite(session, path);
+		for (const entry of edits) {
+			if (entry.old_text.length === 0) {
+				throw new ToolError("old_text must not be empty.");
+			}
+		}
+		const absolutePath = resolvePlanPath(session, path);
+		return await withEditPathMutation([absolutePath], () =>
+			executeReplaceEntriesUnderLock({ ...options, absolutePath }),
+		);
+	} catch (err) {
+		const errorText = err instanceof Error ? err.message : String(err);
+		return {
+			content: [{ type: "text", text: `Error editing ${path}: ${errorText}` }],
+			details: { diff: "", path },
+			isError: true,
+		};
+	}
+}
+
+async function executeReplaceEntriesUnderLock(
+	options: Omit<ExecuteReplaceSingleOptions, "params"> & {
+		edits: ReplaceEditEntry[];
+		absolutePath: string;
+	},
+): Promise<AgentToolResult<EditToolDetails, typeof replaceEditSchema>> {
+	const {
+		session,
+		path,
+		edits,
+		signal,
+		batchRequest,
+		allowFuzzy,
+		fuzzyThreshold,
+		writethrough,
+		beginDeferredDiagnosticsForPath,
+		absolutePath,
+	} = options;
+
+	const rawContent = await readEditFileText(absolutePath, path);
+	assertEditableFileContent(rawContent, path, session.settings);
+	await assertEditableFile(absolutePath, path, session.settings);
+
+	const { bom, text: content } = stripBom(rawContent);
+	const originalEnding = detectLineEnding(content);
+	let normalizedContent = normalizeToLF(content);
+	const originalNormalized = normalizedContent;
+	const texts: string[] = [];
+
+	for (const [index, entry] of edits.entries()) {
+		const normalizedOldText = normalizeToLF(entry.old_text);
+		const normalizedNewText = normalizeToLF(entry.new_text);
+		const replaced = await replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
+			fuzzy: allowFuzzy,
+			all: entry.all ?? false,
+			threshold: fuzzyThreshold,
+		});
+		if (replaced.count === 0) {
+			const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
+				allowFuzzy,
+				threshold: fuzzyThreshold,
+			});
+			if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
+				throw new ToolError(formatOccurrenceError(path, matchOutcome));
+			}
+			throw new EditMatchError(path, normalizedOldText, matchOutcome.closest, {
+				allowFuzzy,
+				threshold: fuzzyThreshold,
+				fuzzyMatches: matchOutcome.fuzzyMatches,
+			});
+		}
+		if (normalizedContent === replaced.content) {
+			throw new ToolError(`Edits to ${path} resulted in no changes being made.`);
+		}
+		normalizedContent = replaced.content;
+		if (index < edits.length - 1) {
+			assertEditableFileContent(normalizedContent, path, session.settings);
+		}
+		texts.push(
+			replaced.count > 1
+				? `Successfully replaced ${replaced.count} occurrences in ${path}.`
+				: `Successfully replaced text in ${path}.`,
+		);
+	}
+
+	const finalContent = await serializeEditFileText(
+		absolutePath,
+		path,
+		bom + restoreLineEndings(normalizedContent, originalEnding),
+	);
+	const diagnostics = await writethrough(
+		absolutePath,
+		finalContent,
+		signal,
+		Bun.file(absolutePath),
+		batchRequest,
+		dst => (dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined),
+	);
+	invalidateFsScanAfterWrite(absolutePath);
+
+	const diffResult = generateDiffString(originalNormalized, normalizedContent);
+	const meta = outputMeta()
+		.diagnostics(diagnostics?.summary ?? "", diagnostics?.messages ?? [])
+		.get();
+	return {
+		content: [{ type: "text", text: texts.join("\n") }],
 		details: {
 			diff: diffResult.diff,
 			path: absolutePath,

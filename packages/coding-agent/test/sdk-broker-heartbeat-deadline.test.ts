@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as lockModule from "../src/config/file-lock";
 import { Broker } from "../src/sdk/broker/broker";
 import { brokerDiscoveryPath, readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import * as incarnationModule from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
 describe("broker startup heartbeat budget", () => {
@@ -148,6 +149,52 @@ describe("broker startup heartbeat budget", () => {
 		} finally {
 			await successor.stop();
 			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("aborts startup after slow process probes exhaust the checkpoint budget", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-startup-heartbeat-probe-deadline-"));
+		const index = await new SessionIndex(dir).open();
+		for (let row = 0; row < 4; row++) {
+			await index.append({
+				type: "host_registered",
+				sessionId: `slow-probe-host-${row}`,
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+		}
+		const controller = new AbortController();
+		const realMono = performance.now.bind(performance);
+		let simulatedWorkMs = 0;
+		const mono = vi.spyOn(performance, "now").mockImplementation(() => realMono() + simulatedWorkMs);
+		const deadline = performance.now() + 1_000;
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		let probeCount = 0;
+		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
+			probeCount++;
+			simulatedWorkMs += 600;
+			if (simulatedWorkMs >= 1_200) controller.abort();
+			return realProcessIncarnation(pid);
+		});
+		const broker = new Broker({
+			agentDir: dir,
+			port: 0,
+			startupAbortSignal: controller.signal,
+			startupCheckpointDeadline: deadline,
+		});
+		try {
+			// A deadline can fire while a synchronous OS probe is in progress. The
+			// broker must stop before probing every remaining host or publishing.
+			await expect(broker.start()).rejects.toThrow("interrupted before retained publication");
+			expect(probeCount).toBe(2);
+			expect(broker.discovery).toBeNull();
+			expect(await readBrokerDiscovery(dir)).toBeNull();
+		} finally {
+			await broker.stop();
+			incarnation.mockRestore();
+			mono.mockRestore();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});

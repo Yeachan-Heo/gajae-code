@@ -1,8 +1,8 @@
 /**
  * Shared types for `gjc migrate`.
  *
- * Imports MCP servers and skills from other coding agents (Claude Code, Codex,
- * OpenCode) into native GJC config. See the consensus plan under
+ * Imports MCP servers, skills, and instruction files from other coding agents
+ * (Claude Code, Codex, OpenCode) into native GJC config. See the consensus plan under
  * `.gjc/plans/ralplan/` for the full taxonomy and force/collision semantics.
  */
 import type { MCPServerConfig } from "../runtime-mcp/types";
@@ -16,7 +16,7 @@ export const MIGRATE_SOURCES: readonly MigrateSource[] = ["claude-code", "codex"
 export const CANONICAL_SOURCE_ORDER: readonly MigrateSource[] = MIGRATE_SOURCES;
 
 /** What kind of thing an action/coverage row is about. */
-export type MigrateItemType = "mcp" | "skill" | "source";
+export type MigrateItemType = "mcp" | "skill" | "instruction" | "source";
 
 /**
  * Per-item outcome taxonomy.
@@ -77,6 +77,13 @@ export interface SkillCandidate {
 	warnings: string[];
 }
 
+/** An instructions file imported as the active GJC AGENTS.md for its scope. */
+export interface InstructionCandidate {
+	source: MigrateSource;
+	name: string;
+	content: string;
+}
+
 /**
  * Source-level diagnostic for a single source/type pair (e.g. "codex mcp config
  * was malformed"). Distinct from per-item actions so absent/unreadable sources
@@ -93,6 +100,7 @@ export interface SourceDiagnostic {
 export interface AdapterResult {
 	mcpCandidates: McpCandidate[];
 	skillCandidates: SkillCandidate[];
+	instructionCandidates: InstructionCandidate[];
 	diagnostics: SourceDiagnostic[];
 }
 
@@ -112,6 +120,7 @@ export interface MigrateAction {
 	/** Resolved payload the executor needs; never serialized to the report. */
 	mcp?: { config: MCPServerConfig; force: boolean };
 	skill?: { content: string };
+	instruction?: { content: string };
 }
 
 export interface MigrateWarning {
@@ -126,6 +135,7 @@ export type StatusCounts = Record<MigrationStatus, number>;
 export interface MigrateDestinations {
 	mcpConfigPath: string;
 	skillsDir: string;
+	instructionsPath: string;
 }
 
 /** The full machine-readable report emitted with `--json`. */
@@ -138,7 +148,7 @@ export interface MigrateReport {
 	destinations: MigrateDestinations;
 	summary: {
 		total: StatusCounts;
-		byType: { mcp: StatusCounts; skill: StatusCounts; source: StatusCounts };
+		byType: { mcp: StatusCounts; skill: StatusCounts; instruction: StatusCounts; source: StatusCounts };
 		bySource: Record<MigrateSource, StatusCounts>;
 	};
 	actions: Array<{

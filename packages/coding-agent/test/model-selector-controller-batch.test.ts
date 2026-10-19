@@ -54,6 +54,7 @@ function createControllerContext() {
 		installedAgentModelOverrides: new Map(),
 		manualModelRoles: new Set(),
 		manualAgentModelOverrides: new Set(),
+		configuredAgentModelOverrides: new Set(),
 		preProfileModel: undefined,
 	};
 

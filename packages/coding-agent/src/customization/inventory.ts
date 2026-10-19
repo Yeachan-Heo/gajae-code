@@ -6,9 +6,10 @@
  *   discovery/policy model (trust, include/ignore, disabledExtensions,
  *   bundled-name protection). A narrow supplemental scan flags SKILL.md files
  *   the management loader rejects as `invalid` rows.
- * - Hooks: canonical `<root>/hooks/<pre|post>/` layout with the runtime's
- *   project-first, first-wins dedupe key (`<type>:<tool>:<name>`); losers are
- *   shown as `shadowed`.
+ * - Hooks: canonical `<root>/hooks/<pre|post>/` layout. Project hooks are
+ *   stored-only and do not shadow user hooks because sessions never load
+ *   repository hook modules. User-scope collisions follow the runtime's
+ *   first-wins dedupe key (`<type>:<tool>:<name>`); losers are `shadowed`.
  * - MCPs: canonical config files for both scopes with the runtime's
  *   project-first precedence and the union of disabled markers; malformed
  *   files surface as `invalid` rows without leaking raw JSON.
@@ -173,7 +174,8 @@ const HOOK_PHASES = ["pre", "post"] as const;
 
 async function loadHookRows(options: LoadCustomizationInventoryOptions, _warnings: string[]): Promise<InventoryRow[]> {
 	const rows: InventoryRow[] = [];
-	// Runtime semantics: project-first, first-wins on `<type>:<tool>:<name>`.
+	// Repository hooks are deliberately excluded by session startup. They stay
+	// visible for management, but are stored-only and cannot shadow user hooks.
 	const seen = new Set<string>();
 	for (const scope of ["project", "global"] as const) {
 		const hooksDir = resolveScopePaths(scope, options.cwd).hooksDir;
@@ -190,19 +192,33 @@ async function loadHookRows(options: LoadCustomizationInventoryOptions, _warning
 				const hookPath = path.join(phaseDir, entry.name);
 				const baseName = entry.name.includes(".") ? entry.name.slice(0, entry.name.lastIndexOf(".")) : entry.name;
 				const key = `${phase}:${baseName}:${entry.name}`;
-				const shadowed = seen.has(key);
-				seen.add(key);
+				const storedOnly = scope === "project";
+				const shadowed = !storedOnly && seen.has(key);
+				if (!storedOnly) seen.add(key);
+				let status: InventoryStatus;
+				let diagnostics: string[] | undefined;
+				if (storedOnly) {
+					status = "stored-only";
+					diagnostics = [
+						"project hooks are stored only; sessions do not load repository hook modules automatically",
+					];
+				} else if (shadowed) {
+					status = "shadowed";
+					diagnostics = ["shadowed by the same hook at higher-precedence scope"];
+				} else {
+					status = "enabled";
+				}
 				rows.push({
 					id: inventoryRowId("hooks", scope, hookPath),
 					surface: "hooks",
 					name: entry.name,
 					displayName: `${phase}/${entry.name}`,
-					status: shadowed ? "shadowed" : "enabled",
+					status,
 					provenance: `${scopeLabel(scope)} hooks/${phase}`,
 					path: hookPath,
 					scope,
 					description: `${phase}-tool hook for ${baseName}`,
-					diagnostics: shadowed ? ["shadowed by the same hook at higher-precedence scope"] : undefined,
+					diagnostics,
 					raw: { name: entry.name, type: phase, tool: baseName },
 				});
 			}

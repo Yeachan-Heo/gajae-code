@@ -496,7 +496,7 @@ export async function characterize(): Promise<CharacterizationOutcome> {
 	emitPhase("constructed");
 	try {
 		await Promise.all([
-			fs.mkdir(path.join(cwd, ".gjc", "extensions"), { recursive: true }),
+			fs.mkdir(path.join(agentDir, "extensions"), { recursive: true }),
 			fs.mkdir(stateRoot, { recursive: true }),
 			fs.mkdir(homeDir, { recursive: true }),
 			fs.mkdir(evidenceDir, { recursive: true }),
@@ -539,7 +539,8 @@ export async function characterize(): Promise<CharacterizationOutcome> {
 				"export default function characterizeExtension(api) {",
 			);
 		if (runtimeExtension === extensionSource) throw new Error("Could not prepare the isolated characterization extension entrypoint.");
-		await Bun.write(path.join(cwd, ".gjc", "extensions", "characterize-extension.js"), runtimeExtension);
+		// The harness owns this isolated user scope; project modules are not auto-loaded.
+		await Bun.write(path.join(agentDir, "extensions", "characterize-extension.js"), runtimeExtension);
 		await Bun.write(path.join(evidenceDir, "requests.jsonl"), "");
 		await Bun.write(path.join(evidenceDir, "tools.jsonl"), "");
 

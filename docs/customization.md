@@ -26,13 +26,12 @@ source, normalizes the selected surfaces, and writes the accepted result into
 the chosen `.gjc` destination. Import does not edit the source files. MCP and
 skill files from those hosts are never implicit standalone-session authorities.
 
-Hooks follow the same authority boundary: ordinary sessions adapt canonical
-native `.gjc/hooks/` modules to `ExtensionRunner`. Claude/Codex directory hook
-providers remain available for explicit import and diagnostics, but their
-foreign files are not imported or executed directly at startup. Codex still
-owns managed `hooks.json` command scheduling. The accepted event and phase
-rules are in [Hooks](./hooks.md); importing a hook creates the canonical
-`.gjc/hooks/` copy and its provenance boundary.
+Hooks follow the same authority boundary: ordinary sessions adapt user-agent
+`~/.gjc/agent/hooks/` modules to `ExtensionRunner`. A repository `.gjc/hooks/`
+module is not imported. Claude/Codex directory hook providers remain available
+for explicit import and diagnostics, but their foreign files are not imported
+or executed directly at startup. Codex still owns managed `hooks.json` command
+scheduling. The accepted event and phase rules are in [Hooks](./hooks.md).
 
 ## One cross-surface map
 
@@ -45,7 +44,7 @@ wizard (or use an explicit non-interactive command).
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **MCP** | `<project>/.gjc/mcp.json` | `~/.gjc/agent/mcp.json` | `<project>/.mcp.json` for the #4492 import transaction; the doctor also reports `.claude/mcp.json` and `.claude/.mcp.json` convention candidates | `~/.claude.json` for the import transaction | `<project>/.codex/config.toml`, `[mcp_servers.<name>]` | `~/.codex/config.toml`, `[mcp_servers.<name>]` | Only native `.gjc` MCPs autoload in ordinary standalone sessions. Import adapters normalize bounded JSON/TOML entries, validate them, and write native `mcp.json`. |
 | **Skill** | `<project>/.gjc/skills/<name>/SKILL.md` | `~/.gjc/agent/skills/<name>/SKILL.md` | `<project>/.claude/skills/<name>/SKILL.md` | `~/.claude/skills/<name>/SKILL.md` | `<project>/.codex/skills/<name>/SKILL.md` | `~/.codex/skills/<name>/SKILL.md` | Native `.gjc` skills are loaded by GJC. Claude/Codex skills are import candidates; they are not loaded directly into a GJC session. |
-| **Hook** | `<project>/.gjc/hooks/pre|post/<file>` | `~/.gjc/agent/hooks/pre|post/<file>` | `<project>/.claude/hooks/pre|post/<file>` | `~/.claude/hooks/pre|post/<file>` when explicitly selected for import | `<project>/.codex/hooks/pre-<tool>.ts` / `post-<tool>.ts` | `~/.codex/hooks/pre-<tool>.ts` / `post-<tool>.ts` when explicitly selected for import | Ordinary sessions execute only canonical native `.gjc` directory hooks. Claude/Codex layouts are explicit import and diagnostic sources; accepted imports are normalized to canonical `pre`/`post` phases. Codex-managed `hooks.json` remains Codex-owned. |
+| **Hook** | `<project>/.gjc/hooks/pre|post/<file>` | `~/.gjc/agent/hooks/pre|post/<file>` | `<project>/.claude/hooks/pre|post/<file>` | `~/.claude/hooks/pre|post/<file>` when explicitly selected for import | `<project>/.codex/hooks/pre-<tool>.ts` / `post-<tool>.ts` | `~/.codex/hooks/pre-<tool>.ts` / `post-<tool>.ts` when explicitly selected for import | Ordinary sessions load user-agent hooks and explicit hook paths. Project-scope hooks imported into `.gjc` are stored-only; they are not loaded automatically. Import hooks into Global `.gjc` or configure an explicit hook path to activate them. Claude/Codex layouts remain import and diagnostic sources. Codex-managed `hooks.json` remains Codex-owned. |
 
 The Claude MCP paths above are intentionally explicit: the `/extensions`
 import implementation reads the project `.mcp.json` and user `~/.claude.json`
@@ -71,12 +70,21 @@ A project import writes beneath `<project>/.gjc/`; a user import writes beneath
 user source does not write into the project unless the destination was selected
 as project. The source is read only during preview/apply and is never mutated.
 
-For non-interactive MCP/skill-only migration, `gjc migrate --from
-claude-code|codex` supports the user destination by default, `--project` for a
-project destination, `--dry-run` for a plan, and `--force` for its explicit
-update behavior. It is not a replacement for the all-surface `/extensions`
-preview. Direct native MCP registration uses `gjc mcp add`; see the linked MCP
-reference.
+For non-interactive migration, `gjc migrate --from claude-code|codex` imports
+MCP servers, skills, and the selected scope's instructions into `AGENTS.md`.
+User scope is the default: Claude Code reads `~/.claude/CLAUDE.md` and Codex
+reads `~/.codex/AGENTS.md`, writing instructions to `~/.gjc/agent/AGENTS.md`.
+With `--project`, Claude Code reads the project-root `CLAUDE.md` and writes it
+to `<project>/.gjc/AGENTS.md`. A project-root Codex `AGENTS.md` is already a
+native GJC instruction source, so it is left in place rather than copied.
+`--dry-run` reports the planned imports and skips without writing; `--force`
+explicitly updates existing destination files. Instruction writes refuse to
+follow symlinked destination directories. Codex prompts are imported as skills.
+Claude Code commands, subagents, extensions, Claude Code/Codex hooks and
+settings (model, permissions, and environment), and optional session history are
+not imported by this command and still need manual migration. This is not a
+replacement for the all-surface `/extensions` preview. Direct native MCP
+registration uses `gjc mcp add`; see the linked MCP reference.
 
 ### Effective runtime precedence
 
@@ -89,13 +97,13 @@ Import collision policy and runtime precedence are different decisions:
   diagnosed. The four bundled workflow names (`deep-interview`, `ralplan`,
   `team`, and `ultragoal`) are protected; a disk copy cannot replace the
   bundled definition.
-- **Hooks:** native project hooks win over the same native user hook. The
-  capability registry gives the native GJC provider precedence over the Claude
-  and Codex directory providers; `normalizeDirectoryHook` preserves the
-  convention's phase and rejects unsupported convention/event combinations.
-  A `pre` hook remains pre-tool authority and a `post` hook cannot acquire
-  blocking authority. See [Hooks](./hooks.md) for event, timeout, and runtime
-  ownership details.
+- **Hooks:** ordinary sessions load native user-agent hooks and explicit hook
+  paths; project-scope `.gjc` hooks are stored-only and do not shadow user hooks.
+  Claude/Codex hooks are import and diagnostic sources, not automatic runtime
+  authorities. `normalizeDirectoryHook` preserves the convention's phase and
+  rejects unsupported convention/event combinations. A `pre` hook remains
+  pre-tool authority and a `post` hook cannot acquire blocking authority. See
+  [Hooks](./hooks.md) for event, timeout, and runtime ownership details.
 - **MCP:** a native project server wins over a native user server with the same
   name. `disabledServers` from either native scope disables that name, and
   plugin-bundle MCPs have their separately documented collision authority; see
@@ -153,8 +161,10 @@ execution that its directory adapter does not support.
 
 A native MCP server is startup-eligible only when it is not `enabled: false`,
 not listed in either scope's `disabledServers`, and not `autoload: false`.
-Project MCP loading is on by default and is disabled for an environment only by
-an explicit `mcp.enableProjectConfig: false`. `--no-mcp` opts one standalone
+Project HTTP and SSE MCP loading is on by default. A project stdio server
+starts only when the user config sets `mcp.enableProjectConfig` to true; a
+project settings file cannot set that flag, and `false` disables every
+project-scope source. `--no-mcp` opts one standalone
 session out of conventional native autoload; an exact-file `--mcp-config` is a
 separate top-level opt-in that replaces conventional autoload.
 

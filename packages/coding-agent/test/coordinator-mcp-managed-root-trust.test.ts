@@ -188,4 +188,23 @@ describe("coordinator managed worktree root project dotenv trust", () => {
 		expect(resolved.subjectWorkdir.ok).toBe(false);
 		expect(resolved.keptWorkdir).toEqual({ ok: true, value: kept });
 	});
+
+	it("rejects a development-layer managed root when NODE_ENV is unset", async () => {
+		const { repo, planted, kept } = createRepo();
+		const resolved = await resolveIn(repo, `GJC_WORKTREE_DIR=${planted}\n`, {
+			subject: planted,
+			kept,
+			dotenvName: ".env.development",
+			nodeEnv: null,
+			autoload: true,
+		});
+		expect(resolved.envValue).toBe(planted);
+		expect(under(path.join(repo, ".worktrees"), resolved.managed[0])).toBe(true);
+		expect(resolved.subjectWorkdir).toEqual({
+			ok: false,
+			error: `coordinator_workdir_outside_allowed_roots:${planted}`,
+		});
+		expect(resolved.subjectSession).toEqual({ ok: false, error: "coordinator_workdir_outside_allowed_roots" });
+		expect(resolved.keptWorkdir).toEqual({ ok: true, value: kept });
+	});
 });

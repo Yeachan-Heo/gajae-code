@@ -1,13 +1,16 @@
-import type { AuthCredentialSelector, AuthCredentialSnapshotEntry } from "@gajae-code/ai/core";
+import {
+	type AuthCredentialSelector,
+	type AuthCredentialSnapshotEntry,
+	formatOAuthIdentityLabel,
+	oauthCredentialMatchesOrganization,
+} from "@gajae-code/ai/core";
 import { parseCliCredentialSelector } from "../../runtime-credential-selector";
 import type { SlashCommandRuntime } from "../types";
 
 /** Human-readable label for one stored OAuth credential row. */
 function describeCredentialRow(entry: AuthCredentialSnapshotEntry): string {
 	if (entry.credential.type !== "oauth") return `id:${entry.id} (api key)`;
-	const email = entry.credential.email;
-	const accountId = entry.credential.accountId;
-	const label = email ?? accountId ?? `row ${entry.id}`;
+	const label = formatOAuthIdentityLabel(entry.credential) ?? `row ${entry.id}`;
 	return `id:${entry.id} — ${label}`;
 }
 
@@ -33,6 +36,8 @@ function selectorMatchesRow(selector: AuthCredentialSelector, entry: AuthCredent
 			return entry.credential.accountId === selector.value;
 		case "project":
 			return entry.credential.projectId === selector.value;
+		case "org":
+			return oauthCredentialMatchesOrganization(entry.credential, selector.value);
 	}
 }
 
@@ -116,7 +121,7 @@ export async function switchSessionCredentialCommand(runtime: SlashCommandRuntim
 	try {
 		parsed = parseCliCredentialSelector(trimmed);
 	} catch {
-		return `Invalid selector "${trimmed}". Use email:name@example.com, id:15, account:<id>, project:<id>, or provider/<selector>.`;
+		return `Invalid selector "${trimmed}". Use email:name@example.com, id:15, account:<id>, project:<id>, org:<organization id or name>, or provider/<selector>.`;
 	}
 
 	const authStorage = runtime.session.modelRegistry.authStorage;

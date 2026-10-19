@@ -103,3 +103,18 @@ describe.each([
 		});
 	});
 });
+
+describe("harness directory backslash-hash comment", () => {
+	describe.each(KEYS)("%s", key => {
+		it("drops a project assignment whose hash is preceded by a backslash", async () => {
+			expect(await resolveIn(tempDir(`${key}=/repo/${key}\\#note\n`), key, { autoload: true })).toBeNull();
+		});
+
+		it("keeps a different shell value when the project assignment uses a backslash hash", async () => {
+			const inherited = `/operator/${key}`;
+			expect(await resolveIn(tempDir(`${key}=/repo/${key}\\#note\n`), key, { autoload: true, inherited })).toBe(
+				inherited,
+			);
+		});
+	});
+});

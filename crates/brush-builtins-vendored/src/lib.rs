@@ -60,6 +60,8 @@ mod jobs;
 mod kill;
 #[cfg(feature = "builtin.let")]
 mod let_;
+#[cfg(any(feature = "builtin.mapfile", feature = "builtin.read"))]
+mod line_input;
 #[cfg(feature = "builtin.mapfile")]
 mod mapfile;
 #[cfg(feature = "builtin.popd")]

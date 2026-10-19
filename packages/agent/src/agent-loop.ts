@@ -405,6 +405,14 @@ export const ESCAPED_NONASCII_RECOVERY_PROMPT = escapedNonAsciiRecoveryPrompt;
 
 const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
 
+/**
+ * Recovery guidance kept byte-for-byte for every incomplete-argument rejection
+ * that carries a typed reason, and identical in meaning for the fallback where
+ * only the boolean was set.
+ */
+const INCOMPLETE_ARGUMENTS_REISSUE_GUIDANCE =
+	"Re-issue the call with complete arguments, splitting the work into smaller steps if needed.";
+
 /** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
 interface EscapedToolCallMetadata {
 	guarded: boolean;
@@ -415,6 +423,13 @@ interface EscapedToolCallMetadata {
 }
 
 const acceptedToolCallMetadata = new WeakMap<object, EscapedToolCallMetadata>();
+
+/** The closed reason vocabulary the tool-call contract accepts. */
+const INCOMPLETE_ARGUMENTS_REASONS = new Set(["truncated", "malformed", "conflicting", "ambiguous"]);
+
+function isIncompleteArgumentsReason(value: unknown): value is "truncated" | "malformed" | "conflicting" | "ambiguous" {
+	return typeof value === "string" && INCOMPLETE_ARGUMENTS_REASONS.has(value);
+}
 
 function escapedToolCallMetadata(
 	block: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
@@ -442,6 +457,15 @@ function escapedToolCallMetadata(
 		(typeof incompleteReasonRead.value === "string" && SANITIZER_SENTINELS.has(incompleteReasonRead.value)) ||
 		(evidenceRead.present && (evidenceRead.value === undefined || evidence === undefined || evidence.malformed));
 	const incomplete = incompleteRead.ok && incompleteRead.value === true;
+	// A producer that typed the reason has already answered the question the
+	// metadata check is guessing at, so the declaration survives a failed or
+	// unverifiable evidence read instead of being overwritten with `malformed`.
+	// Re-labelling it would report a decode failure for a call the wire said was
+	// truncated (or conflicting, or ambiguously identified).
+	const declaredReason =
+		incompleteReasonRead.ok && typeof incompleteReasonRead.value === "string"
+			? incompleteReasonRead.value
+			: undefined;
 	return {
 		guarded:
 			malformedMetadata ||
@@ -451,7 +475,7 @@ function escapedToolCallMetadata(
 		evidence,
 		incompleteArguments: incomplete,
 		incompleteArgumentsReason:
-			!incompleteReasonRead.ok || malformedMetadata ? "malformed" : incompleteReasonRead.value,
+			declaredReason ?? (!incompleteReasonRead.ok || malformedMetadata ? "malformed" : incompleteReasonRead.value),
 	};
 }
 
@@ -2019,6 +2043,7 @@ const LOSSLESS_SNAPSHOT_KEYS = [
 	"provider",
 	"model",
 	"responseId",
+	"serviceTier",
 	"usage",
 	"stopReason",
 	"errorMessage",
@@ -3031,11 +3056,25 @@ class ManagedAttemptTransaction {
 						metadata.incompleteArgumentsReason ?? detachedMetadata.incompleteArgumentsReason,
 				};
 				if (combinedMetadata.malformed) {
+					// The snapshot could not corroborate this call's account of its
+					// arguments, so it must not execute. A reason the producer already
+					// declared is still the accurate cause and is preserved: rewriting
+					// every incomplete call to `malformed` here is what left a typed
+					// reason unreachable at dispatch, where the block's own field is
+					// the last surviving declaration of why the arguments stopped. If
+					// no reason was declared, leave it unknown rather than claiming that
+					// the terminal arguments failed to decode.
+					const declaredReason = managedProperty(snapshotBlock, "incompleteArgumentsReason");
+					const markedReason = combinedMetadata.incompleteArgumentsReason ?? declaredReason;
 					const marked = {
 						...snapshotBlock,
 						incompleteArguments: true,
-						incompleteArgumentsReason: "malformed" as const,
 					};
+					if (isIncompleteArgumentsReason(markedReason)) {
+						marked.incompleteArgumentsReason = markedReason;
+					} else {
+						delete marked.incompleteArgumentsReason;
+					}
 					snapshot.content[index] = marked;
 					acceptedToolCallMetadata.set(marked, combinedMetadata);
 				} else {
@@ -3413,7 +3452,7 @@ function buildAgentEndEvent(
 	messages: AgentMessage[],
 	telemetry: AgentTelemetry | undefined,
 	stepCount: number,
-	stopReason: "completed" | "paused" = "completed",
+	stopReason: "completed" | "paused" | "cancelled" = "completed",
 	scope?: AttemptScope,
 ): Extract<AgentEvent, { type: "agent_end" }> {
 	const base = { type: "agent_end" as const, messages, stopReason, ...(scope ? { scope } : {}) };
@@ -3812,6 +3851,9 @@ async function runLoopBody(
 ): Promise<void> {
 	let firstTurn = true;
 	let lastAttemptScope: AttemptScope | undefined;
+	// A subscriber may abort reentrantly from the final assistant message_end;
+	// do not relabel that already-accepted answer as cancelled.
+	let lastAttemptAcceptedFinalAssistantMessage = false;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 	let harmonyRetryAttempt = 0;
@@ -3857,6 +3899,23 @@ async function runLoopBody(
 	// the loop could run forever. Any turn that produces a non-malformed batch
 	// resets the counter, so healthy runs are unaffected.
 	let consecutiveMalformedTurns = 0;
+	const finishCancelled = (scope?: AttemptScope): void => {
+		publishAgentEnd(
+			stream,
+			config,
+			buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "cancelled", scope),
+			scope,
+		);
+		stream.end(newMessages);
+	};
+	const commitMessages = (messages: AgentMessage[], scope?: AttemptScope): void => {
+		for (const message of messages) {
+			stream.push({ type: "message_start", message, scope });
+			stream.push({ type: "message_end", message, scope });
+			currentContext.messages.push(message);
+			newMessages.push(message);
+		}
+	};
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -3864,6 +3923,7 @@ async function runLoopBody(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			lastAttemptAcceptedFinalAssistantMessage = false;
 			const scope =
 				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
 			initialScope = undefined;
@@ -3889,12 +3949,7 @@ async function runLoopBody(
 			// Commit queued user input outside the provisional assistant transaction so a
 			// discarded managed attempt cannot lose it before its retry continuation.
 			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					stream.push({ type: "message_start", message, scope: attemptScope });
-					stream.push({ type: "message_end", message, scope: attemptScope });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
+				commitMessages(pendingMessages, attemptScope);
 				pendingMessages = [];
 			}
 
@@ -4411,13 +4466,17 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
-				publishAgentEnd(
-					stream,
-					config,
-					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
-					attemptScope,
-				);
-				stream.end(newMessages);
+				if (message.stopReason === "aborted") {
+					finishCancelled(attemptScope);
+				} else {
+					publishAgentEnd(
+						stream,
+						config,
+						buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+						attemptScope,
+					);
+					stream.end(newMessages);
+				}
 				return;
 			}
 
@@ -4427,6 +4486,7 @@ async function runLoopBody(
 				(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 			);
 			hasMoreToolCalls = toolCalls.length > 0;
+			lastAttemptAcceptedFinalAssistantMessage = !hasMoreToolCalls;
 
 			const toolResults: ToolResultMessage[] = [];
 			let repeatedMalformedToolCall = false;
@@ -4578,8 +4638,18 @@ async function runLoopBody(
 		}
 
 		// Agent would stop here. Check for follow-up messages.
-		await config.onBeforeYield?.();
-		if (config.shouldPause?.()) {
+		if (loopSignal.aborted && !lastAttemptAcceptedFinalAssistantMessage) {
+			finishCancelled(lastAttemptScope);
+			return;
+		}
+		if (!loopSignal.aborted) {
+			await config.onBeforeYield?.();
+		}
+		if (loopSignal.aborted && !lastAttemptAcceptedFinalAssistantMessage) {
+			finishCancelled(lastAttemptScope);
+			return;
+		}
+		if (!loopSignal.aborted && config.shouldPause?.()) {
 			publishAgentEnd(
 				stream,
 				config,
@@ -4591,9 +4661,22 @@ async function runLoopBody(
 		}
 		// Poll the consume-on-read recovery candidate before follow-ups so a real
 		// user message can supersede it without letting the stale recovery resurface
-		// after that follow-up turn.
+		// after that follow-up turn. An abort from an accepted final message_end must
+		// also see a pending recovery before the run can report successful completion.
 		const syntheticRecoveryMessage = await config.getSyntheticRecoveryMessage?.();
+		if (loopSignal.aborted) {
+			if (lastAttemptAcceptedFinalAssistantMessage && !syntheticRecoveryMessage) break;
+			finishCancelled(lastAttemptScope);
+			return;
+		}
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		if (loopSignal.aborted) {
+			commitMessages(followUpMessages, lastAttemptScope);
+			if (lastAttemptAcceptedFinalAssistantMessage && followUpMessages.length === 0 && !syntheticRecoveryMessage)
+				break;
+			finishCancelled(lastAttemptScope);
+			return;
+		}
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
@@ -5504,8 +5587,18 @@ async function executeToolCalls(
 					record.argumentValidationFailed = true;
 					// The provider flagged this call's arguments as unsafe to execute.
 					// The typed reason selects accurate recovery guidance; callers that
-					// only read the boolean still get a safe, actionable rejection.
-					const reason = metadata.incompleteArgumentsReason;
+					// only read the boolean still get a safe, actionable rejection. An
+					// attempt-scoped snapshot can carry metadata captured before the
+					// terminal block declared its reason, so the block's own field is
+					// consulted whenever the snapshot has none.
+					const reason =
+						metadata.incompleteArgumentsReason ?? managedProperty(toolCall, "incompleteArgumentsReason");
+					// The output-token-limit sentence is an assertion about WHY the
+					// arguments stopped, and only a length stop proves it. A call that
+					// carries no typed reason (an older producer that set only the
+					// boolean) is rejected honestly with the same actionable guidance
+					// instead of blaming a limit the turn may never have hit.
+					const lengthTruncation = reason === "truncated" || assistantMessage.stopReason === "length";
 					const detail =
 						reason === "malformed"
 							? `The terminal arguments for tool call "${toolCall.name}" did not decode to a valid JSON object. The arguments cannot be executed. Re-issue the call with valid, complete arguments.`
@@ -5513,7 +5606,9 @@ async function executeToolCalls(
 								? `The streamed and terminal arguments for tool call "${toolCall.name}" disagree. The arguments cannot be executed safely. Re-issue the call with consistent arguments.`
 								: reason === "ambiguous"
 									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
-									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
+									: lengthTruncation
+										? `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. ${INCOMPLETE_ARGUMENTS_REISSUE_GUIDANCE}`
+										: `Tool call "${toolCall.name}" was incomplete before its arguments finished streaming. The partial arguments cannot be executed. ${INCOMPLETE_ARGUMENTS_REISSUE_GUIDANCE}`;
 					throw markDesignedError(new Error(detail));
 				}
 				const displaySafeEscapedArguments =
@@ -5599,6 +5694,12 @@ async function executeToolCalls(
 					);
 					if (beforeResult?.block) {
 						throw new ToolCallBlockedError(beforeResult.reason);
+					}
+					// The hook may await (e.g. native TTSR matching). A run cancelled or a
+					// record skipped meanwhile already owes only its aborted/skipped result;
+					// it must not start, since non-abortable tools would still mutate state.
+					if (toolSignal?.aborted || record.skipped || interruptState.triggered) {
+						throw new ToolCallBlockedError("Tool call was cancelled before dispatch");
 					}
 				}
 				// Reflect post-hook args so emitted tool results / afterToolCall see what actually executed.

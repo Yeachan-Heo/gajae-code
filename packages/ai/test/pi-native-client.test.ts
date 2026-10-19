@@ -137,6 +137,22 @@ describe("streamPiNative request shape", () => {
 		expect((bodies[1].options as Record<string, unknown>).maxTokens).toBe(70_000);
 	});
 
+	it("preserves the per-request idle timeout on the pi-native wire", async () => {
+		let body: { options: Record<string, unknown> } | undefined;
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			body = JSON.parse(init?.body as string) as { options: Record<string, unknown> };
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+
+		await streamSimple(fakeModel({ streamIdleTimeoutMs: 120_000 }), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: fetchImpl,
+			streamIdleTimeoutMs: 300_000,
+		}).result();
+
+		expect(body?.options.streamIdleTimeoutMs).toBe(300_000);
+	});
+
 	it("keeps zero and non-finite request budgets on the safe default", async () => {
 		const budgets: unknown[] = [];
 		const fetchImpl: FetchImpl = (async (_input, init) => {

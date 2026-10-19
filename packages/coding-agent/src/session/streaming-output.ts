@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
 
 import { sanitizeText } from "@gajae-code/utils";
@@ -27,6 +28,78 @@ export const DEFAULT_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024; // 10MB
 const NL = "\n";
 
 const ELLIPSIS = "…";
+
+// Bound the temporary parts/join allocation in #applyColumnCap for a single
+// large callback. Keep batches small enough to avoid per-line retention work.
+const COLUMN_CAP_BATCH_CHARS = 64 * 1024;
+
+const outputPlainSecrets = new AsyncLocalStorage<readonly string[]>();
+
+/** Run `fn` while column caps can see these plain secrets. */
+export function runWithOutputRedaction<T>(plainSecrets: readonly string[], fn: () => T): T {
+	return outputPlainSecrets.run(plainSecrets, fn);
+}
+
+/** Get the active plain secrets from AsyncLocalStorage, if any are set. */
+function activePlainSecrets(): readonly string[] | undefined {
+	const secrets = outputPlainSecrets.getStore();
+	return secrets && secrets.length > 0 ? secrets : undefined;
+}
+
+/**
+ * Pull a column-cap end back to the start of any plain secret that crosses it.
+ * A secret that ends on the cut stays, so a later whole-string obfuscator can match it.
+ */
+function columnHeadEndOutsideSecrets(segment: string, end: number, secrets: readonly string[]): number {
+	let cut = end;
+	while (cut > 0) {
+		let earliest = cut;
+		for (const secret of secrets) {
+			const secretChars = secret.length;
+			if (secretChars === 0) continue;
+			const windowStart = Math.max(0, cut - secretChars);
+			const window = segment.slice(windowStart, Math.min(segment.length, cut + secretChars));
+			const limit = cut - windowStart;
+			let from = 0;
+			while (from < limit) {
+				const rel = window.indexOf(secret, from);
+				if (rel === -1 || rel >= limit) break;
+				if (rel + secretChars > limit) earliest = Math.min(earliest, windowStart + rel);
+				from = rel + 1;
+			}
+		}
+		if (earliest === cut) break;
+		cut = earliest;
+	}
+	return cut;
+}
+
+/**
+ * Pull a column-cap end off a proper prefix of a plain secret.
+ * Each candidate's continuation is checked from longest to shortest.
+ * A longer candidate that is already finished or contradicted does not hide
+ * a shorter open prefix. A secret that already ends on the cut stays.
+ */
+function columnHeadEndBeforeOpenPrefix(text: string, end: number, secrets: readonly string[]): number {
+	let cut = end;
+	const after = text.slice(end);
+	for (const secret of secrets) {
+		const secretChars = secret.length;
+		if (secretChars < 2 || end < 1) continue;
+		if (end >= secretChars && text.slice(end - secretChars, end) === secret) continue;
+		const maxPrefix = Math.min(secretChars - 1, end);
+		for (let k = maxPrefix; k >= 1; k--) {
+			if (text.slice(end - k, end) !== secret.slice(0, k)) continue;
+			const rest = secret.slice(k);
+			const have = Math.min(after.length, rest.length);
+			if (have === rest.length) continue;
+			if (after.slice(0, have) !== rest.slice(0, have)) continue;
+			cut = Math.min(cut, end - k);
+			break;
+		}
+	}
+	return cut;
+}
 
 const ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES = 256;
 
@@ -312,6 +385,72 @@ export function truncateLine(
 ): { text: string; wasTruncated: boolean } {
 	if (line.length <= maxChars) return { text: line, wasTruncated: false };
 	return { text: `${line.slice(0, maxChars)}…`, wasTruncated: true };
+}
+
+/**
+ * Truncate each line to max characters without leaving a configured plain-secret
+ * prefix in the retained text. Prior uncapped lines remain in scope because a
+ * later line's cut can split a multiline secret.
+ */
+export function truncateTextWithSecretAwareness(
+	text: string,
+	maxChars: number = DEFAULT_MAX_COLUMN,
+	secrets?: readonly string[],
+): { text: string; wasTruncated: boolean } {
+	const lines = text.split(NL);
+	const activeSecrets = secrets ?? activePlainSecrets();
+	if (!activeSecrets?.some(secret => secret.length > 0)) {
+		let wasTruncated = false;
+		const truncated = lines.map(line => {
+			const result = truncateLine(line, maxChars);
+			wasTruncated ||= result.wasTruncated;
+			return result.text;
+		});
+		return { text: truncated.join(NL), wasTruncated };
+	}
+
+	const contextChars = activeSecrets.reduce((max, secret) => Math.max(max, secret.length), 0);
+	let context = "";
+	const outputParts: string[] = [];
+	let wasTruncated = false;
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index] ?? "";
+		const newline = index < lines.length - 1 ? NL : "";
+		if (line.length <= maxChars) {
+			outputParts.push(line, newline);
+			context = (context + line + newline).slice(-contextChars);
+			continue;
+		}
+
+		wasTruncated = true;
+		const combined = context + line;
+		let end = context.length + maxChars;
+		while (end > 0) {
+			const next = Math.min(
+				columnHeadEndOutsideSecrets(combined, end, activeSecrets),
+				columnHeadEndBeforeOpenPrefix(combined, end, activeSecrets),
+			);
+			if (next >= end) break;
+			end = next;
+		}
+
+		if (end < context.length) {
+			const retract = context.slice(end);
+			let output = outputParts.join("");
+			if (output.endsWith(retract)) {
+				output = output.slice(0, output.length - retract.length);
+				output += NL.repeat(countNewlines(retract));
+			} else {
+				output = NL.repeat(countNewlines(output));
+			}
+			outputParts.length = 0;
+			outputParts.push(output);
+		}
+		const keptChars = Math.max(0, end - context.length);
+		outputParts.push(line.slice(0, keptChars), ELLIPSIS, newline);
+		context = "";
+	}
+	return { text: outputParts.join(""), wasTruncated };
 }
 
 // =============================================================================
@@ -952,6 +1091,13 @@ export class OutputSink {
 	#columnEllipsisAdded = false;
 	#columnDroppedBytes = 0;
 	#columnTruncatedLines = 0;
+	/** Plain secrets captured when this sink is built inside an active redaction scope. */
+	readonly #plainSecrets?: readonly string[];
+	readonly #plainSecretContextChars: number;
+	/** Text already retained for the open line. A later chunk may shorten it. */
+	#columnLine = "";
+	/** Bounded suffix of prior uncapped output, preserved for multiline secrets. */
+	#columnLineContext = "";
 	#file?: {
 		path: string;
 		artifactId?: string;
@@ -1010,6 +1156,8 @@ export class OutputSink {
 		this.#artifactMaxBytes = Math.max(0, artifactMaxBytes);
 		this.#artifactPublisher = artifactPublisher;
 		this.#coalesceSanitize = coalesceSanitize;
+		this.#plainSecrets = activePlainSecrets();
+		this.#plainSecretContextChars = this.#plainSecrets?.reduce((max, secret) => Math.max(max, secret.length), 0) ?? 0;
 	}
 
 	#headText(): string {
@@ -1104,10 +1252,45 @@ export class OutputSink {
 
 		if (rawBytes === 0) return;
 
-		const visibleChunk = this.#maxColumns > 0 ? this.#applyColumnCap(sanitizedChunk) : sanitizedChunk;
 		if (this.#artifactPath && this.#maxColumns > 0) this.#enqueueFileWrite(rawChunk, rawBytes);
 		else if (this.#artifactPublisher && this.#maxColumns > 0) this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
+
+		if (this.#maxColumns > 0) {
+			if (this.#plainSecrets) {
+				// Secret-aware cuts can retract text from an earlier line, so retain
+				// each line before processing the next one.
+				let cursor = 0;
+				while (cursor < sanitizedChunk.length) {
+					const newline = sanitizedChunk.indexOf(NL, cursor);
+					const end = newline === -1 ? sanitizedChunk.length : newline + 1;
+					this.#retainVisible(this.#applyColumnCap(sanitizedChunk.slice(cursor, end)));
+					cursor = end;
+				}
+			} else {
+				// Batch ordinary output while bounding #applyColumnCap's temporary
+				// parts/join allocation for large single callbacks. Retaining each
+				// line separately repeats accounting millions of times.
+				let cursor = 0;
+				while (cursor < sanitizedChunk.length) {
+					let end = Math.min(cursor + COLUMN_CAP_BATCH_CHARS, sanitizedChunk.length);
+					// UTF-8 byte accounting must not observe a surrogate pair as two
+					// replacement characters when a batch boundary lands between them.
+					if (end < sanitizedChunk.length) {
+						const before = sanitizedChunk.charCodeAt(end - 1);
+						const after = sanitizedChunk.charCodeAt(end);
+						if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end--;
+					}
+					this.#retainVisible(this.#applyColumnCap(sanitizedChunk.slice(cursor, end)));
+					cursor = end;
+				}
+			}
+		} else {
+			this.#retainVisible(sanitizedChunk);
+		}
 		if (this.#columnDroppedBytes > 0) this.#createFileSink();
+	}
+
+	#retainVisible(visibleChunk: string): void {
 		const visibleBytes = Buffer.byteLength(visibleChunk, "utf-8");
 		if (visibleChunk.length > 0) {
 			this.#processedBytes += visibleBytes;
@@ -1125,6 +1308,7 @@ export class OutputSink {
 				return;
 			}
 			const headSlice = truncateHeadBytes(visibleChunk, room);
+			this.#headRetentionDisabled = true;
 			if (headSlice.bytes > 0) {
 				this.#appendHead(headSlice.text, headSlice.bytes);
 				tailChunk = visibleChunk.substring(headSlice.text.length);
@@ -1161,32 +1345,104 @@ export class OutputSink {
 					if (segBytes <= remaining) {
 						parts.push(segment);
 						this.#currentLineBytes += segBytes;
+						if (this.#plainSecrets) this.#columnLine += segment;
 					} else {
 						// First overflow on this line: keep what fits, append ellipsis,
-						// arm the skip-until-newline flag.
+						// arm the skip-until-newline flag. With secrets, do not emit a
+						// kept-head suffix that is still a prefix of a plain secret, and
+						// do not end inside one the whole-string obfuscator must see whole.
 						const ellipsisBytes = 3; // "…" in UTF-8
 						const headRoom = Math.max(0, remaining - ellipsisBytes);
 						let keptBytes = 0;
+						let keptText = "";
 						if (headRoom > 0) {
 							const sliced = truncateHeadBytes(segment, headRoom);
+							keptText = sliced.text;
 							keptBytes = sliced.bytes;
-							parts.push(sliced.text);
 						}
+						const secrets = this.#plainSecrets;
+						let lineBytesReset = false;
+						if (secrets && segment.startsWith(keptText)) {
+							const prior = this.#columnLine;
+							const prefix = this.#columnLineContext + prior;
+							const text = prefix + segment;
+							const cut = prefix.length + keptText.length;
+							let end = cut;
+							while (end > 0) {
+								const next = Math.min(
+									columnHeadEndOutsideSecrets(text, end, secrets),
+									columnHeadEndBeforeOpenPrefix(text, end, secrets),
+								);
+								if (next >= end) break;
+								end = next;
+							}
+							if (end < cut) {
+								if (end < prefix.length) {
+									this.#retractColumnSuffix(prefix.slice(end));
+									if (end < this.#columnLineContext.length) {
+										this.#columnLineContext = this.#columnLineContext.slice(0, end);
+										this.#columnLine = "";
+									} else {
+										this.#columnLine = prior.slice(0, end - this.#columnLineContext.length);
+									}
+									keptText = "";
+									keptBytes = 0;
+								} else {
+									keptText = segment.slice(0, end - prefix.length);
+									keptBytes = Buffer.byteLength(keptText, "utf-8");
+									this.#columnLine = prior + keptText;
+								}
+								// columnLine already includes the bytes kept from this segment.
+								this.#currentLineBytes = Buffer.byteLength(this.#columnLine, "utf-8");
+								lineBytesReset = true;
+							} else {
+								this.#columnLine = prior + keptText;
+							}
+						}
+						if (keptText.length > 0) parts.push(keptText);
 						parts.push(ELLIPSIS);
 						this.#columnDroppedBytes += segBytes - keptBytes;
 						this.#columnTruncatedLines++;
-						this.#currentLineBytes += keptBytes + ellipsisBytes;
+						this.#currentLineBytes += (lineBytesReset ? 0 : keptBytes) + ellipsisBytes;
 						this.#columnEllipsisAdded = true;
 					}
 				}
 			}
 			if (nlIdx === -1) break;
 			parts.push(NL);
+			if (this.#plainSecretContextChars > 0 && !this.#columnEllipsisAdded) {
+				const context = this.#columnLineContext + this.#columnLine + NL;
+				this.#columnLineContext = context.slice(-this.#plainSecretContextChars);
+			} else {
+				this.#columnLineContext = "";
+			}
 			this.#currentLineBytes = 0;
 			this.#columnEllipsisAdded = false;
+			this.#columnLine = "";
 			cursor = nlIdx + 1;
 		}
 		return parts.join("");
+	}
+
+	/** Remove a suffix of previously retained output after a secret-aware cut-back. */
+	#retractColumnSuffix(suffix: string): void {
+		if (suffix.length === 0) return;
+		const bytes = Buffer.byteLength(suffix, "utf-8");
+		const startByte = Math.max(0, this.#processedBytes - bytes);
+		const tailStartByte = Math.max(0, this.#processedBytes - this.#bufferBytes);
+		const keptTailBytes = Math.max(0, Math.min(this.#bufferBytes, startByte - tailStartByte));
+		if (keptTailBytes < this.#bufferBytes) {
+			const nextTail = truncateHeadBytes(this.#buffer, keptTailBytes);
+			this.#setTail(nextTail.text, nextTail.bytes);
+		}
+		if (startByte < this.#headBytes) {
+			const nextHead = truncateHeadBytes(this.#head, startByte);
+			this.#head = nextHead.text;
+			this.#headBytes = nextHead.bytes;
+		}
+		this.#processedBytes = Math.max(0, this.#processedBytes - bytes);
+		this.#processedLines = Math.max(0, this.#processedLines - countNewlines(suffix));
+		this.#columnDroppedBytes += bytes;
 	}
 
 	#retainedSummary(text: string): { text: string; bytes: number; lines: number } {
@@ -1458,6 +1714,8 @@ export class OutputSink {
 	 */
 	replace(text: string): void {
 		this.#coalesceBuf = "";
+		this.#columnLine = "";
+		this.#columnLineContext = "";
 		const replacementBytes = Buffer.byteLength(text, "utf-8");
 		this.#head = "";
 		this.#headBytes = 0;

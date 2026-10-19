@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which, hasFsCode, isEnoent, Snowflake } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
 	parseFileDiffs,
@@ -198,7 +199,10 @@ async function runCommand(
 	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
 	const child = Bun.spawn(["git", ...commandArgs], {
 		cwd,
-		env: options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined,
+		// The inherited environment holds the autoloaded project `.env`; without
+		// filtering, a repository could set e.g. `GIT_CONFIG_*` (`core.hooksPath`)
+		// or `GIT_SSH_COMMAND` and have GJC's own commit/fetch/push run its code.
+		env: options.env ? { ...projectSafeSpawnEnv(), GIT_OPTIONAL_LOCKS: "0", ...options.env } : projectSafeSpawnEnv(),
 		signal: options.signal,
 		stdin: normalizeStdin(options.stdin),
 		stdout: "pipe",
@@ -1594,6 +1598,14 @@ function formatGhFailure(args: readonly string[], stdout: string, stderr: string
 	return `GitHub CLI command failed: gh ${args.join(" ")}`;
 }
 
+/** Captured `gh` output never wants a pager or forced-terminal behavior. */
+function ghSpawnEnv(): Record<string, string> {
+	const env = projectSafeSpawnEnv();
+	delete env.GH_FORCE_TTY;
+	env.GH_PAGER = "cat";
+	return env;
+}
+
 export const github = {
 	/** Check if `gh` CLI is installed. */
 	available(): boolean {
@@ -1609,6 +1621,10 @@ export const github = {
 		try {
 			const child = Bun.spawn(["gh", ...args], {
 				cwd,
+				// Same project-dotenv filtering as git: `gh` runs git for checkout
+				// and push. Output is captured, so gh must never page or act as if
+				// on a terminal; pin both so a project `.env` cannot select a pager.
+				env: ghSpawnEnv(),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",

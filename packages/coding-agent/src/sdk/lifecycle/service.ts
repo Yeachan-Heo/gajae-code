@@ -550,7 +550,7 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 }
 
 function certaintyForBrokerCode(code: string): SessionLifecycleCertainty {
-	if (code === "terminal_uncertain") return "uncertain";
+	if (code === "terminal_uncertain" || code === "legacy_lifecycle_ambiguous") return "uncertain";
 	if (code === "cleanup_pending") return "cleanup_pending";
 	if (RETRYABLE_BROKER_ERRORS.has(code)) return "retryable";
 	return "terminal";
@@ -686,6 +686,7 @@ const savedSessionScopeDetailCodes = new Set([
 	"migration_busy",
 	"atomic_unavailable",
 	"invalid_request",
+	"permission_denied",
 	"durability_failed",
 	"durability_not_provable",
 	"capacity_exceeded",
@@ -700,6 +701,7 @@ const savedSessionCandidateDetailCodes = new Set([
 	"cwd_not_utf8",
 	"cwd_network_unsupported",
 	"cwd_identity_unavailable",
+	"permission_denied",
 	"cwd_io_error",
 ]);
 

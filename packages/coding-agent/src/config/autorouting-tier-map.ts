@@ -44,7 +44,8 @@ type NormalizedAutoroutingCuratedTierMap = {
 export const TIER_MAP_VERSION = 1;
 
 export const CURATED_TIER_LABELS = {
-	"anthropic/claude-haiku-4-5": [{ tier: "fast", rank: 1 }],
+	"anthropic/claude-haiku-5-5": [{ tier: "fast", rank: 1 }],
+	"anthropic/claude-haiku-4-5": [{ tier: "fast", rank: 2 }],
 	"anthropic/claude-sonnet-5-5": [{ tier: "balanced", rank: 1 }],
 	"anthropic/claude-sonnet-5": [{ tier: "balanced", rank: 2 }],
 	"anthropic/claude-sonnet-4-6": [{ tier: "balanced", rank: 3 }],
@@ -77,14 +78,62 @@ export const CURATED_TIER_LABELS = {
 
 /** Generated from packages/ai/src/models.json at feature land: 3936 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
+	"amazon-bedrock/anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/au.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/eu.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/global.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/jp.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
+	"amazon-bedrock/us.anthropic.claude-haiku-5-5": {
+		rationale: "Haiku 5.5 Bedrock catalog addition; not yet curated",
+	},
 	"amazon-bedrock/au.anthropic.claude-sonnet-5-5": {
 		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
+	},
+	"amazon-bedrock/in.anthropic.claude-haiku-4-5-20251001-v1:0": {
+		rationale: "India-region Bedrock Anthropic catalog addition (#6731); not yet curated",
+	},
+	"amazon-bedrock/in.anthropic.claude-opus-5": {
+		rationale: "India-region Bedrock Anthropic catalog addition (#6731); not yet curated",
+	},
+	"amazon-bedrock/in.anthropic.claude-sonnet-5": {
+		rationale: "India-region Bedrock Anthropic catalog addition (#6731); not yet curated",
 	},
 	"amazon-bedrock/jp.anthropic.claude-sonnet-5-5": {
 		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
 	},
 	"amazon-bedrock/us.anthropic.claude-sonnet-5-5": {
 		rationale: "Sonnet 5.5 catalog addition (#6111); not yet curated",
+	},
+	"github-copilot/gemini-4-argon": {
+		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
+	},
+	"google/gemini-4-argon": {
+		rationale: "Gemini 4 Argon catalog addition (#6731); tier ordering not yet reviewed",
+	},
+	"kilo/google/gemini-4-argon": {
+		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
+	},
+	"opencode-zen/gemini-4-argon": {
+		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
+	},
+	"openrouter/google/gemini-4-argon": {
+		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
+	},
+	"openrouter/google/gemini-4-argon:batch": {
+		rationale: "Gemini 4 Argon batch provider catalog addition (#6731); not yet curated",
+	},
+	"vercel-ai-gateway/google/gemini-4-argon": {
+		rationale: "Gemini 4 Argon provider catalog addition (#6731); not yet curated",
 	},
 	"kiro/claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kiro/claude-opus-5.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },

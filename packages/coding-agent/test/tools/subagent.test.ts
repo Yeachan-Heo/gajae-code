@@ -2013,3 +2013,134 @@ describe("await liveness (#4465)", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 });
+
+describe("compact subagent panel await gating (#6774)", () => {
+	afterEach(() => {
+		AsyncJobManager.resetForTests();
+	});
+
+	function liveProgress(id: string, toolCount: number, lastActivityMs: number): AgentProgress {
+		return {
+			index: 0,
+			id,
+			agent: "executor",
+			agentSource: "bundled",
+			status: "running",
+			task: "Work.",
+			currentTool: "bash",
+			recentTools: [],
+			recentOutput: [],
+			toolCount,
+			tokens: 0,
+			cost: 0,
+			durationMs: 0,
+			lastActivityMs,
+		};
+	}
+
+	async function churnUpdates(compact: boolean): Promise<{ churn: number; idle: number }> {
+		const manager = createManager();
+		const session = createSession();
+		session.settings = Settings.isolated({ "task.compactSubagentPanel": compact });
+		const tool = new SubagentTool(session);
+		const gate = Promise.withResolvers<string>();
+		const ids = Array.from({ length: 15 }, (_, index) => `0-Compact${index}`);
+		for (const [index, id] of ids.entries()) {
+			manager.register("task", `compact ${index}`, async () => gate.promise, {
+				id: `job-compact-${index}`,
+				ownerId: "0-Main",
+				metadata: { subagent: { id, agent: "executor", agentSource: "bundled", description: "worker" } },
+			});
+			manager.registerSubagentRecord({
+				subagentId: id,
+				ownerId: "0-Main",
+				currentJobId: `job-compact-${index}`,
+				historicalJobIds: [],
+				status: "running",
+				sessionFile: null,
+				resumable: false,
+			});
+			manager.recordSubagentProgress(id, liveProgress(id, 0, Date.now()));
+		}
+		// Freeze the liveness clock so only signature changes can emit.
+		const restore = tool.withLivenessClock(() => 0);
+		const updates: unknown[] = [];
+		const awaiting = tool.execute(
+			"await-compact",
+			{ action: "await", ids, heartbeat_ms: 100, timeout_ms: 2_000 },
+			undefined,
+			update => updates.push(update),
+		);
+		await Bun.sleep(60);
+		const initial = updates.length;
+		// Every subagent does real work on every tick; no group count moves.
+		for (let round = 1; round <= 3; round++) {
+			for (const id of ids) manager.recordSubagentProgress(id, liveProgress(id, round, Date.now()));
+			await Bun.sleep(150);
+		}
+		const churn = updates.length - initial;
+		// One subagent goes quiet past the idle threshold: the summary changes.
+		manager.recordSubagentProgress(ids[0]!, liveProgress(ids[0]!, 3, Date.now() - 45_000));
+		await Bun.sleep(150);
+		const idle = updates.length - initial - churn;
+		gate.resolve("done");
+		await awaiting;
+		restore();
+		await manager.dispose({ timeoutMs: 100 });
+		return { churn, idle };
+	}
+
+	it("does not re-emit for per-subagent activity that leaves the summary unchanged", async () => {
+		const compact = await churnUpdates(true);
+		expect(compact.churn).toBe(0);
+		expect(compact.idle).toBe(1);
+	});
+
+	it("emits when a silent subagent crosses the idle threshold with no new progress", async () => {
+		const manager = createManager();
+		const session = createSession();
+		session.settings = Settings.isolated({ "task.compactSubagentPanel": true });
+		const tool = new SubagentTool(session);
+		const gate = Promise.withResolvers<string>();
+		const id = "0-Quiet";
+		manager.register("task", "quiet", async () => gate.promise, {
+			id: "job-quiet",
+			ownerId: "0-Main",
+			metadata: { subagent: { id, agent: "executor", agentSource: "bundled", description: "worker" } },
+		});
+		manager.registerSubagentRecord({
+			subagentId: id,
+			ownerId: "0-Main",
+			currentJobId: "job-quiet",
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		// 200ms short of idle; nothing records progress afterwards.
+		manager.recordSubagentProgress(id, liveProgress(id, 1, Date.now() - 29_800));
+		const restore = tool.withLivenessClock(() => 0);
+		const updates: Array<{ details?: SubagentToolDetails }> = [];
+		const awaiting = tool.execute(
+			"await-quiet",
+			{ action: "await", ids: [id], heartbeat_ms: 100, timeout_ms: 2_000 },
+			undefined,
+			update => updates.push(update as { details?: SubagentToolDetails }),
+		);
+		await Bun.sleep(60);
+		const initial = updates.length;
+		await Bun.sleep(500);
+		const crossed = updates.length - initial;
+		gate.resolve("done");
+		await awaiting;
+		restore();
+		await manager.dispose({ timeoutMs: 100 });
+		expect(initial).toBeGreaterThanOrEqual(1);
+		expect(crossed).toBe(1);
+	});
+
+	it("keeps per-subagent re-emits when the compact panel is off", async () => {
+		const full = await churnUpdates(false);
+		expect(full.churn).toBeGreaterThanOrEqual(3);
+	});
+});

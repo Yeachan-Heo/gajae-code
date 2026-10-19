@@ -74,6 +74,8 @@ describe("AgentSession configuration reload", () => {
 		withProfile?: boolean;
 		profileRoleMapping?: boolean;
 		profilePlannerModelId?: string;
+		withUnmappedProfile?: boolean;
+		configuredPlannerBinding?: string;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
 		thinking?: TestModelThinking;
@@ -119,6 +121,9 @@ describe("AgentSession configuration reload", () => {
 						"        maxTokens: 4096",
 					]
 				: []),
+			...(options.configuredPlannerBinding
+				? ["modelBindings:", "  agentModelOverrides:", `    planner: ${options.configuredPlannerBinding}`]
+				: []),
 			...(options.withProfile
 				? [
 						"profiles:",
@@ -128,6 +133,14 @@ describe("AgentSession configuration reload", () => {
 						`      default: ${providerId}/${modelIdValue}`,
 						...(options.profileRoleMapping
 							? [`      planner: ${providerId}/${options.profilePlannerModelId ?? modelIdValue}`]
+							: []),
+						...(options.withUnmappedProfile
+							? [
+									"  no-planner-profile:",
+									"    required_providers: []",
+									"    model_mapping:",
+									`      default: ${providerId}/${modelIdValue}`,
+								]
 							: []),
 					]
 				: []),
@@ -143,6 +156,8 @@ describe("AgentSession configuration reload", () => {
 		withProfile?: boolean;
 		profileRoleMapping?: boolean;
 		profilePlannerModelId?: string;
+		withUnmappedProfile?: boolean;
+		configuredPlannerBinding?: string;
 		requiresProvider?: boolean;
 		apiKeyEnv?: string;
 		thinking?: TestModelThinking;
@@ -167,6 +182,8 @@ describe("AgentSession configuration reload", () => {
 				withProfile: options?.withProfile,
 				profileRoleMapping: options?.profileRoleMapping,
 				profilePlannerModelId: options?.profilePlannerModelId,
+				withUnmappedProfile: options?.withUnmappedProfile,
+				configuredPlannerBinding: options?.configuredPlannerBinding,
 				requiresProvider: options?.requiresProvider,
 				apiKeyEnv: options?.apiKeyEnv,
 				thinking: options?.thinking,
@@ -379,6 +396,74 @@ describe("AgentSession configuration reload", () => {
 		expect(session!.getProfileInstalledOverrideState().manualAgentModelOverrides).toEqual(new Set(["planner"]));
 	});
 
+	it("keeps configured agent bindings out of active successor profiles after reload", async () => {
+		const configuredBefore = `${provider}/configured-next`;
+		const configuredAfter = `${provider}/${modelId}`;
+		const { configPath, modelsPath } = await createSession({
+			withProfile: true,
+			profileRoleMapping: true,
+			profilePlannerModelId: modelId,
+			withUnmappedProfile: true,
+			additionalModelId: "configured-next",
+			configuredPlannerBinding: configuredBefore,
+		});
+		await session!.activateModelProfileForControl("active-profile");
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBe(`${provider}/${modelId}`);
+
+		const reloadedModels = modelsText({
+			name: "After",
+			baseUrl: "https://after.example/v1",
+			additionalModelId: "configured-next",
+			withProfile: true,
+			profileRoleMapping: true,
+			profilePlannerModelId: modelId,
+			withUnmappedProfile: true,
+			configuredPlannerBinding: configuredAfter,
+		});
+		const staged = candidate(12, configPath, modelsPath, await Bun.file(configPath).text(), reloadedModels);
+		await session!.validateConfiguration(staged);
+		await session!.reloadConfiguration(staged, new AbortController().signal);
+		expect(modelRegistry!.getConfiguredModelBindings()?.agentModelOverrides?.planner).toBe(configuredAfter);
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBe(`${provider}/${modelId}`);
+		expect(session!.getProfileInstalledOverrideState().manualAgentModelOverrides).not.toContain("planner");
+
+		await session!.activateModelProfileForControl("no-planner-profile");
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBeUndefined();
+
+		await session!.setDefaultModelSelection(session!.model!, undefined);
+		expect(session!.getActiveModelProfile()).toBeUndefined();
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBe(configuredAfter);
+	});
+
+	it("does not restore a removed configured agent binding from an active profile baseline", async () => {
+		const configuredBefore = `${provider}/configured-next`;
+		const { configPath, modelsPath } = await createSession({
+			withProfile: true,
+			profileRoleMapping: true,
+			profilePlannerModelId: modelId,
+			withUnmappedProfile: true,
+			additionalModelId: "configured-next",
+			configuredPlannerBinding: configuredBefore,
+		});
+		await session!.activateModelProfileForControl("active-profile");
+
+		const reloadedModels = modelsText({
+			name: "After",
+			baseUrl: "https://after.example/v1",
+			additionalModelId: "configured-next",
+			withProfile: true,
+			profileRoleMapping: true,
+			profilePlannerModelId: modelId,
+			withUnmappedProfile: true,
+		});
+		const staged = candidate(13, configPath, modelsPath, await Bun.file(configPath).text(), reloadedModels);
+		await session!.validateConfiguration(staged);
+		await session!.reloadConfiguration(staged, new AbortController().signal);
+		await session!.activateModelProfileForControl("no-planner-profile");
+
+		expect(session!.settings.getOverride("task.agentModelOverrides")?.planner).toBeUndefined();
+	});
+
 	it("cancels a queued reload without publishing or blocking the next admission", async () => {
 		const { configPath, modelsPath, initialModel } = await createSession();
 		const staged = candidate(
@@ -446,6 +531,7 @@ describe("AgentSession configuration reload", () => {
 		try {
 			await watcher.start({ configPath, modelsPath });
 			await Bun.write(configPath, settingsText({ todoEnabled: true, compactionEnabled: false }));
+			watcher.__testRequestScan();
 			await waitFor(() => publicationFenceEntered);
 
 			const transition = session!.newSession();
@@ -556,6 +642,7 @@ describe("AgentSession configuration reload", () => {
 				baseUrl: "https://before.example/v1",
 			});
 			await Promise.all([Bun.write(configPath, nextConfig), Bun.write(modelsPath, nextModels)]);
+			watcher.__testRequestScan();
 
 			await transitionStarted.promise;
 			await firstAvailabilityCheck.promise;

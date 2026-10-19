@@ -46,7 +46,7 @@ export function getProviderFirstEventTimeoutFallbackMs(provider: string): number
 	return provider === "kimi-code" ? KIMI_CODE_FIRST_EVENT_TIMEOUT_MS : undefined;
 }
 
-function normalizeIdleTimeoutMs(value: string | undefined, fallback: number): number | undefined {
+function normalizeIdleTimeoutMs(value: string | undefined, fallback: number | undefined): number | undefined {
 	if (value === undefined) return fallback;
 	const parsed = Number(value);
 	if (!Number.isFinite(parsed)) return fallback;
@@ -86,16 +86,29 @@ export function getStreamIdleTimeoutRemediationMs(): number {
  * Returns the idle timeout used for OpenAI-family streaming transports.
  *
  * Honors `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` first (`PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` is the legacy alias). Set `=0` to disable.
+ * A configured model timeout takes precedence over the built-in provider/model floors; environment overrides win over it.
  * When `provider` is given, long-reasoning hosts (xAI Grok and Grok Build) use that floor instead of the 120s default.
  * Grok models reached through other OpenAI-compatible hosts (`openrouter/x-ai/grok-*`, kilo, litellm, …) get the
  * same floor keyed on the model id, because long-reasoning silence is a property of the model (#4797).
  */
-export function getOpenAIStreamIdleTimeoutMs(provider?: string, modelId?: string): number | undefined {
+export function getOpenAIStreamIdleTimeoutMs(
+	provider?: string,
+	modelId?: string,
+	configuredTimeoutMs?: number,
+): number | undefined {
+	const builtInFallback =
+		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ??
+		(isGrokModelId(modelId) ? LONG_REASONING_STREAM_IDLE_TIMEOUT_MS : undefined) ??
+		DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+	let configuredFallback: number | undefined = builtInFallback;
+	if (configuredTimeoutMs === 0) {
+		configuredFallback = undefined;
+	} else if (configuredTimeoutMs !== undefined && Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0) {
+		configuredFallback = Math.max(1, Math.trunc(configuredTimeoutMs));
+	}
 	return normalizeIdleTimeoutMs(
 		$env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS,
-		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ??
-			(isGrokModelId(modelId) ? LONG_REASONING_STREAM_IDLE_TIMEOUT_MS : undefined) ??
-			DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+		configuredFallback,
 	);
 }
 
@@ -139,19 +152,26 @@ export function resolveOpenAISdkRequestTimeoutMs(
 	provider: string,
 	streamFirstEventTimeoutOverride?: number,
 	modelId?: string,
+	configuredIdleTimeoutMs?: number,
+	effectiveIdleTimeoutOverride?: number,
 ): number | undefined {
 	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(provider);
 	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(
-		getOpenAIStreamIdleTimeoutMs(provider, modelId),
+		effectiveIdleTimeoutOverride ?? getOpenAIStreamIdleTimeoutMs(provider, modelId, configuredIdleTimeoutMs),
 		providerFirstEventFallbackMs,
 	);
 	if (streamFirstEventTimeoutOverride === 0) return undefined;
+	let sdkTimeoutMs: number | undefined;
 	if (streamFirstEventTimeoutOverride !== undefined) {
-		return providerFirstEventFallbackMs !== undefined
-			? streamFirstEventTimeoutOverride
-			: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride);
+		sdkTimeoutMs =
+			providerFirstEventFallbackMs !== undefined
+				? streamFirstEventTimeoutOverride
+				: Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride);
+	} else {
+		sdkTimeoutMs = envSdkTimeoutMs;
 	}
-	return envSdkTimeoutMs;
+	if (sdkTimeoutMs === undefined || !Number.isFinite(sdkTimeoutMs) || sdkTimeoutMs <= 0) return undefined;
+	return Math.min(Math.trunc(sdkTimeoutMs), MAX_TIMER_DELAY_MS);
 }
 
 /**

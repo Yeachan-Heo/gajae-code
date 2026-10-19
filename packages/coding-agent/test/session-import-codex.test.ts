@@ -4,7 +4,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import { ManagedPublishError, ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import { classifyNativePublishOutcome } from "../src/session/internal/native-publish-outcome";
 import { SessionManager } from "../src/session/session-manager";
 import {
 	CODEX_IMPORT_BATCH_LIMIT,
@@ -133,6 +134,54 @@ describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 		} as unknown as SlashCommandRuntime);
 		expect(result).toEqual({ consumed: true, exitCode: 1 });
 		expect(output.join("\n")).toContain("source_not_found");
+	});
+
+	it("reports access-denied publication as a permission failure", async () => {
+		await source("access-denied-publish", workspace, [message("assistant", "managed publication")]);
+		const outcome = classifyNativePublishOutcome({
+			ok: false,
+			code: "access_denied",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "access_denied",
+			primitive: "windows_rename_noreplace",
+			phase: "rename",
+			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+		});
+		const denied = new ManagedPublishError("permission_denied", outcome);
+		const prototype = ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplace;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplace").mockImplementation(async function (
+			this: ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): Promise<void> {
+			if (relativePath.endsWith("artifact-recovery.json")) {
+				injected += 1;
+				throw denied;
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
+
+		try {
+			const result = await importCodexSessions(workspace, ["access-denied-publish"]);
+			expect(injected).toBe(1);
+			expect(result).toMatchObject({
+				status: "failed",
+				results: [
+					{
+						status: "failed",
+						code: "permission_denied",
+						phase: "publish",
+						retryable: false,
+						causeCode: "permission_denied",
+					},
+				],
+			});
+		} finally {
+			publish.mockRestore();
+		}
 	});
 
 	it("uses the latest sanitized Codex session index title", async () => {

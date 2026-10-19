@@ -156,6 +156,9 @@ export interface UsageCredential {
 	email?: string;
 	enterpriseUrl?: string;
 	profileArn?: string;
+	/** Organization the OAuth token is scoped to; usage limits are per organization. */
+	organizationId?: string;
+	organizationName?: string;
 	mcpBinding?: UsageMCPOAuthBinding;
 	metadata?: Record<string, unknown>;
 }

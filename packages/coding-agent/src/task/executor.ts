@@ -51,6 +51,7 @@ import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
+import type { PlanModeState } from "../plan-mode/state";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
@@ -59,6 +60,7 @@ import { discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../session/agent-session";
 import { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
+import type { ClientBridge } from "../session/client-bridge";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
@@ -300,6 +302,21 @@ export interface ExecutorOptions {
 	 * the same immutable child settings snapshot.
 	 */
 	inheritedServiceTier?: ServiceTier;
+	/**
+	 * Parent ACP/SDK approval mode. `deny` and `prompt` replace the child
+	 * default (`allow`) before the first prompt. `allow` is that default.
+	 */
+	sdkPermissionMode?: "prompt" | "allow" | "deny";
+	/**
+	 * Parent plan-mode state. Copied onto the child before the first prompt so
+	 * `enforcePlanModeWrite` still refuses product-file writes.
+	 */
+	planModeState?: PlanModeState;
+	/**
+	 * Parent client bridge. Only `requestPermission` is copied onto the child.
+	 * Terminal, filesystem, and deferAgentInitiatedTurns stay on the parent.
+	 */
+	clientBridge?: ClientBridge;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -342,28 +359,32 @@ export interface ExecutorOptions {
 export class ManagedTaskPersistence {
 	readonly #artifacts: ArtifactManager;
 	readonly #taskId: string;
+	readonly #getArtifacts: () => ArtifactManager;
 
-	constructor(artifacts: ArtifactManager, taskId: string) {
+	constructor(artifacts: ArtifactManager, taskId: string, getArtifacts: () => ArtifactManager = () => artifacts) {
 		this.#artifacts = artifacts;
 		this.#taskId = validateAllocatedTaskId(taskId);
+		this.#getArtifacts = getArtifacts;
 		if (!artifacts.getManagedSubtreeRootAuthority())
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
 	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
-		const store = this.#artifacts.getManagedStore();
+		const artifacts = this.#getArtifacts();
+		const store = artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
-		this.#artifacts.assertManagedBinding();
-		const sessionFile = path.join(this.#artifacts.dir, `${this.#taskId}.jsonl`);
+		artifacts.assertManagedBinding();
+		const sessionFile = path.join(artifacts.dir, `${this.#taskId}.jsonl`);
 		const session = await SessionManager.openNestedManaged(
 			sessionFile,
-			SessionManager.nestedManagedDestination(store, this.#artifacts.dir),
+			SessionManager.nestedManagedDestination(store, artifacts.dir),
 			store,
 			undefined,
 			cwd,
 			sessionMemoryMode,
 		);
-		this.#artifacts.assertManagedBinding();
+		artifacts.assertManagedBinding();
+		session.registerManagedTranscriptRelocationResolver(this.#getArtifacts);
 		return session;
 	}
 	async openStagedSession(attemptId = this.#taskId): Promise<SessionManager> {
@@ -385,8 +406,10 @@ export class ManagedTaskPersistence {
 	}
 
 	async publishOutput(rawOutput: string, metadata: Uint8Array): Promise<void> {
-		await withArtifactManagerFinalizationTurn(this.#artifacts, () =>
-			this.#artifacts.publishManagedOutputGeneration(
+		const artifacts = this.#getArtifacts();
+		artifacts.assertManagedBinding();
+		await withArtifactManagerFinalizationTurn(artifacts, () =>
+			artifacts.publishManagedOutputGeneration(
 				`${this.#taskId}.md.selector.json`,
 				`${this.#taskId}.md`,
 				Buffer.from(rawOutput, "utf8"),
@@ -396,8 +419,12 @@ export class ManagedTaskPersistence {
 	}
 }
 
-export function createManagedTaskPersistence(artifacts: ArtifactManager, taskId: string): ManagedTaskPersistence {
-	return new ManagedTaskPersistence(artifacts, taskId);
+export function createManagedTaskPersistence(
+	artifacts: ArtifactManager,
+	taskId: string,
+	getArtifacts?: () => ArtifactManager,
+): ManagedTaskPersistence {
+	return new ManagedTaskPersistence(artifacts, taskId, getArtifacts);
 }
 
 const MAX_REVIEW_FINDINGS_ARTIFACT_BYTES = 16 * 1024 * 1024;
@@ -1004,6 +1031,16 @@ function autoroutingAttemptDisposition(failure: AutoroutingPreflightFailure): {
 	if (failure.kind === "local" && (!failure.transient || failure.op === "preflight_validation"))
 		return { code: "config_invalid_terminal", advance: false };
 	return { code: "unclassified_terminal", advance: false };
+}
+
+/** Permission callback only. Terminal, filesystem, and defer flags stay on the parent. */
+function permissionOnlyBridge(bridge: ClientBridge | undefined): ClientBridge | undefined {
+	if (!bridge?.requestPermission || bridge.capabilities.requestPermission !== true) return undefined;
+	const requestPermission = bridge.requestPermission.bind(bridge);
+	return {
+		capabilities: { requestPermission: true },
+		requestPermission: (toolCall, options, signal) => requestPermission(toolCall, options, signal),
+	};
 }
 
 export async function runSubprocessOnce(options: ExecutorOptions): Promise<SingleResult> {
@@ -1739,9 +1776,14 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					});
 			let modelRegistry = options.modelRegistry ?? ownedModelRegistry!;
 			const authStorage = modelRegistry.authStorage;
-			if (options.authStorage && options.authStorage !== authStorage) {
+			// Reject if both authStorage and modelRegistry are provided with different instances.
+			if (
+				options.authStorage !== undefined &&
+				options.modelRegistry !== undefined &&
+				options.authStorage !== authStorage
+			) {
 				throw new Error(
-					"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
+					"options.authStorage and options.modelRegistry.authStorage must be the same instance or one must be omitted",
 				);
 			}
 			checkAbort();
@@ -2101,6 +2143,22 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			);
 
 			activeSession = session;
+			// Plan mode is session state, not a tool-list filter. Copy it before the
+			// first prompt so product writes hit the same read-only guard as the parent.
+			if (options.planModeState?.enabled) {
+				session.setPlanModeState({
+					enabled: true,
+					planFilePath: options.planModeState.planFilePath,
+					...(options.planModeState.workflow ? { workflow: options.planModeState.workflow } : {}),
+					...(options.planModeState.reentry !== undefined ? { reentry: options.planModeState.reentry } : {}),
+				});
+			}
+			// `allow` is the child default. deny/prompt must be copied before the first prompt.
+			if (options.sdkPermissionMode === "deny" || options.sdkPermissionMode === "prompt") {
+				session.setSdkPermissionMode(options.sdkPermissionMode);
+			}
+			const approvalBridge = permissionOnlyBridge(options.clientBridge);
+			if (approvalBridge) session.setClientBridge(approvalBridge);
 			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
 			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
 			if (!parentFallbackSelector) {
@@ -2881,6 +2939,39 @@ function preflightTerminalResult(
 
 /** Run routed initial tasks through the bounded probe/durable candidate ledger. */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	// Resume routing resolves credentials before dispatch; do not let an unexpected
+	// lookup exception bypass terminalization just because the initial probe ledger is off.
+	if (
+		(options.runMode ?? "initial") !== "initial" &&
+		options.autoroutingCandidates &&
+		options.autoroutingPreflightErrors
+	) {
+		const failedSelector = options.autoroutingCandidates.find(selector =>
+			options.autoroutingPreflightErrors?.has(selector),
+		);
+		if (failedSelector) {
+			const preflightError = options.autoroutingPreflightErrors.get(failedSelector);
+			const failure = classifyAutoroutingPreflightFailure(preflightError, "auth_resolve");
+			const { code } = autoroutingAttemptDisposition(failure);
+			const skips = buildBoundedRoutingSkips(options.autoroutingSkips);
+			const routedOptions = options.routing ? { ...options.routing, ...skips } : options.routing;
+			return preflightTerminalResult(
+				{ ...options, routing: routedOptions },
+				[{ selector: failedSelector, phase: "probe", code }],
+				"preflight_exhausted",
+			);
+		}
+	}
+	if ((options.runMode ?? "initial") !== "initial" && options.autoroutingCandidates?.length === 0 && options.routing) {
+		const skippedCandidates = options.autoroutingSkips?.filter(skip => skip.code === "credential_unavailable") ?? [];
+		return preflightTerminalResult(
+			{ ...options, routing: { ...options.routing, ...buildBoundedRoutingSkips(options.autoroutingSkips) } },
+			skippedCandidates
+				.slice(0, 6)
+				.map(skip => ({ selector: skip.selector, phase: "probe", code: "credential_unavailable" })),
+			"all_candidates_skipped",
+		);
+	}
 	if (
 		!options.autoroutingPreflight ||
 		(options.runMode ?? "initial") !== "initial" ||

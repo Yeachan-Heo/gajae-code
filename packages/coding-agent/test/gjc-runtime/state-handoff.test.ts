@@ -778,7 +778,38 @@ describe("gjc state handoff", () => {
 		});
 	});
 
-	for (const mutation of ["replacement", "prefix-edit", "new-user", "branch-rewind", "stale-spec"] as const) {
+	// SessionManager persists full rewrites by atomic rename (new inode). Approval binds content, so a
+	// real rewrite of the same entries must not invalidate consent, before approval or at handoff.
+	for (const afterApproval of [false, true]) {
+		it(`accepts persisted Ask consent after a SessionManager full rewrite ${afterApproval ? "at handoff" : "before approval"}`, async () => {
+			await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
+				await askAndPersistExecutionApproval(cwd, manager, "rewrite-approval");
+				const inodeBefore = (await fs.stat(transcriptPath)).ino;
+				const bytesBefore = await Bun.file(transcriptPath).text();
+				if (afterApproval) {
+					const approved = await approvePersistedCrystal(cwd, sessionId);
+					expect(approved.status, approved.stderr).toBe(0);
+				}
+				await manager.rewriteEntries();
+				expect((await fs.stat(transcriptPath)).ino).not.toBe(inodeBefore);
+				expect(await Bun.file(transcriptPath).text()).toBe(bytesBefore);
+				if (!afterApproval) {
+					const approved = await approvePersistedCrystal(cwd, sessionId);
+					expect(approved.status, approved.stderr).toBe(0);
+				}
+				manager.appendMessage(
+					persistedApprovalAssistant([{ type: "text", text: "The approved handoff is ready." }]),
+				);
+				await manager.flush();
+				await manager.rewriteEntries();
+				const handoff = await handoffPersistedCrystal(cwd, sessionId);
+				expect(handoff.status, handoff.stderr).toBe(0);
+				expect((await readJson(modeStatePath(cwd, sessionId, "ultragoal")))?.handoff_from).toBe("deep-interview");
+			});
+		});
+	}
+
+	for (const mutation of ["replacement-edit", "prefix-edit", "new-user", "branch-rewind", "stale-spec"] as const) {
 		for (const afterApproval of [false, true]) {
 			it(`rejects persisted Ask consent after ${mutation} ${afterApproval ? "at handoff" : "before approval"}`, async () => {
 				await withPersistedApprovalSession(async (cwd, manager, sessionId, transcriptPath) => {
@@ -789,8 +820,12 @@ describe("gjc state handoff", () => {
 						expect(approved.status, approved.stderr).toBe(0);
 					}
 					const transcript = await Bun.file(transcriptPath).text();
-					if (mutation === "replacement") {
-						await Bun.write(`${transcriptPath}.replacement`, transcript);
+					if (mutation === "replacement-edit") {
+						// An atomic replacement is judged by content: an edited prefix is still rejected.
+						await Bun.write(
+							`${transcriptPath}.replacement`,
+							transcript.replace("Build a report.", "Build a portal."),
+						);
 						await fs.chmod(`${transcriptPath}.replacement`, 0o600);
 						await fs.rename(`${transcriptPath}.replacement`, transcriptPath);
 					} else if (mutation === "prefix-edit") {

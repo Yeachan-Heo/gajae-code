@@ -80,6 +80,7 @@ export class ManagedPublishError extends Error {
 		| "invalid_request"
 		| "durability_not_provable"
 		| "identity_mismatch"
+		| "permission_denied"
 		| "io_error"
 		| "durability_failed";
 	readonly diagnostic: string;
@@ -141,17 +142,19 @@ function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
 	const classification =
 		outcome.reason === "destination_exists"
 			? "destination_conflict"
-			: outcome.reason === "atomic_unavailable"
-				? "atomic_unavailable"
-				: outcome.reason === "invalid_request"
-					? "invalid_request"
-					: outcome.reason === "durability_not_provable"
-						? "durability_not_provable"
-						: outcome.reason === "identity_violation"
-							? "identity_mismatch"
-							: outcome.reason === "io_failure"
-								? "io_error"
-								: "durability_failed";
+			: outcome.reason === "access_denied" || outcome.reason === "permission_denied"
+				? "permission_denied"
+				: outcome.reason === "atomic_unavailable"
+					? "atomic_unavailable"
+					: outcome.reason === "invalid_request"
+						? "invalid_request"
+						: outcome.reason === "durability_not_provable"
+							? "durability_not_provable"
+							: outcome.reason === "identity_violation"
+								? "identity_mismatch"
+								: outcome.reason === "io_failure"
+									? "io_error"
+									: "durability_failed";
 	return new ManagedPublishError(classification, outcome);
 }
 
@@ -167,7 +170,11 @@ function exactUnlinkCompleted(result: NativeExactUnlinkResult): boolean {
 }
 
 function isRetryableReplacementReceiptCleanupError(error: unknown): boolean {
-	return error instanceof Error && error.message === "managed_replace_receipt_cleanup_pending:io_error";
+	return (
+		error instanceof Error &&
+		(error.message === "managed_replace_receipt_cleanup_pending:io_error" ||
+			error.message === "managed_replace_receipt_cleanup_pending:access_denied")
+	);
 }
 
 /**
@@ -445,6 +452,17 @@ function replacementReceiptIsOwned(bytes: Uint8Array): boolean {
 	const observed = observeProcessIncarnation(publisher.pid);
 	if (observed.status === "absent") return false;
 	return observed.status !== "present" || observed.incarnation === publisher.incarnation;
+}
+
+/** Only positive local process-incarnation evidence proves a mismatched receipt's publisher is stale. */
+function replacementReceiptPublisherIsVerifiedDead(bytes: Uint8Array): boolean {
+	const publisher = replacementReceiptPublisher(bytes);
+	if (!publisher || publisher.host !== os.hostname()) return false;
+	if (publisher.pid === process.pid && publisher.ownerId === replacementPublisherOwnerId) return false;
+	const observed = observeProcessIncarnation(publisher.pid);
+	return (
+		observed.status === "absent" || (observed.status === "present" && observed.incarnation !== publisher.incarnation)
+	);
 }
 
 type LegacyReplacementCleanupIdentity = {
@@ -1097,6 +1115,7 @@ const GENERAL_FAILURE_CODES = new Set([
 	"identity_unavailable",
 	"identity_mismatch",
 	"owner_mismatch",
+	"access_denied",
 	"mode_mismatch",
 	"io_error",
 ]);
@@ -1961,6 +1980,59 @@ export class ManagedSessionDescendantStore {
 		return true;
 	}
 
+	#recoverRenumberedReplacementCleanupReceipt(
+		receiptPath: string,
+		binding: { predecessor: { dev: bigint; ino: bigint }; receipt: { dev: bigint; ino: bigint } },
+		receipt: ManagedFileSnapshot,
+	): boolean {
+		const parsed = parseReplacementCleanupReceipt(receipt.bytes);
+		const predecessor = parsed ? parseReplacementIdentity(parsed.predecessor) : undefined;
+		if (
+			receipt.identity.dev === binding.receipt.dev ||
+			receipt.identity.ino !== binding.receipt.ino ||
+			!parsed ||
+			!predecessor ||
+			predecessor.dev !== binding.predecessor.dev ||
+			predecessor.ino !== binding.predecessor.ino ||
+			!replacementReceiptPublisherIsVerifiedDead(receipt.bytes)
+		)
+			return false;
+
+		// The filename's device is the only identity component allowed to drift.
+		// The no-follow snapshot supplies the exact current size and digest, and
+		// detachOnly preserves those bytes under a non-canonical quarantine name.
+		const quarantineName = replacementReceiptRetirementName(receipt.identity, binding.predecessor);
+		const detached = nativeSessionStorage().exactUnlink(receiptPath, {
+			dev: receipt.identity.dev,
+			ino: receipt.identity.ino,
+			nlink: receipt.identity.nlink,
+			parentDev: this.#subtreeRoot.dev,
+			parentIno: this.#subtreeRoot.ino,
+			size: BigInt(receipt.identity.size),
+			mtimeNs: receipt.identity.mtimeNs,
+			sha256: receipt.identity.sha256,
+			detachOnly: true,
+			quarantineName,
+		});
+		if (isPeerOwnedReceiptRetirement(detached)) return true;
+		if (
+			!detached.ok &&
+			detached.code === "not_found" &&
+			detached.retainedSuccessorPath === undefined &&
+			detached.retainedUnknownPath === undefined
+		)
+			return true;
+		if (
+			(!detached.ok && detached.code !== "cleanup_pending") ||
+			detached.detachedPath !== path.join(this.#baseDir, quarantineName) ||
+			detached.retainedSuccessorPath ||
+			detached.retainedUnknownPath
+		)
+			throw new Error(`managed_replace_receipt_cleanup_pending:${detached.code ?? "unknown"}`);
+		fsyncDirectory(this.#baseDir);
+		return true;
+	}
+
 	#detachReplacementCleanupReceipt(receiptPath: string): void {
 		const binding = replacementCleanupReceiptBinding(path.basename(receiptPath));
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
@@ -1972,6 +2044,7 @@ export class ManagedSessionDescendantStore {
 			throw error;
 		}
 		if (receipt.identity.dev !== binding.receipt.dev || receipt.identity.ino !== binding.receipt.ino) {
+			if (this.#recoverRenumberedReplacementCleanupReceipt(receiptPath, binding, receipt)) return;
 			if (this.#recoverReplacementCleanupPlaceholder(receiptPath, binding, receipt)) return;
 			throw new Error("managed_replace_cleanup_receipt_invalid");
 		}

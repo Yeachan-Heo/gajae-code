@@ -19,11 +19,11 @@ export const ROOT_LAUNCH_FLAGS = {
 	"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
 	credential: Flags.string({
 		description:
-			"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
+			"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, org:<id|name>, or provider/email:<addr>",
 	}),
 	"prefer-credential": Flags.string({
 		description:
-			"Preferred stored credential with quota fallback: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/id:<n>",
+			"Preferred stored credential with quota fallback: email:<addr>, id:<n>, account:<id>, project:<id>, org:<id|name>, or provider/id:<n>",
 	}),
 	"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 	"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),

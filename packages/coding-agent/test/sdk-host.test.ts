@@ -21,6 +21,51 @@ describe("session SDK event stream", () => {
 });
 
 describe("SessionSdkHost", () => {
+	// The notifications bus delivers awaiting_input live-only and never retains it;
+	// this pins the host gate so a retained one could still not leak to clients
+	// that lack the dedicated capability.
+	test("a retained awaiting_input event requires its own capability rather than tool activity or frame claims", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
+		const host = new SessionSdkHost({
+			sessionId: "awaiting-capabilities",
+			stateRoot: "/tmp/awaiting-capabilities",
+			token: "token",
+			connectionCapabilities: connectionId =>
+				connectionId === "awaiting" ? new Set(["awaiting_input_v1"]) : new Set(["tool_activity_v2"]),
+			sendFrame: (connectionId, frame) => {
+				sent.push({ connectionId, frame });
+				return "written";
+			},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+		});
+		await host.start();
+		try {
+			host.emitEvent({ kind: "awaiting_input", payload: { type: "awaiting_input", toolCallId: "call-1" } });
+			host.emitEvent({ kind: "tool_activity", payload: { type: "tool_activity" } });
+			receive("awaiting", { type: "event_replay", id: "awaiting", sinceSeq: 0, capabilities: [] });
+			await Bun.sleep(0);
+			expect((sent.at(-1)!.frame.events as Array<{ kind: string }>).slice(1).map(event => event.kind)).toEqual([
+				"awaiting_input",
+			]);
+			receive("tool-only", {
+				type: "event_replay",
+				id: "tool-only",
+				sinceSeq: 0,
+				capabilities: ["awaiting_input_v1"],
+			});
+			await Bun.sleep(0);
+			expect((sent.at(-1)!.frame.events as Array<{ kind: string }>).slice(1).map(event => event.kind)).toEqual([
+				"tool_activity",
+			]);
+		} finally {
+			await host.stop();
+		}
+	});
+
 	test("replay authorization uses negotiated connection capabilities, not frame claims", async () => {
 		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
 		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
@@ -297,6 +342,67 @@ describe("SessionSdkHost", () => {
 					"held by pid 123 (live)",
 				);
 				error.message = "operator wording can change";
+				throw error;
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).resolves.toBe("stopped");
+		expect(host.started).toBe(false);
+	});
+
+	test("does not suppress access-denied publication failures as lock contention", async () => {
+		const error = new FileLockAcquireError(
+			"/tmp/index.jsonl",
+			"/tmp/index.jsonl.lock",
+			3,
+			"publication failed with access_denied",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+		);
+		const host = new SessionSdkHost({
+			sessionId: "access-denied-stop",
+			stateRoot: "/tmp/access-denied-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw error;
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).rejects.toBe(error);
+		expect(host.started).toBe(true);
+	});
+
+	test("allows access-denied lock contention during shutdown when a holder is proven live", async () => {
+		const error = new FileLockAcquireError(
+			"/tmp/index.jsonl",
+			"/tmp/index.jsonl.lock",
+			3,
+			"held by pid 123 (live)",
+			"acquire_timeout",
+			undefined,
+			undefined,
+			"access_denied",
+			true,
+		);
+		const host = new SessionSdkHost({
+			sessionId: "live-access-denied-stop",
+			stateRoot: "/tmp/live-access-denied-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
 				throw error;
 			},
 		});

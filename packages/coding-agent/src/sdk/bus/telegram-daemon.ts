@@ -302,6 +302,8 @@ export const ASK_SELECTED_ACK_CAPABILITY = "ask_selected_ack_v1";
 export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
 /** Capability for the closed tool phase set: started, completed, failed, and cancelled. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+/** Receive content-free notifications when a running command needs host-side authentication. */
+export const AWAITING_INPUT_CAPABILITY = "awaiting_input_v1";
 /** Receive-only compatibility capability for pre-v2 hosts. */
 export const LEGACY_TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
 /** Public `sdk/bus/telegram-daemon` path for the canonical `sdk/host` capability token. */
@@ -5428,6 +5430,7 @@ export class TelegramNotificationDaemon {
 					ASK_CONTROLS_CAPABILITY,
 					ASK_SELECTED_ACK_CAPABILITY,
 					TOOL_ACTIVITY_CAPABILITY,
+					AWAITING_INPUT_CAPABILITY,
 					LEGACY_TOOL_ACTIVITY_CAPABILITY,
 					POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 					"ephemeral_turn_v1",
@@ -7255,6 +7258,7 @@ export class TelegramNotificationDaemon {
 		"config_update",
 		"control_command_result",
 		"tool_activity",
+		"awaiting_input",
 		"reasoning_summary",
 	]);
 
@@ -10874,8 +10878,12 @@ export class TelegramNotificationDaemon {
 				this.failLegacyToolStart(toolActivity);
 				await this.#failPublicationPreSend(publicationId, "topic authority is inactive or malformed");
 			}
+			const flatSend =
+				threadedFrame.type === "awaiting_input"
+					? { ...send, text: `${send.text} · ${sessionTag(logicalSessionId)}` }
+					: send;
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(logicalSessionId)) {
-				await this.deliverFlatFallback(logicalSessionId, send, toolActivity, socketLease, publicationId);
+				await this.deliverFlatFallback(logicalSessionId, flatSend, toolActivity, socketLease, publicationId);
 				return;
 			}
 			const topicId =
@@ -10896,7 +10904,7 @@ export class TelegramNotificationDaemon {
 					abandonStaleToolStart();
 					return;
 				}
-				await this.deliverFlatFallback(logicalSessionId, send, toolActivity, socketLease, publicationId);
+				await this.deliverFlatFallback(logicalSessionId, flatSend, toolActivity, socketLease, publicationId);
 				return;
 			}
 			if (send.identity) {

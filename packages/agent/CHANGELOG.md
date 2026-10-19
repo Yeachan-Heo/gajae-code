@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Preserve a completed terminal outcome when a subscriber aborts after an accepted assistant response with no pending tool calls.
+
+- Standalone agent loops now report `agent_end.stopReason: "cancelled"` when cancellation aborts a provider request or pending tool execution, including when a pause is requested at the same boundary.
+
+- Preserve completed agent runs when a subscriber aborts after a final assistant message is accepted, while still reporting cancellation for interrupted tool execution and continuations.
+
+- A project `.env` value of `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` no longer turns GenAI message-content capture on. An operator value the project does not declare is unchanged, including a downgrade before the first read. Removing the variable before that read keeps capture off, even when a trusted agent env file still says `full`.
+
+- The typed `incompleteArgumentsReason` an adapter recorded on a tool-call block survives the accepted attempt snapshot. The snapshot rewrote every incomplete call to `malformed`, so a call the adapter had typed as `truncated`, `conflicting`, or `ambiguous` reached dispatch with only the boolean left and was reported with the generic wording.
+- An incomplete tool call with no typed reason is no longer reported as an output-token-limit truncation unless the turn actually stopped for length, or as a decode failure the provider never declared. The rejection keeps the same actionable `Re-issue the call` guidance.
+
+- Billing callbacks now receive the provider-effective service tier after a downgrade, avoiding cost-tier mismatches.
+- Lossless message snapshots preserve the provider-effective service tier when other metadata is not cloneable.
+
 ## [0.18.11] - 2026-10-12
 
 ## [0.18.10] - 2026-10-12

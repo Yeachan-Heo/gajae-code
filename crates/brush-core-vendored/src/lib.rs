@@ -23,6 +23,7 @@ pub mod jobs;
 mod keywords;
 pub mod namedoptions;
 pub mod openfiles;
+pub mod output_decode;
 pub mod options;
 pub mod pathcache;
 pub mod pathsearch;

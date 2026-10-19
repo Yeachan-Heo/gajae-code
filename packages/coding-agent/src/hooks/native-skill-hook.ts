@@ -1,10 +1,12 @@
 import { appendFile, mkdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, getConfigDirName } from "@gajae-code/utils";
+import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { YAML } from "bun";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
 import { sessionLogsDir } from "../gjc-runtime/session-layout";
+import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 import {
 	detectMcpDelegateFlowActivation,
 	type McpDelegateHostContextV1,
@@ -281,14 +283,14 @@ function readTurnId(payload: HookPayload): string | undefined {
 	return safeString(payload.turn_id ?? payload.turnId).trim() || undefined;
 }
 
-function readSessionFile(payload: HookPayload): string | undefined {
-	return (
-		safeString(
-			payload.session_file ?? payload.sessionFile ?? payload.transcript_path ?? payload.transcriptPath,
-		).trim() ||
-		process.env.GJC_SESSION_FILE?.trim() ||
-		undefined
-	);
+function readSessionFile(payload: HookPayload, cwd: string): string | undefined {
+	const explicit = safeString(
+		payload.session_file ?? payload.sessionFile ?? payload.transcript_path ?? payload.transcriptPath,
+	).trim();
+	if (explicit) return explicit;
+	// Bun has already copied the project dotenv into the environment. A value
+	// that matches that snapshot must not select another transcript.
+	return trustedCoordinatorEnv("GJC_SESSION_FILE", process.env, projectEnvSnapshot(cwd));
 }
 
 export async function dispatchGjcNativeSkillHook(
@@ -297,6 +299,7 @@ export async function dispatchGjcNativeSkillHook(
 ): Promise<GjcNativeHookDispatchResult> {
 	const hookEventName = readHookEventName(payload);
 	const cwd = (options.cwd ?? safeString(payload.cwd).trim()) || process.cwd();
+	const sessionFile = readSessionFile(payload, cwd);
 	if (hookEventName === "UserPromptSubmit") {
 		const recoveryDiagnostics = await collectUserPromptStateRecoveryDiagnostics({
 			cwd,
@@ -304,7 +307,7 @@ export async function dispatchGjcNativeSkillHook(
 			threadId: readThreadId(payload),
 			stateDir: options.stateDir,
 			prompt: readPromptText(payload),
-			sessionFile: readSessionFile(payload),
+			sessionFile,
 		});
 		const recoveryContext = buildStateRecoveryDiagnosticsContext(recoveryDiagnostics);
 		const prompt = readPromptText(payload);
@@ -346,7 +349,7 @@ export async function dispatchGjcNativeSkillHook(
 					threadId: readThreadId(payload),
 					stateDir: options.stateDir,
 					prompt,
-					sessionFile: readSessionFile(payload),
+					sessionFile,
 				});
 		if (activeUltragoalContext?.startsWith("BLOCK_ULTRAGOAL_COMPLETION:")) {
 			return {
@@ -390,7 +393,7 @@ export async function dispatchGjcNativeSkillHook(
 				sessionId: readSessionId(payload),
 				threadId: readThreadId(payload),
 				stateDir: options.stateDir,
-				sessionFile: readSessionFile(payload),
+				sessionFile,
 			}),
 		};
 	}

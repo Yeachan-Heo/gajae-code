@@ -1,9 +1,16 @@
 import { afterEach, expect, test, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { inspectFileLockStagingDir, reapOrphanedLockStagingDirs, withFileLock } from "../src/config/file-lock";
+import {
+	FileLockTestHooks,
+	inspectFileLockStagingDir,
+	processStartTime,
+	reapOrphanedLockStagingDirs,
+	withFileLock,
+} from "../src/config/file-lock";
 import { collectFileLocksForGc, fileLocksGcAdapter } from "../src/config/file-lock-gc";
 import type { GcContext } from "../src/gjc-runtime/gc-runtime";
 
@@ -12,13 +19,20 @@ const roots: string[] = [];
 const uuid = "12345678-1234-1234-1234-123456789abc";
 afterEach(async () => {
 	vi.restoreAllMocks();
+	FileLockTestHooks.nativeQuarantineBindings = undefined;
+	FileLockTestHooks.stagingIdentityEvidence = undefined;
 	for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
-async function fixture(pid = DEAD_PID, info: object | null = { pid, timestamp: 1 }) {
+async function fixture(
+	pid = DEAD_PID,
+	info: object | null = { pid, timestamp: 1 },
+	startTime = pid === process.pid ? (processStartTime(pid) ?? "unknown") : "fixture-start-time",
+) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "staging-orphan-"));
 	roots.push(root);
 	const file = path.join(root, "index.jsonl");
-	const staging = `${file}.lock.pending.${pid}.${uuid}`;
+	const encodedStartTime = `s${crypto.createHash("sha256").update(startTime, "utf8").digest("base64url").slice(0, 16)}`;
+	const staging = `${file}.lock.pending.${pid}.${encodedStartTime}.1234567890123456`;
 	await fs.mkdir(staging);
 	if (info) await Bun.write(path.join(staging, "info"), JSON.stringify(info));
 	return { root, file, staging };
@@ -61,6 +75,99 @@ test.each([true, false])("current process staging is retained (info=%s)", async 
 	expect(await fs.exists(staging)).toBe(true);
 });
 
+test.each(["alive", "unknown"] as const)("unproven staging owner is skipped before snapshotting (%s)", async status => {
+	const { staging } = await fixture(DEAD_PID, { pid: DEAD_PID, timestamp: 1 }, "unknown");
+	const probe = vi.fn(() => status);
+	const snapshot = vi.fn(() => {
+		throw new Error("unproven staging owner must not be snapshotted");
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: snapshot,
+		exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+	});
+
+	const result = await inspectFileLockStagingDir(staging, probe, true);
+	expect(result).toMatchObject({ pid: DEAD_PID, status, removed: false });
+	expect(probe).toHaveBeenCalledWith(DEAD_PID);
+	expect(snapshot).not.toHaveBeenCalled();
+	expect(await fs.exists(staging)).toBe(true);
+});
+
+test.each(["unknown", "start-time"] as const)("probes liveness for old synthetic %s staging identities", async kind => {
+	const startTime = processStartTime(process.pid);
+	if (!startTime) throw new Error("Expected a process start time for this regression test");
+	const ownerStartTime = kind === "unknown" ? "unknown" : startTime;
+	const { file, staging } = await fixture(
+		process.pid,
+		{
+			pid: process.pid,
+			timestamp: 1,
+			start_time: ownerStartTime,
+			start_time_format: "utc-v1",
+		},
+		"fixture-start-time",
+	);
+	const encoded = crypto
+		.createHash("sha256")
+		.update(`${process.pid}:${ownerStartTime}`, "utf8")
+		.digest("base64url")
+		.slice(0, 16);
+	const syntheticStaging = `${file}.lock.pending.${process.pid}.s${encoded}.1234567890123456`;
+	await fs.rename(staging, syntheticStaging);
+	const probe = vi.fn(() => "alive" as const);
+	const snapshot = vi.fn(() => {
+		throw new Error("live synthetic staging owner must not be snapshotted");
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: snapshot,
+		exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+	});
+
+	const result = await inspectFileLockStagingDir(syntheticStaging, probe, true);
+	expect(result).toMatchObject({ pid: process.pid, status: "alive", removed: false });
+	expect(probe).toHaveBeenCalledWith(process.pid);
+	expect(snapshot).not.toHaveBeenCalled();
+	expect(await fs.exists(syntheticStaging)).toBe(true);
+});
+
+test.each(["alive", "unknown"] as const)("legacy fallback staging retains a %s owner", async status => {
+	const { file, staging } = await fixture(DEAD_PID, {
+		pid: DEAD_PID,
+		timestamp: 1,
+		start_time: "later-known-start-time",
+		start_time_format: "utc-v1",
+	});
+	const legacyStaging = `${file}.lock.pending.${DEAD_PID}.${uuid}`;
+	await fs.rename(staging, legacyStaging);
+	const probe = vi.fn(() => status);
+	const snapshot = vi.fn(() => {
+		throw new Error("unproven legacy owner must not be snapshotted");
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: snapshot,
+		exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+	});
+
+	const result = await inspectFileLockStagingDir(legacyStaging, probe, true);
+	expect(result).toMatchObject({ pid: DEAD_PID, status, removed: false });
+	expect(probe).toHaveBeenCalledWith(DEAD_PID);
+	expect(snapshot).not.toHaveBeenCalled();
+	expect(await fs.exists(legacyStaging)).toBe(true);
+});
+
+test("reaps old staging after its name-encoded PID is reused", async () => {
+	const { staging } = await fixture(
+		process.pid,
+		{ pid: process.pid, timestamp: 1, start_time: "old-process-incarnation", start_time_format: "utc-v1" },
+		"old-process-incarnation",
+	);
+	const probe = vi.fn(() => "alive" as const);
+
+	const result = await inspectFileLockStagingDir(staging, probe, true);
+	expect(result).toMatchObject({ pid: process.pid, status: "dead", removed: true });
+	expect(await fs.exists(staging)).toBe(false);
+});
+
 test("record pid is authoritative over a dead name pid", async () => {
 	const { staging } = await fixture(DEAD_PID, { pid: process.pid, timestamp: 1 });
 	expect((await inspectFileLockStagingDir(staging, () => "dead", true)).removed).toBe(false);
@@ -70,6 +177,33 @@ test.each(["alive", "unknown"] as const)("missing info retains %s owner", async 
 	const { staging } = await fixture(DEAD_PID, null);
 	expect((await inspectFileLockStagingDir(staging, () => status, true)).status).toBe(status);
 	expect(await fs.exists(staging)).toBe(true);
+});
+
+test("reaps a legacy staging name after its PID is proven dead", async () => {
+	const { file, staging } = await fixture();
+	const legacyStaging = `${file}.lock.pending.${DEAD_PID}.${uuid}`;
+	await fs.rename(staging, legacyStaging);
+	deadPid();
+
+	const summary = await reapOrphanedLockStagingDirs(`${file}.lock`);
+	expect(summary.removed).toEqual([legacyStaging]);
+	expect(await fs.exists(legacyStaging)).toBe(false);
+});
+
+test("reaps bounded staging names for long lock basenames", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "staging-orphan-long-name-"));
+	roots.push(root);
+	const file = path.join(root, "x".repeat(220));
+	const lockPath = `${file}.lock`;
+	const basenameHash = crypto.createHash("sha256").update(path.basename(lockPath)).digest("hex");
+	const staging = path.join(root, `.gjc-lock-${basenameHash}.pending.${DEAD_PID}.${uuid}`);
+	await fs.mkdir(staging);
+	deadPid();
+
+	const summary = await reapOrphanedLockStagingDirs(lockPath);
+	expect(summary.removed).toEqual([staging]);
+	expect(summary.retained).toEqual([]);
+	expect(await fs.exists(staging)).toBe(false);
 });
 
 test("symlink candidate and malformed names are untouched", async () => {

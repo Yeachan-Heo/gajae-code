@@ -42,6 +42,44 @@
 				},
 				"credentialPinStoreIdentity": {
 					"type": "string"
+				},
+				"credentialPreferences": {
+					"type": "object",
+					"additionalProperties": {
+						"anyOf": [
+							{
+								"type": "string",
+								"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+							},
+							{
+								"type": "array",
+								"minItems": 1,
+								"uniqueItems": true,
+								"items": {
+									"anyOf": [
+										{
+											"type": "string",
+											"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+										},
+										{
+											"type": "object",
+											"minProperties": 1,
+											"maxProperties": 1,
+											"propertyNames": {
+												"pattern": "^(email:[^@\\s]+@[^@\\s]+|account:\\S+|[^@\\s:]+@[^@\\s]+)$"
+											},
+											"additionalProperties": {
+												"type": "number",
+												"exclusiveMinimum": 0,
+												"maximum": 100
+											}
+										}
+									]
+								}
+							}
+						]
+					},
+					"default": {}
 				}
 			},
 			"additionalProperties": false
@@ -156,6 +194,13 @@
 				"masterOrphanGraceMs": {
 					"type": "integer",
 					"description": "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
+					"default": 120000,
+					"minimum": 60000,
+					"maximum": 3600000
+				},
+				"brokerAbandonedGraceMs": {
+					"type": "integer",
+					"description": "Grace before a detached broker with no client connection, no live session host, and no open spawn authority exits on its own. A supervised `gjc sdk broker run` service never reaps itself.",
 					"default": 120000,
 					"minimum": 60000,
 					"maximum": 3600000
@@ -1009,10 +1054,11 @@
 				"flex",
 				"scale",
 				"priority",
+				"ultrafast",
 				"openai-only",
 				"claude-only"
 			],
-			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
+			"description": "Processing priority hint (none = omit). OpenAI accepts the tier values directly; ultrafast is a 6x premium tier. Anthropic realizes `priority` as `speed: \"fast\"` on supported Opus models. Scoped values target one family.",
 			"default": "none"
 		},
 		"task": {
@@ -1028,6 +1074,7 @@
 						"flex",
 						"scale",
 						"priority",
+						"ultrafast",
 						"openai-only",
 						"claude-only"
 					],
@@ -1109,6 +1156,11 @@
 					"type": "number",
 					"description": "Safer concurrent limit for subagents; higher fan-out still requires an explicit plan above 4 tasks.",
 					"default": 8
+				},
+				"compactSubagentPanel": {
+					"type": "boolean",
+					"description": "Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
+					"default": false
 				},
 				"enableLsp": {
 					"type": "boolean",
@@ -2322,6 +2374,9 @@
 					"default": true
 				},
 				"settingsPath": {
+					"type": "string"
+				},
+				"settingsHash": {
 					"type": "string"
 				},
 				"only": {

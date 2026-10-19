@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { zodToWireSchema } from "../packages/ai/src/utils/schema/wire";
 import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../packages/coding-agent/src/config/autorouting-contract";
 import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
+import { PREFERENCE_ACCOUNT_PATTERN } from "../packages/coding-agent/src/session/startup-auth-config";
 import { ModelsConfigSchema } from "../packages/coding-agent/src/config/models-config-schema";
 
 type JsonSchema = boolean | JsonSchemaObject;
@@ -139,7 +140,7 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.minimum = 60_000;
 		schema.maximum = 86_400_000;
 	}
-	if (settingPath === "sdk.masterOrphanGraceMs") {
+	if (settingPath === "sdk.masterOrphanGraceMs" || settingPath === "sdk.brokerAbandonedGraceMs") {
 		schema.type = "integer";
 		schema.minimum = 60_000;
 		schema.maximum = 3_600_000;
@@ -214,6 +215,7 @@ function recordValueSchema(
 	valueSchema?:
 		| { readonly type: "model-selector-value" }
 		| { readonly type: "credential-selector" }
+		| { readonly type: "credential-preference-list" }
 		| { readonly type: "string-enum"; readonly values: readonly string[] },
 ): JsonSchema {
 	if (valueSchema?.type === "string-enum") return { type: "string", enum: valueSchema.values };
@@ -221,6 +223,19 @@ function recordValueSchema(
 		return {
 			type: "string",
 			pattern: PERSISTED_CREDENTIAL_SELECTOR_PATTERN,
+		};
+	}
+	if (valueSchema?.type === "credential-preference-list") {
+		const account = { type: "string", pattern: PREFERENCE_ACCOUNT_PATTERN };
+		const cappedAccount = {
+			type: "object",
+			minProperties: 1,
+			maxProperties: 1,
+			propertyNames: { pattern: PREFERENCE_ACCOUNT_PATTERN },
+			additionalProperties: { type: "number", exclusiveMinimum: 0, maximum: 100 },
+		};
+		return {
+			anyOf: [account, { type: "array", minItems: 1, uniqueItems: true, items: { anyOf: [account, cappedAccount] } }],
 		};
 	}
 	if (valueSchema?.type !== "model-selector-value") return true;

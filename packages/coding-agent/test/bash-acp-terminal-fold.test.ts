@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { AsyncJobManager, type FoldReason, type JobFoldEvent } from "../src/async";
+import { Settings } from "../src/config/settings";
 import { JobsObserver } from "../src/modes/jobs-observer";
 import type {
 	ClientBridge,
@@ -41,12 +42,14 @@ function makeHarness(
 		},
 	});
 	const adapters: FoldAdapter[] = [];
+	const shellSettings = Settings.isolated();
 	const session = {
 		cwd: "/tmp",
 		hasUI: false,
 		skills: [],
 		getSessionFile: () => null,
 		settings: {
+			getShellConfig: () => shellSettings.getShellConfig(),
 			get(key: string) {
 				if (key === "async.enabled") return true;
 				if (key === "bash.autoBackground.enabled") return options.autoBackgroundEnabled ?? false;

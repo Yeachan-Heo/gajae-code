@@ -3093,7 +3093,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
 			record: {
-				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
 		});
 		const revoke = spyOn(stateRuntime, "revokeDeepInterviewExecutionApproval").mockResolvedValue();
@@ -3189,7 +3189,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/should-not-record.json",
 			record: {
-				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
 		});
 		await expect(
@@ -3226,7 +3226,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/deep-interview-execution-approval.json",
 			record: {
-				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
 		});
 		let executionVisits = 0;
@@ -3658,7 +3658,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const approvalRecord = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
 			path: "/tmp/ralplan-approval.json",
 			record: {
-				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+				transcript_boundary: { byte_length: 1, leaf_id: null },
 			} as DeepInterviewExecutionApprovalRecord,
 		});
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({

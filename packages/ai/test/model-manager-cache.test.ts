@@ -842,6 +842,74 @@ describe("online-if-uncached model refresh", () => {
 		expect(cache?.models.map(entry => entry.id)).toEqual(["static", "dynamic-b"]);
 	});
 
+	test("does not serve or relabel a legacy row from another discovery User-Agent after a failed fetch", async () => {
+		for (const [context, provenance] of [
+			["unbound", undefined],
+			["bound", "credential-a\u0000https://provider-a.example.test"],
+		] as const) {
+			const providerId = `cache-failed-fetch-old-user-agent-${context}`;
+			const staticModels = [model(providerId, "static")];
+			const oldUserAgent = "antigravity-ide";
+			const currentUserAgent = "antigravity/cli/1.3.4";
+			const now = 1_700_000_000_000;
+			const oldCatalog = [...staticModels, model(providerId, "old-dynamic")];
+			writeModelCache(
+				providerId,
+				now,
+				oldCatalog,
+				true,
+				fingerprint(staticModels),
+				cacheDbPath,
+				undefined,
+				undefined,
+				oldUserAgent,
+			);
+
+			let discoveryCalls = 0;
+			const options = {
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				discoveryUserAgent: currentUserAgent,
+				...(provenance === undefined ? {} : { cacheDynamicModelProvenance: provenance }),
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return null;
+				},
+			};
+
+			const failedRefresh = await resolveProviderModels<Api>(options, "online");
+			expect(
+				failedRefresh.models.map(entry => entry.id),
+				context,
+			).toEqual(["static"]);
+			expect(discoveryCalls, context).toBe(1);
+			expect(
+				readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath, currentUserAgent),
+				context,
+			).toBe(null);
+			expect(
+				readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath),
+				context,
+			).toMatchObject({
+				authoritative: true,
+				discoveryUserAgent: oldUserAgent,
+				models: oldCatalog,
+			});
+
+			await resolveProviderModels<Api>(options, "online-if-uncached");
+			expect(discoveryCalls, `${context} context retries under the new User-Agent`).toBe(2);
+			expect(
+				readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath),
+				context,
+			).toMatchObject({
+				discoveryUserAgent: oldUserAgent,
+				models: oldCatalog,
+			});
+		}
+	});
+
 	test("inserts a non-authoritative tombstone when a failed fetch has no cache row", async () => {
 		for (const staticIds of [[], ["static"]] as const) {
 			const providerId = `cache-failed-fetch-missing-row-tombstone-${staticIds.length === 0 ? "empty" : "static"}`;

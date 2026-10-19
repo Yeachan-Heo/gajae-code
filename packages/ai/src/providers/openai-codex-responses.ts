@@ -32,7 +32,9 @@ import {
 	type Context,
 	type FetchImpl,
 	type Model,
+	modelSupportsUltrafastTier,
 	type ProviderSessionState,
+	parseResolvedServiceTier,
 	resolveServiceTier,
 	type ServiceTier,
 	type StreamFunction,
@@ -774,15 +776,15 @@ function getCodexUserAgent(): string {
 	return formatCodexUserAgent(os.platform(), os.release(), os.arch());
 }
 
-function getCodexServiceTierCostMultiplier(
-	model: Pick<Model<"openai-codex-responses">, "id">,
-	serviceTier: ServiceTier | "default" | undefined,
-): number {
+/** ChatGPT Codex included-usage multipliers; API token pricing uses separate provider paths. */
+function getCodexServiceTierCostMultiplier(serviceTier: ServiceTier | "default" | undefined): number {
 	switch (serviceTier) {
 		case "flex":
 			return 0.5;
 		case "priority":
-			return model.id === "gpt-5.5" ? 2.5 : 2;
+			return 2.5;
+		case "ultrafast":
+			return 8;
 		default:
 			return 1;
 	}
@@ -795,23 +797,19 @@ function resolveCodexCostServiceTier(res: unknown, req?: unknown): ServiceTier |
 		case "flex":
 		case "scale":
 		case "priority":
+		case "ultrafast":
 			return res;
 		default:
-			if (req === "flex" || req === "priority") {
+			if (req === "flex" || req === "priority" || req === "ultrafast") {
 				return req;
 			}
 			return "default";
 	}
 }
 
-function applyCodexServiceTierPricing(
-	model: Pick<Model<"openai-codex-responses">, "id">,
-	usage: AssistantMessage["usage"],
-	resTier: unknown,
-	reqTier: unknown,
-): void {
+function applyCodexServiceTierPricing(usage: AssistantMessage["usage"], resTier: unknown, reqTier: unknown): void {
 	const resolvedTier = resolveCodexCostServiceTier(resTier, reqTier);
-	const multiplier = getCodexServiceTierCostMultiplier(model, resolvedTier);
+	const multiplier = getCodexServiceTierCostMultiplier(resolvedTier);
 	if (multiplier === 1) return;
 	usage.cost.input *= multiplier;
 	usage.cost.output *= multiplier;
@@ -988,6 +986,12 @@ async function buildTransformedCodexRequestBody(
 	const resolvedServiceTier = resolveServiceTier(options?.serviceTier, model.provider);
 	if (resolvedServiceTier === "flex" || resolvedServiceTier === "scale" || resolvedServiceTier === "priority") {
 		params.service_tier = resolvedServiceTier;
+	} else if (resolvedServiceTier === "ultrafast") {
+		// Gate ultrafast to models that explicitly support it
+		if (modelSupportsUltrafastTier(model)) {
+			params.service_tier = "ultrafast";
+		}
+		// else: silently omit ultrafast if model doesn't support it (fail-closed)
 	}
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertOpenAICodexResponsesTools(context.tools, model);
@@ -2301,7 +2305,10 @@ function handleResponseCompleted(
 	}
 
 	calculateCost(model, output.usage);
-	applyCodexServiceTierPricing(model, output.usage, response?.service_tier, runtime.requestBodyForState.service_tier);
+	output.serviceTier =
+		parseResolvedServiceTier(response?.service_tier) ??
+		parseResolvedServiceTier(runtime.requestBodyForState.service_tier);
+	applyCodexServiceTierPricing(output.usage, response?.service_tier, runtime.requestBodyForState.service_tier);
 	output.stopReason = mapOpenAIResponsesStopReason(response?.status as OpenAI.Responses.ResponseStatus | undefined);
 	// A response cut short for length may have stopped mid-tool-call. Flag any
 	// call that never received its `output_item.done` so the agent loop rejects

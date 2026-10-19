@@ -28,6 +28,7 @@ html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
 ignore.workspace = true
 image = { workspace = true, features = ["bmp"] }
+flate2.workspace = true
 png.workspace = true
 resvg.workspace = true
 # Feature activation only (see workspace manifest): zune-jpeg needs `log` to compile.

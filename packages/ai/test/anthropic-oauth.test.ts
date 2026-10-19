@@ -119,7 +119,7 @@ describe("anthropic oauth alignment", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("extracts account uuid and email from token-exchange response", async () => {
+	it("extracts account and organization identity from token-exchange response", async () => {
 		const fetchMock = vi.fn(async () => {
 			return new Response(
 				JSON.stringify({
@@ -130,7 +130,7 @@ describe("anthropic oauth alignment", () => {
 						uuid: "11111111-2222-3333-4444-555555555555",
 						email_address: "user@example.com",
 					},
-					organization: { uuid: "99999999-8888-7777-6666-555555555555" },
+					organization: { uuid: "99999999-8888-7777-6666-555555555555", name: "Acme Team" },
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
@@ -143,9 +143,11 @@ describe("anthropic oauth alignment", () => {
 
 		expect(result.accountId).toBe("11111111-2222-3333-4444-555555555555");
 		expect(result.email).toBe("user@example.com");
+		expect(result.organizationId).toBe("99999999-8888-7777-6666-555555555555");
+		expect(result.organizationName).toBe("Acme Team");
 	});
 
-	it("extracts account uuid and email from refresh response", async () => {
+	it("extracts account and organization identity from refresh response", async () => {
 		const fetchMock = vi.fn(async () => {
 			return new Response(
 				JSON.stringify({
@@ -156,6 +158,7 @@ describe("anthropic oauth alignment", () => {
 						uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
 						email_address: "refreshed@example.com",
 					},
+					organization: { uuid: "org-refreshed", name: "Personal" },
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
@@ -166,6 +169,8 @@ describe("anthropic oauth alignment", () => {
 
 		expect(result.accountId).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
 		expect(result.email).toBe("refreshed@example.com");
+		expect(result.organizationId).toBe("org-refreshed");
+		expect(result.organizationName).toBe("Personal");
 	});
 
 	it("leaves accountId/email undefined when token response omits account block", async () => {
@@ -187,6 +192,8 @@ describe("anthropic oauth alignment", () => {
 
 		expect(result.accountId).toBeUndefined();
 		expect(result.email).toBeUndefined();
+		expect(result.organizationId).toBeUndefined();
+		expect(result.organizationName).toBeUndefined();
 	});
 });
 

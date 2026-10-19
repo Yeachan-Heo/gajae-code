@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import { rmSync } from "node:fs";
+import { renameSync, rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
@@ -52,7 +52,13 @@ function pinWindowsLockRemoval(): void {
 	});
 	FileLockTestHooks.nativeQuarantineBindings = () => ({
 		snapshotDirectoryTree: native.snapshotDirectoryTree,
-		exactRemoveDirectoryTree: target => {
+		exactRemoveDirectoryTree: (target, _snapshot, _parentIdentity, detachOnly) => {
+			// The Windows protocol detaches first, then removes the parked tree.
+			if (detachOnly && !target.endsWith(".removing")) {
+				const detachedPath = `${target}.removing`;
+				renameSync(target, detachedPath);
+				return { ok: true, detachedPath };
+			}
 			rmSync(target, { recursive: true, force: true });
 			return { ok: true };
 		},

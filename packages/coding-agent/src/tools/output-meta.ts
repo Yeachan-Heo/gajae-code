@@ -20,13 +20,14 @@ import {
 	formatMiddleElisionMarker,
 	type OutputSummary,
 	type ReadWindow,
+	runWithOutputRedaction,
 	type TruncationResult,
 	truncateMiddle,
 	truncateTail,
 } from "../session/streaming-output";
 
 import { formatBytes, wrapBrackets } from "./render-utils";
-import { renderError, ToolError } from "./tool-errors";
+import { renderError, ToolError, throwIfAborted } from "./tool-errors";
 
 /**
  * Truncation metadata for the output notice.
@@ -1155,6 +1156,19 @@ async function enforceInlineResultBackstop(
 // Tool wrapper
 // =============================================================================
 
+async function outputRedactionFor(settings: Settings): Promise<readonly string[] | undefined> {
+	const { collectEnvSecrets, loadSecrets } = await import("../secrets");
+	const entries = [...(await loadSecrets(settings.getCwd(), settings.getAgentDir())), ...collectEnvSecrets()];
+	const plain: string[] = [];
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type !== "plain" || entry.content.length === 0 || seen.has(entry.content)) continue;
+		seen.add(entry.content);
+		plain.push(entry.content);
+	}
+	return plain.length > 0 ? plain : undefined;
+}
+
 async function wrappedExecute(
 	this: AgentTool & { [kUnwrappedExecute]: AgentToolExecFn },
 	toolCallId: string,
@@ -1166,7 +1180,14 @@ async function wrappedExecute(
 	const originalExecute = this[kUnwrappedExecute];
 
 	try {
-		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+		const settings = context?.settings;
+		let plainSecrets: readonly string[] | undefined;
+		if (settings?.get("secrets.enabled") === true) {
+			plainSecrets = await outputRedactionFor(settings);
+			throwIfAborted(signal);
+		}
+		const run = () => originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+		let result = plainSecrets ? await runWithOutputRedaction(plainSecrets, run) : await run();
 
 		// Spill large results to artifact, truncate to tail
 		result = await spillLargeResultToArtifact(result, this.name, context);

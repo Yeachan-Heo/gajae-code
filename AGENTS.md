@@ -120,6 +120,7 @@ GJC exposes exactly four default workflow skills (`deep-interview`, `ralplan`, `
 - Keep source-bundled skills/agents in sync with tests/gates; do not rely on committed `.gjc` copies.
 - Planning workflows (`deep-interview`, `ralplan`) never execute implementation without explicit user approval; artifacts stay `pending approval` until then. `autoresearch` is a research workflow: it produces findings and a verdict, never an implementation.
 - Subagent await timeouts are observation windows, not failure signals; inspect before cancelling.
+- GitHub comment `/re-review` on PRs re-requests reviews from those with pending `CHANGES_REQUESTED` or `COMMENTED` feedback.
 
 ## Code quality
 

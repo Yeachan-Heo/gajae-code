@@ -20,6 +20,7 @@ export const SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES = [
 	"managed_gc_journal_capacity_exceeded",
 	"atomic_unavailable",
 	"invalid_request",
+	"permission_denied",
 	"durability_failed",
 	"durability_not_provable",
 	"capacity_exceeded",

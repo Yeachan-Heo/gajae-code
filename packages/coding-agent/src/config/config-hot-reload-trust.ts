@@ -58,10 +58,16 @@ async function inspectFilePath(filePath: string): Promise<CheckedFilePath> {
 }
 
 /**
- * Linux directory modes include the POSIX ACL mask, so denying group/other
- * access also denies named ACL grants. Other platforms are rejected because
- * Node does not expose enough ACL state to establish equivalent privacy.
+ * Hot reload requires a privacy check that only Linux can perform: its
+ * directory modes include the POSIX ACL mask, so denying group/other access
+ * also denies named ACL grants. Node does not expose enough ACL state on other
+ * platforms to establish equivalent privacy, so they do not watch at all.
  */
+export function isConfigHotReloadSupported(): boolean {
+	return process.platform === "linux" && typeof process.getuid === "function";
+}
+
+/** Returns whether both configuration paths live in private, safely owned directories. */
 export async function isConfigHotReloadTrusted(paths: {
 	readonly configPath: string;
 	readonly modelsPath: string;

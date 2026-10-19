@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as tls from "node:tls";
-import { clampThinkingLevelForModel, Effort } from "@gajae-code/ai";
+import { clampThinkingLevelForModel, Effort, getBundledModel } from "@gajae-code/ai";
 import {
 	applyClaudeToolPrefix,
 	buildAnthropicClientOptions,
@@ -1209,6 +1209,115 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.top_k).toBeUndefined();
 		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.output_config).toEqual({ effort: "high" });
+	});
+
+	it("drops sampling params for Haiku 5.5 when thinking is Off", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: false, temperature: 0.2, topP: 0.3, topK: 4 },
+		)) as {
+			temperature?: number;
+			top_p?: number;
+			top_k?: number;
+			thinking?: { type?: string };
+		};
+
+		expect(payload.temperature).toBeUndefined();
+		expect(payload.top_p).toBeUndefined();
+		expect(payload.top_k).toBeUndefined();
+		expect(payload.thinking).toEqual({ type: "disabled" });
+	});
+
+	it("drops sampling params for Haiku 5.5 with adaptive thinking enabled", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		for (const [reasoning, effort] of [
+			[Effort.XHigh, "xhigh"],
+			[Effort.Max, "max"],
+		] as const) {
+			const payload = (await captureAnthropicPayload(
+				model,
+				{
+					systemPrompt: ["Stay concise."],
+					messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+				},
+				{ thinkingEnabled: true, reasoning, temperature: 0.2, topP: 0.3, topK: 4 },
+			)) as {
+				temperature?: number;
+				top_p?: number;
+				top_k?: number;
+				thinking?: { type?: string; display?: string };
+				output_config?: { effort?: string };
+			};
+
+			expect(payload.temperature).toBeUndefined();
+			expect(payload.top_p).toBeUndefined();
+			expect(payload.top_k).toBeUndefined();
+			expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+			expect(payload.output_config).toEqual({ effort });
+		}
+	});
+
+	it("keeps the selected effort on forced-tool Haiku 5.5 requests with thinking disabled", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-5-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 5.5 model");
+		const context: Context = {
+			systemPrompt: ["Stay concise."],
+			messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			tools: [{ name: "resolve", description: "Resolve", parameters: { type: "object", properties: {} } as never }],
+		};
+		type Forced = {
+			tool_choice?: { type?: string };
+			thinking?: { type?: string };
+			output_config?: { effort?: string };
+		};
+		for (const [reasoning, expected] of [
+			[Effort.Medium, "medium"],
+			[Effort.High, "high"],
+			[Effort.XHigh, "high"],
+			[Effort.Max, "high"],
+		] as const) {
+			const payload = (await captureAnthropicPayload(model, context, {
+				thinkingEnabled: true,
+				reasoning,
+				toolChoice: { type: "tool", name: "resolve" },
+			})) as Forced;
+			expect(payload.tool_choice?.type).toBe("tool");
+			expect(payload.thinking).toEqual({ type: "disabled" });
+			expect(payload.output_config).toEqual({ effort: expected });
+		}
+		const off = (await captureAnthropicPayload(model, context, {
+			thinkingEnabled: false,
+			toolChoice: { type: "tool", name: "resolve" },
+		})) as Forced;
+		expect(off.thinking).toEqual({ type: "disabled" });
+	});
+
+	it("preserves sampling params for Haiku 4.5", async () => {
+		const model = getBundledModel<"anthropic-messages">("anthropic", "claude-haiku-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic Haiku 4.5 model");
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: false, temperature: 0.2, topP: 0.3, topK: 4 },
+		)) as {
+			temperature?: number;
+			top_p?: number;
+			top_k?: number;
+		};
+
+		expect(payload.temperature).toBe(0.2);
+		expect(payload.top_p).toBe(0.3);
+		expect(payload.top_k).toBe(4);
 	});
 
 	// A single-component alias (`claude-opus-5`) and its dated snapshot describe the

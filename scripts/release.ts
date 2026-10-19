@@ -875,7 +875,7 @@ async function cmdRelease(version: string): Promise<void> {
 	// stale addon (built against the previous sentinel) and fails. CI rebuilds
 	// per platform; this keeps the maintainer's release run a single shot.
 	console.log("Rebuilding native addon for the new sentinel…");
-	await $`bun --cwd=packages/natives run build`;
+	await $`bun --cwd=packages/natives run build`.env({ ...process.env, PI_NATIVE_PROFILE: "dist" });
 	console.log();
 
 	// 4d. Regenerate the telegram-daemon-generation-guard manifest so the

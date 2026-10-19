@@ -71,8 +71,8 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		vi.restoreAllMocks();
 	});
 
-	function installOwnerManager(): AsyncJobManager {
-		manager = new AsyncJobManager({ onJobComplete: async () => {} });
+	function installOwnerManager(maxRunningJobs?: number): AsyncJobManager {
+		manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs });
 		AsyncJobManager.setInstance(manager);
 		return manager;
 	}
@@ -170,28 +170,233 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		await expect(session.newSession()).resolves.toBe(false);
 		expect(session.sessionFile).toBe(previous);
 		expect(notices).toEqual([CLEANUP_NOTICE]);
-		expect(ownerManager.finishOwnerSubagentShutdown).toHaveBeenCalledWith(expect.any(Object), "release");
+		expect(ownerManager.finishOwnerSubagentShutdown).toHaveBeenCalledWith(expect.any(Object), "release", {
+			drainResumeQueue: true,
+		});
 	});
 
 	it("does not cancel generic owner jobs or replace identity when flush rejects", async () => {
-		const ownerManager = installOwnerManager();
+		const ownerManager = installOwnerManager(2);
 		const previous = session.sessionFile;
+		const genericStarted = Promise.withResolvers<void>();
 		const genericGate = Promise.withResolvers<string>();
-		const genericJobId = ownerManager.register("bash", "generic", async () => genericGate.promise, {
+		const genericJobId = ownerManager.register(
+			"bash",
+			"generic",
+			async () => {
+				genericStarted.resolve();
+				return genericGate.promise;
+			},
+			{ ownerId: "owner" },
+		);
+		await genericStarted.promise;
+		const foreignStarted = Promise.withResolvers<void>();
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = ownerManager.register(
+			"bash",
+			"foreign blocker",
+			async () => {
+				foreignStarted.resolve();
+				return foreignGate.promise;
+			},
+			{ ownerId: "foreign-owner" },
+		);
+		await foreignStarted.promise;
+		ownerManager.registerSubagentRecord({
+			subagentId: "queued-child",
 			ownerId: "owner",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/queued-child.jsonl",
+			resumable: true,
+		});
+		let resumeStarts = 0;
+		ownerManager.setResumeRunner(subagentId => {
+			resumeStarts++;
+			return ownerManager.register("task", `resume ${subagentId}`, async () => "resumed", {
+				ownerId: "owner",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		expect(ownerManager.resumeSubagent("queued-child", { ownerId: "owner" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
 		});
 		const cancelAndSettle = vi.spyOn(ownerManager, "cancelAndSettleOwnerJobs");
 		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
-		vi.spyOn(sessionManager, "flush").mockRejectedValue(new Error("disk full"));
+		const flushStarted = Promise.withResolvers<void>();
+		const rejectFlush = Promise.withResolvers<void>();
+		vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			flushStarted.resolve();
+			await rejectFlush.promise;
+			throw new Error("disk full");
+		});
 
-		await expect(session.newSession()).rejects.toThrow("disk full");
+		const transition = session.newSession();
+		await flushStarted.promise;
+		foreignGate.resolve("foreign complete");
+		await ownerManager.getJob(foreignJobId)?.promise;
+		expect(ownerManager.getSubagentRecord("queued-child")?.status).toBe("queued");
+		expect(resumeStarts).toBe(0);
+		rejectFlush.resolve();
+		await expect(transition).rejects.toThrow("disk full");
 		expect(session.sessionFile).toBe(previous);
 		expect(cancelAndSettle).not.toHaveBeenCalled();
 		expect(ownerManager.getJob(genericJobId)?.status).toBe("running");
 		expect(ownerManager.getDeliveryState({ ownerId: "owner" }).queued).toBe(0);
-		expect(finishShutdown).toHaveBeenCalledWith(expect.any(Object), "release");
+		expect(finishShutdown).toHaveBeenCalledWith(expect.any(Object), "release", { drainResumeQueue: true });
+		expect(resumeStarts).toBe(1);
+		const resumedJobId = ownerManager.getSubagentRecord("queued-child")?.currentJobId;
+		if (!resumedJobId) throw new Error("Queued child did not start after rollback");
+		await ownerManager.getJob(resumedJobId)?.promise;
+		expect(ownerManager.getSubagentRecord("queued-child")?.status).toBe("completed");
 		genericGate.resolve("finished after retained session");
 		await ownerManager.getJob(genericJobId)?.promise;
+	});
+
+	it("drains a queued resume after a live session-switch flush failure", async () => {
+		const ownerManager = installOwnerManager(1);
+		const previousSessionFile = session.sessionFile;
+		const appendMessage = vi.spyOn(sessionManager, "appendMessage");
+		const foreignStarted = Promise.withResolvers<void>();
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = ownerManager.register(
+			"bash",
+			"foreign blocker",
+			async () => {
+				foreignStarted.resolve();
+				return foreignGate.promise;
+			},
+			{ ownerId: "foreign-owner" },
+		);
+		await foreignStarted.promise;
+		ownerManager.registerSubagentRecord({
+			subagentId: "queued-child",
+			ownerId: "owner",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/queued-child.jsonl",
+			resumable: true,
+		});
+		let resumeStarts = 0;
+		ownerManager.setResumeRunner(subagentId => {
+			resumeStarts++;
+			return ownerManager.register("task", `resume ${subagentId}`, async () => "resumed", {
+				ownerId: "owner",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		expect(ownerManager.resumeSubagent("queued-child", { ownerId: "owner" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+
+		const flushEntered = Promise.withResolvers<void>();
+		const rejectFlush = Promise.withResolvers<void>();
+		const flushSpy = vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			flushEntered.resolve();
+			await rejectFlush.promise;
+			throw new Error("disk full");
+		});
+		const transition = session.switchSession(path.join(tempDir.path(), "target.session"));
+		try {
+			await flushEntered.promise;
+			foreignGate.resolve("foreign complete");
+			await ownerManager.getJob(foreignJobId)?.promise;
+			expect(ownerManager.getSubagentRecord("queued-child")?.status).toBe("queued");
+			expect(resumeStarts).toBe(0);
+
+			rejectFlush.resolve();
+			await expect(transition).rejects.toThrow("disk full");
+			expect(session.sessionFile).toBe(previousSessionFile);
+			session.agent.emitExternalEvent({
+				type: "message_end",
+				message: { role: "user", content: "predecessor bridge restored", timestamp: Date.now() },
+			});
+			expect(appendMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ content: "predecessor bridge restored" }),
+			);
+			expect(resumeStarts).toBe(1);
+			const resumedJobId = ownerManager.getSubagentRecord("queued-child")?.currentJobId;
+			if (!resumedJobId) throw new Error("Queued child did not start after the failed switch");
+			await ownerManager.getJob(resumedJobId)?.promise;
+			expect(ownerManager.getSubagentRecord("queued-child")?.status).toBe("completed");
+		} finally {
+			rejectFlush.resolve();
+			flushSpy.mockRestore();
+			foreignGate.resolve("foreign complete");
+		}
+	});
+
+	it("drains preserved resumes when fork retirement fails before successor adoption", async () => {
+		const ownerManager = installOwnerManager(1);
+		const previousSessionFile = session.sessionFile;
+		const foreignStarted = Promise.withResolvers<void>();
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = ownerManager.register(
+			"bash",
+			"foreign blocker",
+			async () => {
+				foreignStarted.resolve();
+				return foreignGate.promise;
+			},
+			{ ownerId: "foreign-owner" },
+		);
+		await foreignStarted.promise;
+		ownerManager.registerSubagentRecord({
+			subagentId: "fork-queued-child",
+			ownerId: "owner",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "paused",
+			sessionFile: "/tmp/fork-queued-child.jsonl",
+			resumable: true,
+		});
+		let resumeStarts = 0;
+		ownerManager.setResumeRunner(subagentId => {
+			resumeStarts++;
+			return ownerManager.register("task", `resume ${subagentId}`, async () => "resumed", {
+				ownerId: "owner",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+		expect(ownerManager.resumeSubagent("fork-queued-child", { ownerId: "owner" })).toMatchObject({
+			ok: true,
+			queued: true,
+			status: "queued",
+		});
+
+		const deliveryGateEntered = Promise.withResolvers<void>();
+		const releaseDeliveryGate = Promise.withResolvers<boolean>();
+		const deliveryGateSpy = vi.spyOn(ownerManager, "waitForOwnerInFlightDeliveries").mockImplementation(async () => {
+			deliveryGateEntered.resolve();
+			return releaseDeliveryGate.promise;
+		});
+		const transition = session.fork();
+		try {
+			await deliveryGateEntered.promise;
+			foreignGate.resolve("foreign complete");
+			await ownerManager.getJob(foreignJobId)?.promise;
+			expect(ownerManager.getSubagentRecord("fork-queued-child")?.status).toBe("queued");
+			expect(resumeStarts).toBe(0);
+
+			releaseDeliveryGate.resolve(false);
+			await expect(transition).rejects.toThrow("Owned async deliveries did not settle before artifact retirement.");
+			expect(session.sessionFile).toBe(previousSessionFile);
+			expect(resumeStarts).toBe(1);
+			const resumedJobId = ownerManager.getSubagentRecord("fork-queued-child")?.currentJobId;
+			if (!resumedJobId) throw new Error("Queued child did not start after fork rollback");
+			await ownerManager.getJob(resumedJobId)?.promise;
+			expect(ownerManager.getSubagentRecord("fork-queued-child")?.status).toBe("completed");
+		} finally {
+			releaseDeliveryGate.resolve(false);
+			deliveryGateSpy.mockRestore();
+			foreignGate.resolve("foreign complete");
+		}
 	});
 
 	it("waits for in-flight owner delivery before flush and generic owner cancellation", async () => {
@@ -387,7 +592,9 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		// cancelling/classifying this job (review thread P1).
 		expect(lookupOwnedRegistration(ownerJobId, ownerJob.generation, predecessorEndpointId)).toBeDefined();
 		expect(producerCleanupCalls).toBe(0);
-		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "release");
+		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "release", {
+			drainResumeQueue: true,
+		});
 
 		validation.mockRestore();
 		await expect(session.switchSession(copiedFile)).resolves.toBe(true);

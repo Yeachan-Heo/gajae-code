@@ -242,6 +242,14 @@ export class ConfigHotReloadWatcher {
 		await this.#initializeBinding(binding);
 	}
 
+	/**
+	 * Test-only: request the same scan an fs event would schedule. Tests that
+	 * exercise the watcher cannot rely on platform fs-event delivery timing.
+	 */
+	__testRequestScan(): void {
+		if (this.#binding && this.#isCurrent(this.#binding)) this.#scheduleScan(this.#binding);
+	}
+
 	/** Closes all watches and cancels or fences pending and in-flight callbacks. */
 	dispose(): void {
 		if (this.#disposed) return;

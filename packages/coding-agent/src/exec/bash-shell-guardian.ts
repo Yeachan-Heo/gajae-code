@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import type { Process as NativeProcess } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { BASH_SHELL_SUPERVISOR_ARG, type BashShellWorkerRequest } from "./bash-shell-worker-protocol";
 
 type NativeProcessBindings = { Process: typeof NativeProcess };
@@ -401,7 +402,9 @@ export async function runBashShellGuardian(): Promise<void> {
 	const [executable, ...args] = supervisorArgv();
 	const supervisor = childProcess.spawn(executable!, args, {
 		detached: process.platform !== "win32",
-		env: process.env,
+		// This process reloaded the project `.env` on startup; keep project hook
+		// variables out of the supervisor -> runtime -> native shell chain.
+		env: projectSafeSpawnEnv(),
 		stdio: ["pipe", "inherit", "inherit"],
 		windowsHide: true,
 	});

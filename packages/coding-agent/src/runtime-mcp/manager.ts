@@ -303,6 +303,30 @@ export interface MCPToolCatalogSnapshot {
 	generation: number;
 }
 
+/** Drop project stdio servers unless the user/global opt-in is set. */
+export function omitUnapprovedProjectStdio(
+	configs: Record<string, MCPServerConfig>,
+	sources: Record<string, SourceMeta>,
+	allowProjectStdio: boolean,
+	toolsOnly = false,
+): void {
+	if (allowProjectStdio) return;
+	for (const name of Object.keys(configs)) {
+		const config = configs[name];
+		if (!config || config.type === "http" || config.type === "sse") continue;
+		if (!isUntrustedProjectMcpSource(sources[name], toolsOnly)) continue;
+		delete configs[name];
+		delete sources[name];
+		if (!toolsOnly) {
+			logger.warn("Skipping MCP autoload registration", {
+				path: `mcp:${name}`,
+				serverName: name,
+				reason: "project stdio server is not user-approved",
+			});
+		}
+	}
+}
+
 /** Options for discovering and connecting to MCP servers */
 export interface MCPDiscoverOptions {
 	/** Whether to load project-level config (default: true) */
@@ -330,6 +354,11 @@ export interface MCPDiscoverOptions {
 export interface MCPManagerOptions {
 	/** Restrict this instance to tools from an explicit MCP config. */
 	toolsOnly?: boolean;
+	/**
+	 * Spawn stdio servers loaded from a project MCP file. Default false.
+	 * User-scope servers and an explicit `--mcp-config` file are unaffected.
+	 */
+	allowUntrustedProjectStdio?: boolean;
 	/**
 	 * Ceiling for the startup wait, in milliseconds. ACP lifecycle launches and
 	 * plugin MCP startup use bounded caller-owned budgets; other consumers keep
@@ -460,6 +489,7 @@ export class MCPManager {
 	#scopedLifecycle: "open" | "disconnecting" | "reconnecting" = "open";
 	#scopedLifecycleEpoch = 0;
 	readonly #toolsOnly: boolean;
+	readonly #allowUntrustedProjectStdio: boolean;
 	#toolCacheServerNames: Set<string> | undefined;
 	#toolsOnlyConfigLoaded = false;
 	#connectionSetMutationBlocked = false;
@@ -995,6 +1025,7 @@ export class MCPManager {
 		options: MCPManagerOptions = {},
 	) {
 		this.#toolsOnly = options.toolsOnly === true;
+		this.#allowUntrustedProjectStdio = options.allowUntrustedProjectStdio === true;
 		this.#toolCacheServerNames = options.toolCacheServerNames ? new Set(options.toolCacheServerNames) : undefined;
 		this.#maxStartupTimeoutMs = options.maxStartupTimeoutMs;
 		this.#sleep = options.sleep ?? delay;
@@ -1185,6 +1216,7 @@ export class MCPManager {
 			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
 		});
+		omitUnapprovedProjectStdio(configs, sources, this.#allowUntrustedProjectStdio, this.#toolsOnly);
 		if (this.#toolCacheServerNames !== undefined) {
 			this.#toolCacheServerNames = new Set(
 				Object.keys(configs).filter(name => sources[name]?.provider !== "gjc-plugins"),

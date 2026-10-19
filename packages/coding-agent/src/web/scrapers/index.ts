@@ -169,7 +169,9 @@ specialHandlers.push(
 	handleGitHub,
 	handleGitLab,
 	// Video/Media
-	(url, timeout, signal) => handleYouTube(url, timeout, signal),
+	// Registered directly (not through an argument-dropping adapter) so the
+	// handler receives the caller's storage and settings.
+	handleYouTube,
 	handleVimeo,
 	handleSpotify,
 	handleDiscogs,

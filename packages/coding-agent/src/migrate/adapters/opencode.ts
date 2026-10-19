@@ -18,7 +18,12 @@ const SOURCE = "opencode" as const;
 export const opencodeAdapter: Adapter = {
 	source: SOURCE,
 	async collect({ homeDir }: AdapterOptions): Promise<AdapterResult> {
-		const result: AdapterResult = { mcpCandidates: [], skillCandidates: [], diagnostics: [] };
+		const result: AdapterResult = {
+			mcpCandidates: [],
+			skillCandidates: [],
+			instructionCandidates: [],
+			diagnostics: [],
+		};
 		const baseDir = path.join(homeDir, ".config", "opencode");
 
 		const configPath = path.join(baseDir, "opencode.json");

@@ -1,16 +1,29 @@
 /**
- * Claude Code adapter: reads `~/.claude.json` (mcpServers) and `~/.claude/skills`.
+ * Claude Code adapter: reads `~/.claude.json` (mcpServers), `~/.claude/skills`,
+ * and the selected scope's `CLAUDE.md`.
  */
 import * as path from "node:path";
 import type { AdapterResult, McpCandidate } from "../types";
-import { type Adapter, type AdapterOptions, collectSkillDir, parseSourceJson, readSourceText } from "./index";
+import {
+	type Adapter,
+	type AdapterOptions,
+	collectInstructionFile,
+	collectSkillDir,
+	parseSourceJson,
+	readSourceText,
+} from "./index";
 
 const SOURCE = "claude-code" as const;
 
 export const claudeCodeAdapter: Adapter = {
 	source: SOURCE,
-	async collect({ homeDir }: AdapterOptions): Promise<AdapterResult> {
-		const result: AdapterResult = { mcpCandidates: [], skillCandidates: [], diagnostics: [] };
+	async collect({ homeDir, cwd, scope }: AdapterOptions): Promise<AdapterResult> {
+		const result: AdapterResult = {
+			mcpCandidates: [],
+			skillCandidates: [],
+			instructionCandidates: [],
+			diagnostics: [],
+		};
 
 		const configPath = path.join(homeDir, ".claude.json");
 		const read = await readSourceText(configPath, SOURCE, "mcp");
@@ -33,6 +46,12 @@ export const claudeCodeAdapter: Adapter = {
 		const skills = await collectSkillDir(path.join(homeDir, ".claude", "skills"), SOURCE);
 		result.skillCandidates.push(...skills.candidates);
 		result.diagnostics.push(...skills.diagnostics);
+
+		const instructionsPath =
+			scope === "project" ? path.join(cwd, "CLAUDE.md") : path.join(homeDir, ".claude", "CLAUDE.md");
+		const instructions = await collectInstructionFile(instructionsPath, SOURCE);
+		result.instructionCandidates.push(...instructions.candidates);
+		result.diagnostics.push(...instructions.diagnostics);
 
 		return result;
 	},

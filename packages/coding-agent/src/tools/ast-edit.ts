@@ -13,7 +13,11 @@ import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/workflow-m
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
-import { resolveAstEditPreviewWritePaths } from "./ast-edit-write-path";
+import {
+	AST_EDIT_OUTSIDE_ROOT_MESSAGE,
+	astEditSingleFileOutsideReferenceRoot,
+	resolveAstEditPreviewWritePaths,
+} from "./ast-edit-write-path";
 import { assertEditableFile } from "./auto-generated-guard";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
@@ -220,6 +224,18 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
+			const assertSingleFileReferenceRoot = async (flowSignal?: AbortSignal): Promise<void> => {
+				const nativeWritePaths = multiTargets ? multiTargets.map(target => target.basePath) : [resolvedSearchPath];
+				const outsideRoot = await astEditSingleFileOutsideReferenceRoot(
+					this.session.cwd,
+					nativeWritePaths,
+					flowSignal,
+				);
+				if (outsideRoot) {
+					throw new ToolError(`${AST_EDIT_OUTSIDE_ROOT_MESSAGE}: ${outsideRoot}`);
+				}
+			};
+
 			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 				rewrites: normalizedRewrites,
 				dryRun: true,
@@ -351,6 +367,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						for (const filePath of previewedFiles) {
 							await assertEditableFile(resolvePlanPath(this.session, filePath), filePath, this.session.settings);
 						}
+						await assertSingleFileReferenceRoot();
 						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,

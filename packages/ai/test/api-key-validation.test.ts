@@ -160,12 +160,34 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 	it("requires an inference response instead of accepting a public catalog-shaped body", async () => {
 		stubFetch(() => new Response(JSON.stringify({ object: "list", data: [{ id: "m" }] }), { status: 200 }));
 		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		stubFetch(() => new Response(JSON.stringify({ choices: [] }), { status: 200 }));
+		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
 		stubFetch(() => new Response(JSON.stringify({ choices: [{}] }), { status: 200 }));
-		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		await expect(validateInferenceProbe()).rejects.toThrow(/choices without a valid message/);
 		stubFetch(() => new Response(JSON.stringify({ choices: [{ message: { content: null } }] }), { status: 200 }));
-		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		await expect(validateInferenceProbe()).rejects.toThrow(/choices with empty content/);
 		stubFetch(() => new Response(JSON.stringify({ choices: [{ message: { content: "   " } }] }), { status: 200 }));
-		await expect(validateInferenceProbe()).rejects.toThrow(/no choices/);
+		await expect(validateInferenceProbe()).rejects.toThrow(/choices with empty content/);
+	});
+
+	it("accepts reasoning-only output and token-limit completions", async () => {
+		const choices = [
+			{
+				index: 0,
+				message: {
+					role: "assistant",
+					content: "",
+					reasoning_content: "Let me consider how to respond to this",
+				},
+				finish_reason: "length",
+			},
+			{ message: { content: "", reasoning_content: "reasoning output" } },
+			{ message: { content: "" }, finish_reason: "length" },
+		];
+		for (const choice of choices) {
+			stubFetch(() => new Response(JSON.stringify({ choices: [choice] }), { status: 200 }));
+			await validateInferenceProbe();
+		}
 	});
 
 	it("rejects forbidden inference entitlement", async () => {

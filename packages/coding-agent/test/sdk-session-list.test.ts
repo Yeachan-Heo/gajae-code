@@ -44,7 +44,10 @@ test("shared session-list traversal seeds the seen cursor set from input", async
 	expect(cursors).toEqual(["initial-cursor"]);
 });
 
-test("broker session.list preserves the managed journal capacity omission diagnostic", async () => {
+test.each([
+	["managed_gc_journal_capacity_exceeded", "Managed cleanup journal replay exceeded its read budget."],
+	["permission_denied", "Managed publication was denied before mutation."],
+] as const)("broker session.list preserves the %s omission diagnostic", async (code, message) => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-session-list-capacity-"));
 	const cwd = path.join(root, "workspace");
 	const agentDir = path.join(root, "agent");
@@ -55,8 +58,8 @@ test("broker session.list preserves the managed journal capacity omission diagno
 		await new SessionIndex(agentDir).open();
 		const resolveScope = vi.spyOn(sessionDirectory, "resolveManagedSessionScope").mockResolvedValue({
 			kind: "error",
-			code: "managed_gc_journal_capacity_exceeded",
-			message: "Managed cleanup journal replay exceeded its read budget.",
+			code,
+			message,
 		});
 		const response = await broker.handleRequest("session.list", { cwd, resolveSessionId: "saved-session" });
 		expect(resolveScope).toHaveBeenCalledWith({ cwd, agentDir });
@@ -67,11 +70,11 @@ test("broker session.list preserves the managed journal capacity omission diagno
 				savedSessionOmission: {
 					sessionId: "saved-session",
 					reason: "scope_unavailable",
-					detailCode: "managed_gc_journal_capacity_exceeded",
+					detailCode: code,
 				},
 			},
 		});
-		expect(SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES).toContain("managed_gc_journal_capacity_exceeded");
+		expect(SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES).toContain(code);
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });

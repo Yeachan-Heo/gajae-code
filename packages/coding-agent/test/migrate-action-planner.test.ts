@@ -11,7 +11,11 @@ let dest: MigrateDestinations;
 
 beforeEach(async () => {
 	tmp = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-planner-"));
-	dest = { mcpConfigPath: path.join(tmp, "mcp.json"), skillsDir: path.join(tmp, "skills") };
+	dest = {
+		mcpConfigPath: path.join(tmp, "mcp.json"),
+		skillsDir: path.join(tmp, "skills"),
+		instructionsPath: path.join(tmp, "AGENTS.md"),
+	};
 });
 
 afterEach(async () => {
@@ -24,8 +28,11 @@ function mcp(name: string, raw: unknown): McpCandidate {
 function skill(slug: string, content = `---\ndescription: d\n---\nbody`): SkillCandidate {
 	return { source: "claude-code", slug, content, warnings: [] };
 }
+function instruction(content: string, source: "claude-code" | "codex" = "claude-code") {
+	return { source, name: source === "codex" ? "AGENTS.md" : "CLAUDE.md", content };
+}
 function result(partial: Partial<AdapterResult>): AdapterResult {
-	return { mcpCandidates: [], skillCandidates: [], diagnostics: [], ...partial };
+	return { mcpCandidates: [], skillCandidates: [], instructionCandidates: [], diagnostics: [], ...partial };
 }
 
 async function writeMcpConfig(servers: Record<string, unknown>): Promise<void> {
@@ -241,6 +248,63 @@ describe("planMigration — skills", () => {
 	});
 });
 
+describe("planMigration — instructions", () => {
+	test("fresh instructions are imported and included in the scoped destination", async () => {
+		const { actions } = await planMigration({
+			results: [result({ instructionCandidates: [instruction("Follow the project rules.")] })],
+			destinations: dest,
+			force: false,
+		});
+		expect(actions[0]).toMatchObject({
+			type: "instruction",
+			name: "CLAUDE.md",
+			destination: dest.instructionsPath,
+			operation: "create",
+			status: "imported",
+			instruction: { content: "Follow the project rules." },
+		});
+	});
+
+	test("existing instructions are skipped unless force is explicit", async () => {
+		await fs.writeFile(dest.instructionsPath, "Existing instructions.", "utf-8");
+		const candidate = result({ instructionCandidates: [instruction("Imported instructions.")] });
+		const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+		expect(skipped.actions[0]).toMatchObject({ operation: "skip", status: "skipped_exists" });
+		const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+		expect(forced.actions[0]).toMatchObject({ operation: "update", status: "updated" });
+	});
+
+	test("multiple selected sources never silently overwrite the shared instructions file", async () => {
+		const results = [
+			result({ instructionCandidates: [instruction("Claude instructions.")] }),
+			result({ instructionCandidates: [instruction("Codex instructions.", "codex")] }),
+		];
+		for (const force of [false, true]) {
+			const { actions } = await planMigration({ results, destinations: dest, force });
+			expect(actions[0]).toMatchObject({ status: "imported" });
+			expect(actions[1]).toMatchObject({
+				operation: "skip",
+				status: "skipped_exists",
+				reason: "another selected source already targets this file; import one source at a time",
+			});
+		}
+	});
+
+	test("a destination symlink is skipped by default and rejected with force", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-instructions-outside-"));
+		try {
+			await fs.symlink(path.join(outside, "AGENTS.md"), dest.instructionsPath, "file");
+			const candidate = result({ instructionCandidates: [instruction("Imported instructions.")] });
+			const skipped = await planMigration({ results: [candidate], destinations: dest, force: false });
+			expect(skipped.actions[0]).toMatchObject({ operation: "skip", status: "skipped_exists" });
+			const forced = await planMigration({ results: [candidate], destinations: dest, force: true });
+			expect(forced.actions[0]).toMatchObject({ operation: "fail", status: "failed_invalid_destination" });
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("planMigration — diagnostics", () => {
 	test("source diagnostics become source actions", async () => {
 		const { actions } = await planMigration({
@@ -253,6 +317,39 @@ describe("planMigration — diagnostics", () => {
 			force: false,
 		});
 		expect(actions[0]).toMatchObject({ type: "source", status: "failed_invalid_source", operation: "fail" });
+	});
+});
+
+describe("executeActions — instruction destination safety", () => {
+	test("does not follow a symlinked project .gjc directory", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-instructions-executor-outside-"));
+		try {
+			const agentRoot = path.join(tmp, ".gjc");
+			await fs.symlink(outside, agentRoot, "dir");
+			const [action] = await executeActions(
+				[
+					{
+						source: "claude-code",
+						type: "instruction",
+						name: "CLAUDE.md",
+						destination: path.join(agentRoot, "AGENTS.md"),
+						operation: "create",
+						status: "imported",
+						instruction: { content: "Imported instructions." },
+					},
+				],
+				{ project: true },
+			);
+			expect(action).toMatchObject({ operation: "fail", status: "failed_io" });
+			expect(
+				await fs.access(path.join(outside, "AGENTS.md")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -285,5 +382,66 @@ describe("executeActions — skill destination safety", () => {
 		} finally {
 			await fs.rm(outside, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("executeActions — mcp destination safety", () => {
+	test("does not follow a symlinked .gjc while writing mcp config", async () => {
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "migrate-executor-mcp-outside-"));
+		try {
+			const agentRoot = path.join(tmp, ".gjc");
+			await fs.symlink(outside, agentRoot, "dir");
+			const [action] = await executeActions(
+				[
+					{
+						source: "claude-code",
+						type: "mcp",
+						name: "alpha",
+						destination: path.join(agentRoot, "mcp.json"),
+						operation: "create",
+						status: "imported",
+						mcp: { config: { command: "alpha-bin" }, force: false },
+					},
+				],
+				{ project: true },
+			);
+
+			expect(action).toMatchObject({ operation: "fail", status: "failed_io" });
+			expect(
+				await fs.access(path.join(outside, "mcp.json")).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("still allows an update when .gjc is a real directory", async () => {
+		const agentRoot = path.join(tmp, ".gjc");
+		await fs.mkdir(agentRoot);
+		const destination = path.join(agentRoot, "mcp.json");
+		await fs.writeFile(destination, JSON.stringify({ mcpServers: { alpha: { command: "old-bin" } } }), "utf-8");
+		const [action] = await executeActions(
+			[
+				{
+					source: "claude-code",
+					type: "mcp",
+					name: "alpha",
+					destination,
+					operation: "update",
+					status: "updated",
+					mcp: { config: { command: "new-bin" }, force: true },
+				},
+			],
+			{ project: true },
+		);
+
+		expect(action).toMatchObject({ operation: "update", status: "updated" });
+		const written = JSON.parse(await fs.readFile(destination, "utf-8")) as {
+			mcpServers: { alpha: { command: string } };
+		};
+		expect(written.mcpServers.alpha.command).toBe("new-bin");
 	});
 });

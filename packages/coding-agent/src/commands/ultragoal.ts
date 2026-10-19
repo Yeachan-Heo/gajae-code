@@ -51,12 +51,17 @@ export default class Ultragoal extends Command {
 			objective,
 			provenance,
 		});
-		await writePendingGoalModeRequest({
-			cwd,
-			objective,
-			goalsPath,
-			provenance,
-			sessionId: process.env[GJC_SESSION_ID_ENV],
-		});
+		// A matching or dynamic project declaration must not select the session.
+		// Skip the write in that case: the helper falls back to the same env value.
+		const sessionId = trustedCoordinatorEnv(GJC_SESSION_ID_ENV);
+		if (sessionId !== undefined || !process.env[GJC_SESSION_ID_ENV]?.trim()) {
+			await writePendingGoalModeRequest({
+				cwd,
+				objective,
+				goalsPath,
+				provenance,
+				sessionId,
+			});
+		}
 	}
 }

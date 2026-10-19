@@ -496,4 +496,53 @@ describe("defaultFinalizeChecks.runValidation (async runner)", () => {
 			await run.catch(() => undefined);
 		}
 	});
+
+	async function withPaneIdentity<T>(body: () => Promise<T>): Promise<T> {
+		const previousTmux = process.env.TMUX;
+		const previousPane = process.env.TMUX_PANE;
+		process.env.TMUX = `/tmp/tmux-validation-${process.pid},12345,0`;
+		process.env.TMUX_PANE = "%47";
+		try {
+			return await body();
+		} finally {
+			if (previousTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = previousTmux;
+			if (previousPane === undefined) delete process.env.TMUX_PANE;
+			else process.env.TMUX_PANE = previousPane;
+		}
+	}
+
+	it("does not run a validation command that targets this agent tmux pane", async () => {
+		const marker = path.join(root, "tmux-injection-marker");
+		await withPaneIdentity(async () => {
+			const checks = defaultFinalizeChecks(root);
+			const run = await checks.runValidation({
+				name: "inject",
+				command: "tmux send-keys -t %47 x; touch tmux-injection-marker",
+			});
+			expect(run.pass).toBe(false);
+			expect(run.exitStatus).not.toBe(0);
+			expect(run.exactCommand).toBe("tmux send-keys -t %47 x; touch tmux-injection-marker");
+			expect(run.cwd).toBe(root);
+			await expect(readFile(marker, "utf8")).rejects.toThrow();
+		});
+	});
+
+	it("still runs an ordinary validation command when a tmux pane identity is present", async () => {
+		const marker = path.join(root, "tmux-allowed-marker");
+		await withPaneIdentity(async () => {
+			const checks = defaultFinalizeChecks(root);
+			const run = await checks.runValidation({
+				name: "allowed",
+				command: "touch tmux-allowed-marker",
+			});
+			expect(run).toEqual({
+				exactCommand: "touch tmux-allowed-marker",
+				cwd: root,
+				exitStatus: 0,
+				pass: true,
+			});
+			expect(await readFile(marker, "utf8")).toBe("");
+		});
+	});
 });

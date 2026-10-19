@@ -15,6 +15,7 @@ import { createReconciliationStore } from "../src/sdk/bus/reconciliation-store";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import type { SdkFrame } from "../src/sdk/host/types";
 import { SessionManager } from "../src/session/session-manager";
+import { testBrokerDiscovery } from "./sdk-test-broker-discovery";
 
 /**
  * Acceptance for the LAST hop: a real `gjc` CLI process, run against a
@@ -139,6 +140,7 @@ async function publishRealLifecycleFrames(failure: AssistantMessage): Promise<Pu
 		} as never;
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: publisherRoot,
+			ensureBrokerImpl: async () => testBrokerDiscovery,
 			createTransport: async ({
 				sessionId,
 				stateRoot,

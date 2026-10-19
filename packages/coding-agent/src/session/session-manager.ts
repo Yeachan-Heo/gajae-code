@@ -3634,7 +3634,15 @@ function isLinkedWorktreePeer(a: string, b: string): boolean {
  * Read the terminal breadcrumb for the current terminal, scoped to a cwd.
  * Returns the session file path if it exists and matches the cwd, null otherwise.
  */
-async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
+async function readTerminalBreadcrumb(
+	cwd: string,
+	options: {
+		sessionsRoot?: string;
+		allowExplicitOutsideRoot?: boolean;
+		/** Managed continuation inventory, including project-local transcripts. */
+		continuationInventory?: readonly SessionInfo[];
+	} = {},
+): Promise<string | null> {
 	const terminalId = getTerminalId();
 	if (!terminalId) return null;
 
@@ -3656,9 +3664,9 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 
 		if (isStagedSessionPath(sessionFile)) return null;
 		const inspected = inspectResumeSessionFile(sessionFile, new FileSessionStorage());
+		const sessionsRoot = options.sessionsRoot ?? getSessionsDir();
 		if ("kind" in inspected) {
 			if (inspected.reason !== "missing") return null;
-			const sessionsRoot = getSessionsDir();
 			const resolved = resolveManagedScope({
 				cwd: breadcrumbCwd,
 				agentDir: path.resolve(sessionsRoot, ".."),
@@ -3675,7 +3683,6 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 		}
 		const header = inspected.entries[0] as SessionHeader;
 		if (resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(breadcrumbCwd)) return null;
-		const sessionsRoot = getSessionsDir();
 		const resolved = resolveManagedScope({
 			cwd: header.cwd,
 			agentDir: path.resolve(sessionsRoot, ".."),
@@ -3693,7 +3700,22 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 			candidate => !isStagedSessionPath(candidate.path) && candidate.sessionId === header.id,
 		);
 		if (byIdentity) return byIdentity.path;
-		return pathIsWithin(sessionsRoot, path.resolve(sessionFile)) ? null : path.resolve(sessionFile);
+		// Not an owned managed candidate. A file inside the sessions root stays
+		// rejected. A file outside that root is resumed only when this continuation
+		// inventory already contains it. An explicit destination still receives an
+		// unmatched outside path; the caller applies containment.
+		const resolvedFile = path.resolve(sessionFile);
+		const insideSessionsRoot = pathIsWithin(sessionsRoot, resolvedFile);
+		if (
+			!insideSessionsRoot &&
+			options.continuationInventory?.some(
+				session => session.id === header.id && path.resolve(session.path) === resolvedFile,
+			)
+		) {
+			return resolvedFile;
+		}
+		if (!options.allowExplicitOutsideRoot || insideSessionsRoot) return null;
+		return resolvedFile;
 	} catch (err) {
 		if (!isEnoent(err)) logger.debug("Terminal breadcrumb read failed", { err });
 		// Breadcrumb doesn't exist or is corrupt — fall through
@@ -7576,14 +7598,14 @@ type ManagedDestinationTransition = {
 /**
  * Freshness snapshot captured with every async whole-session persistence
  * preparation. Immediately before the synchronous persistence transaction, the
- * live values are compared: a `sessionFile`/`lifecycleId` change aborts (lifecycle
- * switch); a revision change discards the prepared bytes and re-prepares (bounded),
+ * live values are compared: a logical lifecycle change aborts; a verified storage
+ * relocation or revision change discards prepared bytes and re-prepares (bounded),
  * so a stale snapshot is never published.
  */
 export interface PersistenceInputToken {
 	/** Canonical session file path the prepared bytes target. */
 	sessionFile: string;
-	/** Per-manager lifecycle identity (`sessionId@sessionFile`); changes on switch/open/reset. */
+	/** Logical lifecycle identity; storage-only relocation preserves its verified origin. */
 	lifecycleId: string;
 	/** Revision of #fileEntries affecting persisted bytes. */
 	entryRevision: number;
@@ -7800,6 +7822,10 @@ export class SessionManager {
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
+	#managedTranscriptRelocationResolver: (() => ArtifactManager) | undefined;
+	#managedTranscriptRelocationResolverToken: symbol | undefined;
+	#managedTranscriptRelocationFileOrigin: string | undefined;
+	#managedTranscriptRelocationParentArtifacts: ArtifactManager | undefined;
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
 	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
 	readonly #managedSidecarCleanupStores = new Set<EphemeralBlobStore>();
@@ -10289,6 +10315,7 @@ export class SessionManager {
 						}
 						this.#artifactManager = null;
 						this.#artifactManagerSessionFile = null;
+						this.#clearManagedTranscriptRelocationResolver();
 						this.#artifactLifecycle = Symbol("session-artifact-adoption");
 						installedGeneration = this.#artifactLifecycle;
 						installedSessionId = this.#sessionId;
@@ -10402,6 +10429,7 @@ export class SessionManager {
 					throw error;
 				}
 				managedTransition?.adopt();
+				this.#clearManagedTranscriptRelocationResolver();
 				this.#sessionFile = resolvedSessionFile;
 				this.#sessionId = sessionId;
 				this.#sessionName = header?.title;
@@ -10489,6 +10517,7 @@ export class SessionManager {
 				prepared.dispose();
 				throw error;
 			}
+			this.#clearManagedTranscriptRelocationResolver();
 			managedTransition?.settle();
 			this.#pendingStrictAdoption = undefined;
 			await this.#rewriteFile();
@@ -10958,6 +10987,7 @@ export class SessionManager {
 		this.#adoptedArtifactManager = null;
 		this.#managedPersistExpectedIdentity = expectedIdentity;
 		this.#commitResidentTextStoreTransition(transition);
+		this.#clearManagedTranscriptRelocationResolver();
 		this.#retireEphemeralArtifacts();
 		stage.committed = true;
 		this.#preparedNewSessions.delete(stage);
@@ -12196,6 +12226,9 @@ export class SessionManager {
 								path.basename(oldArtifactDir),
 								managedPublishedArtifacts,
 							);
+							// The restored namespace has a new directory identity, even at the same path.
+							this.#artifactManager = null;
+							this.#artifactManagerSessionFile = null;
 						}
 						if (managedTranscript && !managedSourceStore.readExpected(path.basename(oldSessionFile)))
 							await managedSourceStore.publishNoReplace(path.basename(oldSessionFile), managedTranscript.bytes);
@@ -12303,6 +12336,8 @@ export class SessionManager {
 									path.basename(oldArtifactDir),
 									managedPublishedArtifacts,
 								);
+								this.#artifactManager = null;
+								this.#artifactManagerSessionFile = null;
 								const restored = managedSourceStore.captureTree(path.basename(oldArtifactDir));
 								if (!retainedTreeSnapshotEqualsAfterRename(restored, managedArtifacts))
 									throw new Error("managed_move_source_restore_mismatch");
@@ -12653,7 +12688,7 @@ export class SessionManager {
 	#capturePersistenceInputToken(): PersistenceInputToken {
 		return {
 			sessionFile: this.#sessionFile ?? "",
-			lifecycleId: `${this.#sessionId}@${this.#sessionFile ?? ""}`,
+			lifecycleId: `${this.#sessionId}@${this.#managedTranscriptRelocationFileOrigin ?? this.#sessionFile ?? ""}`,
 			entryRevision: this.#entryRevision,
 			headerRevision: this.#headerExportRevision,
 			residentBlobRevision: this.#residentBlobRevision,
@@ -12667,9 +12702,10 @@ export class SessionManager {
 	 */
 	#persistenceInputTokenMatches(token: PersistenceInputToken): boolean {
 		const live = this.#capturePersistenceInputToken();
-		if (live.sessionFile !== token.sessionFile || live.lifecycleId !== token.lifecycleId) {
+		if (live.lifecycleId !== token.lifecycleId) {
 			throw new Error("session_persistence_lifecycle_changed");
 		}
+		if (live.sessionFile !== token.sessionFile) return false;
 		return (
 			live.entryRevision === token.entryRevision &&
 			live.headerRevision === token.headerRevision &&
@@ -12935,10 +12971,162 @@ export class SessionManager {
 		this.#ownedManagedAuthority = undefined;
 	}
 
+	/**
+	 * Register the same-owner task capability used to follow a parent's managed
+	 * artifact root after its session move. The synchronous resolver must return
+	 * only the current ArtifactManager for the same parent ID and parent transcript
+	 * basename; it retains the last verified manager on a logical successor.
+	 * Registration captures the exact original manager identity. Unchanged identity
+	 * keeps using the child's retained store; a changed identity triggers strict
+	 * destination transcript verification before re-rooting.
+	 */
+	registerManagedTranscriptRelocationResolver(resolver: () => ArtifactManager): () => void {
+		if (this.destination.kind !== "managed")
+			throw new Error("Managed transcript relocation requires a managed session");
+		if (this.#managedTranscriptRelocationResolver)
+			throw new Error("Managed transcript relocation resolver is already registered");
+		const originalParentArtifacts = resolver();
+		const registrationToken = Symbol("managed-transcript-relocation");
+		this.#managedTranscriptRelocationResolver = resolver;
+		this.#managedTranscriptRelocationResolverToken = registrationToken;
+		this.#managedTranscriptRelocationParentArtifacts = originalParentArtifacts;
+		return () => {
+			if (this.#managedTranscriptRelocationResolverToken === registrationToken)
+				this.#clearManagedTranscriptRelocationResolver();
+		};
+	}
+
+	#clearManagedTranscriptRelocationResolver(): void {
+		this.#managedTranscriptRelocationResolver = undefined;
+		this.#managedTranscriptRelocationResolverToken = undefined;
+		this.#managedTranscriptRelocationFileOrigin = undefined;
+		this.#managedTranscriptRelocationParentArtifacts = undefined;
+	}
+
+	#refreshManagedTranscriptRelocation(sessionFile = this.#sessionFile): void {
+		const currentSessionFile = this.#sessionFile;
+		const resolver = this.#managedTranscriptRelocationResolver;
+		if (this.destination.kind !== "managed" || !currentSessionFile || sessionFile !== currentSessionFile || !resolver)
+			return;
+
+		const parentArtifacts = resolver();
+		const nextDirectory = path.resolve(parentArtifacts.dir);
+		const parentArtifactsChanged = this.#managedTranscriptRelocationParentArtifacts !== parentArtifacts;
+		if (nextDirectory === path.resolve(this.destination.directory) && !parentArtifactsChanged) return;
+		parentArtifacts.assertManagedBinding();
+		const parentStore = parentArtifacts.getManagedStore();
+		if (!parentStore || path.resolve(parentStore.dir) !== nextDirectory)
+			throw new Error("managed_transcript_relocation_parent_authority_unavailable");
+		parentStore.assertBound();
+		if (path.resolve(path.dirname(currentSessionFile)) !== path.resolve(this.destination.directory))
+			throw new Error("managed_transcript_relocation_source_path_unverified");
+		const transcriptName = path.basename(currentSessionFile);
+		const nextSessionFile = path.join(nextDirectory, transcriptName);
+		if (path.basename(nextSessionFile) !== transcriptName)
+			throw new Error("managed_transcript_relocation_transcript_name_mismatch");
+
+		if (this.#stagedPublication) throw new Error("managed_transcript_relocation_staged_publication_unavailable");
+		if (this.#persistWriter || this.#persistWriterPath)
+			throw new Error("managed_transcript_relocation_writer_unavailable");
+		if (this.#boundedManagedSource) throw new Error("managed_transcript_relocation_bounded_source_unavailable");
+		if (this.#coldSidecarActive() || (this.#sidecarRuntime?.coldEntries.size ?? 0) > 0)
+			throw new Error("managed_transcript_relocation_cold_sidecar_unavailable");
+		if (this.#recoveryHydrationContext || this.#recoveryPromotionTranscriptPath || this.#pendingStrictAdoption)
+			throw new Error("managed_transcript_relocation_recovery_state_unavailable");
+
+		const expectedIdentity = this.#managedPersistExpectedIdentity;
+		if (
+			!expectedIdentity ||
+			!Number.isSafeInteger(expectedIdentity.size) ||
+			expectedIdentity.size < 0 ||
+			typeof expectedIdentity.sha256 !== "string" ||
+			!/^[0-9a-f]{64}$/.test(expectedIdentity.sha256)
+		)
+			throw new Error("managed_transcript_relocation_original_identity_unavailable");
+
+		let nextDestination: SessionDestination | undefined;
+		let nextStore: ManagedSessionDescendantStore | undefined;
+		let adopted = false;
+		try {
+			nextDestination = SessionManager.nestedManagedDestination(parentStore, nextDirectory);
+			if (nextDestination.kind !== "managed")
+				throw new Error("managed_transcript_relocation_destination_unavailable");
+			nextStore = managedStoreFromContext(nextDestination.securityContext, nextDirectory);
+			nextStore.verifyRootSecurity();
+			nextStore.assertBound();
+			const destinationTranscript = nextStore.readExpected(transcriptName);
+			if (!destinationTranscript) throw new Error("managed_transcript_relocation_destination_missing");
+			const destinationSha256 = crypto.createHash("sha256").update(destinationTranscript.bytes).digest("hex");
+			if (
+				destinationTranscript.identity.size !== expectedIdentity.size ||
+				destinationTranscript.bytes.byteLength !== expectedIdentity.size ||
+				destinationTranscript.identity.sha256 !== expectedIdentity.sha256 ||
+				destinationSha256 !== expectedIdentity.sha256
+			)
+				throw new Error("managed_transcript_relocation_destination_identity_mismatch");
+
+			parentArtifacts.assertManagedBinding();
+			parentStore.assertBound();
+			nextStore.assertBound();
+
+			const previousDestination = this.destination;
+			const previousCache = this.#managedTranscriptStoreCache;
+			const previousOwnedAuthority = this.#ownedManagedAuthority;
+			const previousArtifactStore = this.#artifactManager?.getManagedStore();
+			// A hot/shadow sidecar remains a disposable cache over the same verified
+			// transcript bytes. Keep its resident state and cache root; only retag the
+			// cache key. Cold and bounded source state was rejected above because it
+			// pins descriptor/path state that cannot be retargeted without rebuilding.
+			if (this.#managedSidecarCacheStore) this.#managedSidecarCacheSessionFile = nextSessionFile;
+			this.#boundedReadStorageProxy = undefined;
+			this.#managedTranscriptRelocationFileOrigin ??= currentSessionFile;
+			this.destination = nextDestination;
+			this.sessionDir = nextDirectory;
+			this.#sessionFile = nextSessionFile;
+			this.#managedTranscriptStoreCache = { directory: nextDirectory, store: nextStore };
+			this.#managedPersistExpectedIdentity = { ...destinationTranscript.identity };
+			this.#managedRangeExpectedDescriptor = {
+				dev: destinationTranscript.identity.dev,
+				ino: destinationTranscript.identity.ino,
+				nlink: destinationTranscript.identity.nlink,
+				size: destinationTranscript.identity.size,
+				mtimeNs: destinationTranscript.identity.mtimeNs,
+				ctimeNs: destinationTranscript.identity.ctimeNs,
+			};
+			this.#adoptedArtifactManager = parentArtifacts;
+			this.#managedTranscriptRelocationParentArtifacts = parentArtifacts;
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+			this.#ownedManagedAuthority = undefined;
+			adopted = true;
+
+			// These stores were created by this manager. Their close methods release
+			// only authorities they actually own; the borrowed parent manager remains
+			// untouched.
+			previousCache?.store.close();
+			if (previousOwnedAuthority && previousOwnedAuthority !== previousCache?.store) previousOwnedAuthority.close();
+			if (previousArtifactStore && previousArtifactStore !== parentStore && previousArtifactStore !== nextStore)
+				previousArtifactStore.close();
+			if (previousDestination.kind === "managed") previousDestination.securityContext.retainedAuthority?.close();
+		} catch (error) {
+			if (!adopted) {
+				nextStore?.close();
+				if (nextDestination?.kind === "managed") nextDestination.securityContext.retainedAuthority?.close();
+			}
+			throw error;
+		}
+	}
+
 	#managedTranscriptStore(sessionFile = this.#sessionFile): ManagedSessionDescendantStore {
 		if (this.destination.kind !== "managed" || !sessionFile) {
 			throw new Error("Managed transcript authority is unavailable");
 		}
+		const previousSessionFile = this.#sessionFile;
+		if (sessionFile === previousSessionFile) {
+			this.#refreshManagedTranscriptRelocation(sessionFile);
+			if (this.#sessionFile !== previousSessionFile) sessionFile = this.#sessionFile;
+		}
+		if (!sessionFile) throw new Error("Managed transcript authority is unavailable");
 		const sessionDir = path.resolve(path.dirname(sessionFile));
 		if (sessionDir !== path.resolve(this.destination.directory)) {
 			throw new Error("Managed transcript escaped its session directory");
@@ -16592,6 +16780,7 @@ export class SessionManager {
 		// aborts. A stale snapshot is never published.
 		let written = false;
 		for (let attempt = 0; attempt <= 2 && !written; attempt++) {
+			this.#refreshManagedTranscriptRelocation();
 			this.#ensureFullHotView();
 			const token = this.#capturePersistenceInputToken();
 			await this.#closePersistWriterInternal();
@@ -16601,6 +16790,7 @@ export class SessionManager {
 				),
 			);
 			written = this.#withSessionPersistenceFenceSync(() => {
+				this.#refreshManagedTranscriptRelocation();
 				if (!this.#persistenceInputTokenMatches(token)) return false;
 				this.#writeEntriesAtomicallySync(entries);
 				return true;
@@ -16624,6 +16814,7 @@ export class SessionManager {
 
 	#rewriteFileSync(): void {
 		if (!this.persist || !this.#sessionFile) return;
+		this.#refreshManagedTranscriptRelocation();
 		this.#withSessionPersistenceFenceSync(() => {
 			this.#ensureFullHotView();
 			// Sync lane: capture and check the token immediately (always fresh absent
@@ -16958,6 +17149,7 @@ export class SessionManager {
 	}
 
 	#releaseClosedSessionState(): void {
+		this.#clearManagedTranscriptRelocationResolver();
 		const runtime = this.#sidecarRuntime;
 		if (runtime) {
 			runtime.enabled = false;
@@ -18552,6 +18744,7 @@ export class SessionManager {
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
+		this.#refreshManagedTranscriptRelocation();
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		this.#withSessionPersistenceFenceSync(() => {
 			const sessionFile = this.#sessionFile!;
@@ -18580,12 +18773,23 @@ export class SessionManager {
 
 	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
 		if (records.length === 0) return;
-		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
-		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) return;
-		const sessionFile = this.#sessionFile;
+		try {
+			this.#refreshManagedTranscriptRelocation();
+		} catch (error) {
+			this.#recordPersistError(error);
+			throw this.#persistError ?? toError(error);
+		}
+		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) {
+			if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+			return;
+		}
+		let sessionFile = this.#sessionFile;
 		const publishResumeBreadcrumb = this.#readOnlyResume;
 		await this.#queuePersistTask(async () => {
 			for (let attempt = 0; attempt <= 2; attempt++) {
+				this.#refreshManagedTranscriptRelocation();
+				if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+				sessionFile = this.#sessionFile!;
 				const token = this.#capturePersistenceInputToken();
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (
@@ -18594,6 +18798,7 @@ export class SessionManager {
 					(header?.version ?? 1) < CURRENT_SESSION_VERSION
 				) {
 					await this.#rewriteFileContents();
+					sessionFile = this.#sessionFile!;
 					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
 					this.#readOnlyResume = false;
 					return;
@@ -18613,6 +18818,7 @@ export class SessionManager {
 				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
 				let persisted = false;
 				const written = this.#withSessionPersistenceFenceSync(() => {
+					this.#refreshManagedTranscriptRelocation();
 					if (!this.#persistenceInputTokenMatches(token)) return false;
 					if (this.destination.kind === "managed") {
 						this.#appendManagedRecordsSync(persistedRecords);
@@ -18645,8 +18851,14 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#strictClosePending) throw new Error("Session manager is closing.");
-		const publishResumeBreadcrumb = this.#readOnlyResume;
 		if (this.#persistError) throw this.#persistError;
+		try {
+			this.#refreshManagedTranscriptRelocation();
+		} catch (error) {
+			this.#recordPersistError(error);
+			throw this.#persistError ?? toError(error);
+		}
+		const publishResumeBreadcrumb = this.#readOnlyResume;
 
 		// Normally we wait for the first assistant message before persisting to avoid
 		// creating files for sessions that never produce output. Once ensureOnDisk() has
@@ -20553,6 +20765,7 @@ export class SessionManager {
 			}
 			this.#sessionId = newSessionId;
 			this.#sessionFile = newSessionFile;
+			this.#clearManagedTranscriptRelocationResolver();
 			this.#flushed = true;
 			this.#commitResidentTextStoreTransition(transition);
 			this.#adoptManagedPersistIdentity(newSessionFile);
@@ -20587,6 +20800,7 @@ export class SessionManager {
 			"retain-and-throw",
 		);
 		this.#sessionId = newSessionId;
+		this.#clearManagedTranscriptRelocationResolver();
 		this.#commitResidentTextStoreTransition(transition);
 		return undefined;
 	}
@@ -23045,7 +23259,15 @@ export class SessionManager {
 						storage,
 					);
 
-		const terminalSession = await readTerminalBreadcrumb(cwd);
+		const terminalSession = await readTerminalBreadcrumb(cwd, {
+			...(destination.kind === "managed"
+				? {
+						sessionsRoot: destination.securityContext.sessionsRoot,
+						continuationInventory: managedCandidates,
+					}
+				: {}),
+			allowExplicitOutsideRoot: destination.kind === "explicit",
+		});
 		const terminalSessionIsInExplicitRoot = (() => {
 			if (destination.kind === "managed" || !terminalSession) return destination.kind === "managed";
 			const canonicalRoot = canonicalizeTrustedPath(destination.directory);

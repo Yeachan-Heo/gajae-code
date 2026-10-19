@@ -311,6 +311,12 @@ export class NotificationSettingsOverrideError extends Error {
 }
 
 const LOCAL_NOTIFICATION_SETTING_KEYS = new Set(["terminalBell", "bellOnComplete", "bellOnApproval", "bellOnAsk"]);
+/** `auth.*` keys that select credentials; startup reads them from global config only, so project copies are dropped. */
+const GLOBAL_ONLY_AUTH_SETTING_KEYS = new Set([
+	"credentialPins",
+	"credentialPinStoreIdentity",
+	"credentialPreferences",
+]);
 const LOCAL_NOTIFICATION_SETTING_PATHS = new Set(
 	[...LOCAL_NOTIFICATION_SETTING_KEYS].map(key => `notifications.${key}`),
 );
@@ -384,6 +390,11 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"paseo.autoImport",
 	"ui.language",
 	"telemetry.enabled",
+	// Destination of the operator Hindsight server. A project file must not redirect it.
+	"hindsight.apiUrl",
+	// Operator consent for repository skills. A project file must not flip it.
+	"skills.trustProjectSkills",
+	"skills.enablePiProject",
 ]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
@@ -2043,13 +2054,16 @@ export class Settings implements NotificationSettingsReader {
 				const data = item.path.endsWith(`${path.sep}settings.json`)
 					? await this.#stripRetiredWorkflowKeys(item.path, structuredClone(item.data as RawSettings))
 					: (item.data as RawSettings);
-				const { settings, rejectedNotifications, rejectedCredentialPins } =
+				const { settings, rejectedNotifications, rejectedCredentialSelection } =
 					this.#stripProjectNotificationSettings(data);
 				if (rejectedNotifications) {
 					logger.warn("Settings: ignoring project notification settings", { path: item.path });
 				}
-				if (rejectedCredentialPins) {
-					logger.warn("Settings: ignoring project auth.credentialPins; pins are global-only", { path: item.path });
+				if (rejectedCredentialSelection) {
+					logger.warn(
+						"Settings: ignoring project auth credential pins/preferences; credential selection is global-only",
+						{ path: item.path },
+					);
 				}
 				merged = this.#deepMerge(merged, settings);
 			}
@@ -6469,27 +6483,25 @@ export class Settings implements NotificationSettingsReader {
 	#stripProjectNotificationSettings(settings: RawSettings): {
 		settings: RawSettings;
 		rejectedNotifications: boolean;
-		rejectedCredentialPins: boolean;
+		rejectedCredentialSelection: boolean;
 	} {
 		let rejectedNotifications = false;
-		let rejectedCredentialPins = false;
+		let rejectedCredentialSelection = false;
 		const sanitized: RawSettings = {};
 		for (const [key, value] of Object.entries(settings)) {
 			if (key === "auth" && value && typeof value === "object" && !Array.isArray(value)) {
 				const authSettings = { ...(value as Record<string, unknown>) };
-				if (Object.hasOwn(authSettings, "credentialPins")) {
-					delete authSettings.credentialPins;
-					rejectedCredentialPins = true;
-				}
-				if (Object.hasOwn(authSettings, "credentialPinStoreIdentity")) {
-					delete authSettings.credentialPinStoreIdentity;
-					rejectedCredentialPins = true;
+				for (const key of GLOBAL_ONLY_AUTH_SETTING_KEYS) {
+					if (Object.hasOwn(authSettings, key)) {
+						delete authSettings[key];
+						rejectedCredentialSelection = true;
+					}
 				}
 				if (Object.keys(authSettings).length > 0) sanitized[key] = authSettings;
 				continue;
 			}
-			if (key === "auth.credentialPins" || key === "auth.credentialPinStoreIdentity") {
-				rejectedCredentialPins = true;
+			if (key.startsWith("auth.") && GLOBAL_ONLY_AUTH_SETTING_KEYS.has(key.slice("auth.".length))) {
+				rejectedCredentialSelection = true;
 				continue;
 			}
 			if (key === "notifications" && value && typeof value === "object" && !Array.isArray(value)) {
@@ -6510,7 +6522,7 @@ export class Settings implements NotificationSettingsReader {
 			}
 			sanitized[key] = value;
 		}
-		return { settings: sanitized, rejectedNotifications, rejectedCredentialPins };
+		return { settings: sanitized, rejectedNotifications, rejectedCredentialSelection };
 	}
 
 	#deepMerge(base: RawSettings, overrides: RawSettings): RawSettings {

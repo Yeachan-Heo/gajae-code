@@ -232,6 +232,40 @@ export function isRateLimitedGhResult(exitCode: number, stderr: string): boolean
 	return /rate limit exceeded|secondary rate limit|abuse detection/iu.test(stderr);
 }
 
+/** stderr patterns for a read GitHub dropped in flight, not a refusal or a "does not exist" answer. */
+const TRANSIENT_GH_PATTERNS: readonly RegExp[] = [
+	// `gh --jq` over a truncated or empty response body.
+	/unexpected end of JSON input/iu,
+	/\bHTTP 50[0234]\b/u,
+	/connection reset by peer|unexpected EOF|i\/o timeout|TLS handshake timeout/iu,
+];
+
+/**
+ * True for a transport-level failure where the same read can succeed on retry.
+ * A large release window issues hundreds of reads, so one dropped response is
+ * likely. Before this check it failed release-note derivation after the tag was
+ * already immutable (v0.18.12 failed twice on "unexpected end of JSON input").
+ * Retrying does not change which results count as complete. A failure that
+ * persists still fails closed.
+ */
+export function isTransientGhResult(exitCode: number, stderr: string): boolean {
+	if (exitCode === 0) return false;
+	return TRANSIENT_GH_PATTERNS.some(pattern => pattern.test(stderr));
+}
+
+const GH_TRANSIENT_ATTEMPTS = 4;
+
+/** Runs a read-only gh call, retrying only transient transport failures with exponential backoff. */
+async function runGh(args: readonly string[]): Promise<$.ShellOutput> {
+	for (let attempt = 1; ; attempt++) {
+		const result = await $`gh ${args}`.quiet().nothrow();
+		if (attempt >= GH_TRANSIENT_ATTEMPTS || !isTransientGhResult(result.exitCode, result.stderr.toString())) {
+			return result;
+		}
+		await Bun.sleep(1_000 * 2 ** attempt);
+	}
+}
+
 /**
  * Milliseconds to wait for a quota window to reopen, from a UNIX-second reset
  * stamp. Clamped: a missing/absurd stamp still waits a usable minimum, and a
@@ -268,7 +302,7 @@ async function ghSearch(args: readonly string[]): Promise<string> {
 		if (quota && quota.remaining <= 1) {
 			await Bun.sleep(rateLimitWaitMs(quota.reset, Date.now()));
 		}
-		const result = await $`gh ${args}`.quiet().nothrow();
+		const result = await runGh(args);
 		if (result.exitCode === 0) return result.stdout.toString();
 		const stderr = result.stderr.toString().trim();
 		if (attempt >= 5 || !isRateLimitedGhResult(result.exitCode, stderr)) {
@@ -279,7 +313,7 @@ async function ghSearch(args: readonly string[]): Promise<string> {
 }
 
 async function gh(args: readonly string[]): Promise<string> {
-	const result = await $`gh ${args}`.quiet().nothrow();
+	const result = await runGh(args);
 	if (result.exitCode !== 0) {
 		throw new Error(`gh ${args.join(" ")} failed (exit ${result.exitCode}): ${result.stderr.toString().trim()}`);
 	}
@@ -287,7 +321,7 @@ async function gh(args: readonly string[]): Promise<string> {
 }
 
 async function ghAllowExplicitEmpty(args: readonly string[]): Promise<string | undefined> {
-	const result = await $`gh ${args}`.quiet().nothrow();
+	const result = await runGh(args);
 	if (result.exitCode !== 0) {
 		const stderr = result.stderr.toString().trim();
 		if (isExplicitEmptyGhResult(result.exitCode, stderr)) return undefined;
@@ -329,7 +363,7 @@ async function cherryPickOrigin(sha: string): Promise<string> {
  * attribution, so the shipped OID is used instead.
  */
 async function isKnownCommit(repo: string, sha: string): Promise<boolean> {
-	const result = await $`gh api ${`repos/${repo}/commits/${sha}`} --jq .sha`.quiet().nothrow();
+	const result = await runGh(["api", `repos/${repo}/commits/${sha}`, "--jq", ".sha"]);
 	if (result.exitCode === 0) return true;
 	const stderr = result.stderr.toString().trim();
 	if (isUnknownCommitGhResult(result.exitCode, stderr)) return false;

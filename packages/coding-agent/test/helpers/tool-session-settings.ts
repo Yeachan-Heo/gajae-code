@@ -25,6 +25,7 @@ export const stubBashExecutorSettings: {
 	getGroup: () => ({
 		enabled: false,
 		settingsPath: undefined,
+		settingsHash: undefined,
 		only: [],
 		except: [],
 		maxCaptureBytes: 0,

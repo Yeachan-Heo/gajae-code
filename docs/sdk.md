@@ -144,6 +144,19 @@ This boundary prevents a child from newly loading caller-cwd or user-global Bun 
 
 Broker and per-session discovery tokens remain in their authoritative private discovery files for SDK-core resolution. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
 
+### Recovering legacy broker locks
+
+Broker lock records written before host qualification do not identify which machine created them. A machine cannot safely infer that such a lock belongs to it from a locally absent or reused PID when the agent directory is shared. GJC therefore refuses to reclaim a host-unqualified lock automatically; the error links here rather than treating an unverifiable owner as dead.
+
+For a legacy lock that blocks startup, recover it only after confirming that every GJC broker using the same agent directory has stopped on every host that can access that directory:
+
+1. Stop the GJC processes or supervisor services that can start the broker on each host using that agent directory. Do not proceed while any broker may still be serving sessions or renewing discovery.
+2. Copy `sdk/broker.lock` and `sdk/broker.json` to a backup location outside the agent directory. Preserve the originals until startup and session state have been checked.
+3. Move both `sdk/broker.lock` and `sdk/broker.json` out of the `sdk` directory. Do not use this procedure for a host-qualified lock or while any host may still be running a broker.
+4. Start one GJC process using the agent directory and verify broker startup before restarting other clients or supervisors.
+
+This procedure is a one-time operator migration for old host-unqualified records, not a way to take over a lock from a running broker. If all brokers cannot be stopped or the record already contains a host identity, preserve the lock and investigate the owning host instead.
+
 ## Internal protocol
 
 The following frame shapes are SDK-core implementation details for maintainers.
@@ -194,6 +207,20 @@ broker-bound CLI, or Coordinator MCP instead.
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
+Live tool content on both the broker-created bus host and SDK-only host uses
+`{type:"event", kind:"tool_execution_start"|"tool_execution_update"|"tool_execution_end", payload:{event_type,event}}`.
+Prompt owners receive their command/turn correlation. Explicit observers must
+negotiate **both** `turn_stream` and `session_host_observer_v1`; their copy has no
+other client's correlation, and an owner also observing receives no duplicate.
+On the internal wire, `hello` or `event_replay.capabilities` declares these opt-ins
+on the authenticated connection; replay negotiation merges with existing caps.
+Capabilities do not confer lifecycle or session identity authority.
+Tool updates carry cumulative `partialResult` snapshots, not append-only deltas;
+replace the prior snapshot. The end frame's `result` is authoritative, including
+when it differs from the last update. These content frames are best-effort and
+not retained in lifecycle replay. A replay acknowledgement without content is
+not evidence that a running tool produced no output.
+
 `bash_folded` — a foreground bash wait left the foreground and became a background job. Emitted once per fold into the replayable session event ring (so late-connecting clients receive it on `event_replay`), with `generic_safe` adapter disposition:
 
 ```json
@@ -204,7 +231,7 @@ Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 - A replayed frame may describe a job that has since finished. `runtime.jobs.list` is the source of truth: each running/recent job carries `metadata.backgrounded` and, whenever it is `true` because of a fold, `metadata.foldReason` with the same values. The `bash.background` control (C52) returns `{ backgrounded: true, jobId }` on a fresh fold, `already_backgrounded` when no wait is foldable but a running job of this session was already folded (by steer, chord, timer, or a prior control call), `no_active_bash` when nothing is running or foldable, and `not_foldable` when a live wait refused the fold.
 - A `turn.steer` that folds a running bash behaves exactly like a TUI steer: the steer is consumed by the same turn at the tool boundary immediately after the fold result; `turn.steer_status` is unchanged.
 
-The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
+The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), `awaiting_input` (a foreground `bash` command printed a browser sign-in or device-code prompt and went quiet; carries only `toolCallId`, `toolName`, and `kind` — `browser_auth` or `device_code` — never the URL, code, command, or output; delivered live only to clients that advertise the `awaiting_input_v1` capability and never retained for `event_replay`; a notice detected while notification policy is provisional is held and delivered on activation if the command is still running), and `pong`.
 
 ### Internal inbound frames
 
@@ -1020,8 +1047,9 @@ or gateway details outside logged payloads.
 answer remotely, so its `question` and `options` are always sent unredacted
 (otherwise it would be unanswerable). When redaction is enabled, `idle`
 summaries are removed and streamed content frames (`turn_stream`,
-`context_update`, `image_attachment`) are suppressed at their emit sites. When
-redaction is disabled, all content is delivered unchanged.
+`context_update`, `image_attachment`) are suppressed at their emit sites. The
+content-free `awaiting_input` notice is still delivered. When redaction is
+disabled, all content is delivered unchanged.
 
 ### Local `/notify`
 

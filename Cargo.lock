@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "gjc-sdk"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "futures-util",
  "hmac",
@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -3074,11 +3074,11 @@ dependencies = [
 
 [[package]]
 name = "pi-diff"
-version = "0.18.11"
+version = "0.18.12"
 
 [[package]]
 name = "pi-edit"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "async-trait",
  "libc",
@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3119,6 +3119,7 @@ dependencies = [
  "clipboard-win",
  "dashmap",
  "find-msvc-tools",
+ "flate2",
  "gjc-sdk",
  "globset",
  "grep-matcher",
@@ -3175,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "anyhow",
  "brush-builtins",
@@ -3192,6 +3193,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",
@@ -3202,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "pi-vfs"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "async-trait",
  "libc",
@@ -3215,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "0.18.11"
+version = "0.18.12"
 dependencies = [
  "globset",
  "ignore",

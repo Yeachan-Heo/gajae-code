@@ -30,6 +30,8 @@ import {
 	completeSimple,
 	type Message,
 	type Model,
+	modelSupportsServiceTier,
+	modelSupportsUltrafastTier,
 	type ServiceTier,
 	type SimpleStreamOptions,
 	type StopReason,
@@ -775,7 +777,7 @@ export function startChatSpan(
 		model,
 		parent: options.parent,
 		stepNumber: options.stepNumber,
-		attributes: buildChatRequestAttributes(options.stepNumber, options.request, model.provider),
+		attributes: buildChatRequestAttributes(options.stepNumber, options.request, model),
 	});
 	if (span) {
 		telemetry.collector.beginChat(span, {
@@ -809,7 +811,7 @@ export interface ChatRequestSnapshot {
 	readonly messages?: readonly Message[];
 }
 
-function buildChatRequestAttributes(stepNumber: number, request: ChatRequestSnapshot, provider: string): Attributes {
+function buildChatRequestAttributes(stepNumber: number, request: ChatRequestSnapshot, model: Model): Attributes {
 	const attrs: Attributes = {
 		[PiGenAIAttr.AgentStepNumber]: stepNumber,
 		[GenAIAttr.OutputType]: "text",
@@ -825,7 +827,16 @@ function buildChatRequestAttributes(stepNumber: number, request: ChatRequestSnap
 	if (request.stopSequences && request.stopSequences.length > 0) {
 		attrs[GenAIAttr.RequestStopSequences] = [...request.stopSequences];
 	}
-	if (request.serviceTier && shouldSendServiceTier(request.serviceTier, provider)) {
+	if (
+		request.serviceTier &&
+		shouldSendServiceTier(
+			request.serviceTier,
+			model.provider,
+			modelSupportsServiceTier(model),
+			modelSupportsUltrafastTier(model),
+		) &&
+		(request.serviceTier !== "ultrafast" || modelSupportsUltrafastTier(model))
+	) {
 		attrs[OpenAIAttr.RequestServiceTier] = request.serviceTier;
 	}
 	if (request.reasoningEffort) attrs[PiGenAIAttr.RequestReasoningEffort] = request.reasoningEffort;
@@ -1189,17 +1200,18 @@ export async function finishChatSpan(
 		readonly baseUrl?: string;
 	},
 ): Promise<void> {
+	const serviceTier = resolveCompletedServiceTier(message, options.serviceTier);
 	// Usage-only mode (spans disabled): the chat span is absent but usage/cost
 	// hooks must still fire per contract C3. Cost estimation and the usage
 	// event run against a non-recording placeholder span.
 	if (!span) {
 		if (!telemetry || telemetry.spansEnabled) return;
 		const placeholder = trace.wrapSpanContext(INVALID_SPAN_CONTEXT);
-		const usageCost = applyCostEstimate(telemetry, placeholder, message, options.serviceTier, options.stepNumber);
+		const usageCost = applyCostEstimate(telemetry, placeholder, message, serviceTier, options.stepNumber);
 		await emitChatUsage(telemetry, placeholder, {
 			model: message.model,
 			provider: message.provider,
-			serviceTier: options.serviceTier,
+			serviceTier,
 			stepNumber: options.stepNumber,
 			usage: message.usage,
 			applied: usageCost,
@@ -1217,12 +1229,12 @@ export async function finishChatSpan(
 	applyChatResponseAttributes(span, message);
 	applyUsageAttributes(span, message.usage);
 	applyGatewayAttributes(span, options.responseHeaders, options.baseUrl);
-	const cost = applyCostEstimate(telemetry, span, message, options.serviceTier, options.stepNumber);
+	const cost = applyCostEstimate(telemetry, span, message, serviceTier, options.stepNumber);
 	if (telemetry) {
 		await emitChatUsage(telemetry, span, {
 			model: message.model,
 			provider: message.provider,
-			serviceTier: options.serviceTier,
+			serviceTier,
 			stepNumber: options.stepNumber,
 			usage: message.usage,
 			applied: cost,
@@ -1287,6 +1299,15 @@ export function failChatSpan(
 	}
 	telemetry?.collector.failChat(span, { errorType });
 	span.end();
+}
+
+function resolveCompletedServiceTier(
+	message: AssistantMessage,
+	requestedServiceTier: ServiceTier | undefined,
+): ServiceTier | undefined {
+	if (message.serviceTier !== undefined) return message.serviceTier;
+	// Ultrafast is sent only for opted-in models, so an absent completion tier means it was not applied.
+	return requestedServiceTier === "ultrafast" ? undefined : requestedServiceTier;
 }
 
 function applyChatResponseAttributes(span: Span, message: AssistantMessage): void {

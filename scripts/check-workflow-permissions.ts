@@ -27,6 +27,10 @@ export const JOB_WRITE_ALLOWLIST: readonly { workflow: string; job: string; scop
 	// short-lived registry credential. It grants nothing in this repository, and
 	// it is what removes the long-lived NPM_TOKEN from the release path.
 	{ workflow: ".github/workflows/ci.yml", job: "publish", scope: "id-token" },
+	// Re-request review workflow needs pull-requests and issues write permissions
+	// to request reviews and react to comments on PRs triggered by issue_comment.
+	{ workflow: ".github/workflows/re-review.yml", job: "request-review-on-comment", scope: "pull-requests" },
+	{ workflow: ".github/workflows/re-review.yml", job: "request-review-on-comment", scope: "issues" },
 ];
 
 export const REQUIRED_READ_DEFAULT: readonly string[] = [
@@ -42,7 +46,7 @@ const EXPECTED_WORKFLOW_DEFAULT = "an explicit least-privilege permissions block
 const EXPECTED_SCOPE_VALUE = '"read", "write", or "none"';
 const EXPECTED_NON_WRITE_SCOPE = '"read" or "none"';
 const EXPECTED_PERMISSION_VALUE = '"read-all" or a permissions mapping';
-const JOB_WRITE_ALLOWLIST_NOTE = 'only jobs "release_finalize" (contents: write) and "publish" (id-token: write) in .github/workflows/ci.yml may hold write scopes';
+const JOB_WRITE_ALLOWLIST_NOTE = 'only jobs "release_finalize" (contents: write) and "publish" (id-token: write) in .github/workflows/ci.yml, and "request-review-on-comment" (pull-requests: write, issues: write) in .github/workflows/re-review.yml may hold write scopes';
 
 type RecordValue = Record<string, unknown>;
 

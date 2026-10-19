@@ -1,14 +1,15 @@
 /**
  * Source adapters for `gjc migrate`.
  *
- * Each adapter reads GLOBAL/home config for one source agent and returns
- * normalized MCP + skill candidates plus source-level diagnostics. Adapters never
- * read project-level config and never connect to anything.
+ * Each adapter returns normalized home-scoped MCP/skill candidates, selected-scope
+ * instruction candidates, and source-level diagnostics. Adapters never connect to
+ * anything.
  */
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import { normalizeSkill } from "../skill-normalizer";
-import type { AdapterResult, MigrateSource, SkillCandidate, SourceDiagnostic } from "../types";
+import type { AdapterResult, InstructionCandidate, MigrateSource, SkillCandidate, SourceDiagnostic } from "../types";
 import { claudeCodeAdapter } from "./claude-code";
 import { codexAdapter } from "./codex";
 import { opencodeAdapter } from "./opencode";
@@ -16,6 +17,10 @@ import { opencodeAdapter } from "./opencode";
 export interface AdapterOptions {
 	/** Home directory root; overridable for tests. */
 	homeDir: string;
+	/** Source scope for instructions; other source files remain home-scoped. */
+	scope: "project" | "user";
+	/** Project root used when importing project instructions. */
+	cwd: string;
 }
 
 export interface Adapter {
@@ -31,6 +36,19 @@ const ADAPTERS: Record<MigrateSource, Adapter> = {
 
 export function getAdapter(source: MigrateSource): Adapter {
 	return ADAPTERS[source];
+}
+
+/** Collect one source instruction file without interpreting or rewriting its content. */
+export async function collectInstructionFile(
+	filePath: string,
+	source: MigrateSource,
+): Promise<{ candidates: InstructionCandidate[]; diagnostics: SourceDiagnostic[] }> {
+	const read = await readSourceText(filePath, source, "instruction");
+	if ("diagnostic" in read) return { candidates: [], diagnostics: [read.diagnostic] };
+	return {
+		candidates: [{ source, name: path.basename(filePath), content: read.text }],
+		diagnostics: [],
+	};
 }
 
 /** Read a text file, classifying absence/IO errors into source diagnostics. */

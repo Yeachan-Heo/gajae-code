@@ -3,10 +3,15 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import type { NativeBrokerRestartIntent, NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
+import {
+	exactRemoveDirectoryTree,
+	type NativeBrokerRestartIntent,
+	type NativeDirectoryTreeSnapshot,
+	snapshotDirectoryTree,
+} from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
-import { FileLockAcquireError } from "../../config/file-lock";
+import { FileLockAcquireError, withFileLock } from "../../config/file-lock";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { readExistingStateForMutation, withWorkflowStateLock } from "../../gjc-runtime/state-writer";
@@ -80,6 +85,7 @@ import {
 	type LifecycleState,
 	type TerminalReadBack,
 } from "./lifecycle-ledger";
+import { brokerLockHostIdentity } from "./lock-host-identity";
 import {
 	cancelManagedTasks,
 	createManagedDomainBinding,
@@ -111,8 +117,15 @@ import {
 } from "./managed-task-dag";
 import { reconcileRunningManagedVerification, verifyManagedTaskAttempt } from "./managed-task-verification";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
+import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
 import { sdkInternalRuntimeImage } from "./runtime";
-import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	SessionIndex,
+	type SessionList,
+	sessionIndexStartupLockOptions,
+} from "./session-index";
 import {
 	type ResolvedScopeV1,
 	resolveScopeRequest,
@@ -152,6 +165,21 @@ export interface BrokerSettings {
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
 	masterOrphanGraceMs?: number;
+	/**
+	 * Grace before a broker nobody is left to use exits on its own. The clock only
+	 * runs while the index proves no live session host and no open spawn authority,
+	 * so a broker whose client died without closing exits instead of holding its
+	 * port, its publication, and its lock for the life of the machine.
+	 */
+	abandonedGraceMs?: number;
+	/**
+	 * Whether this broker may end itself once nobody is left to use it. Only the
+	 * detached autostart entry point enables this: an operator-supervised
+	 * `gjc sdk broker run` service owns its own lifetime, and its supervisor reads an
+	 * owned-root completion as a clean exit, so self-reaping would quietly retire a
+	 * service that was meant to keep serving.
+	 */
+	reapWhenAbandoned?: boolean;
 	/** Host model resolver override for lifecycle tests and embedders. */
 	resolveModelPin?: SdkHostModelResolver;
 	/**
@@ -189,6 +217,8 @@ type ResolvedBrokerSettings = {
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
+	abandonedGraceMs: number;
+	reapWhenAbandoned: boolean;
 	restartRequestId?: string;
 };
 export function resolveBrokerPackageGeneration(): string {
@@ -214,6 +244,7 @@ function modelResolutionCwd(input: Record<string, unknown>): string | undefined 
 
 export type BrokerErrorCode =
 	| "idempotency_conflict"
+	| "legacy_lifecycle_ambiguous"
 	| "terminal_uncertain"
 	| "broker_restarting"
 	| "unavailable"
@@ -610,6 +641,7 @@ const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
+const BROKER_ABANDONED_GRACE_DEFAULT_MS = 120_000;
 const MANAGED_CLOSE_WAIT_MS = 10_000;
 
 function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
@@ -1088,6 +1120,13 @@ function sameSessionControlAuthority(
 	);
 }
 
+const SESSION_TARGETED_LIFECYCLE_OPERATIONS: ReadonlySet<string> = new Set([
+	"session.close",
+	"session.resume",
+	"session.delete",
+	"session.reconcile_uncertain",
+]);
+
 function lifecycleTarget(operation: string, input: Record<string, unknown>): unknown {
 	const target = input.target as Record<string, unknown> | undefined;
 	const string = (...values: unknown[]): string | undefined =>
@@ -1163,9 +1202,28 @@ const BROKER_LOCK_RETRY_MS = 10;
 type BrokerLockSnapshot = {
 	ownerId?: string;
 	pid: number;
+	incarnation?: string;
+	ownerHostId?: string;
 	identity: string;
 	lockIdentity: string;
 };
+
+function isBrokerLockOwnerAlive(
+	snapshot: Pick<BrokerLockSnapshot, "pid" | "incarnation" | "ownerHostId">,
+	currentHostId: string | undefined,
+	pidAlive: (pid: number) => boolean = isPidAlive,
+	readProcessIncarnation: (pid: number) => string | undefined = brokerProcessIncarnation,
+): boolean {
+	if (snapshot.pid <= 0) return false;
+	// Local PID evidence is meaningful only when the owner record identifies this host.
+	// Foreign and legacy host-unqualified owners are never reclaimed from this process table.
+	if (snapshot.ownerHostId === undefined || snapshot.ownerHostId !== currentHostId) return true;
+	if (!pidAlive(snapshot.pid)) return false;
+	// A live PID is retained unless its recorded incarnation proves reuse.
+	if (!snapshot.incarnation) return true;
+	const incarnation = readProcessIncarnation(snapshot.pid);
+	return !incarnation || incarnation === snapshot.incarnation;
+}
 
 /** Tombstone prefix used by {@link Broker.reclaimStaleLock} when a dead owner's lock is renamed aside. */
 export const BROKER_LOCK_TOMBSTONE_PREFIX = ".broker.lock.stale-";
@@ -1214,11 +1272,12 @@ function isBrokerLockArtifactName(name: string): boolean {
  * Decide whether one candidate directory is provably abandoned.
  *
  * Fail-closed by construction: every branch that cannot prove abandonment
- * returns a retention reason. A tombstone with an owner record is only
- * abandoned when that record names a dead PID. A missing record is abandoned
- * only when the aged tombstone is empty; non-empty tombstones remain retained
- * as ambiguous evidence. Backup directories carry no owner contract, so an
- * absent record there is not ambiguity and age alone governs.
+ * returns a retention reason. A tombstone with an owner record is abandoned
+ * only when its PID is dead or validated incarnation evidence proves PID reuse;
+ * missing or unavailable evidence remains retained. A missing record is
+ * abandoned only when the aged tombstone is empty; non-empty tombstones remain
+ * retained as ambiguous evidence. Backup directories carry no owner contract,
+ * so an absent record there is not ambiguity and age alone governs.
  */
 async function classifyBrokerLockArtifact(
 	directory: string,
@@ -1226,6 +1285,8 @@ async function classifyBrokerLockArtifact(
 	now: number,
 	graceMs: number,
 	pidAlive: (pid: number) => boolean,
+	readProcessIncarnation: (pid: number) => string | undefined,
+	currentHostId: string | undefined,
 ): Promise<BrokerLockArtifactRetentionReason | "abandoned"> {
 	const target = path.join(directory, name);
 	// lstat, never stat: a symlink pointing at live state must never be followed
@@ -1248,14 +1309,26 @@ async function classifyBrokerLockArtifact(
 			return "owner-record-unreadable";
 		}
 	}
-	let pid: unknown;
+	let owner: { pid?: unknown; incarnation?: unknown; ownerHostId?: unknown };
 	try {
-		pid = (JSON.parse(raw) as { pid?: unknown }).pid;
+		owner = JSON.parse(raw) as { pid?: unknown; incarnation?: unknown; ownerHostId?: unknown };
 	} catch {
 		return "owner-record-unreadable";
 	}
-	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return "owner-record-unreadable";
-	return pidAlive(pid) ? "owner-alive" : "abandoned";
+	if (typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0)
+		return "owner-record-unreadable";
+	return isBrokerLockOwnerAlive(
+		{
+			pid: owner.pid,
+			incarnation: isProcessIncarnation(owner.incarnation) ? owner.incarnation : undefined,
+			ownerHostId: typeof owner.ownerHostId === "string" ? owner.ownerHostId : undefined,
+		},
+		currentHostId,
+		pidAlive,
+		readProcessIncarnation,
+	)
+		? "owner-alive"
+		: "abandoned";
 }
 
 /**
@@ -1274,11 +1347,18 @@ export async function reapStaleBrokerLockArtifacts(input: {
 	now?: number;
 	graceMs?: number;
 	pidAlive?: (pid: number) => boolean;
+	processIncarnation?: (pid: number) => string | undefined;
 }): Promise<BrokerLockArtifactReapResult> {
 	const directory = path.join(input.agentDir, "sdk");
 	const now = input.now ?? Date.now();
 	const graceMs = input.graceMs ?? BROKER_LOCK_ARTIFACT_GRACE_MS;
 	const pidAlive = input.pidAlive ?? isPidAlive;
+	const readProcessIncarnation = input.processIncarnation ?? brokerProcessIncarnation;
+	// Without this host's identity no host-qualified owner can be matched, so all of them are retained.
+	const currentHostId = await brokerLockHostIdentity(input.agentDir).then(
+		identity => identity.ownerHostId,
+		() => undefined,
+	);
 	const removed: string[] = [];
 	const retained: BrokerLockArtifactRetention[] = [];
 	const retainedByReason = new Map<BrokerLockArtifactRetentionReason, number>();
@@ -1295,7 +1375,15 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		const target = path.join(directory, name);
 		let verdict: BrokerLockArtifactRetentionReason | "abandoned";
 		try {
-			verdict = await classifyBrokerLockArtifact(directory, name, now, graceMs, pidAlive);
+			verdict = await classifyBrokerLockArtifact(
+				directory,
+				name,
+				now,
+				graceMs,
+				pidAlive,
+				readProcessIncarnation,
+				currentHostId,
+			);
 		} catch (error) {
 			// A vanished candidate needs no decision; anything else is ambiguous.
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -1528,7 +1616,12 @@ const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
+const brokerLockReclaimHooksForTest = new WeakMap<
+	Broker,
+	{ beforeQuarantine?: () => Promise<void>; onContended?: () => void }
+>();
 const livenessGraceOverridesForTest = new WeakMap<Broker, number>();
+const abandonedGraceOverridesForTest = new WeakMap<Broker, number>();
 const heartbeatStallOverridesForTest = new WeakMap<Broker, PromiseWithResolvers<void>>();
 const managedCloseWaitOverridesForTest = new WeakMap<Broker, number>();
 
@@ -1539,6 +1632,8 @@ export class Broker {
 	discovery: BrokerDiscovery | null = null;
 	#lock: string;
 	#owner = randomBytes(12).toString("hex");
+	#ownedLockIdentity: string | undefined;
+	#ownedLockIncarnation: string | undefined;
 	/** Public publication-incarnation id, fixed at startup; never the endpoint generation. */
 	#diagnosticGeneration = randomBytes(16).toString("hex");
 	/** Trusted build snapshot captured at startup; unknown buildId stays null. */
@@ -1569,6 +1664,8 @@ export class Broker {
 	#publishedAt: bigint | null = null;
 	#startedAt: bigint | null = null;
 	#watchInFlight = false;
+	#abandonedAt: number | null = null;
+	#abandonedReapInFlight = false;
 	#checkpointInFlight = false;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
@@ -1608,6 +1705,8 @@ export class Broker {
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
+			abandonedGraceMs: settings.abandonedGraceMs ?? BROKER_ABANDONED_GRACE_DEFAULT_MS,
+			reapWhenAbandoned: settings.reapWhenAbandoned === true,
 			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
 		};
 		this.index = new SessionIndex(settings.agentDir);
@@ -3581,6 +3680,96 @@ export class Broker {
 		await this.#reapSpawnOrphans();
 	}
 
+	/**
+	 * Grace before an idle broker exits. The clock starts only after the index has
+	 * already stopped proving any host live, so this grace is time on top of that
+	 * freshness window, never a substitute for it.
+	 */
+	#abandonedGraceMs(): number {
+		return abandonedGraceOverridesForTest.get(this) ?? this.settings.abandonedGraceMs;
+	}
+
+	/**
+	 * What the index proves about the hosts using this agent directory. Liveness is
+	 * judged on read -- fresh checkpoint, live pid, matching incarnation -- so a host
+	 * that died without closing stops proving it without help. A row that is not live
+	 * is absence only once the OS confirms the process is gone: an inconclusive
+	 * reading is never death proof on any platform, and a pid that still exists but
+	 * cannot be matched to the recorded incarnation leaves the host undecided.
+	 */
+	async #sessionHostLiveness(): Promise<"live" | "absent" | "unknown"> {
+		try {
+			await this.index.refreshIfChanged();
+		} catch (error) {
+			logger.warn(`sdk broker: abandonment probe could not read the session index: ${String(error)}`);
+			return "unknown";
+		}
+		for (const row of this.index.listSessionIdentities()) {
+			if (row.endpointGeneration <= 0) continue;
+			if (row.live) return "live";
+			// The tri-state observer keeps positive absence separate from every
+			// inconclusive outcome, which is the difference between reaping a broker and
+			// killing one out from under a host this platform simply cannot confirm.
+			const observed = observeProcessIncarnation(row.pid);
+			if (observed.status === "unknown") return "unknown";
+			if (observed.status === "absent") continue;
+			const recorded = row.hostIncarnation ?? row.processIncarnation;
+			if (recorded === undefined) return "unknown";
+			if (observed.incarnation === recorded) return "live";
+			// The pid names another process now: the host that registered it is gone.
+		}
+		return "absent";
+	}
+
+	/** Whether any client currently holds a transport connection to this broker. */
+	#hasAttachedClient(): boolean {
+		return (this.#transport?.clientCount ?? 0) > 0;
+	}
+
+	/** Whether this broker still owns a spawn authority it must keep serving. */
+	#hasOpenSpawnAuthority(): boolean {
+		const store = this.#spawnAuthority;
+		if (!store) return false;
+		for (const claim of store.claims()) {
+			const authority = store.authority(claim.lifecycleIdentity);
+			if (authority && (authority.closeState === "active" || authority.closeState === "close_requested"))
+				return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Ends a broker nobody is left to use. A client that dies without closing leaves
+	 * no live session host behind, and nothing else reaps this process: without this
+	 * pass it would hold its port, its publication, and its lock until the machine
+	 * reboots. The clock only runs while absence is confirmed and no client holds a
+	 * connection, and any live host, attached client, open authority, or undecided
+	 * reading disarms it, so a slow reattach never races the grace. Brokers an
+	 * operator supervises never reap themselves at all.
+	 */
+	async #reapSelfIfAbandoned(): Promise<void> {
+		if (!this.settings.reapWhenAbandoned) return;
+		if (this.#stopping || this.#completionTask !== null || this.#fenceReason !== null) return;
+		if (this.#abandonedReapInFlight) return;
+		this.#abandonedReapInFlight = true;
+		try {
+			const liveness = await this.#sessionHostLiveness();
+			const now = Date.now();
+			if (liveness !== "absent" || this.#hasAttachedClient() || this.#hasOpenSpawnAuthority()) {
+				this.#abandonedAt = null;
+				return;
+			}
+			if (this.#abandonedAt === null) {
+				this.#abandonedAt = now;
+				return;
+			}
+			if (now - this.#abandonedAt < this.#abandonedGraceMs()) return;
+			await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root", "abandoned");
+		} finally {
+			this.#abandonedReapInFlight = false;
+		}
+	}
+
 	async #reapSpawnOrphans(): Promise<void> {
 		if (this.#spawnReapInFlight || this.#stopping) return;
 		this.#spawnReapInFlight = true;
@@ -3663,7 +3852,12 @@ export class Broker {
 	}
 	async #lockSnapshot(raw: string, lockIdentity: string): Promise<BrokerLockSnapshot> {
 		try {
-			const lock = JSON.parse(raw) as { ownerId?: unknown; pid?: unknown };
+			const lock = JSON.parse(raw) as {
+				ownerId?: unknown;
+				pid?: unknown;
+				incarnation?: unknown;
+				ownerHostId?: unknown;
+			};
 			if (
 				typeof lock.ownerId === "string" &&
 				lock.ownerId.length > 0 &&
@@ -3671,7 +3865,14 @@ export class Broker {
 				Number.isInteger(lock.pid) &&
 				lock.pid > 0
 			)
-				return { ownerId: lock.ownerId, pid: lock.pid, identity: `owner:${lock.ownerId}`, lockIdentity };
+				return {
+					ownerId: lock.ownerId,
+					pid: lock.pid,
+					incarnation: isProcessIncarnation(lock.incarnation) ? lock.incarnation : undefined,
+					ownerHostId: typeof lock.ownerHostId === "string" ? lock.ownerHostId : undefined,
+					identity: `owner:${lock.ownerId}`,
+					lockIdentity,
+				};
 		} catch {}
 		return { pid: 0, identity: `contents:${createHash("sha256").update(raw).digest("hex")}`, lockIdentity };
 	}
@@ -3703,34 +3904,102 @@ export class Broker {
 		}
 		return this.#lockSnapshot(raw, lockIdentity);
 	}
-	async #createLock(): Promise<void> {
-		await fs.mkdir(this.#lock, { mode: 0o700 });
+	async #withLockReclaimGuard<T>(operation: () => Promise<T>): Promise<T> {
+		const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+		return withFileLock(`${this.#lock}.reclaim`, operation, {
+			...hostIdentity,
+			onContended: () => brokerLockReclaimHooksForTest.get(this)?.onContended?.(),
+		});
+	}
+	async #hasCanonicalLockOwnership(): Promise<boolean> {
+		if (!this.#ownedLockIdentity || !this.#ownedLockIncarnation) return false;
 		try {
-			const incarnation = brokerProcessIncarnation(process.pid);
-			// A minimal, non-secret receipt delta for D9 stale-artifact detach
-			// (sequenced follow-up): the OS incarnation and a digest of the exact
-			// resolved root this lock authorizes, so a later positive-death check can
-			// cross-bind this owner record against the discovery record it authored
-			// without re-deriving anything from file content or adding new identity.
-			const rootDigest = await canonicalServiceRootDigest(this.settings.agentDir);
-			await fs.writeFile(
-				this.#lockRecordPath(),
-				JSON.stringify({
-					version: 1,
-					ownerId: this.#owner,
-					pid: process.pid,
-					acquiredAt: Date.now(),
-					...(incarnation ? { incarnation } : {}),
-					rootDigest,
-				}),
-				{ flag: "wx", mode: 0o600 },
+			const current = await this.#readLock();
+			return (
+				current?.identity === `owner:${this.#owner}` &&
+				current.lockIdentity === this.#ownedLockIdentity &&
+				current.pid === process.pid &&
+				current.incarnation === this.#ownedLockIncarnation
 			);
-		} catch (e) {
-			try {
-				await fs.rmdir(this.#lock);
-			} catch {}
-			throw e;
+		} catch {
+			return false;
 		}
+	}
+	#removeCreatedLockGeneration(
+		lockIdentity: { dev: string; ino: string },
+		parentIdentity: { dev: bigint; ino: bigint },
+		ownerHash?: string,
+	): void {
+		const captured = snapshotDirectoryTree(this.#lock);
+		const snapshot = captured.snapshot;
+		const root = snapshot?.entries.find(entry => entry.relativePath === "");
+		if (
+			!captured.ok ||
+			!snapshot ||
+			root?.kind !== "directory" ||
+			snapshot.rootDev !== lockIdentity.dev ||
+			snapshot.rootIno !== lockIdentity.ino
+		)
+			return;
+
+		const owner = snapshot.entries.find(entry => entry.relativePath === BROKER_LOCK_RECORD);
+		const exactOwner =
+			ownerHash !== undefined &&
+			snapshot.entries.length === 2 &&
+			owner?.kind === "file" &&
+			owner.sha256 === ownerHash;
+		if (!exactOwner && snapshot.entries.length !== 1) return;
+
+		exactRemoveDirectoryTree(this.#lock, snapshot, parentIdentity);
+	}
+	async #createLockInsideGuard(): Promise<void> {
+		const rootDigest = await canonicalServiceRootDigest(this.settings.agentDir);
+		const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+		const parent = await fs.lstat(path.dirname(this.#lock), { bigint: true });
+		await fs.mkdir(this.#lock, { mode: 0o700 });
+		let createdLockIdentity: { dev: string; ino: string } | undefined;
+		let createdOwnerHash: string | undefined;
+		try {
+			const lockStat = await fs.lstat(this.#lock, { bigint: true });
+			if (!lockStat.isDirectory()) throw new Error("SDK broker lock is not a directory.");
+			createdLockIdentity = { dev: String(lockStat.dev), ino: String(lockStat.ino) };
+			const incarnation = brokerProcessIncarnation(process.pid);
+			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
+			const ownerRecord = JSON.stringify({
+				version: 1,
+				ownerId: this.#owner,
+				pid: process.pid,
+				acquiredAt: Date.now(),
+				incarnation,
+				ownerHostId: hostIdentity.ownerHostId,
+				rootDigest,
+			});
+			createdOwnerHash = createHash("sha256").update(ownerRecord).digest("hex");
+			await fs.writeFile(this.#lockRecordPath(), ownerRecord, { flag: "wx", mode: 0o600 });
+			const current = await this.#readLock();
+			if (
+				!current ||
+				current.ownerId !== this.#owner ||
+				current.pid !== process.pid ||
+				current.incarnation !== incarnation
+			)
+				throw new Error("SDK broker lock ownership changed during startup.");
+			this.#ownedLockIdentity = current.lockIdentity;
+			this.#ownedLockIncarnation = incarnation;
+		} catch (error) {
+			try {
+				if (createdLockIdentity)
+					this.#removeCreatedLockGeneration(
+						createdLockIdentity,
+						{ dev: parent.dev, ino: parent.ino },
+						createdOwnerHash,
+					);
+			} catch {}
+			throw error;
+		}
+	}
+	async #createLock(): Promise<void> {
+		await this.#withLockReclaimGuard(() => this.#createLockInsideGuard());
 	}
 	async #waitForBrokerDiscovery(): Promise<BrokerDiscovery | null> {
 		const deadline = Date.now() + BROKER_LOCK_STARTUP_WAIT_MS;
@@ -3741,50 +4010,63 @@ export class Broker {
 		}
 		return readBrokerDiscovery(this.settings.agentDir, this.settings.heartbeatTtlMs);
 	}
-	async #reclaimStaleLock(snapshot: BrokerLockSnapshot): Promise<void> {
-		const current = await this.#readLock();
-		if (
-			!current ||
-			current.identity !== snapshot.identity ||
-			current.lockIdentity !== snapshot.lockIdentity ||
-			(current.pid > 0 && isPidAlive(current.pid))
-		)
-			return;
+	async #reclaimStaleLock(snapshot: BrokerLockSnapshot): Promise<boolean> {
+		return await this.#withLockReclaimGuard(async () => {
+			const current = await this.#readLock();
+			const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+			if (
+				!current ||
+				current.identity !== snapshot.identity ||
+				current.lockIdentity !== snapshot.lockIdentity ||
+				isBrokerLockOwnerAlive(current, hostIdentity.ownerHostId)
+			)
+				return false;
+			await brokerLockReclaimHooksForTest.get(this)?.beforeQuarantine?.();
 
-		// Give every reclaimed generation a fresh quarantine name. Older brokers
-		// used only the lock inode hash; if that tombstone survived a crash, the
-		// deterministic name collided forever and left the dead canonical lock in
-		// place. The random suffix preserves no-replace rename semantics without
-		// letting retained cleanup debris block takeover.
-		for (let attempt = 0; attempt < 8; attempt++) {
-			const tombstone = path.join(
-				path.dirname(this.#lock),
-				`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}-${randomBytes(8).toString("hex")}`,
-			);
-			try {
-				await fs.rename(this.#lock, tombstone);
-				return;
-			} catch (e) {
-				const code = (e as NodeJS.ErrnoException).code;
-				if (code === "EEXIST" || code === "ENOTEMPTY") continue;
-				if (["ENOENT", "EISDIR", "ENOTDIR"].includes(code ?? "")) return;
-				if (code === "EPERM") {
-					try {
-						await fs.lstat(tombstone);
-						continue;
-					} catch (statError) {
-						if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+			// Keep validation, quarantine, and successor lock publication under one
+			// cross-process fence so a stale snapshot can never move a newer lock.
+			for (let attempt = 0; attempt < 8; attempt++) {
+				const tombstone = path.join(
+					path.dirname(this.#lock),
+					`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}-${randomBytes(8).toString("hex")}`,
+				);
+				try {
+					await fs.rename(this.#lock, tombstone);
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException).code;
+					if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+					if (["ENOENT", "EISDIR", "ENOTDIR"].includes(code ?? "")) return false;
+					if (code === "EPERM") {
+						try {
+							await fs.lstat(tombstone);
+							continue;
+						} catch (statError) {
+							if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+						}
 					}
+					throw error;
 				}
-				throw e;
+				try {
+					await this.#createLockInsideGuard();
+					return true;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+					throw error;
+				}
 			}
-		}
-		throw new Error(`Broker lock quarantine namespace is saturated for ${this.#lock}`);
+			throw new Error(`Broker lock quarantine namespace is saturated for ${this.#lock}`);
+		});
 	}
 	async #releaseOwnedLock(): Promise<void> {
 		try {
 			const lock = await this.#readLock();
-			if (lock?.ownerId !== this.#owner) return;
+			if (
+				!lock ||
+				lock.ownerId !== this.#owner ||
+				lock.lockIdentity !== this.#ownedLockIdentity ||
+				lock.incarnation !== this.#ownedLockIncarnation
+			)
+				return;
 			await fs.unlink(this.#lockRecordPath());
 			await fs.rmdir(this.#lock);
 		} catch (error) {
@@ -3833,8 +4115,15 @@ export class Broker {
 		this.#ambiguousAt = null;
 		this.#publishedAt = null;
 		this.#startedAt = process.hrtime.bigint();
+		this.#ownedLockIdentity = undefined;
+		this.#ownedLockIncarnation = undefined;
 		this.#watchInFlight = false;
 		this.#checkpointInFlight = false;
+		// A restarted instance is a new generation: it holds none of the state the
+		// previous one stopped with, so the abandonment clock it armed (and any reap
+		// still unwinding) must not survive into the generation clients reconnect to.
+		this.#abandonedAt = null;
+		this.#abandonedReapInFlight = false;
 		this.#throwIfStartupAborted();
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
 		this.#throwIfStartupAborted();
@@ -3861,7 +4150,8 @@ export class Broker {
 			}
 			const snapshot = await this.#readLock();
 			if (!snapshot) continue;
-			if (snapshot.pid > 0 && isPidAlive(snapshot.pid)) {
+			const hostIdentity = await brokerLockHostIdentity(this.settings.agentDir);
+			if (isBrokerLockOwnerAlive(snapshot, hostIdentity.ownerHostId)) {
 				const starting = await this.#waitForBrokerDiscovery();
 				if (starting) {
 					logger.info(
@@ -3872,22 +4162,59 @@ export class Broker {
 					return starting;
 				}
 				const current = await this.#readLock();
-				if (current && current.identity === snapshot.identity && current.pid > 0 && isPidAlive(current.pid)) {
+				if (
+					current &&
+					current.identity === snapshot.identity &&
+					isBrokerLockOwnerAlive(current, hostIdentity.ownerHostId)
+				) {
+					const hostUnqualified = current.ownerHostId === undefined;
+					const foreignHostOwner = !hostUnqualified && current.ownerHostId !== hostIdentity.ownerHostId;
+					let refusal: string;
+					let errorMessage: string;
+					if (hostUnqualified) {
+						refusal = `owner pid ${current.pid} has no host identity; automatic recovery is unsafe for shared agent directories. Stop every broker using this agent directory on all hosts, then follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
+						errorMessage = `Broker lock owner is host-unqualified (pid ${current.pid}); refusing automatic recovery because its host cannot be verified. Stop every broker using this agent directory on all hosts and follow https://github.com/Yeachan-Heo/gajae-code/blob/dev/docs/sdk.md#recovering-legacy-broker-locks`;
+					} else if (foreignHostOwner) {
+						refusal = `owner pid ${current.pid} is attributed to another host; its liveness cannot be verified here`;
+						errorMessage = `Broker lock owner is attributed to a different host (pid ${current.pid}); refusing automatic recovery because its liveness cannot be verified from this host.`;
+					} else {
+						refusal = `live pid ${current.pid} has published no discovery record`;
+						errorMessage = `Broker lock is held by a live owner (pid ${current.pid})`;
+					}
 					logger.warn(
-						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by live pid ${current.pid} that published no discovery record`,
+						`sdk broker: lock contention, refusing to start because ${this.#lock} is held by ${refusal}`,
 					);
-					throw new Error(`Broker lock is held by a live owner (pid ${current.pid})`);
+					throw new Error(errorMessage);
 				}
 				continue;
 			}
-			await this.#reclaimStaleLock(snapshot);
+			if (await this.#reclaimStaleLock(snapshot)) break;
 		}
 		this.#throwIfStartupAborted();
 		// Only the lock holder reaps, so concurrent brokers cannot race the removal.
 		await this.#reapLockArtifacts();
 		try {
 			this.#throwIfStartupAborted();
-			await this.index.open();
+			// Recheck under the broker ownership lock: a restart can be committed while
+			// an ordinary startup is waiting to acquire this lock.
+			const restartIntent = await readBrokerRestartIntent(this.settings.agentDir);
+			const activeCommittedIntent =
+				restartIntent?.phase === "committed" && restartIntent.expiresAt > Date.now() ? restartIntent : undefined;
+			if (
+				this.settings.restartRequestId === undefined
+					? activeCommittedIntent !== undefined
+					: activeCommittedIntent?.requestId !== this.settings.restartRequestId
+			)
+				throw new Error("A committed SDK broker restart is active; startup requires its exact request ID.");
+			await this.index.open(
+				this.#startupCheckpointDeadline === undefined
+					? undefined
+					: sessionIndexStartupLockOptions(
+							this.#startupCheckpointDeadline,
+							this.#startupAbortSignal,
+							this.settings.restartRequestId === undefined ? "ordinary" : "authorized-successor",
+						),
+			);
 			await this.ledger.open();
 			const brokerIdentityKey = await getBrokerIdentityKey(this.settings.agentDir);
 			this.#spawnAuthority = new SpawnAuthorityStore(this.settings.agentDir, brokerIdentityKey);
@@ -3950,6 +4277,8 @@ export class Broker {
 			await this.#startupPrePublicationTestHook?.();
 			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);
 			this.#throwIfStartupAborted();
+			if (!(await this.#hasCanonicalLockOwnership()))
+				throw new Error("SDK broker lock ownership changed before discovery publication.");
 			this.#publication = await publishBrokerDiscovery(
 				this.settings.agentDir,
 				this.discovery,
@@ -3968,6 +4297,7 @@ export class Broker {
 			this.#heartbeatTimer = setInterval(() => {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
+				void this.#reapSelfIfAbandoned();
 			}, cadenceMs);
 			if (this.#startupPostPublicationDelayMs > 0) await Bun.sleep(this.#startupPostPublicationDelayMs);
 			// This process is now the independently verified successor: its own
@@ -4016,6 +4346,10 @@ export class Broker {
 			this.#publicationState === "healthy-owned" &&
 			this.discovery?.ownerId === this.#owner
 		);
+	}
+	/** Whether this broker completed its initial retained discovery publication. */
+	get hasPublishedDiscovery(): boolean {
+		return this.#publishedAt !== null;
 	}
 	get completion(): Promise<void> {
 		return this.#completion;
@@ -4851,7 +5185,19 @@ export class Broker {
 	}
 
 	// Wire requests are readiness-gated by BrokerTransport before reaching this dispatcher.
-	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+	async handleRequest(
+		operation: string,
+		input: Record<string, unknown>,
+		idempotencyKey?: string,
+	): Promise<BrokerResponse> {
+		if (
+			this.#publication !== null &&
+			this.#publicationState === "healthy-owned" &&
+			!(await this.#hasCanonicalLockOwnership())
+		) {
+			this.#fence("suspect-unpublished");
+			return error("unavailable", "broker lock ownership is not held");
+		}
 		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
 		if (operation === "broker.prepare_restart")
 			return this.prepareRestart(input as unknown as BrokerRestartPrepareOptions).then(
@@ -4875,6 +5221,32 @@ export class Broker {
 			release();
 			this.#admitted.delete(admission);
 		});
+	}
+	/**
+	 * Session-targeted lifecycle requests may pass terminal legacy rows recorded
+	 * for other sessions. A row equal to this key's legacy target identity for its
+	 * recorded session proves cross-target key reuse and keeps the fence; close
+	 * targets are reconstructed sessionId-only because legacy close rows may lack
+	 * endpoint authority.
+	 */
+	async #legacySessionTarget(
+		operation: string,
+		input: Record<string, unknown>,
+		idempotencyKey: string,
+	): Promise<{ sessionId: string; keyReuseIdentities: ReadonlySet<string> } | undefined> {
+		if (!SESSION_TARGETED_LIFECYCLE_OPERATIONS.has(operation)) return undefined;
+		const { sessionId } = lifecycleTarget(operation, input) as { sessionId?: string };
+		if (sessionId === undefined) return undefined;
+		const keyReuseIdentities = new Set<string>();
+		for (const recordedSessionId of this.ledger.terminalLegacySessionIds()) {
+			const recordedTarget = createHash("sha256")
+				.update(canonicalJson(lifecycleTarget(operation, { sessionId: recordedSessionId })))
+				.digest("hex");
+			keyReuseIdentities.add(
+				await deriveLegacyTargetIdentity(this.settings.agentDir, operation, idempotencyKey, recordedTarget),
+			);
+		}
+		return { sessionId, keyReuseIdentities };
 	}
 	async #handleRequest(
 		operation: string,
@@ -5094,10 +5466,13 @@ export class Broker {
 				} else if (
 					this.ledger.hasLegacyIdentity(
 						new Set(this.#spawnAuthority?.claims().map(claim => claim.lifecycleIdentity) ?? []),
-						{ ignoreFinalRows: operation === "session.create" },
+						{
+							ignoreFinalRows: operation === "session.create",
+							sessionTarget: await this.#legacySessionTarget(operation, input, idempotencyKey),
+						},
 					)
 				) {
-					return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
+					return error("legacy_lifecycle_ambiguous", "legacy lifecycle request has an ambiguous target");
 				}
 			}
 		}
@@ -5173,6 +5548,9 @@ export class Broker {
 			const begun = await this.ledger.begin(identity, requestHash, metadata);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
+				// Proven errors are immutable even when their response carries cleanup
+				// metadata. Only unproven cleanup outcomes may execute again.
+				if (begun.entry.state === "terminal_error") return replay;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
 				if (!cleanup) {
 					if (
@@ -5217,7 +5595,7 @@ export class Broker {
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
-				await this.ledger.transition(identity, lifecycleResponseState(response), {
+				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(operation === "session.delete" &&
 					typeof input.sessionId === "string" &&
 					lifecycleResponseState(response) === "terminal_uncertain" &&
@@ -5229,6 +5607,10 @@ export class Broker {
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
+				// A late transition may have proven a terminal result already. The ledger
+				// preserves that row; return it instead of the freshly computed response.
+				if (recorded.state === "terminal_error" && recorded.response !== undefined)
+					return recorded.response as BrokerResponse;
 				return response;
 			}
 			if (begun.kind === "idempotency_conflict")
@@ -5241,7 +5623,7 @@ export class Broker {
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
-				await this.ledger.transition(identity, lifecycleResponseState(response), {
+				const recorded = await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 					...(operation === "session.delete" &&
 					typeof input.sessionId === "string" &&
@@ -5254,6 +5636,8 @@ export class Broker {
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
+				if (recorded.state === "terminal_error" && recorded.response !== undefined)
+					return recorded.response as BrokerResponse;
 				return response;
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
@@ -5339,6 +5723,21 @@ export function setAmbiguityGraceForTest(broker: Broker, graceMs: number | undef
 export function setLockArtifactGraceForTest(broker: Broker, graceMs: number | undefined): void {
 	if (graceMs === undefined) lockArtifactGraceOverridesForTest.delete(broker);
 	else lockArtifactGraceOverridesForTest.set(broker, graceMs);
+}
+
+/** Test-only barriers for exercising the cross-process broker-lock reclaim fence. */
+export function setBrokerLockReclaimHooksForTest(
+	broker: Broker,
+	hooks: { beforeQuarantine?: () => Promise<void>; onContended?: () => void } | undefined,
+): void {
+	if (hooks === undefined) brokerLockReclaimHooksForTest.delete(broker);
+	else brokerLockReclaimHooksForTest.set(broker, hooks);
+}
+
+/** Test-only hook for shortening the bounded abandonment grace. */
+export function setAbandonedGraceForTest(broker: Broker, graceMs: number | undefined): void {
+	if (graceMs === undefined) abandonedGraceOverridesForTest.delete(broker);
+	else abandonedGraceOverridesForTest.set(broker, graceMs);
 }
 
 /** Test-only hook for shortening the bounded liveness deadline. */

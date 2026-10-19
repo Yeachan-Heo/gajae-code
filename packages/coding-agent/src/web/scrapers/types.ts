@@ -2,6 +2,7 @@
  * Shared types and utilities for web-fetch handlers
  */
 import { ptree } from "@gajae-code/utils";
+import type { Settings } from "../../config/settings";
 import type { AgentStorage } from "../../session/agent-storage";
 import { ToolAbortError } from "../../tools/tool-errors";
 import type { AddressResolver } from "../insane/url-guard";
@@ -20,11 +21,18 @@ export interface RenderResult {
 	notes: string[];
 }
 
+/**
+ * `settings` is the caller's session settings. Handlers must read through it
+ * rather than the process-global singleton: the SDK/ACP host path runs tools
+ * without ever calling `Settings.init()`, where a global read throws
+ * "Settings not initialized" instead of scraping the page.
+ */
 export type SpecialHandler = (
 	url: string,
 	timeout: number,
 	signal?: AbortSignal,
 	storage?: AgentStorage | null,
+	settings?: Settings,
 ) => Promise<RenderResult | null>;
 
 export const MAX_OUTPUT_CHARS = 500_000;

@@ -113,7 +113,12 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
 	]);
 }
 
-function countAbortListeners(signal: AbortSignal): { readonly count: () => number; readonly restore: () => void } {
+type AbortListenerCounter = {
+	readonly count: () => number;
+	readonly restore: () => void;
+};
+
+function countAbortListeners(signal: AbortSignal): AbortListenerCounter {
 	let count = 0;
 	const originalAdd = signal.addEventListener.bind(signal);
 	const originalRemove = signal.removeEventListener.bind(signal);
@@ -373,6 +378,7 @@ describe("python eval lifecycle red-team", () => {
 			Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 			using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 			const controller = new AbortController();
+			let listeners: AbortListenerCounter | undefined;
 			const kernelStarted = Promise.withResolvers<void>();
 			let stoppedKernel: PythonKernel | undefined;
 			let shutdown: (() => Promise<KernelShutdownResult>) | undefined;
@@ -383,6 +389,11 @@ describe("python eval lifecycle red-team", () => {
 						const kernel = await originalStart({ cwd: tempDir.path() });
 						stoppedKernel ??= kernel;
 						shutdown = () => kernel.shutdown({ timeoutMs: 100 });
+						const execute = kernel.execute.bind(kernel);
+						kernel.execute = (code, options) => {
+							if (!listeners && options?.signal) listeners = countAbortListeners(options.signal);
+							return execute(code, options);
+						};
 						kernelStarted.resolve();
 						return kernel;
 					} catch (error) {
@@ -404,6 +415,7 @@ describe("python eval lifecycle red-team", () => {
 				);
 				await kernelStarted.promise;
 				await waitForFile(executionReadyFile);
+				expect(listeners?.count()).toBe(1);
 				if (!shutdown || !stoppedKernel) throw new Error("Python kernel did not expose shutdown after startup");
 
 				expect(await shutdown()).toEqual({ confirmed: true });
@@ -413,6 +425,7 @@ describe("python eval lifecycle red-team", () => {
 				expect(result.exitCode).toBeUndefined();
 				expect(stoppedKernel.isAlive()).toBe(false);
 				expect(stoppedKernel.getExitCode()).not.toBeNull();
+				expect(listeners?.count()).toBe(0);
 
 				// A completed caller's composite signal must not cancel the replacement session.
 				const successorReadyFile = `${tempDir.path()}/successor-executing`;
@@ -432,6 +445,7 @@ describe("python eval lifecycle red-team", () => {
 			} finally {
 				await shutdown?.().catch(() => undefined);
 				await execution?.catch(() => undefined);
+				listeners?.restore();
 			}
 		},
 		LIFECYCLE_TEST_TIMEOUT_MS,
@@ -485,12 +499,10 @@ describe("python eval lifecycle red-team", () => {
 			}
 			expect(startupFinished).toBe(true);
 			expect(kernel.shutdownCalls).toBe(1);
-			// The first dispose attempt gets an unconfirmed shutdown; assert the error and retry.
-			const disposeError = await disposeAllKernelSessions().catch(error => error);
+			await expect(disposeAllKernelSessions()).rejects.toMatchObject({
+				name: "PythonKernelShutdownUnconfirmedError",
+			});
 			expect(kernel.shutdownCalls).toBe(2);
-			expect(disposeError).toBeInstanceOf(Error);
-			expect(disposeError.name).toBe("PythonKernelShutdownUnconfirmedError");
-			// On retry with confirmed result, dispose succeeds.
 			kernel.shutdownResult = { confirmed: true };
 			await disposeAllKernelSessions();
 			expect(kernel.shutdownCalls).toBe(3);
@@ -498,7 +510,7 @@ describe("python eval lifecycle red-team", () => {
 		LIFECYCLE_TEST_TIMEOUT_MS,
 	);
 
-	it("treats clean exit code 0 as confirmed and starts a fresh session instead of reinserting", async () => {
+	it("starts a fresh session after disposal instead of reusing the old kernel", async () => {
 		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 		const firstKernel = new FakeKernel();
@@ -525,4 +537,20 @@ describe("python eval lifecycle red-team", () => {
 		expect(startCalls).toBe(2);
 		expect(secondKernel.executeCalls).toEqual(["print('after clean shutdown')"]);
 	});
+
+	it(
+		"confirms clean exit code zero from the real Python kernel process",
+		async () => {
+			using tempDir = TempDir.createSync("@gjc-python-kernel-exit-zero-");
+			const kernel = await originalStart({ cwd: tempDir.path() });
+			try {
+				expect(kernel.getExitCode()).toBeNull();
+				expect(await kernel.shutdown()).toEqual({ confirmed: true });
+				expect(kernel.getExitCode()).toBe(0);
+			} finally {
+				await kernel.shutdown();
+			}
+		},
+		LIFECYCLE_TEST_TIMEOUT_MS,
+	);
 });

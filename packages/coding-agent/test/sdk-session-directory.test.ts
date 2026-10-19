@@ -12,6 +12,7 @@ import {
 	computeManagedScopeDigest,
 	prepareManagedSessionScopeForWriteSync,
 } from "../src/session/internal/managed-session-scope";
+import { SessionManager } from "../src/session/session-manager";
 
 const temporaryDirectories: string[] = [];
 
@@ -178,6 +179,52 @@ describe("managed session directory SDK", () => {
 		const listed = await listManagedSessionCandidates({ scope: resolved.scope });
 		expect(listed).toMatchObject({ kind: "complete", owned: [], invalid: [], foreignCount: 0 });
 		await expect(fs.access(agentDir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it.skipIf(process.platform === "win32")("lists and reopens a session from a long cwd", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-long-cwd-"));
+		temporaryDirectories.push(root);
+		const base = path.join(root, "a".repeat(100));
+		const finalComponentLength = 253 - Buffer.byteLength(base) - 1;
+		expect(finalComponentLength).toBeGreaterThan(0);
+		const cwd = path.join(base, "b".repeat(finalComponentLength));
+		const legacyName = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+		expect(Buffer.byteLength(cwd)).toBe(253);
+		expect(Buffer.byteLength(legacyName)).toBeGreaterThan(255);
+		await fs.mkdir(cwd, { recursive: true });
+
+		const agentDir = path.join(root, "agent");
+		const original = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		let originalClosed = false;
+		try {
+			original.appendMessage({ role: "user", content: "long cwd resume probe", timestamp: Date.now() });
+			await original.ensureOnDisk();
+			await original.flush();
+			const sessionFile = original.getSessionFile();
+			if (!sessionFile) throw new Error("expected a persisted session file");
+			const sessionId = original.getSessionId();
+			expect(await original.closeStrict()).toMatchObject({ kind: "closed" });
+			originalClosed = true;
+
+			const resolved = await resolveManagedSessionScope({ cwd, agentDir });
+			expect(resolved.kind).toBe("resolved");
+			if (resolved.kind !== "resolved") return;
+			const listed = await listManagedSessionCandidates({ scope: resolved.scope });
+			expect(listed.kind).toBe("complete");
+			if (listed.kind !== "complete") return;
+			const candidate = listed.owned.find(item => item.sessionId === sessionId);
+			expect(candidate?.path).toBe(sessionFile);
+			if (!candidate) return;
+
+			const resumed = await SessionManager.open(candidate.path, SessionManager.managedDestination(cwd, agentDir));
+			try {
+				expect(resumed.getSessionId()).toBe(sessionId);
+			} finally {
+				await resumed.closeStrict();
+			}
+		} finally {
+			if (!originalClosed) await original.closeStrict();
+		}
 	});
 
 	it("maps an alias to the same v2 component while preserving its legacy lexical encoding", async () => {

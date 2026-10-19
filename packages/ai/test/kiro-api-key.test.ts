@@ -138,16 +138,22 @@ describe("parseKiroApiEvents", () => {
 	test("parses combined usage and stopReason:COMPLETED in the same metadata object", () => {
 		// Metadata object with usage and normal completion (no refusal)
 		const { events } = parseKiroApiEvents('{"stopReason":"COMPLETED","usage":{"inputTokens":20,"outputTokens":5}}');
-		// Should only emit usage event (normal completion without refusal is ignored)
+		// Usage is retained for accounting and the accepted completion confirms the stream.
 		const usageEvents = events.filter(e => e.type === "usage");
 		expect(usageEvents).toHaveLength(1);
 		if (usageEvents[0]?.type === "usage") {
 			expect(usageEvents[0].data.inputTokens).toBe(20);
 			expect(usageEvents[0].data.outputTokens).toBe(5);
 		}
+		const completionEvent = events.find(e => e.type === "completion");
+		expect(completionEvent).toEqual({ type: "completion", data: { stopReason: "COMPLETED" } });
 		// Should not emit any refusal events for COMPLETED
 		const refusalEvents = events.filter(e => e.type === "refusal");
 		expect(refusalEvents).toHaveLength(0);
+	});
+	test("does not treat an unknown stop reason as successful completion", () => {
+		const { events } = parseKiroApiEvents('{"stopReason":"FUTURE_STOP_REASON"}');
+		expect(events).toHaveLength(0);
 	});
 	test("detects refusal even when stopReason/stopDetails is not the first property (order-independent parsing)", () => {
 		// P1 fix (#6150): refusal must be detected regardless of property order

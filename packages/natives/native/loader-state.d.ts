@@ -88,7 +88,9 @@ export function loadFromCandidates<T>(input: LoadFromCandidatesInput<T>): LoadFr
 export interface CachedEmbeddedExtractionIsFreshInput {
 	targetPath: string;
 	embeddedPath: string;
+	expectedDigest: string | null | undefined;
 	sizeOf: (path: string) => number | null;
+	digestOf: (path: string) => string | null;
 }
 
 export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;
@@ -136,6 +138,7 @@ export interface LoadNativeOptions {
 	acquireStagedCandidateLease?: (candidate: string) => () => void;
 	requireCandidate?: (candidate: string) => Record<string, unknown>;
 	validateCandidate?: (bindings: Record<string, unknown>, candidate: string) => void;
+	loadNativeLibrary?: (runtime: string) => bigint | number | null;
 }
 
 export function loadNative(options?: LoadNativeOptions): Record<string, unknown>;

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	applyUltrafastTierModelPolicies,
 	CODEX_GPT6_IDS,
 	injectAlibabaTokenPlanModels,
 	injectCodexGpt6Models,
@@ -98,6 +99,61 @@ describe("injectCodexGpt6Models", () => {
 		injectCodexGpt6Models(models);
 
 		expect(models.find(model => model.id === "gpt-6-astra")).toEqual(discovered);
+	});
+});
+
+describe("applyUltrafastTierModelPolicies", () => {
+	const model = (provider: string, id: string): Model =>
+		({
+			id,
+			name: id,
+			api: "openai-responses",
+			provider,
+			baseUrl: "https://example.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_000,
+			compat: { supportsReasoningEffort: true },
+		}) as Model;
+
+	it("preserves model-specific ultrafast support without enabling other tiers", () => {
+		const models = [
+			model("openai", "gpt-6-astra"),
+			model("openai-codex", "gpt-6.1-sol"),
+			model("github-copilot", "gpt-6-astra"),
+			model("opencode-zen", "gpt-6.1-sol"),
+			model("openai-codex", "gpt-6-sol"),
+		];
+		models[2]!.compat = { ...models[2]!.compat, supportsServiceTier: true };
+		models[3]!.compat = { ...models[3]!.compat, supportsServiceTier: true };
+
+		applyUltrafastTierModelPolicies(models);
+
+		expect(models[0]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[1]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[2]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[3]?.compat).toEqual({ supportsReasoningEffort: true, supportsUltrafastTier: true });
+		expect(models[4]?.compat).toEqual({ supportsReasoningEffort: true });
+	});
+
+	it("does not infer ultrafast support for GPT-5.6 models", () => {
+		const models = [
+			model("openai", "gpt-5.6-sol"),
+			model("openai-codex", "gpt-5.6-sol"),
+			model("github-copilot", "gpt-5.6-sol"),
+			model("opencode-zen", "gpt-5.6-sol"),
+		];
+
+		applyUltrafastTierModelPolicies(models);
+
+		expect(models.map(candidate => candidate.compat?.supportsUltrafastTier)).toEqual([
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+		]);
 	});
 });
 

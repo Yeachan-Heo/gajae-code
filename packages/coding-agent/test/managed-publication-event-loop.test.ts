@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import { ArtifactManager } from "../src/session/artifacts";
 import {
@@ -110,6 +111,37 @@ describe("async native no-replace publication boundary (issue #4394)", () => {
 			const syncDestination = path.join(dir, "sync.output");
 			publishManagedFileNoReplaceSync(syncDestination, bytes);
 			expect(await fsp.readFile(syncDestination)).toEqual(Buffer.from(bytes));
+		});
+	});
+
+	it("reports pre-mutation access denial as an actionable managed permission error", async () => {
+		await withTempDir("gjc-async-publish-access-denied-", async dir => {
+			const destination = path.join(dir, "generation.output");
+			const result: NativeNoReplaceResult = {
+				ok: false,
+				code: "access_denied",
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "access_denied",
+				primitive: "windows_rename_noreplace",
+				phase: "rename",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			};
+			const rename = vi.spyOn(native, "renameNoReplacePathAsync").mockResolvedValue(result);
+			try {
+				await expect(
+					publishManagedFileNoReplace(destination, new TextEncoder().encode("managed-output")),
+				).rejects.toMatchObject({
+					name: "ManagedPublishError",
+					message: "permission_denied",
+					classification: "permission_denied",
+					stagingCleanupSafe: true,
+				});
+				expect(rename).toHaveBeenCalledTimes(1);
+				expect(await fsp.readdir(dir)).toEqual([]);
+			} finally {
+				rename.mockRestore();
+			}
 		});
 	});
 

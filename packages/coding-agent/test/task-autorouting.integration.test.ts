@@ -4,7 +4,7 @@ import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { TaskTool } from "../src/task";
 import * as discoveryModule from "../src/task/discovery";
-import type { runSubprocess } from "../src/task/executor";
+import { runSubprocess } from "../src/task/executor";
 import { buildTaskReceipt } from "../src/task/receipt";
 import type { SingleResult, TaskRoutingEvidence } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
@@ -399,15 +399,35 @@ describe("TaskTool autorouting integration surfaces", () => {
 		expect(result.content[0]?.type).toBe("text");
 		expect(JSON.stringify(result)).not.toContain('"routing"');
 	});
-	it("registered resume runner recomputes a fresh route and marks freshOnResume", async () => {
+	it("registered resume runner refreshes tier, credential, and disabled-provider routing", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
 		const settings = Settings.isolated({
 			"task.autorouting.enabled": true,
 			"task.autorouting.tiers": { fast: ["anthropic/claude-haiku-4-5"] },
 		});
-		const captured: Array<{ runMode?: string; routing?: unknown; modelOverride?: string | string[] }> = [];
+		const unavailableCredentials = new Set<string>();
+		const failedCredentialLookups = new Set<string>();
+		const resumeCredentialModels: never[] = [];
+		const executions: Array<{
+			options: Parameters<typeof runSubprocess>[0];
+			result?: SingleResult;
+			error?: unknown;
+		}> = [];
+		const captured: Array<{
+			runMode?: string;
+			routing?: unknown;
+			modelOverride?: string | string[];
+			autoroutingCandidates?: string[];
+			autoroutingPreflightErrors?: Map<string, unknown>;
+		}> = [];
 		const stub = async (options: Parameters<typeof runSubprocess>[0]) => {
-			captured.push({ runMode: options.runMode, routing: options.routing, modelOverride: options.modelOverride });
+			captured.push({
+				runMode: options.runMode,
+				routing: options.routing,
+				modelOverride: options.modelOverride,
+				autoroutingCandidates: options.autoroutingCandidates,
+				autoroutingPreflightErrors: options.autoroutingPreflightErrors,
+			});
 			return {
 				index: options.index,
 				id: options.id,
@@ -425,25 +445,52 @@ describe("TaskTool autorouting integration surfaces", () => {
 				routing: options.routing,
 			} as SingleResult;
 		};
+		const capturingStub = async (options: Parameters<typeof runSubprocess>[0]) => {
+			const execution: {
+				options: Parameters<typeof runSubprocess>[0];
+				result?: SingleResult;
+				error?: unknown;
+			} = { options };
+			executions.push(execution);
+			try {
+				const result =
+					options.runMode !== "initial" && options.autoroutingCandidates?.length === 0
+						? await runSubprocess(options)
+						: await stub(options);
+				execution.result = result;
+				return result;
+			} catch (error) {
+				execution.error = error;
+				throw error;
+			}
+		};
 		const tool = await TaskTool.create(
 			session(
 				{},
 				{
 					settings,
 					modelRegistry: {
-						getAvailable: () => registryModels,
+						getAvailable: () => [...registryModels, ...resumeCredentialModels],
+						getApiKey: async (model: { provider: string; id: string }) => {
+							const selector = `${model.provider}/${model.id}`;
+							if (failedCredentialLookups.has(selector)) throw new Error("keychain access denied");
+							return unavailableCredentials.has(selector) ? undefined : "test-key";
+						},
 						withConsumerLease: async <T>(body: () => T | Promise<T>): Promise<T> => await body(),
 					} as never,
 				},
 			),
-			{ runSubprocess: stub },
+			{ runSubprocess: capturingStub },
 		);
 		await tool.execute("resume-seed", {
 			agent: "task",
 			tasks: [{ id: "Resume", description: "resume", assignment: "run", tier: "fast" }],
 		} as never);
 		await AsyncJobManager.instance()!.waitForAll();
-		settings.override("task.autorouting.tiers", { fast: ["anthropic/claude-opus-5"] });
+		unavailableCredentials.add("anthropic/claude-haiku-4-5");
+		settings.override("task.autorouting.tiers", {
+			fast: ["anthropic/claude-haiku-4-5", "anthropic/claude-opus-5"],
+		});
 		const record = AsyncJobManager.instance()!.getSubagentRecords()[0];
 		expect(record).toBeDefined();
 		if (!record) return;
@@ -453,6 +500,71 @@ describe("TaskTool autorouting integration surfaces", () => {
 		expect(captured.at(-1)?.routing).toMatchObject({
 			freshOnResume: true,
 			effectiveModel: "anthropic/claude-opus-5",
+			skips: [{ selector: "anthropic/claude-haiku-4-5", code: "credential_unavailable" }],
+		});
+
+		const exhaustedSelectors = Array.from({ length: 7 }, (_, index) => `resume-test/model-${index}`);
+		for (let index = 0; index < exhaustedSelectors.length; index++) {
+			resumeCredentialModels.push(model("resume-test", `model-${index}`));
+			unavailableCredentials.add(exhaustedSelectors[index]!);
+		}
+		settings.override("task.autorouting.tiers", { fast: exhaustedSelectors });
+		const executedCountBeforeCredentialExhaustion = executions.length;
+		expect(AsyncJobManager.instance()!.resumeSubagent(record.subagentId).ok).toBe(true);
+		await AsyncJobManager.instance()!.waitForAll();
+		expect(executions.length).toBe(executedCountBeforeCredentialExhaustion + 1);
+		expect(executions.at(-1)?.options).toMatchObject({
+			runMode: "resume",
+			autoroutingCandidates: [],
+			routing: { freshOnResume: true },
+		});
+		const exhaustedResult = executions.at(-1)?.result;
+		expect(executions.at(-1)?.error).toBeUndefined();
+		expect(exhaustedResult).toMatchObject({
+			exitCode: 1,
+			routing: { freshOnResume: true, notExecuted: true, terminal: "all_candidates_skipped" },
+		});
+		expect(exhaustedResult?.routing).toMatchObject({
+			freshOnResume: true,
+			notExecuted: true,
+			terminal: "all_candidates_skipped",
+			attempts: exhaustedSelectors.slice(0, 6).map(selector => ({
+				selector,
+				phase: "probe",
+				code: "credential_unavailable",
+			})),
+			skips: exhaustedSelectors.map(selector => ({ selector, code: "credential_unavailable" })),
+		});
+
+		settings.override("task.autorouting.tiers", {
+			fast: ["anthropic/claude-haiku-4-5", "anthropic/claude-opus-5"],
+		});
+		failedCredentialLookups.add("anthropic/claude-haiku-4-5");
+		expect(AsyncJobManager.instance()!.resumeSubagent(record.subagentId).ok).toBe(true);
+		await AsyncJobManager.instance()!.waitForAll();
+		expect(executions.at(-1)?.options.modelOverride).toEqual(["anthropic/claude-haiku-4-5"]);
+		expect(executions.at(-1)?.options.autoroutingCandidates).toEqual(["anthropic/claude-haiku-4-5"]);
+		expect(executions.at(-1)?.options.autoroutingPreflightErrors?.has("anthropic/claude-haiku-4-5")).toBe(true);
+		expect(executions.at(-1)?.options.routing).toMatchObject({
+			freshOnResume: true,
+			effectiveModel: "anthropic/claude-haiku-4-5",
+		});
+
+		settings.override("disabledProviders", ["anthropic"]);
+		unavailableCredentials.delete("anthropic/claude-opus-5");
+		expect(AsyncJobManager.instance()!.resumeSubagent(record.subagentId).ok).toBe(true);
+		await AsyncJobManager.instance()!.waitForAll();
+		expect(executions.at(-1)?.options.runMode).toBe("resume");
+		expect(executions.at(-1)?.options.modelOverride).toEqual(["manual/frontmatter"]);
+		expect(executions.at(-1)?.options.routing).toMatchObject({
+			freshOnResume: true,
+			requestedSelector: "manual-model-chain",
+			effectiveModel: "manual-model-chain",
+			manualFallbackReason: "tier_unmatched",
+			skips: [
+				{ selector: "anthropic/claude-haiku-4-5", code: "provider_disabled" },
+				{ selector: "anthropic/claude-opus-5", code: "provider_disabled" },
+			],
 		});
 	});
 

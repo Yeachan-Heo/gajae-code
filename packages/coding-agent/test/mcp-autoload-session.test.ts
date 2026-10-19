@@ -100,7 +100,8 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			agentDir,
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({}),
+			// Project stdio autoload requires an explicit user opt-in.
+			settings: Settings.isolated({ "mcp.enableProjectConfig": true }),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
 			skills: [],
@@ -480,7 +481,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		const { session, startDeferredMcpConfig } = await createAgentSession({
 			...isolatedSessionOptions(),
 			sessionManager: seededManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "mcp.enableProjectConfig": true }),
 			deferMcpConfigStartup: true,
 		});
 		try {

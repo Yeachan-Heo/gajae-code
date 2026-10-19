@@ -260,6 +260,34 @@ describe("SDK session index lock contention (#4544)", () => {
 			spy.mockRestore();
 		}
 	});
+	it("stops heartbeat probes when the checkpoint deadline expires", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-6624-heartbeat-deadline-"));
+		const index = await new SessionIndex(dir).open();
+		for (let row = 0; row < 4; row++) await index.append(event(`deadline-host-${row}`));
+
+		const initialSeq = index.indexSeq;
+		const realMono = performance.now.bind(performance);
+		let simulatedWorkMs = 0;
+		const mono = vi.spyOn(performance, "now").mockImplementation(() => realMono() + simulatedWorkMs);
+		const deadline = performance.now() + 1_000;
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
+			simulatedWorkMs += 600;
+			return realProcessIncarnation(pid);
+		});
+		try {
+			// Simulate slow synchronous OS probes under CPU contention. Once this
+			// pass has consumed its budget, remaining registrations must not add
+			// more synchronous probes before the broker's startup fence.
+			expect(await index.checkpointLiveHeartbeats(Date.now(), undefined, deadline)).toBe(0);
+			expect(incarnation).toHaveBeenCalledTimes(2);
+			expect(index.indexSeq).toBe(initialSeq);
+		} finally {
+			incarnation.mockRestore();
+			mono.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("fails closed when the locked replay outlives the probe freshness window", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-replay-stale-"));
 		const seed = await new SessionIndex(dir).open();

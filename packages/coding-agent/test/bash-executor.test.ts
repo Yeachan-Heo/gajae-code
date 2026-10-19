@@ -46,7 +46,7 @@ function makeTempDir(): string {
 
 describe("executeBash", () => {
 	it("caps minimizer captures to the supported protocol boundary", () => {
-		const base = { enabled: true, settingsPath: "", only: [], except: [] };
+		const base = { enabled: true, settingsPath: "", settingsHash: undefined, only: [], except: [] };
 		expect(buildMinimizerOptions({ ...base, maxCaptureBytes: Number.MAX_SAFE_INTEGER })?.maxCaptureBytes).toBe(
 			4 * 1024 * 1024,
 		);

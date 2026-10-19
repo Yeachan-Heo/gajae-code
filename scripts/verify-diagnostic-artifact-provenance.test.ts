@@ -99,6 +99,103 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 		}
 	});
 
+	it("keeps local addons out of release records and verifies their separate embed digest", async () => {
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-local-build-"));
+		try {
+			const fixture = await fixturePackage(workspace);
+			const initial = await run(["--rebuild-from-sidecars", fixture.native], workspace);
+			expect(initial.exitCode).toBe(0);
+
+			const localAddon = path.join(fixture.native, "pi_natives.linux-x64-modern.node");
+			const localManifest = path.join(fixture.native, "diagnostic-artifact.local.json");
+			await Bun.write(localAddon, "local addon bytes");
+			await Bun.write(`${localAddon}.build.json`, JSON.stringify({ profile: "local", version: fixture.version }));
+			await Bun.write(
+				localManifest,
+				JSON.stringify({
+					schema: "gjc.diagnostic-artifact",
+					version: fixture.version,
+					artifacts: { [path.basename(localAddon)]: await sha256(localAddon) },
+				}),
+			);
+
+			const beforeRebuild = await run(["--verify", fixture.native], workspace);
+			expect(beforeRebuild.exitCode).not.toBe(0);
+			expect(beforeRebuild.stderr).toContain("pi_natives.linux-x64-modern.node");
+			await fs.rm(localManifest);
+			const missingLocalManifest = await run(["--verify-for-embedding", fixture.native], workspace);
+			expect(missingLocalManifest.exitCode).not.toBe(0);
+			expect(missingLocalManifest.stderr).toContain("has no local diagnostic artifact manifest");
+			await Bun.write(
+				localManifest,
+				JSON.stringify({
+					schema: "gjc.diagnostic-artifact",
+					version: fixture.version,
+					artifacts: { [path.basename(localAddon)]: await sha256(localAddon) },
+				}),
+			);
+			const embedding = await run(["--verify-for-embedding", fixture.native], workspace);
+			expect(embedding.exitCode).toBe(0);
+			expect(embedding.stdout).toContain("verified 2 present artifact(s)");
+
+			await Bun.write(localAddon, "modified local addon bytes");
+			const modified = await run(["--verify-for-embedding", fixture.native], workspace);
+			expect(modified.exitCode).not.toBe(0);
+			expect(modified.stderr).toContain("pi_natives.linux-x64-modern.node bytes do not match the local digest");
+
+			const rebuilt = await run(["--rebuild-from-sidecars", fixture.native], workspace);
+			expect(rebuilt.exitCode).toBe(0);
+			const manifest = (await Bun.file(path.join(fixture.native, "diagnostic-artifact.json")).json()) as {
+				artifacts: Record<string, string>;
+			};
+			expect(manifest.artifacts).toEqual({
+				"pi_natives.darwin-arm64.node": await sha256(path.join(fixture.native, "pi_natives.darwin-arm64.node")),
+			});
+			const afterRebuild = await run(["--verify", fixture.native], workspace);
+			expect(afterRebuild.exitCode).not.toBe(0);
+			expect(afterRebuild.stderr).toContain("pi_natives.linux-x64-modern.node");
+		} finally {
+			await fs.rm(workspace, { recursive: true, force: true });
+		}
+	});
+
+	it("embeds a local-only build when the trusted record still has the previous package version", async () => {
+		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-local-stale-record-"));
+		try {
+			const fixture = await fixturePackage(workspace, {
+				version: "9.9.9-fixture",
+				addons: { "pi_natives.linux-x64-modern.node": "local addon bytes" },
+				sidecars: "none",
+			});
+			const addon = path.join(fixture.native, "pi_natives.linux-x64-modern.node");
+			await Bun.write(`${addon}.build.json`, JSON.stringify({ profile: "local", version: fixture.version }));
+			await Bun.write(
+				path.join(fixture.native, "diagnostic-artifact.local.json"),
+				JSON.stringify({
+					schema: "gjc.diagnostic-artifact",
+					version: fixture.version,
+					artifacts: { [path.basename(addon)]: await sha256(addon) },
+				}),
+			);
+			await Bun.write(
+				path.join(fixture.native, "diagnostic-artifact.json"),
+				JSON.stringify({ schema: "gjc.diagnostic-artifact", version: "9.9.8-fixture", artifacts: {} }),
+			);
+
+			const embedding = await run(["--verify-for-embedding", fixture.native], workspace);
+			expect(embedding.exitCode).toBe(0);
+			expect(embedding.stdout).toContain("verified 1 present artifact(s) for embedding");
+
+			const releaseVerification = await run(["--verify", fixture.native], workspace);
+			expect(releaseVerification.exitCode).not.toBe(0);
+			expect(releaseVerification.stderr).toContain(
+				"record version 9.9.8-fixture does not match package version 9.9.9-fixture",
+			);
+		} finally {
+			await fs.rm(workspace, { recursive: true, force: true });
+		}
+	});
+
 	it("refuses an addon that arrived without its provenance sidecar", async () => {
 		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-missing-"));
 		try {
@@ -172,6 +269,7 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 				(await run(["--stage-check", staged, "--trusted-native-dir", fixture.native], workspace)).exitCode,
 			).toBe(0);
 
+			await Bun.write(`${path.join(staged, "pi_natives.darwin-arm64.node")}.build.json`, JSON.stringify({ profile: "local" }));
 			await Bun.write(path.join(staged, "pi_natives.darwin-arm64.node"), "different-bytes");
 			const mismatch = await run(["--stage-check", staged, "--trusted-native-dir", fixture.native], workspace);
 			expect(mismatch.exitCode).not.toBe(0);
@@ -238,19 +336,35 @@ describe("diagnostic artifact provenance transfer (C2)", () => {
 			expect(listed.exitCode).toBe(0);
 			const entries = new TextDecoder().decode(listed.stdout ?? new Uint8Array()).split("\n");
 			expect(entries).toContain("package/native/diagnostic-artifact.json");
+			expect(entries).toContain("package/native/diagnostic-artifact-embedded.json");
 			expect(entries).toContain("package/native/diagnostic-loader.js");
 		} finally {
 			await fs.rm(workspace, { recursive: true, force: true });
 		}
 	}, 120_000);
 
-	it("keeps the shipped record in step with the built addon in this checkout", async () => {
+	it("verifies shipped artifacts and refuses local-profile artifacts in this checkout", async () => {
 		// The runner gets a task-owned HOME/TMPDIR even though it inspects the real
 		// package directory, so nothing is written inside the checkout.
 		const workspace = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "gjc-prov-checkout-"));
 		try {
-			const result = await run(["--verify", path.join(NATIVES_PACKAGE, "native")], workspace);
-			expect(result.exitCode).toBe(0);
+			const nativeDir = path.join(NATIVES_PACKAGE, "native");
+			const entries = await fs.readdir(nativeDir);
+			const localAddons: string[] = [];
+			for (const addon of entries.filter(entry => entry.endsWith(".node"))) {
+				const metadataPath = `${path.join(nativeDir, addon)}.build.json`;
+				if (!(await Bun.file(metadataPath).exists())) continue;
+				const metadata = (await Bun.file(metadataPath).json()) as { profile?: string };
+				if (metadata.profile === "local") localAddons.push(addon);
+			}
+
+			const result = await run(["--verify", nativeDir], workspace);
+			if (localAddons.length === 0) {
+				expect(result.exitCode).toBe(0);
+			} else {
+				expect(result.exitCode).not.toBe(0);
+				for (const addon of localAddons) expect(result.stderr).toContain(addon);
+			}
 		} finally {
 			await fs.rm(workspace, { recursive: true, force: true });
 		}

@@ -250,6 +250,99 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.body?.prompt_cache_key).toBe("session-123");
 	});
 
+	it("enables relay affinity automatically for a loopback relay", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{ ...model, provider: "ocx", baseUrl: "http://127.0.0.1:10100/v1" },
+		);
+
+		expect(captured.sessionId).toBe("session-123");
+		expect(captured.clientRequestId).toBe("session-123");
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+	});
+
+	it.each([
+		"http://127.0.0.1:10100/v1",
+		"http://127.9.9.9:10100/v1",
+		"http://localhost:10100/v1",
+		"http://[::1]:10100/v1",
+	])("treats the loopback origin %s as a local relay", async baseUrl => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{ ...model, provider: "openai-relay", baseUrl },
+		);
+
+		expect(captured.sessionId).toBe("session-123");
+		expect(captured.clientRequestId).toBe("session-123");
+	});
+
+	it.each([
+		"http://192.168.1.10:10100/v1",
+		"http://10.0.0.5:10100/v1",
+		"https://relay.example.com/v1",
+	])("keeps the non-loopback relay %s opt-in", async baseUrl => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{ ...model, provider: "openai-relay", baseUrl },
+		);
+
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+	});
+
+	it("lets a loopback relay opt back out of affinity headers", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{
+				...model,
+				provider: "ocx",
+				baseUrl: "http://127.0.0.1:10100/v1",
+				compat: { ...model.compat, supportsResponsesSessionAffinity: false },
+			},
+		);
+
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+		expect(captured.body?.prompt_cache_key).toBe("session-123");
+	});
+
+	it("gates loopback affinity headers on effective retention", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ cacheRetention: "none", sessionId: "session-123" },
+			{ ...model, provider: "ocx", baseUrl: "http://127.0.0.1:10100/v1" },
+		);
+
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+		expect(captured.body?.prompt_cache_retention).toBeUndefined();
+	});
+
+	it("keeps known non-target providers excluded on loopback origins", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{
+				...model,
+				provider: "github-copilot",
+				baseUrl: "http://127.0.0.1:10100/v1",
+				compat: { ...model.compat, supportsResponsesSessionAffinity: true },
+			},
+		);
+
+		expect(captured.sessionId).toBeNull();
+		expect(captured.clientRequestId).toBeNull();
+	});
+
+	it("auto-enables affinity for the official provider pointed at a loopback gateway", async () => {
+		const captured = await captureOpenAIResponseHeaders(
+			{ sessionId: "session-123" },
+			{ ...model, baseUrl: "http://127.0.0.1:4000/v1" },
+		);
+
+		expect(captured.sessionId).toBe("session-123");
+		expect(captured.clientRequestId).toBe("session-123");
+	});
+
 	it("excludes known non-target providers even when affinity is explicitly enabled", async () => {
 		const captured = await captureOpenAIResponseHeaders(
 			{ sessionId: "session-123" },

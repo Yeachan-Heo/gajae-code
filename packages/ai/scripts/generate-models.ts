@@ -37,7 +37,7 @@ import {
 import { getGitLabDuoModels } from "../src/providers/gitlab-duo";
 import { kiroApiStaticModels } from "../src/providers/kiro-api-key";
 import { JWT_CLAIM_PATH } from "../src/providers/openai-codex/constants";
-import type { Model } from "../src/types";
+import type { Model, OpenAICompat } from "../src/types";
 import { fetchAntigravityDiscoveryModels } from "../src/utils/discovery/antigravity";
 import { fetchCodexModels } from "../src/utils/discovery/codex";
 import type { OAuthProvider } from "../src/utils/oauth/types";
@@ -113,6 +113,32 @@ export function injectCodexGpt6Models(models: Model[]): void {
 		const model = gpt6(id, name, priority);
 		const exists = models.some(existing => existing.provider === model.provider && existing.id === model.id);
 		if (!exists) models.push(model);
+	}
+}
+
+const ULTRAFAST_TIER_MODEL_KEYS = new Set([
+	"openai/gpt-6-astra",
+	"openai/gpt-6.1-sol",
+	"openai-codex/gpt-6-astra",
+	"openai-codex/gpt-6.1-sol",
+	"github-copilot/gpt-6-astra",
+	"github-copilot/gpt-6.1-sol",
+	"opencode-zen/gpt-6-astra",
+	"opencode-zen/gpt-6.1-sol",
+]);
+
+const ULTRAFAST_ONLY_PROVIDERS = new Set(["github-copilot", "opencode-zen"]);
+
+/** Preserve reviewed GPT-6 tier capabilities across dynamic catalog regeneration. */
+export function applyUltrafastTierModelPolicies(models: Model[]): void {
+	for (const model of models) {
+		if (!ULTRAFAST_TIER_MODEL_KEYS.has(`${model.provider}/${model.id}`)) continue;
+		const compat: OpenAICompat = { ...(model.compat as OpenAICompat | undefined) };
+		if (ULTRAFAST_ONLY_PROVIDERS.has(model.provider)) delete compat.supportsServiceTier;
+		model.compat = {
+			...compat,
+			supportsUltrafastTier: true,
+		};
 	}
 }
 
@@ -901,6 +927,7 @@ async function generateModels() {
 	injectMuseSparkModels(allModels);
 	linkOpenAIPromotionTargets(allModels);
 	injectImageGenerationModels(allModels);
+	applyUltrafastTierModelPolicies(allModels);
 
 	// Group by provider and sort each provider's models
 	const providers: Record<string, Record<string, Model>> = {};

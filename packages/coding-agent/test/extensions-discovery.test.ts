@@ -19,7 +19,9 @@ describe("extensions discovery", () => {
 	});
 
 	const discoverForTest = async (configuredPaths: string[] = []) => {
-		const result = await discoverAndLoadExtensions(configuredPaths, tempDir.path());
+		// Implicit project discovery no longer imports `<cwd>/.gjc/extensions`.
+		// These cases still pass that directory as an explicit path.
+		const result = await discoverAndLoadExtensions([extensionsDir, ...configuredPaths], tempDir.path());
 		return {
 			...result,
 			extensions: filterUserScoped(result.extensions),
@@ -55,6 +57,24 @@ describe("extensions discovery", () => {
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(2);
 		expect(result.extensions.map(e => path.basename(e.path)).sort()).toEqual(["bar.ts", "foo.ts"]);
+	});
+
+	it("keeps a user extension when a same-named project module is filtered", async () => {
+		const projectExtensionPath = path.join(extensionsDir, "foo", "index.ts");
+		fs.mkdirSync(path.dirname(projectExtensionPath), { recursive: true });
+		fs.writeFileSync(projectExtensionPath, extensionCodeWithTool("project-tool"));
+
+		const agentDir = path.join(tempDir.path(), "user-agent");
+		const userExtensionPath = path.join(agentDir, "extensions", "foo", "index.ts");
+		fs.mkdirSync(path.dirname(userExtensionPath), { recursive: true });
+		fs.writeFileSync(userExtensionPath, extensionCodeWithTool("user-tool"));
+
+		const result = await discoverAndLoadExtensions([], tempDir.path(), undefined, [], { agentDir });
+
+		expect(result.errors).toHaveLength(0);
+		const userExtension = result.extensions.find(extension => extension.path === userExtensionPath);
+		expect(userExtension?.tools.has("user-tool")).toBe(true);
+		expect(result.extensions.some(extension => extension.path === projectExtensionPath)).toBe(false);
 	});
 
 	it("discovers direct .js files in extensions/", async () => {

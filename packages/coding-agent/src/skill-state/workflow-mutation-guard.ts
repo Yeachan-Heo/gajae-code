@@ -6,7 +6,11 @@ import { logger } from "@gajae-code/utils";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { isAutoresearchAuthorizedResearchPath } from "../autoresearch/git";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
-import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
+import {
+	GJC_SESSION_PREFIX,
+	sessionDirName,
+	modeStatePath as sessionModeStatePath,
+} from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema } from "../gjc-runtime/state-schema";
 import { workflowEnvelopeChecksumStatus } from "../gjc-runtime/state-writer";
@@ -31,7 +35,7 @@ export const RALPLAN_MUTATION_BLOCK_MESSAGE =
 export const ULTRAGOAL_GOAL_PLANNING_MUTATION_BLOCK_MESSAGE =
 	"Ultragoal goal-planning phase boundary: finish goal planning and record goals through `gjc ultragoal` before editing code. Product-code mutation tools and patch execution are blocked until goal planning completes and execution begins.";
 export const AUTORESEARCH_MUTATION_BLOCK_MESSAGE =
-	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked everywhere, on every branch. Mission research artifacts (`autoresearch.sh` at the workdir root and mission state through the sanctioned `gjc autoresearch` CLI) stay writable; run experiments through the `python` tool, or finish the mission and hand off to an approved implementation workflow.";
+	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked everywhere, on every branch. Write the root `autoresearch.sh` only with direct file tools; mission state stays writable through the sanctioned `gjc autoresearch` CLI. Run experiments through the `python` tool, or finish the mission and hand off to an approved implementation workflow.";
 
 /** Resolve the phase-boundary block message for the active planning skill. */
 function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
@@ -41,10 +45,15 @@ function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
 	return DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE;
 }
 
-/** Tools whose execute path can mutate product state. `github` is included so side-effect ops share this guard. */
-export const WORKFLOW_MUTATION_TOOL_NAMES = ["edit", "write", "ast_edit", "bash", "github"] as const;
+/**
+ * Tools whose execute path can mutate product state. `github` is included so
+ * side-effect ops share this guard. `eval` and `python` run code that can write
+ * files without going through edit, write, or bash.
+ */
+export const WORKFLOW_MUTATION_TOOL_NAMES = ["edit", "write", "ast_edit", "bash", "github", "eval", "python"] as const;
 
 const BLOCKED_TOOL_NAMES = new Set<string>(WORKFLOW_MUTATION_TOOL_NAMES);
+const AUTORESEARCH_HARNESS_FILE_TOOL_NAMES = new Set(["edit", "write"]);
 
 export function isWorkflowMutationTool(name: string): boolean {
 	return BLOCKED_TOOL_NAMES.has(name);
@@ -80,22 +89,81 @@ const BASH_COMMAND_WRAPPER_SOURCE =
  */
 const BASH_COMMAND_POSITION_KEYWORD_RE = /(?:^|[;&|(\n{}])\s*(?:then|else|elif|do|in|\{|!)(?=\s)/gi;
 const BASH_MUTATION_COMMAND_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:tee|touch|rm|mkdir|cp|mv|install|truncate|chmod|ln)\\b([^;&|()\\n]*)|(?:^|[^<>])(?:>>?|\\d>>?)\\s*([^\\s;&|]+)`,
 	"gi",
 );
 /** Command-word extractor; must accept the same prefixes as `BASH_MUTATION_COMMAND_RE`. */
 const BASH_MUTATION_COMMAND_NAME_RE = new RegExp(
-	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate)\\b`,
+	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(tee|touch|rm|mkdir|cp|mv|install|truncate|chmod|ln)\\b`,
 	"i",
 );
+const BASH_CHMOD_MODE_RE = /^(?:[0-7]{1,4}|(?:[ugoa]*[+=-][rwxXstugo]*)(?:,[ugoa]*[+=-][rwxXstugo]*)*)$/;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = new RegExp(
 	`(?:^|[;&|(\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:sed|perl)\\b([^;&|()\\n]*)`,
 	"gi",
 );
-const BASH_OPAQUE_INTERPRETER_WRITE_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:-c|-e)\b[^;&|\n]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
-const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE =
-	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:python3?|node|ruby)\b[^;&|\n]*(?:<<[-]?\s*['"]?\w+['"]?)[\s\S]*(?:open\s*\(|writeFile(?:Sync)?\s*\(|\.write\s*\()/i;
+/**
+ * Write APIs a planning one-liner cannot be allowed to call. The destination is
+ * not a static path the temp allowlist can trust, so a match fails closed the
+ * same way `open(` / `writeFile(` / `.write(` already do. `perl` is included
+ * because `perl -e 'open(...)'` is that same call.
+ */
+const BASH_INTERPRETER_WRITE_API_PATTERNS = [
+	"open\\s*\\(",
+	"writeFile(?:Sync)?\\s*\\(",
+	"appendFile(?:Sync)?\\s*\\(",
+	"file_put_contents\\s*\\(",
+	"fwrite\\s*\\(",
+	"fputs\\s*\\(",
+	"unlink\\s*\\(",
+	"rename\\s*\\(",
+	"mkdir\\s*\\(",
+	"rmdir\\s*\\(",
+	"copy\\s*\\(",
+	"symlink\\s*\\(",
+	"link\\s*\\(",
+	"move_uploaded_file\\s*\\(",
+	"truncate\\s*\\(",
+	"touch\\s*\\(",
+	"\\.write\\s*\\(",
+	"shutil\\s*\\.\\s*(?:copy2?|copyfileobj|copyfile)\\s*\\(",
+	"os\\s*\\.\\s*symlink\\s*\\(",
+] as const;
+const BASH_INTERPRETER_WRITE_API = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.join("|")})`;
+const BASH_INTERPRETER_WRITE_API_EXCLUDING_OPEN = `(?:${BASH_INTERPRETER_WRITE_API_PATTERNS.slice(1).join("|")})`;
+const INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE =
+	/^\b(?:(?:process|Bun|Deno|sys)(?:\s*\.\s*(?:stdout|stderr)|\s*\[\s*["'`](?:stdout|stderr)["'`]\s*\])|(?:process|Bun|Deno|sys)\s*\[\s*[^\]]+\s*\]\s*(?:\.\s*write|\[\s*["'`]write["'`]\s*\])|(?:(?:globalThis|global)\s*\.\s*)?console)(?:\s*(?:\.\s*[\w$]+|\[\s*[^\]]+\s*\]))?\s*(?:\|\|=|&&=|\?\?=|[+\-*/%&|^]?=(?!=|>))/;
+
+/**
+ * A stream object can also be mutated reflectively, so an exempted
+ * `process.stdout.write(...)` is only trustworthy when nothing in the source can
+ * have replaced that method (`Object.assign(process.stdout, {write: ...})`).
+ */
+const INTERPRETER_OUTPUT_STREAM_MUTATION_RE =
+	/\b(?:Object\s*\.\s*(?:assign|definePropert(?:y|ies))|Reflect\s*\.\s*(?:set|defineProperty))\s*\(\s*(?:process|Bun|Deno|sys)\s*(?:\.\s*(?:stdout|stderr)|\[\s*["'`](?:stdout|stderr)["'`]\s*\])/;
+/**
+ * Inline interpreter source is opaque whenever it exposes code evaluation or
+ * reflective loading. This deliberately scans the complete source spelling,
+ * including quoted spans, because another language may evaluate those spans.
+ */
+const INTERPRETER_DYNAMIC_EXECUTION_RE =
+	/\b(?:eval|exec|execfile|Function|instance_eval|instance_exec|class_eval|class_exec|module_eval|module_exec|send|public_send|__send__|method_missing|__import__|exec_module|import_module|run_path|run_module|loadstring|dofile|loadfile|load|source|include|include_once|require_once|create_function|call_user_func(?:_array)?|setTimeout|setInterval|runInThisContext|runInNewContext|runInContext|getattr|setattr|__getattr__|__getattribute__|ReflectionClass|ReflectionFunction|ReflectionMethod|invokeMethod|invokeArgs)\b/;
+const INTERPRETER_FILESYSTEM_REQUIRE_RE =
+	/\b(?:require|import|from)\s*(?:\(\s*)?(['"\x60])(?:node:)?(?:fs(?:\/promises)?|fs-extra|graceful-fs|child_process|fileutils|io|lfs)\1(?:\s*\))?/i;
+const INTERPRETER_NONLITERAL_REQUIRE_RE = /\brequire\s*(?:\(\s*(?!['"\x60])|\s+(?!['"\x60]))/i;
+const SHELL_DOT_SOURCE_RE = /(?:^|[;&|\n])\s*(?:(?:if|then|do)\s+)?\.\s+(?:["'$`]|[A-Za-z0-9_./~])/;
+/** Executable Python source evaluation and dynamic imports make payloads opaque; compile() alone is inert. */
+const PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE =
+	/^(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
+const PYTHON_DYNAMIC_EXECUTION_TOKEN_RE =
+	/\b(?:exec|eval|execfile|__import__|exec_module|import_module|run_path|run_module|getattr|setattr|__getattr__|__getattribute__)\b/;
+/** JavaScript eval and Function construct executable code from runtime strings. */
+const JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE = /^(?:eval|Function)\b/;
+const JAVASCRIPT_DYNAMIC_EXECUTION_TOKEN_RE = /\b(?:eval|Function)\b/;
+const BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE = new RegExp(
+	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?(?:python3?|node|ruby|perl)\\b[^;&|\\n]*(?:<<[-]?\\s*['"]?\\w+['"]?)[\\s\\S]*${BASH_INTERPRETER_WRITE_API}`,
+	"i",
+);
 const BASH_DD_OUTPUT_RE = new RegExp(
 	`(?:^|[;&|\\n])\\s*(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|]*\\/)?dd\\b([^;&|\\n]*)`,
 	"gi",
@@ -1554,6 +1622,1242 @@ function extractSubstitutionBodies(command: string): SubstitutionBody[] {
 	return bodies;
 }
 
+const BASH_SED_COMMAND_RE = new RegExp(
+	`(?:^|[;&|(\\n])\\s*(?:(?:if|then|else|elif|do|in|while|until)\\s+)*(?:!\\s+)?(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?sed\\b((?:'[^']*'|"(?:\\\\.|[^"\\\\])*"|\\\\.|[^'";&|()\\n\\\\])*)`,
+	"gi",
+);
+const BASH_AWK_COMMAND_RE = new RegExp(
+	`(?:^|[;&|(\\n])\\s*(?:(?:if|then|else|elif|do|in)\\s+)*(?:!\\s+)?(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:awk|gawk|mawk|nawk|busybox\\s+awk)\\b((?:'[^']*'|"(?:\\\\.|[^"\\\\])*"|\\\\.|[^'";&|()\\n\\\\])*)`,
+	"gi",
+);
+
+/** `true` when index sits at a sed command letter, not inside a pattern. */
+function sedCommandPosition(script: string, index: number): boolean {
+	if (index === 0) return true;
+	return /[\s;{}\n\d$,]/.test(script[index - 1] ?? "");
+}
+
+function sedWriteName(script: string, index: number): { path: string | null; next: number } {
+	let cursor = index;
+	while (cursor < script.length && (script[cursor] === " " || script[cursor] === "\t")) cursor++;
+	const start = cursor;
+	while (cursor < script.length && script[cursor] !== ";" && script[cursor] !== "\n" && script[cursor] !== "}") {
+		cursor++;
+	}
+	return { path: cursor > start ? script.slice(start, cursor) : null, next: cursor };
+}
+
+function sedAddressEnd(script: string, start: number): number | undefined {
+	if (script[start] === "/") {
+		let cursor = start + 1;
+		while (cursor < script.length) {
+			if (script[cursor] === "\\") {
+				cursor += 2;
+				continue;
+			}
+			if (script[cursor] === "/") return cursor + 1;
+			cursor++;
+		}
+		return undefined;
+	}
+	if (script[start] === "$") return start + 1;
+	if (!/\d/.test(script[start] ?? "")) return undefined;
+	let cursor = start + 1;
+	while (/\d/.test(script[cursor] ?? "")) cursor++;
+	if (script[cursor] === "~") {
+		cursor++;
+		while (/\d/.test(script[cursor] ?? "")) cursor++;
+	}
+	return cursor;
+}
+
+function sedAddressWithModifiersEnd(script: string, start: number): number | undefined {
+	let cursor = sedAddressEnd(script, start);
+	if (cursor === undefined) return undefined;
+	if (script[start] === "/") {
+		while (script[cursor] === "I" || script[cursor] === "M") cursor++;
+	}
+	return cursor;
+}
+
+function sedRegexAddressWritePath(script: string, start: number): { path: string | null; next: number } | undefined {
+	let cursor = sedAddressWithModifiersEnd(script, start);
+	if (cursor === undefined) return undefined;
+	while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+	if (script[cursor] === ",") {
+		cursor++;
+		while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+		const rangeEnd = sedAddressWithModifiersEnd(script, cursor);
+		if (rangeEnd === undefined) return undefined;
+		cursor = rangeEnd;
+		while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+	}
+	if (script[cursor] === "!") cursor++;
+	while (script[cursor] === " " || script[cursor] === "\t") cursor++;
+	if ((script[cursor] !== "w" && script[cursor] !== "W") || !" \t;\n}".includes(script[cursor + 1] ?? "\n")) {
+		return undefined;
+	}
+	return sedWriteName(script, cursor + 1);
+}
+
+/**
+ * Filename a sed script writes with the `w`/`W` command or an `s///w file` flag.
+ * `undefined` means this text does not write. `null` means it writes without a
+ * literal filename.
+ */
+/**
+ * GNU sed can execute shell commands: the `e` command replaces the pattern
+ * space with a shell command's output and `s///e` runs the result. Neither form
+ * names a file, so their write targets cannot be derived and the whole program
+ * must be treated as an unclassified mutation.
+ */
+function sedScriptRunsShellCommand(script: string): boolean {
+	// GNU sed accepts a numeric, `$`, or regular-expression address (`/re/e cmd`).
+	if (
+		/(?:^|[;{}\n])\s*(?:(?:[0-9$]+(?:,[0-9$]+)?|\/(?:\\[\s\S]|[^\\/\n])*\/)\s*!?\s*)?e(?=[\s;}\n]|$)/.test(
+			script,
+		)
+	)
+		return true;
+	return /\bs(\W)(?:\\.|(?!\1)[^\n])*?\1(?:\\.|(?!\1)[^\n])*?\1[gpiImM0-9]*e(?![A-Za-z])/.test(script);
+}
+
+function sedScriptWritePath(script: string): string | null | undefined {
+	if (sedScriptRunsShellCommand(script)) return null;
+	let index = 0;
+	let foundWrite = false;
+	let foundPath: string | null | undefined;
+	while (index < script.length) {
+		const character = script[index] ?? "";
+		if (" \t\n;{}".includes(character)) {
+			index++;
+			continue;
+		}
+		if (character === "/" && sedCommandPosition(script, index)) {
+			const written = sedRegexAddressWritePath(script, index);
+			if (written) {
+				if (foundWrite) return null;
+				foundWrite = true;
+				foundPath = written.path;
+				index = Math.max(written.next, index + 1);
+				continue;
+			}
+		}
+		if ((character === "w" || character === "W") && sedCommandPosition(script, index)) {
+			const next = script[index + 1];
+			if (next === undefined || " \t;\n}".includes(next)) {
+				const taken = sedWriteName(script, index + 1);
+				if (foundWrite) return null;
+				foundWrite = true;
+				foundPath = taken.path;
+				index = Math.max(taken.next, index + 1);
+				continue;
+			}
+		}
+		if (character === "s" && index + 1 < script.length) {
+			const delimiter = script[index + 1] ?? "";
+			if (delimiter && !/[\s\\]/.test(delimiter)) {
+				index += 2;
+				let fields = 1;
+				while (index < script.length && fields < 3) {
+					if (script[index] === "\\") {
+						index += 2;
+						continue;
+					}
+					if (script[index] === delimiter) fields++;
+					index++;
+				}
+				while (index < script.length && script[index] !== ";" && script[index] !== "\n" && script[index] !== "}") {
+					if (
+						(script[index] === "w" || script[index] === "W") &&
+						(script[index + 1] === " " || script[index + 1] === "\t")
+					) {
+						const taken = sedWriteName(script, index + 1);
+						if (foundWrite) return null;
+						foundWrite = true;
+						foundPath = taken.path;
+						index = Math.max(taken.next, index + 1);
+						break;
+					}
+					index++;
+				}
+				continue;
+			}
+		}
+		index++;
+	}
+	return foundWrite ? foundPath : undefined;
+}
+
+/**
+ * `-c`/`-e` bodies are one shell word, so a `;` inside the quotes is not a
+ * statement break. The line-oriented interpreter regex stops at that `;` and
+ * misses `import shutil; shutil.copy(...)`.
+ */
+function interpreterStatementEnd(command: string, start: number): number {
+	let index = start;
+	let inSingle = false;
+	let inDouble = false;
+	while (index < command.length) {
+		const character = command[index] ?? "";
+		if (inSingle) {
+			if (character === "'") inSingle = false;
+			index++;
+			continue;
+		}
+		if (inDouble) {
+			if (character === "\\") {
+				index += 2;
+				continue;
+			}
+			if (character === '"') inDouble = false;
+			index++;
+			continue;
+		}
+		if (character === "'") {
+			inSingle = true;
+			index++;
+			continue;
+		}
+		if (character === '"') {
+			inDouble = true;
+			index++;
+			continue;
+		}
+		if (character === "\\") {
+			index += 2;
+			continue;
+		}
+		if (character === ";" || character === "&" || character === "|" || character === "\n") break;
+		index++;
+	}
+	return index;
+}
+
+function pythonSystemCallArguments(script: string): { starts: number[]; unclassifiable: boolean } {
+	const starts: number[] = [];
+	let quote: "'" | '"' | null = null;
+	let tripleQuote = false;
+	let inComment = false;
+	let unclassifiable = false;
+	for (let index = 0; index < script.length; index++) {
+		const character = script[index] ?? "";
+		if (inComment) {
+			if (character === "\n") inComment = false;
+			continue;
+		}
+		if (quote) {
+			if (character === "\\") {
+				index++;
+				continue;
+			}
+			if (tripleQuote && script.startsWith(quote.repeat(3), index)) {
+				quote = null;
+				tripleQuote = false;
+				index += 2;
+				continue;
+			}
+			if (!tripleQuote && character === quote) quote = null;
+			continue;
+		}
+		if (character === "#") {
+			inComment = true;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			const isFString = /(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(0, index));
+			tripleQuote = script.startsWith(character.repeat(3), index);
+			quote = character;
+			if (tripleQuote) {
+				const close = script.indexOf(character.repeat(3), index + 3);
+				const body = close < 0 ? script.slice(index + 3) : script.slice(index + 3, close);
+				if (isFString && /\bos\s*\.\s*system\s*\(/.test(body)) unclassifiable = true;
+				index += 2;
+			} else if (isFString) {
+				let close = index + 1;
+				while (close < script.length) {
+					if (script[close] === "\\") {
+						close += 2;
+						continue;
+					}
+					if (script[close] === character) break;
+					close++;
+				}
+				if (/\bos\s*\.\s*system\s*\(/.test(script.slice(index + 1, close))) unclassifiable = true;
+			}
+			continue;
+		}
+		const call = script.slice(index).match(/^\bos\s*\.\s*system\s*\(/);
+		if (call) {
+			starts.push(index + call[0].length);
+			index += call[0].length - 1;
+		}
+	}
+	// `os.system` can reach the shell under another name: a captured callable
+	// (`run = os.system`), a module alias (`import os as o`), or any other
+	// `<obj>.system(...)`. Neither form names its command here, so the shell
+	// payload is unclassifiable rather than invisible.
+	const systemCalls = (script.match(/\.\s*system\s*\(/g) ?? []).length;
+	const osSystemCalls = (script.match(/\bos\s*\.\s*system\s*\(/g) ?? []).length;
+	if (systemCalls > osSystemCalls) unclassifiable = true;
+	if (/\b[A-Za-z_]\w*\s*=\s*(?:os\s*\.\s*(?:system|popen)|subprocess\s*\.\s*\w+)\b/.test(script))
+		unclassifiable = true;
+	return { starts, unclassifiable };
+}
+
+function pythonSystemCommand(script: string, start: number): string | undefined {
+	let index = start;
+	while (/\s/.test(script[index] ?? "")) index++;
+	const quote = script[index];
+	if (quote !== "'" && quote !== '"') return undefined;
+	const tripleQuote = script.startsWith(quote.repeat(3), index);
+	index += tripleQuote ? 3 : 1;
+	let value = "";
+	let hasEscape = false;
+	while (index < script.length) {
+		if (script[index] === "\\") {
+			hasEscape = true;
+			index += 2;
+			continue;
+		}
+		if (tripleQuote && script.startsWith(quote.repeat(3), index)) {
+			index += 3;
+			while (/\s/.test(script[index] ?? "")) index++;
+			return !hasEscape && script[index] === ")" ? value : undefined;
+		}
+		if (!tripleQuote && script[index] === quote) {
+			index++;
+			while (/\s/.test(script[index] ?? "")) index++;
+			return !hasEscape && script[index] === ")" ? value : undefined;
+		}
+		value += script[index];
+		index++;
+	}
+	return undefined;
+}
+
+function collectPythonSystemWrites(script: string, targets: ExtractedTargets, depth: number): void {
+	const calls = pythonSystemCallArguments(script);
+	if (calls.unclassifiable) {
+		targets.explicitMutation = true;
+		targets.unknown = true;
+	}
+	for (const start of calls.starts) {
+		const payload = pythonSystemCommand(script, start);
+		if (payload === undefined || depth >= 2) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			continue;
+		}
+		const nested = extractBashTargets({ command: payload }, depth + 1);
+		for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+		if (nested.unknown) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+		}
+		if (nested.explicitMutation) targets.explicitMutation = true;
+	}
+}
+
+function cleanInterpreterCodeWord(word: string): string | undefined {
+	if (!word.startsWith("$'")) {
+		const fullyQuoted = (/^'[^']*'$/.test(word) || /^"(?:\\.|[^"\\])*"$/.test(word)) && word.length >= 2;
+		if (word.includes("$'") && !fullyQuoted) return undefined;
+		return cleanShellWord(word);
+	}
+	if (word.length < 3 || !word.endsWith("'")) return undefined;
+
+	let decoded = "";
+	for (let index = 2; index < word.length - 1; index++) {
+		const character = word[index] ?? "";
+		if (character !== "\\") {
+			if (character === "'") return undefined;
+			decoded += character;
+			continue;
+		}
+		const escapeCode = word[++index];
+		if (escapeCode === undefined) return undefined;
+		switch (escapeCode) {
+			case "a":
+				decoded += "\x07";
+				break;
+			case "b":
+				decoded += "\b";
+				break;
+			case "e":
+			case "E":
+				decoded += "\x1b";
+				break;
+			case "f":
+				decoded += "\f";
+				break;
+			case "n":
+				decoded += "\n";
+				break;
+			case "r":
+				decoded += "\r";
+				break;
+			case "t":
+				decoded += "\t";
+				break;
+			case "v":
+				decoded += "\v";
+				break;
+			case "\\":
+			case "'":
+			case '"':
+			case "?":
+				decoded += escapeCode;
+				break;
+			case "c": {
+				const control = word[++index];
+				if (control === undefined || control.charCodeAt(0) > 0x7f) return undefined;
+				const code = control === "?" ? 0x7f : control.toUpperCase().charCodeAt(0) & 0x1f;
+				if (code === 0) return undefined;
+				decoded += String.fromCharCode(code);
+				break;
+			}
+			case "x": {
+				let digits = "";
+				while (digits.length < 2 && /[\da-f]/i.test(word[index + 1] ?? "")) {
+					digits += word[++index];
+				}
+				if (!digits) return undefined;
+				const code = Number.parseInt(digits, 16);
+				if (code === 0) return undefined;
+				decoded += String.fromCharCode(code);
+				break;
+			}
+			case "u":
+			case "U": {
+				const width = escapeCode === "u" ? 4 : 8;
+				const digits = word.slice(index + 1, index + 1 + width);
+				if (digits.length !== width || !new RegExp(`^[\\da-f]{${width}}$`, "i").test(digits)) return undefined;
+				const code = Number.parseInt(digits, 16);
+				if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return undefined;
+				decoded += String.fromCodePoint(code);
+				index += width;
+				break;
+			}
+			default: {
+				if (!/[0-7]/.test(escapeCode)) return undefined;
+				let digits = escapeCode;
+				while (digits.length < 3 && /[0-7]/.test(word[index + 1] ?? "")) {
+					digits += word[++index];
+				}
+				const code = Number.parseInt(digits, 8);
+				if (code === 0 || code > 0xff) return undefined;
+				decoded += String.fromCharCode(code);
+				break;
+			}
+		}
+	}
+	return decoded;
+}
+
+function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTargets, depth: number): void {
+	const api = new RegExp(BASH_INTERPRETER_WRITE_API, "i");
+	const names = new RegExp(
+		`(?:^|[;&|\\n])\\s*(?:(?:if|then|else|elif|do|in|while|until)\\s+)*(?:!\\s+)?(?:\\w+=[^\\s]+\\s+)*(?:sudo\\s+)?${BASH_COMMAND_WRAPPER_SOURCE}(?:[^\\s;&|()]*\\/)?(?:busybox\\s+)?(python(?:\\d+(?:\\.\\d+)*)?|pypy(?:\\d+(?:\\.\\d+)*)?|node(?:js)?|bun|deno|ruby|jruby|perl|php(?:\\d+(?:\\.\\d+)*)?|lua(?:\\d+(?:\\.\\d+)*)?|bash|ash|sh|zsh|dash|ksh|fish)\\b`,
+		"gi",
+	);
+	for (const match of command.matchAll(names)) {
+		const start = (match.index ?? 0) + match[0].length;
+		const tail = command.slice(start, interpreterStatementEnd(command, start));
+		const words = shellWords(tail);
+		const parts = words.map(cleanShellWord);
+		const binary = (match[1] ?? "").toLowerCase();
+		const options = interpreterCodeOptions(binary);
+		for (let index = 0; index < parts.length; index++) {
+			const part = parts[index] ?? "";
+			let rawScript: string | undefined;
+			const option = options.find(
+				candidate =>
+					part === candidate || (candidate.length === 2 && part.startsWith(candidate) && part.length > 2),
+			);
+			if (option && part === option) {
+				rawScript = words[++index];
+			} else if (option) {
+				const rawWord = words[index] ?? "";
+				rawScript = rawWord.startsWith("-") ? rawWord.slice(option.length) : part.slice(option.length);
+			} else {
+				const longOption = options.find(
+					candidate => candidate.startsWith("--") && part.startsWith(`${candidate}=`),
+				);
+				if (!longOption) continue;
+				rawScript = words[index]?.slice(longOption.length + 1);
+			}
+			if (rawScript === undefined) continue;
+			const script = cleanInterpreterCodeWord(rawScript);
+			if (
+				script === undefined ||
+				(!rawScript.startsWith("$'") && shellWordHasExpansion(rawScript)) ||
+				containsOpaqueInterpreterSource(script, binary)
+			) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
+			if (/^(?:bash|ash|sh|zsh|dash|ksh|fish)$/.test(binary)) {
+				if (depth >= 2) {
+					targets.explicitMutation = true;
+					targets.unknown = true;
+					return;
+				}
+				const nested = extractBashTargets({ command: script }, depth + 1);
+				for (const nestedPath of nested.paths) addPath(targets, nestedPath);
+				if (nested.unknown) targets.unknown = true;
+				if (nested.explicitMutation) targets.explicitMutation = true;
+				continue;
+			}
+			const language = /^(?:python|pypy)/.test(binary)
+				? "py"
+				: /^(?:node|bun|deno)$/.test(binary)
+					? "js"
+					: /^(?:ruby|jruby)$/.test(binary)
+						? "ruby"
+						: "perl";
+			if (/^(?:python|pypy)/.test(binary)) {
+				scanInterpreterWrites(script, "py", targets);
+				if (
+					interpreterCodeContainsWriteApi(script, "py", new RegExp(BASH_INTERPRETER_WRITE_API_EXCLUDING_OPEN, "i"))
+				) {
+					targets.explicitMutation = true;
+					targets.unknown = true;
+				}
+				collectPythonSystemWrites(script, targets, depth);
+				continue;
+			}
+			if (interpreterCodeContainsWriteApi(script, language, api)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
+		}
+	}
+}
+
+function interpreterCodeOptions(binary: string): string[] {
+	if (/^(?:python|pypy)/.test(binary)) return ["-c"];
+	if (/^(?:node|bun)$/.test(binary)) return ["-e", "--eval", "-p", "--print"];
+	if (binary === "deno") return ["eval", "-e", "--eval"];
+	if (/^(?:ruby|jruby|perl|lua)/.test(binary)) return ["-e"];
+	if (/^php/.test(binary)) return ["-r"];
+	if (/^(?:bash|ash|sh|zsh|dash|ksh|fish)$/.test(binary)) return ["-c"];
+	return [];
+}
+
+function containsOpaqueInterpreterSource(source: string, binary: string): boolean {
+	return (
+		(!/^(?:python|pypy)/.test(binary) && INTERPRETER_DYNAMIC_EXECUTION_RE.test(source)) ||
+		INTERPRETER_FILESYSTEM_REQUIRE_RE.test(source) ||
+		INTERPRETER_NONLITERAL_REQUIRE_RE.test(source) ||
+		(/^php/.test(binary) && /\bassert\b/i.test(source)) ||
+		(/^(?:bash|ash|sh|zsh|dash|ksh|fish)$/.test(binary) && SHELL_DOT_SOURCE_RE.test(source))
+	);
+}
+
+function interpreterCodeContainsWriteApi(
+	script: string,
+	language: "py" | "js" | "ruby" | "perl",
+	api: RegExp,
+): boolean {
+	const apiAtStart = new RegExp(`^(?:${api.source})`, "i");
+	// Reflective mutation of a stream object defeats the stdout/stderr write
+	// exemption: the method that runs may write to a file. Fail closed instead.
+	const streamMutated =
+		INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script) || INTERPRETER_OUTPUT_STREAM_MUTATION_RE.test(script);
+	let index = 0;
+	while (index < script.length) {
+		if (language === "py" || language === "js") {
+			const next =
+				language === "js" && script[index] === "`"
+					? skipJavaScriptTemplate(script, index)
+					: skipNoise(script, index, language);
+			if (next !== index) {
+				const skipped = script.slice(index, next);
+				const isInterpolated =
+					(language === "js" && script[index] === "`" && skipped.includes("${")) ||
+					(language === "py" &&
+						/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(Math.max(0, index - 3), index)) &&
+						skipped.includes("{"));
+				if (
+					isInterpolated &&
+					(api.test(skipped) ||
+						(language === "py" && PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped)) ||
+						(language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_TOKEN_RE.test(skipped)))
+				)
+					return true;
+				index = next;
+				continue;
+			}
+		} else {
+			const next = skipOtherInterpreterNoise(script, index);
+			if (next !== index) {
+				const skipped = script.slice(index, next);
+				if (language === "ruby" && script[index] !== "'" && skipped.includes("#{") && api.test(skipped))
+					return true;
+				index = next;
+				continue;
+			}
+		}
+		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
+		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
+		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
+		if (language === "perl" && /^open\b/.test(script.slice(index))) {
+			// Both `open(...)` and the list form `open H, MODE, EXPR` matter; only an
+			// explicit read mode is safe, and an unparsed open fails closed.
+			if (!isReadOnlyPerlOpen(script, index)) return true;
+			index += "open".length;
+			continue;
+		}
+		if (apiAtStart.test(script.slice(index))) {
+			const outputWrite =
+				!streamMutated &&
+				/^\.\s*write\s*\(/.test(script.slice(index)) &&
+				/\b(?:process|Bun)\s*\.\s*(?:stdout|stderr)\s*$/.test(script.slice(0, index));
+			if (!outputWrite) return true;
+		}
+		index += 1;
+	}
+	return false;
+}
+
+/**
+ * Perl `open` accepts two spellings — `open(H, MODE, EXPR)` and the list form
+ * `open H, MODE, EXPR` — and only an explicit read mode is safe. Any other shape
+ * (write/pipe modes, a variable mode, or an unparsed statement) fails closed.
+ */
+function isReadOnlyPerlOpen(script: string, index: number): boolean {
+	const rest = script.slice(index);
+	if (!/^open\b/.test(rest)) return false;
+	const parenthesized = /^open\s*\(/.exec(rest);
+	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice("open".length);
+	const statementEnd = body.search(/[;\n}]/);
+	const statement = statementEnd < 0 ? body : body.slice(0, statementEnd);
+	const quoted = [...statement.matchAll(/(['"])((?:\\.|(?!\1)[^\n])*?)\1/g)].map(match => match[2] ?? "");
+	const modes = quoted.filter(value => /^\s*[<>+|]/.test(value));
+	if (modes.length === 0) return false;
+	return modes.every(value => {
+		const mode = value.trimStart();
+		return mode.startsWith("<") && !mode.startsWith("<+");
+	});
+}
+
+function skipJavaScriptTemplate(script: string, index: number): number {
+	let cursor = index + 1;
+	while (cursor < script.length) {
+		if (script[cursor] === "\\") {
+			cursor += 2;
+			continue;
+		}
+		if (script[cursor] === "`") return cursor + 1;
+		cursor += 1;
+	}
+	return script.length;
+}
+
+function skipOtherInterpreterNoise(script: string, index: number): number {
+	const character = script[index] ?? "";
+	if (character === "#") {
+		const end = script.indexOf("\n", index);
+		return end < 0 ? script.length : end;
+	}
+	if (character !== "'" && character !== '"' && character !== "`") return index;
+	let cursor = index + 1;
+	while (cursor < script.length) {
+		if (script[cursor] === "\\") {
+			cursor += 2;
+			continue;
+		}
+		if (script[cursor] === character) return cursor + 1;
+		cursor += 1;
+	}
+	return script.length;
+}
+
+function collectSedScriptWrites(command: string, targets: ExtractedTargets): void {
+	for (const match of command.matchAll(BASH_SED_COMMAND_RE)) {
+		const matchIndex = match.index ?? 0;
+		if (!shellSyntaxPosition(command, matchIndex)) continue;
+		const words = shellWords(match[1] ?? "").map(cleanShellWord);
+		const parsed = sedScriptOperands(words);
+		if (parsed.unknown) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+		}
+		for (const script of parsed.scripts) {
+			const writePath = sedScriptWritePath(script);
+			if (writePath === undefined) continue;
+			targets.explicitMutation = true;
+			if (writePath && !isDeviceSinkPath(writePath)) addPath(targets, writePath);
+			else if (!writePath) targets.unknown = true;
+		}
+	}
+}
+
+function sedScriptOperands(words: string[]): { scripts: string[]; unknown: boolean } {
+	const scripts: string[] = [];
+	let hasBareScript = false;
+	let unknown = false;
+	for (let index = 0; index < words.length; index++) {
+		const word = words[index] ?? "";
+		if (!word) continue;
+		if (word === "--") {
+			if (!hasBareScript && scripts.length === 0 && words[index + 1]) scripts.push(words[index + 1] ?? "");
+			break;
+		}
+		if (word === "-e" || word === "--expression") {
+			const script = words[index + 1];
+			if (script) scripts.push(script);
+			index += 1;
+			continue;
+		}
+		if (word.startsWith("--expression=")) {
+			scripts.push(word.slice("--expression=".length));
+			continue;
+		}
+		if (word.startsWith("-e") && word.length > 2) {
+			scripts.push(word.slice(2));
+			continue;
+		}
+		if (word === "-f" || word === "--file") {
+			// The script contents are not present in the command, so their write behavior is opaque.
+			unknown = true;
+			index += 1;
+			continue;
+		}
+		if (word.startsWith("--file=") || (word.startsWith("-f") && word.length > 2)) {
+			unknown = true;
+			continue;
+		}
+		if (word === "-l" || word === "--line-length") {
+			index += 1;
+			continue;
+		}
+		if (word.startsWith("-")) continue;
+		if (!hasBareScript && scripts.length === 0) {
+			scripts.push(word);
+			hasBareScript = true;
+		}
+	}
+	return { scripts, unknown };
+}
+
+function shellSyntaxPosition(command: string, targetIndex: number, allowComment = false): boolean {
+	let quote: "'" | '"' | null = null;
+	let inComment = false;
+	let previous = "";
+	for (let index = 0; index < targetIndex; index++) {
+		const character = command[index] ?? "";
+		if (inComment) {
+			if (character === "\n") {
+				inComment = false;
+				previous = character;
+			}
+			continue;
+		}
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") {
+				index++;
+				continue;
+			}
+			if (character === '"') quote = null;
+			continue;
+		}
+		if (character === "\\") {
+			index++;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			continue;
+		}
+		if (character === "#" && (previous === "" || /\s/.test(previous) || ";|&()".includes(previous))) {
+			inComment = true;
+			continue;
+		}
+		previous = character;
+	}
+	if (command[targetIndex] === "\n" && inComment) return quote === null;
+	return quote === null && (allowComment || !inComment);
+}
+
+function awkRegexCanStart(tokens: AwkToken[]): boolean {
+	const previous = tokens.at(-1);
+	if (!previous) return true;
+	if (previous.kind === "separator") return true;
+	return (
+		(previous.kind === "symbol" &&
+			["{", "(", "[", ",", "?", ":", "=", "==", "!=", "!", "&&", "||", "~", "!~"].includes(previous.value)) ||
+		(previous.kind === "word" && ["print", "printf", "return"].includes(previous.value))
+	);
+}
+
+function awkRegexEnd(program: string, start: number): number | undefined {
+	let inCharacterClass = false;
+	for (let index = start + 1; index < program.length; index++) {
+		const character = program[index] ?? "";
+		if (character === "\\") {
+			index++;
+			continue;
+		}
+		if (character === "[" && !inCharacterClass) inCharacterClass = true;
+		else if (character === "]" && inCharacterClass) inCharacterClass = false;
+		else if (character === "/" && !inCharacterClass) return index + 1;
+		else if (character === "\n") return undefined;
+	}
+	return undefined;
+}
+
+interface AwkToken {
+	kind: "word" | "string" | "symbol" | "separator";
+	value: string;
+	unsafeEscapes?: boolean;
+}
+
+function tokenizeAwkProgram(program: string): { tokens: AwkToken[]; balanced: boolean } {
+	const tokens: AwkToken[] = [];
+	let balanced = true;
+	for (let index = 0; index < program.length; ) {
+		const character = program[index] ?? "";
+		if (character === "\n") {
+			tokens.push({ kind: "separator", value: character });
+			index++;
+			continue;
+		}
+		if (/\s/.test(character)) {
+			index++;
+			continue;
+		}
+		if (character === "#") {
+			while (index < program.length && program[index] !== "\n") index++;
+			continue;
+		}
+		if (character === '"') {
+			let value = "";
+			let unsafeEscapes = false;
+			let closed = false;
+			index++;
+			while (index < program.length) {
+				const next = program[index] ?? "";
+				if (next === "\\") {
+					const escapedChar = program[index + 1] ?? "";
+					if (escapedChar === "\\" || escapedChar === '"') {
+						value += escapedChar;
+						index += 2;
+						continue;
+					}
+					switch (escapedChar) {
+						case "a":
+							value += "\u0007";
+							index += 2;
+							continue;
+						case "b":
+							value += "\b";
+							index += 2;
+							continue;
+						case "f":
+							value += "\f";
+							index += 2;
+							continue;
+						case "n":
+							value += "\n";
+							index += 2;
+							continue;
+						case "r":
+							value += "\r";
+							index += 2;
+							continue;
+						case "t":
+							value += "\t";
+							index += 2;
+							continue;
+						case "v":
+							value += "\u000b";
+							index += 2;
+							continue;
+					}
+					if (/[0-7]/.test(escapedChar)) {
+						let end = index + 1;
+						while (end < program.length && end < index + 4 && /[0-7]/.test(program[end] ?? "")) end++;
+						value += String.fromCharCode(Number.parseInt(program.slice(index + 1, end), 8));
+						index = end;
+						continue;
+					}
+					if (escapedChar === "x") {
+						let end = index + 2;
+						while (end < program.length && /[\da-f]/i.test(program[end] ?? "")) end++;
+						const hex = program.slice(index + 2, end);
+						const codePoint = hex ? Number.parseInt(hex, 16) : Number.NaN;
+						if (hex && codePoint <= 0xffff) value += String.fromCharCode(codePoint);
+						else unsafeEscapes = true;
+						index = end;
+						continue;
+					}
+					unsafeEscapes = true;
+					if (escapedChar) value += escapedChar;
+					index += escapedChar ? 2 : 1;
+					continue;
+				}
+				if (next === '"') {
+					closed = true;
+					index++;
+					break;
+				}
+				value += next;
+				index++;
+			}
+			if (!closed) balanced = false;
+			tokens.push({ kind: "string", value, unsafeEscapes });
+			continue;
+		}
+		if (character === "/" && awkRegexCanStart(tokens)) {
+			const end = awkRegexEnd(program, index);
+			if (end === undefined) balanced = false;
+			else {
+				tokens.push({ kind: "symbol", value: "regex" });
+				index = end;
+				continue;
+			}
+		}
+		if (/[A-Za-z_]/.test(character)) {
+			const start = index++;
+			while (/[A-Za-z0-9_]/.test(program[index] ?? "")) index++;
+			tokens.push({ kind: "word", value: program.slice(start, index) });
+			continue;
+		}
+		if (character === ";") {
+			tokens.push({ kind: "separator", value: character });
+			index++;
+			continue;
+		}
+		const pair = program.slice(index, index + 2);
+		const operator = [">>", ">=", "==", "!=", "<=", "&&", "||", "!~", "++", "--"].includes(pair) ? pair : character;
+		tokens.push({ kind: "symbol", value: operator });
+		index += operator.length;
+	}
+	return { tokens, balanced };
+}
+
+interface AwkProgramSource {
+	source: string;
+	expanded: boolean;
+}
+
+function shellWordHasExpansion(word: string): boolean {
+	let quote: "'" | '"' | null = null;
+	for (let index = 0; index < word.length; index++) {
+		const character = word[index] ?? "";
+		if (quote === "'") {
+			if (character === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (character === "\\") {
+				index++;
+				continue;
+			}
+			if (character === '"') quote = null;
+			else if (character === "$" || character === "`") return true;
+			continue;
+		}
+		if (character === "\\") {
+			index++;
+			continue;
+		}
+		if (character === "'" || character === '"') quote = character;
+		else if (character === "$" || character === "`") return true;
+	}
+	return quote !== null;
+}
+
+function awkPrograms(words: string[]): { programs: AwkProgramSource[]; unknown: boolean } {
+	const programs: AwkProgramSource[] = [];
+	const noOperandOptions = new Set([
+		"-b",
+		"-c",
+		"-C",
+		"-g",
+		"-h",
+		"-M",
+		"-n",
+		"-N",
+		"-O",
+		"-P",
+		"-r",
+		"-s",
+		"-S",
+		"-t",
+		"-V",
+		"--characters-as-bytes",
+		"--csv",
+		"--help",
+		"--lint",
+		"--lint-no-ext",
+		"--lint-old",
+		"--posix",
+		"--sandbox",
+		"--traditional",
+		"--version",
+	]);
+	let unknown = false;
+	let hasFileProgram = false;
+	let hasSourceOption = false;
+	const programSource = (raw: string): AwkProgramSource => ({
+		source: cleanShellWord(raw),
+		expanded: shellWordHasExpansion(raw),
+	});
+	const operand = (index: number): string | undefined => {
+		const next = words[index + 1];
+		if (!next) {
+			unknown = true;
+			return undefined;
+		}
+		return next;
+	};
+	for (let index = 0; index < words.length; index++) {
+		const word = words[index];
+		if (!word) continue;
+		if (/^(?:\d+)?(?:>>?|<<<?|&>)/.test(word)) {
+			if (/^(?:\d+)?(?:>>?|<<<?)$/.test(word)) index++;
+			continue;
+		}
+		const part = cleanShellWord(word);
+		if (part === "--") {
+			if (hasFileProgram || hasSourceOption) break;
+			const program = words[index + 1];
+			if (!program) unknown = true;
+			else programs.push(programSource(program));
+			break;
+		}
+		if (part === "-e" || part === "--source") {
+			const program = operand(index);
+			if (program) programs.push(programSource(program));
+			hasSourceOption = true;
+			index++;
+			continue;
+		}
+		if (part.startsWith("--source=")) {
+			programs.push(programSource(part.slice("--source=".length)));
+			hasSourceOption = true;
+			continue;
+		}
+		if (part === "-v" || part === "--assign" || part === "-F" || part === "--field-separator") {
+			if (!operand(index)) continue;
+			index++;
+			continue;
+		}
+		if (part === "-W") {
+			const extension = operand(index);
+			if (extension !== "version" && extension !== "lint" && extension !== "posix") {
+				unknown = true;
+				break;
+			}
+			index++;
+			continue;
+		}
+		if (part.startsWith("-W")) {
+			const extension = part.slice(2);
+			if (extension !== "version" && extension !== "lint" && extension !== "posix") {
+				unknown = true;
+				break;
+			}
+			continue;
+		}
+		if (part.startsWith("--assign=") || part.startsWith("--field-separator=")) continue;
+		if (part === "-f" || part === "--file" || part === "-E") {
+			if (!operand(index)) continue;
+			hasFileProgram = true;
+			index++;
+			continue;
+		}
+		if (part.startsWith("--file=") || (part.startsWith("-f") && part.length > 2)) {
+			hasFileProgram = true;
+			continue;
+		}
+		if (part.startsWith("-e") && part.length > 2) {
+			programs.push(programSource(part.slice(2)));
+			hasSourceOption = true;
+			continue;
+		}
+		if (part.startsWith("-v") && part.length > 2) continue;
+		if (part.startsWith("-F") && part.length > 2) continue;
+		if (part.startsWith("-") && noOperandOptions.has(part)) continue;
+		if (part.startsWith("-") && /^-[bcCghMnNPrStV]+$/.test(part)) continue;
+		if (part.startsWith("-")) {
+			unknown = true;
+			break;
+		}
+		if (hasFileProgram || hasSourceOption) break;
+		programs.push(programSource(word));
+		break;
+	}
+	if (hasFileProgram) unknown = true;
+	return { programs, unknown };
+}
+
+function analyzeAwkProgram(program: string): { paths: string[]; unknown: boolean } {
+	const { tokens, balanced } = tokenizeAwkProgram(program);
+	const paths: string[] = [];
+	let unknown =
+		!balanced ||
+		tokens.some(
+			(token, index) => token.kind === "word" && token.value === "system" && tokens[index + 1]?.value === "(",
+		);
+	let braceDepth = 0;
+	let parenDepth = 0;
+	let bracketDepth = 0;
+	let statementStart = true;
+	let pendingControlParen = false;
+	const controlParens: boolean[] = [];
+	let printStatement: { braceDepth: number; parenDepth: number; bracketDepth: number } | undefined;
+	for (let index = 0; index < tokens.length; index++) {
+		const token = tokens[index];
+		if (!token) continue;
+		if (token.kind === "separator") {
+			if (parenDepth === 0 && bracketDepth === 0) {
+				printStatement = undefined;
+				statementStart = true;
+				pendingControlParen = false;
+			}
+			continue;
+		}
+		if (token.kind === "string" || token.kind === "word") {
+			if (token.kind === "word" && statementStart && (token.value === "print" || token.value === "printf")) {
+				printStatement = { braceDepth, parenDepth, bracketDepth };
+				statementStart = false;
+				pendingControlParen = false;
+				continue;
+			}
+			if (token.kind === "word" && statementStart && ["for", "if", "while"].includes(token.value)) {
+				pendingControlParen = true;
+				statementStart = false;
+				continue;
+			}
+			if (token.kind === "word" && statementStart && ["do", "else"].includes(token.value)) {
+				statementStart = true;
+				pendingControlParen = false;
+				continue;
+			}
+			statementStart = false;
+			pendingControlParen = false;
+			continue;
+		}
+		if (token.value === "{") {
+			braceDepth++;
+			printStatement = undefined;
+			statementStart = true;
+			pendingControlParen = false;
+			continue;
+		}
+		if (token.value === "}") {
+			braceDepth--;
+			if (braceDepth < 0) unknown = true;
+			printStatement = undefined;
+			statementStart = true;
+			pendingControlParen = false;
+			continue;
+		}
+		if (token.value === "(") {
+			controlParens.push(pendingControlParen);
+			pendingControlParen = false;
+			parenDepth++;
+			statementStart = false;
+			continue;
+		}
+		if (token.value === ")") {
+			parenDepth--;
+			if (parenDepth < 0) unknown = true;
+			statementStart = controlParens.pop() ?? false;
+			continue;
+		}
+		if (token.value === "[") {
+			bracketDepth++;
+			statementStart = false;
+			continue;
+		}
+		if (token.value === "]") {
+			bracketDepth--;
+			if (bracketDepth < 0) unknown = true;
+			statementStart = false;
+			continue;
+		}
+		if (token.value === ">" || token.value === ">>") {
+			if (
+				printStatement &&
+				braceDepth === printStatement.braceDepth &&
+				parenDepth === printStatement.parenDepth &&
+				bracketDepth === printStatement.bracketDepth
+			) {
+				const destination = tokens[index + 1];
+				const trailing = tokens[index + 2];
+				if (
+					destination?.kind !== "string" ||
+					destination.unsafeEscapes ||
+					(destination.value !== "" && trailing && trailing.kind !== "separator" && trailing.value !== "}")
+				) {
+					unknown = true;
+				} else if (destination.value) {
+					paths.push(destination.value);
+				} else {
+					unknown = true;
+				}
+			}
+			statementStart = false;
+			continue;
+		}
+		if (token.value === "|") {
+			// AWK pipe I/O executes a command; print, printf, and getline effects are opaque.
+			unknown = true;
+			statementStart = false;
+			continue;
+		}
+		if (token.value === ";" && parenDepth === 0 && bracketDepth === 0) {
+			printStatement = undefined;
+			statementStart = true;
+			pendingControlParen = false;
+			continue;
+		}
+		statementStart = false;
+		pendingControlParen = false;
+	}
+	if (braceDepth !== 0 || parenDepth !== 0 || bracketDepth !== 0 || controlParens.length > 0) unknown = true;
+	return { paths, unknown };
+}
+
+function collectAwkProgramWrites(command: string, targets: ExtractedTargets): void {
+	for (const match of command.matchAll(BASH_AWK_COMMAND_RE)) {
+		const matchIndex = match.index ?? 0;
+		if (!shellSyntaxPosition(command, matchIndex)) continue;
+		const matchEnd = matchIndex + match[0].length;
+		const { programs, unknown } = awkPrograms(shellWords(match[1] ?? ""));
+		if (!shellSyntaxPosition(command, matchEnd, true) || unknown) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+		}
+		for (const program of programs) {
+			if (program.expanded) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+			}
+			const analyzed = analyzeAwkProgram(program.source);
+			if (analyzed.unknown) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+			}
+			for (const destination of analyzed.paths) {
+				targets.explicitMutation = true;
+				if (!isDeviceSinkPath(destination)) addPath(targets, destination);
+			}
+		}
+	}
+}
+
 function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 	const record = getRecord(args);
 	const command = safeString(record?.command);
@@ -1612,10 +2916,7 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
-	if (
-		BASH_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked) ||
-		BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)
-	) {
+	if (BASH_HEREDOC_OPAQUE_INTERPRETER_WRITE_RE.test(heredoc.masked)) {
 		targets.explicitMutation = true;
 		targets.unknown = true;
 	}
@@ -1668,10 +2969,20 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		targets.explicitMutation = true;
 		const parts = shellWords(match[1] ?? "");
 		const commandName = match[0]?.match(BASH_MUTATION_COMMAND_NAME_RE)?.[1]?.toLowerCase();
-		const targetParts =
-			commandName === "cp" || commandName === "mv" || commandName === "install" || commandName === "truncate"
-				? parts.slice(-1)
-				: parts;
+		const chmodModeIndex =
+			commandName === "chmod" ? parts.findIndex(part => BASH_CHMOD_MODE_RE.test(cleanShellWord(part))) : -1;
+		let targetParts = parts;
+		if (
+			commandName === "cp" ||
+			commandName === "mv" ||
+			commandName === "install" ||
+			commandName === "truncate" ||
+			commandName === "ln"
+		) {
+			targetParts = parts.slice(-1);
+		} else if (commandName === "chmod" && chmodModeIndex >= 0) {
+			targetParts = parts.filter((_part, index) => index !== chmodModeIndex);
+		}
 		let extractedTarget = false;
 		for (const part of targetParts) {
 			const cleaned = cleanShellWord(part);
@@ -1687,6 +2998,11 @@ function extractBashTargets(args: unknown, depth = 0): ExtractedTargets {
 		// fail closed rather than allowing a targetless mutation through planning.
 		if (!extractedTarget) targets.unknown = true;
 	}
+	// `sed w file` and `s///w file` write without `-i`. `awk 'print > "file"'`
+	// writes inside the program, which is not a shell redirection.
+	collectInterpreterOneLinerWrites(heredoc.masked, targets, depth);
+	collectSedScriptWrites(heredoc.masked, targets);
+	collectAwkProgramWrites(heredoc.masked, targets);
 	return targets;
 }
 /**
@@ -1699,12 +3015,413 @@ function extractGithubTargets(args: unknown): ExtractedTargets {
 	return { paths: [], unknown: true, explicitMutation: true };
 }
 
+function simpleLiteral(raw: string): string | null {
+	const trimmed = raw.trim();
+	const quote = trimmed[0];
+	if ((quote !== "'" && quote !== '"') || trimmed.length < 2 || trimmed[trimmed.length - 1] !== quote) return null;
+	const body = trimmed.slice(1, -1);
+	return /[\\\n${]/.test(body) || body.includes(quote) ? null : body;
+}
+
+function pythonFStringContainsDynamicExecution(code: string, start: number, end: number): boolean {
+	const source = code.slice(start, end);
+	const isFString = /(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(code.slice(Math.max(0, start - 3), start));
+	return isFString && source.includes("{") && PYTHON_DYNAMIC_EXECUTION_TOKEN_RE.test(source);
+}
+
+function skipNoise(code: string, index: number, language: "py" | "js"): number {
+	if (language === "py" && (code.startsWith('"""', index) || code.startsWith("'''", index))) {
+		const quote = code.slice(index, index + 3);
+		const end = code.indexOf(quote, index + 3);
+		return end < 0 ? code.length : end + 3;
+	}
+	const character = code[index] ?? "";
+	if (character === "'" || character === '"') {
+		let cursor = index + 1;
+		while (cursor < code.length && code[cursor] !== character) cursor += code[cursor] === "\\" ? 2 : 1;
+		return Math.min(code.length, cursor + 1);
+	}
+	if (
+		(language === "py" && character === "#") ||
+		(language === "js" && character === "/" && code[index + 1] === "/")
+	) {
+		const end = code.indexOf("\n", index);
+		return end < 0 ? code.length : end;
+	}
+	if (language === "js" && character === "/" && code[index + 1] === "*") {
+		const end = code.indexOf("*/", index + 2);
+		return end < 0 ? code.length : end + 2;
+	}
+	return index;
+}
+
+function readArg(code: string, index: number): { raw: string; end: number } | null {
+	let cursor = index;
+	while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+	if (cursor >= code.length || code[cursor] === ")") return null;
+	const start = cursor;
+	let depth = 0;
+	while (cursor < code.length) {
+		const character = code[cursor];
+		if (character === "(") depth += 1;
+		else if ((character === "," || character === ")") && depth === 0) break;
+		else if (character === ")") depth -= 1;
+		else if (character === "'" || character === '"') {
+			const quote = character;
+			cursor += 1;
+			while (cursor < code.length && code[cursor] !== quote) cursor += code[cursor] === "\\" ? 2 : 1;
+		}
+		cursor += 1;
+	}
+	const raw = code.slice(start, cursor).trim();
+	return raw.length > 0 ? { raw, end: cursor } : null;
+}
+
+/** Omitted mode is Python's default `"r"`. A non-literal mode cannot be proved read-only. */
+function modeWrites(raw: string | undefined): boolean | null {
+	if (raw === undefined) return false;
+	const literal = simpleLiteral(raw);
+	return literal === null ? null : /[wax+]/.test(literal);
+}
+
+const PY_OS_MUTATORS = new Set(
+	"remove unlink rename replace rmtree move copy copy2 copyfile symlink link mkdir makedirs rmdir truncate open".split(
+		" ",
+	),
+);
+/** Copy and rename write the destination, not only the source. */
+const TWO_ARG_MUTATORS = new Set(
+	"rename replace move copy copy2 copyfile symlink link renameSync copyFileSync".split(" "),
+);
+const JS_FS_MUTATORS = new Set(
+	"writeFileSync writeFile appendFileSync appendFile rmSync unlinkSync renameSync copyFileSync mkdirSync openSync".split(
+		" ",
+	),
+);
+
+function nextCallArg(code: string, end: number): { raw: string; end: number } | null {
+	let cursor = end;
+	while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+	if (code[cursor] !== ",") return null;
+	return readArg(code, cursor + 1);
+}
+
+function openModeWrites(code: string, first: { raw: string; end: number }): boolean | null {
+	let cursor = first.end;
+	let positionalIndex = 1;
+	let mode: string | undefined;
+	let unknownMode = false;
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] !== ",") break;
+		const argument = readArg(code, cursor + 1);
+		if (!argument) break;
+		const raw = argument.raw.trim();
+		if (raw.startsWith("*") || raw.startsWith("**")) {
+			unknownMode = true;
+		} else {
+			const keyword = /^([A-Za-z_]\w*)\s*=\s*([\s\S]*)$/.exec(raw);
+			if (keyword?.[1] === "mode") {
+				if (mode !== undefined) unknownMode = true;
+				else mode = keyword[2];
+			} else if (!keyword && positionalIndex === 1) {
+				if (mode !== undefined) unknownMode = true;
+				else mode = raw;
+			}
+		}
+		positionalIndex += 1;
+		cursor = argument.end;
+	}
+	if (unknownMode) return null;
+	return modeWrites(mode);
+}
+
+/** Whitespace or a backslash-newline may sit before an attribute (`shutil .copy`). */
+function skipCallGap(code: string, index: number): number {
+	let cursor = index;
+	while (cursor < code.length) {
+		const character = code[cursor] ?? "";
+		if (/\s/.test(character)) {
+			cursor += 1;
+			continue;
+		}
+		if (character === "\\" && code[cursor + 1] === "\n") {
+			cursor += 2;
+			continue;
+		}
+		if (character === "\\" && code[cursor + 1] === "\r" && code[cursor + 2] === "\n") {
+			cursor += 3;
+			continue;
+		}
+		break;
+	}
+	return cursor;
+}
+
+function literalWrite(targets: ExtractedTargets, raw: string | undefined, write: boolean | null): void {
+	if (write === false) return;
+	targets.explicitMutation = true;
+	const literal = raw === undefined ? null : simpleLiteral(raw);
+	if (write === null || literal === null || literal.length === 0) {
+		targets.unknown = true;
+		return;
+	}
+	addPath(targets, literal);
+}
+
+/** Arguments of one Path() call, through its own closing parenthesis. */
+function readPathConstructor(code: string, argAt: number): { parts: string[]; after: number } | null {
+	let cursor = argAt;
+	const parts: string[] = [];
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ")") return { parts, after: cursor + 1 };
+		const argument = readArg(code, cursor);
+		if (!argument) return null;
+		parts.push(argument.raw);
+		cursor = argument.end;
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ",") {
+			cursor += 1;
+			continue;
+		}
+		if (code[cursor] === ")") return { parts, after: cursor + 1 };
+		return null;
+	}
+	return null;
+}
+
+/** pathlib keeps the last absolute segment. A non-literal segment is an unresolved receiver. */
+function literalPathReceiver(parts: string[]): string | null {
+	if (parts.length === 0) return ".";
+	let joined = "";
+	for (const part of parts) {
+		const literal = simpleLiteral(part);
+		if (literal === null) return null;
+		if (path.isAbsolute(literal)) joined = literal;
+		else joined = joined ? path.join(joined, literal) : literal;
+	}
+	return joined.length === 0 ? "." : joined;
+}
+
+/** `Path.open()` defaults to read mode; a dynamic mode cannot be proven read-only. */
+function pathlibOpenModeWrites(code: string, methodAt: number): boolean | null {
+	const call = /^\s*\.\s*open\s*\(/.exec(code.slice(methodAt));
+	if (!call) return false;
+	let cursor = methodAt + call[0].length;
+	let mode: string | undefined;
+	let modeSeen = false;
+	let unknownMode = false;
+	let positionalIndex = 0;
+	while (cursor < code.length) {
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ")") break;
+		const argument = readArg(code, cursor);
+		if (!argument) return null;
+		const raw = argument.raw.trim();
+		if (raw.startsWith("*") || raw.startsWith("**")) {
+			unknownMode = true;
+		} else {
+			const keyword = /^([A-Za-z_]\w*)\s*=\s*([\s\S]*)$/.exec(raw);
+			if (keyword?.[1] === "mode") {
+				if (modeSeen) unknownMode = true;
+				else {
+					mode = keyword[2];
+					modeSeen = true;
+				}
+			} else if (!keyword && positionalIndex === 0) {
+				if (modeSeen) unknownMode = true;
+				else {
+					mode = raw;
+					modeSeen = true;
+				}
+			}
+		}
+		positionalIndex += 1;
+		cursor = argument.end;
+		while (/\s/.test(code[cursor] ?? "")) cursor += 1;
+		if (code[cursor] === ",") cursor += 1;
+		else if (code[cursor] !== ")") return null;
+	}
+	return unknownMode ? null : modeWrites(mode);
+}
+
+/** Calls inside strings or comments are skipped. A non-literal write path fails closed. */
+function scanInterpreterWrites(code: string, language: "py" | "js", targets: ExtractedTargets): void {
+	let index = 0;
+	const recognizedPathMethodIndexes = new Set<number>();
+	while (index < code.length) {
+		const trivia = skipNoise(code, index, language);
+		if (trivia !== index) {
+			if (language === "py" && pythonFStringContainsDynamicExecution(code, index, trivia)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
+			index = trivia;
+			continue;
+		}
+		if (
+			INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(code.slice(index)) ||
+			INTERPRETER_OUTPUT_STREAM_MUTATION_RE.test(code.slice(index))
+		) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			return;
+		}
+		const previous = index === 0 ? "" : (code[index - 1] ?? "");
+		if ((index > 0 && /[\w]/.test(previous)) || !/[A-Za-z_]/.test(code[index] ?? "")) {
+			index += 1;
+			continue;
+		}
+		const ident = /^[A-Za-z_]\w*/.exec(code.slice(index));
+		if (!ident) {
+			index += 1;
+			continue;
+		}
+		const name = ident[0];
+		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(name)) {
+			targets.explicitMutation = true;
+			targets.unknown = true;
+			return;
+		}
+		let receiverDot = index - 1;
+		while (receiverDot >= 0 && /\s/.test(code[receiverDot] ?? "")) receiverDot -= 1;
+		const unresolvedPathMethod =
+			language === "py" &&
+			code[receiverDot] === "." &&
+			(/^write_\w+$/.test(name) || name === "touch" || name === "open");
+		if (unresolvedPathMethod && !recognizedPathMethodIndexes.has(index)) {
+			const callAt = skipCallGap(code, index + name.length);
+			if (code[callAt] === "(") {
+				const writes = name === "open" ? pathlibOpenModeWrites(code, receiverDot) : true;
+				if (writes !== false) {
+					targets.explicitMutation = true;
+					targets.unknown = true;
+				}
+				index = Math.max(callAt + 1, index + name.length);
+				continue;
+			}
+		}
+		if ((name === "write" || name === "append") && previous === ".") {
+			index += name.length;
+			continue;
+		}
+		let cursor = skipCallGap(code, index + name.length);
+		let dotted = "";
+		if (code[cursor] === ".") {
+			const methodAt = skipCallGap(code, cursor + 1);
+			const dot = /^\w+/.exec(code.slice(methodAt));
+			dotted = dot?.[0] ?? "";
+			cursor = methodAt + dotted.length;
+		}
+		const paren = /^\s*\(/.exec(code.slice(cursor));
+		const helper = (name === "write" || name === "append") && dotted === "";
+		const open = (name === "open" && language === "py") || (name === "openSync" && language === "js");
+		const pathCtor =
+			(name === "Path" && dotted === "") || (language === "py" && name === "pathlib" && dotted === "Path");
+		const osCall =
+			language === "py" &&
+			((name === "os" && PY_OS_MUTATORS.has(dotted)) || (name === "shutil" && PY_OS_MUTATORS.has(dotted)));
+		const jsCall =
+			language === "js" && ((JS_FS_MUTATORS.has(name) && dotted === "") || (name === "Bun" && dotted === "write"));
+		if (!paren || (!helper && !(open && dotted === "") && !pathCtor && !osCall && !jsCall)) {
+			index += name.length;
+			continue;
+		}
+		const argAt = cursor + paren[0].length;
+		const first = readArg(code, argAt);
+		if (pathCtor) {
+			const ctor = readPathConstructor(code, argAt);
+			if (!ctor) {
+				index += 1;
+				continue;
+			}
+			const method = /^\s*\.\s*(write_\w+|open|touch)\s*\(/.exec(code.slice(ctor.after));
+			if (method) {
+				if (ctor.parts.length > 1) {
+					recognizedPathMethodIndexes.add(ctor.after + method[0].indexOf(method[1]));
+				}
+				const writes = method[1] === "open" ? pathlibOpenModeWrites(code, ctor.after) : true;
+				if (writes !== false) {
+					targets.explicitMutation = true;
+					const receiver = literalPathReceiver(ctor.parts);
+					if (writes === null || receiver === null || receiver.length === 0) targets.unknown = true;
+					else addPath(targets, receiver);
+				}
+			}
+			// Extra segments stay in the argument walk so a nested mutator is still recorded.
+			index =
+				ctor.parts.length > 1 ? index + name.length : Math.max(ctor.after + (method?.[0].length ?? 0), index + 1);
+			continue;
+		}
+		if (!first) {
+			literalWrite(targets, undefined, null);
+			index = Math.max(argAt, index + 1);
+			continue;
+		}
+		if (open && dotted === "") {
+			literalWrite(targets, first.raw, openModeWrites(code, first));
+			index = Math.max(first.end, index + 1);
+			continue;
+		}
+		literalWrite(targets, first.raw, true);
+		let end = first.end;
+		if (TWO_ARG_MUTATORS.has(dotted || name)) {
+			const second = nextCallArg(code, first.end);
+			if (!second) literalWrite(targets, undefined, null);
+			else {
+				literalWrite(targets, second.raw, true);
+				end = second.end;
+			}
+		}
+		index = Math.max(end, index + 1);
+	}
+}
+
+function extractCodeToolTargets(toolName: string, args: unknown): ExtractedTargets {
+	const targets: ExtractedTargets = { paths: [], unknown: false };
+	const record = getRecord(args);
+	if (!record) {
+		targets.unknown = true;
+		targets.explicitMutation = true;
+		return targets;
+	}
+	if (toolName === "python") {
+		if ((safeString(record.action) || "execute") === "clear") return targets;
+		if (typeof record.code !== "string" || record.code.trim() === "") return targets;
+		scanInterpreterWrites(record.code, "py", targets);
+		return targets;
+	}
+	if (!Array.isArray(record.cells)) {
+		targets.unknown = true;
+		targets.explicitMutation = true;
+		return targets;
+	}
+	for (const cell of record.cells) {
+		const cellRecord = getRecord(cell);
+		if (typeof cellRecord?.code !== "string") {
+			targets.unknown = true;
+			targets.explicitMutation = true;
+			continue;
+		}
+		if (cellRecord.language === "py") scanInterpreterWrites(cellRecord.code, "py", targets);
+		else if (cellRecord.language === "js") scanInterpreterWrites(cellRecord.code, "js", targets);
+		else {
+			targets.unknown = true;
+			targets.explicitMutation = true;
+		}
+	}
+	return targets;
+}
+
 function extractTargets(tool: ToolWithEditMode, args: unknown): ExtractedTargets {
 	if (tool.name === "write") return extractWriteTargets(args);
 	if (tool.name === "ast_edit") return extractAstEditTargets(args);
 	if (tool.name === "edit") return extractEditTargets(args, tool);
 	if (tool.name === "bash") return extractBashTargets(args);
 	if (tool.name === "github") return extractGithubTargets(args);
+	if (tool.name === "python" || tool.name === "eval") return extractCodeToolTargets(tool.name, args);
 	return { paths: [], unknown: true };
 }
 
@@ -1767,11 +3484,23 @@ function firstBlockedWorkflowStateSkill(cwd: string, targets: ExtractedTargets):
 	return null;
 }
 
-function isAllowlistedPath(cwd: string, rawPath: string): boolean {
+function planningSessionDirName(sessionId: string | null | undefined): string | undefined {
+	const trimmed = sessionId?.trim();
+	if (!trimmed) return undefined;
+	return sessionDirName(trimmed);
+}
+
+/** Specs and plans are planning-writable. A `_session-` directory must be this session's encoded name. */
+function isAllowlistedPath(cwd: string, rawPath: string, sessionId?: string | null): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
 	if (segments?.[0] !== ".gjc") return false;
-	const generatedRoot = segments[1]?.startsWith(GJC_SESSION_PREFIX) ? segments[2] : segments[1];
-	return generatedRoot === "specs" || generatedRoot === "plans";
+	const head = segments[1];
+	if (head?.startsWith(GJC_SESSION_PREFIX)) {
+		const bound = planningSessionDirName(sessionId);
+		if (!bound || head !== bound) return false;
+		return segments[2] === "specs" || segments[2] === "plans";
+	}
+	return head === "specs" || head === "plans";
 }
 function isBlockedGjcPath(cwd: string, rawPath: string): boolean {
 	const segments = relativeGjcSegments(cwd, rawPath);
@@ -1782,9 +3511,11 @@ function hasBlockedGjcTarget(cwd: string, targets: ExtractedTargets): boolean {
 	return targets.paths.some(rawPath => isBlockedGjcPath(cwd, rawPath));
 }
 
-function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets): boolean {
+function allTargetsAllowlisted(cwd: string, targets: ExtractedTargets, sessionId?: string | null): boolean {
 	return (
-		!targets.unknown && targets.paths.length > 0 && targets.paths.every(rawPath => isAllowlistedPath(cwd, rawPath))
+		!targets.unknown &&
+		targets.paths.length > 0 &&
+		targets.paths.every(rawPath => isAllowlistedPath(cwd, rawPath, sessionId))
 	);
 }
 
@@ -1800,11 +3531,24 @@ function tempEnvNames(): readonly string[] {
 	return process.platform === "win32" ? ["TEMP", "TMP", "TMPDIR"] : ["TMPDIR"];
 }
 
-// The snapshot is the cwd at module import, not a directory created later or a chdir before this module is imported.
-const startupTempSnapshot = projectEnvSnapshot();
+const PROJECT_TEMP_DOTENV_MAX_FILE_BYTES = 64 * 1024;
 
-function projectTempSnapshots(_cwd: string): ProjectEnvSnapshot[] {
-	return [startupTempSnapshot];
+// The snapshot is the cwd at module import, not a directory created later or a chdir before this module is imported.
+const startupTempSnapshot = projectEnvSnapshot(process.cwd(), {
+	maxFileBytes: PROJECT_TEMP_DOTENV_MAX_FILE_BYTES,
+});
+
+function projectTempSnapshots(cwd: string): ProjectEnvSnapshot[] {
+	// Check both the cwd's .env and the startup snapshot (for module-import-time cwd).
+	// The cwd's .env catches project-declared TMPDIR in the current working directory.
+	// The startup snapshot is a fallback for when the cwd's .env is deleted or inaccessible
+	// (e.g., after unlink or chdir), and also handles the case where cwd differs from the
+	// module-import-time cwd. These workspace-controlled files are read as bounded regular files.
+	const snapshots: ProjectEnvSnapshot[] = [
+		projectEnvSnapshot(cwd, { maxFileBytes: PROJECT_TEMP_DOTENV_MAX_FILE_BYTES }),
+		startupTempSnapshot,
+	];
+	return snapshots;
 }
 
 /** macOS account temp directory. `getconf` does not read `TMPDIR`. */
@@ -1845,12 +3589,13 @@ function isPlatformTempPath(resolved: string): boolean {
 	return resolved === resolvedDarwin || isPathWithin(resolvedDarwin, resolved);
 }
 
-/** True when `live` is the temp directory a project dotenv file declares. */
-function projectDeclaresTempPath(cwd: string, live: string): boolean {
+/** True when `live` is declared, or cannot be trusted because a dotenv layer was unsafe to read. */
+function projectDeclaresTempPath(snapshots: readonly ProjectEnvSnapshot[], live: string): boolean {
 	const trimmedLive = live.trim();
 	if (!trimmedLive) return false;
 	const resolvedLive = path.resolve(trimmedLive);
-	for (const snapshot of projectTempSnapshots(cwd)) {
+	for (const snapshot of snapshots) {
+		if (snapshot.incomplete && !isPlatformTempPath(resolvedLive)) return true;
 		for (const name of tempEnvNames()) {
 			const key = canonicalEnvKey(name);
 			const declared = snapshot.values[key];
@@ -1874,8 +3619,9 @@ function neutralTempRoots(cwd: string): string[] {
 	addResolvedTempRoot(roots, darwinUserTempDir());
 	const candidates = [os.tmpdir(), process.env.TMPDIR];
 	if (process.platform === "win32") candidates.push(process.env.TEMP, process.env.TMP);
+	const snapshots = projectTempSnapshots(cwd);
 	for (const candidate of candidates) {
-		if (!candidate || projectDeclaresTempPath(cwd, candidate)) continue;
+		if (!candidate || projectDeclaresTempPath(snapshots, candidate)) continue;
 		addResolvedTempRoot(roots, candidate);
 	}
 	return [...roots];
@@ -1944,10 +3690,14 @@ async function isNeutralTempPath(cwd: string, rawPath: string): Promise<boolean>
 }
 
 /** Targets that remain disallowed during a planning phase (excludes neutral temp scratch). */
-async function planningBlockedTargets(cwd: string, targets: ExtractedTargets): Promise<string[]> {
+async function planningBlockedTargets(
+	cwd: string,
+	targets: ExtractedTargets,
+	sessionId?: string | null,
+): Promise<string[]> {
 	const blocked: string[] = [];
 	for (const rawPath of targets.paths) {
-		if (isAllowlistedPath(cwd, rawPath)) continue;
+		if (isAllowlistedPath(cwd, rawPath, sessionId)) continue;
 		if (!(await isNeutralTempPath(cwd, rawPath))) blocked.push(rawPath);
 	}
 	return blocked;
@@ -1969,12 +3719,15 @@ export async function assertWorkflowMutationRawPathsAllowed(input: {
 		throw new ToolError(`${WORKFLOW_STATE_MUTATION_BLOCK_MESSAGE}\nUse: ${command}`);
 	}
 	if (input.forceOverride) return;
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
+	const guardContext =
+		input.guardContext ??
+		(await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId }));
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, guardContext);
 
 	if (!planning) return;
 	const message = planningPhaseBlockMessage(planning.skill);
 	if (input.rawPaths.length === 0) throw new ToolError(message);
-	const blocked = await planningBlockedTargets(input.cwd, targets);
+	const blocked = await planningBlockedTargets(input.cwd, targets, guardContext.sessionId);
 	if (blocked.length > 0) throw new ToolError(message);
 }
 
@@ -1994,7 +3747,10 @@ export async function getWorkflowMutationDecision(
 			command,
 		};
 	}
-	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, input.guardContext);
+	const guardContext =
+		input.guardContext ??
+		(await readWorkflowGuardContext(input.cwd, { sessionId: input.sessionId, threadId: input.threadId }));
+	const planning = await getActivePlanningSkill(input.cwd, input.sessionId, input.threadId, guardContext);
 	if (!planning) {
 		return { blocked: false, targets: [] };
 	}
@@ -2006,12 +3762,20 @@ export async function getWorkflowMutationDecision(
 	// name is not authorization: an `autoresearch/*` branch isolates keep/discard
 	// bookkeeping, it does not turn product edits into research.
 	//
+	// Shell and code-execution tools can run multiple operations before writing,
+	// so checking the harness once cannot protect the later write destination.
+	// Only direct file-mutation tools may use the harness exception.
 	// The allowance requires at least one named target: `every` is vacuously true
 	// for an empty list, so an opaque mutation that resolves to NO target (e.g.
 	// `python3 -c "open('src/product.ts','w').write('x')"`) would otherwise skip
 	// the fail-closed check below and be waved through on a research mission.
+	// Bash is a compound command list, not a write boundary: an earlier `ln` or
+	// `mv` can retarget the harness before a later redirection. Harness changes
+	// must use a single-target file tool so the final path is checked for symlinks
+	// immediately before that write operation.
 	if (
 		planning.skill === "autoresearch" &&
+		AUTORESEARCH_HARNESS_FILE_TOOL_NAMES.has(input.tool.name) &&
 		targets.paths.length > 0 &&
 		!targets.unknown &&
 		targets.paths.every(p => isAutoresearchAuthorizedResearchPath(input.cwd, p))
@@ -2033,7 +3797,7 @@ export async function getWorkflowMutationDecision(
 	// Neutral temp scratch (outside the project tree) stays writable so agents can
 	// stage artifacts and feed their path to the sanctioned `gjc ... --write` CLIs.
 	// Read-only / `gjc` bash extract no targets and fall through to allowed here.
-	const blockedTargets = await planningBlockedTargets(input.cwd, targets);
+	const blockedTargets = await planningBlockedTargets(input.cwd, targets, guardContext.sessionId);
 	if (blockedTargets.length === 0) {
 		return { blocked: false, targets: targets.paths };
 	}
@@ -2041,7 +3805,9 @@ export async function getWorkflowMutationDecision(
 		blocked: true,
 		message,
 		targets: targets.paths,
-		reason: allTargetsAllowlisted(input.cwd, targets) ? "handoff-artifact-tool-target" : "phase-boundary",
+		reason: allTargetsAllowlisted(input.cwd, targets, guardContext.sessionId)
+			? "handoff-artifact-tool-target"
+			: "phase-boundary",
 	};
 }
 

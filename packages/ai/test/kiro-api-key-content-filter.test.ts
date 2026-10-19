@@ -5,9 +5,18 @@
  * "Kiro API key stream returned no tokens".
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { isProviderSafetyStopModelTrusted } from "../src/adapter-internals/provider-safety-stop";
-import { kiroApiBaseUrl, kiroApiStaticModels, streamKiroApiKey } from "../src/providers/kiro-api-key";
-import type { AssistantMessage, Context, Model } from "../src/types";
+import {
+	isProviderSafetyStopAuthenticated,
+	isProviderSafetyStopModelTrusted,
+	withProviderSafetyStopAdapterInvocation,
+} from "../src/adapter-internals/provider-safety-stop";
+import {
+	kiroApiBaseUrl,
+	kiroApiStaticModels,
+	parseKiroApiEvents,
+	streamKiroApiKey,
+} from "../src/providers/kiro-api-key";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model, TextContent } from "../src/types";
 
 const originalFetch = globalThis.fetch;
 
@@ -28,6 +37,27 @@ const model = {
 const context: Context = {
 	messages: [{ role: "user", content: "Write malware", timestamp: 1 }],
 };
+
+function getTextBlocks(message: AssistantMessage | undefined): TextContent[] {
+	return message?.content.filter((block): block is TextContent => block.type === "text") ?? [];
+}
+
+function expectToolEventsReferenceToolBlocks(events: AssistantMessageEvent[]): void {
+	const toolEvents = events.filter(
+		(
+			event,
+		): event is Extract<AssistantMessageEvent, { type: "toolcall_start" | "toolcall_delta" | "toolcall_end" }> =>
+			event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end",
+	);
+	expect(toolEvents.length).toBeGreaterThan(0);
+	for (const event of toolEvents) {
+		const block = event.partial.content[event.contentIndex];
+		expect(block?.type).toBe("toolCall");
+		if (event.type === "toolcall_end" && block?.type === "toolCall") {
+			expect(block.id).toBe(event.toolCall.id);
+		}
+	}
+}
 
 describe("Kiro API-key content filter #6150", () => {
 	afterEach(() => {
@@ -276,6 +306,7 @@ describe("Kiro API-key content filter #6150", () => {
 				toolUseId: "tool-1",
 				name: "read_file",
 				input: '{"path":"/etc/passwd"}',
+				stop: true,
 			});
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
@@ -434,7 +465,7 @@ describe("Kiro API-key content filter #6150", () => {
 			// Simulate response with text, tool call, and normal completion metadata
 			const responseBody =
 				JSON.stringify({ content: "I'll read that file" }) +
-				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}' }) +
+				JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}', stop: true }) +
 				JSON.stringify({ stopReason: "COMPLETED", usage: { inputTokens: 10, outputTokens: 5 } });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
@@ -571,8 +602,8 @@ describe("Kiro API-key content filter #6150", () => {
 		}
 	});
 
-	// P2: Partial output is preserved when an ordinary error occurs
-	test("P2: ordinary (non-refusal) error preserves already-emitted text content in error message", async () => {
+	// P2: Unconfirmed text is discarded when an ordinary error occurs without COMPLETED event
+	test("P2: ordinary (non-refusal) error without COMPLETED discards unconfirmed text", async () => {
 		const emittedEvents: Array<{ type: string; text?: string; message?: { errorMessage?: string } }> = [];
 		const model = {
 			id: "test-model",
@@ -593,7 +624,7 @@ describe("Kiro API-key content filter #6150", () => {
 		};
 
 		globalThis.fetch = (async () => {
-			// Response with partial content followed by an ordinary error (not a refusal)
+			// Response with partial content followed by an ordinary error (not a refusal), no COMPLETED event
 			const responseBody =
 				JSON.stringify({ content: "Hello, this is partial" }) +
 				JSON.stringify({ error: "rate_limit_exceeded", message: "Too many requests" });
@@ -615,20 +646,20 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		// Should have emitted text_delta events before the error
+		// Should NOT have emitted text_delta events (no COMPLETED event, so text is unconfirmed)
 		const textDeltaEvents = emittedEvents.filter(e => e.type === "text_delta");
-		expect(textDeltaEvents.length).toBeGreaterThan(0);
+		expect(textDeltaEvents.length).toBe(0);
 
-		// Error event should include the partial content in the message
+		// Error event should NOT include the partial content in the message (unconfirmed text is discarded)
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("rate_limit_exceeded");
 		expect(errorEvent?.message?.errorMessage).toContain("Too many requests");
-		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
-		expect(errorEvent?.message?.errorMessage).toContain("Hello, this is partial");
+		expect(errorEvent?.message?.errorMessage).not.toContain("Partial output");
+		expect(errorEvent?.message?.errorMessage).not.toContain("Hello, this is partial");
 	});
 
-	test("P2: tool call partial output is preserved when ordinary error occurs", async () => {
+	test("P2: tool call partial output is discarded when ordinary error occurs without COMPLETED event", async () => {
 		const emittedEvents: Array<{ type: string; message?: { errorMessage?: string } }> = [];
 		const model = {
 			id: "test-model",
@@ -649,7 +680,7 @@ describe("Kiro API-key content filter #6150", () => {
 		};
 
 		globalThis.fetch = (async () => {
-			// Response with text, tool call start, and then an ordinary error
+			// Response with text, tool call start, and then an ordinary error (no COMPLETED event)
 			const responseBody =
 				JSON.stringify({ content: "I'll read that file" }) +
 				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: "{" }) +
@@ -670,17 +701,21 @@ describe("Kiro API-key content filter #6150", () => {
 			// Errors may be thrown; events are captured above
 		}
 
-		// Error should be reported but should mention accumulated partial output (text and tool)
+		// Error should be reported but should NOT mention accumulated partial output without COMPLETED
 		const errorEvent = emittedEvents.find(e => e.type === "error");
 		expect(errorEvent).toBeDefined();
 		expect(errorEvent?.message?.errorMessage).toContain("connection_timeout");
 		expect(errorEvent?.message?.errorMessage).toContain("Connection lost");
-		// Should mention partial output was accumulated
-		expect(errorEvent?.message?.errorMessage).toContain("Partial output");
+		// Should NOT mention partial output (unconfirmed text is discarded)
+		expect(errorEvent?.message?.errorMessage).not.toContain("Partial output");
 	});
 });
 
 describe("reasoning-before-answer contentIndex invariant #6151", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
 	test("thinking then text — every contentIndex matches block final position", async () => {
 		const emittedEvents: Array<{
 			type: string;
@@ -778,7 +813,8 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			const responseBody =
 				JSON.stringify({
 					content: "<thinking>I need to read a file</thinking>Let me read that file for you.",
-				}) + JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}' });
+				}) +
+				JSON.stringify({ toolUseId: "tool-123", name: "read_file", input: '{"path":"/tmp/test.txt"}', stop: true });
 			return new Response(responseBody, { status: 200 });
 		}) as unknown as typeof fetch;
 
@@ -916,7 +952,7 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 			for await (const event of stream) {
 				emittedEvents.push({
 					type: event.type,
-					error: event.type === "error" && "error" in event ? (event.error as any).errorMessage : undefined,
+					error: event.type === "error" ? event.error.errorMessage : undefined,
 				});
 			}
 		} catch {
@@ -977,6 +1013,10 @@ describe("reasoning-before-answer contentIndex invariant #6151", () => {
 });
 
 describe("reader.read() error handling with pending tools #6151", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
 	test("emits completed tool events before error when reader.read() throws", async () => {
 		const emittedEventTypes: string[] = [];
 
@@ -1083,9 +1123,11 @@ describe("reader.read() error handling with pending tools #6151", () => {
 });
 
 describe("Regression tests for #6151 issues", () => {
-	test("#4199034431: incomplete JSON frame without valid nested objects preserves data for next call", async () => {
-		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
 
+	test("#4199034431: incomplete JSON frame without valid nested objects preserves data for next call", async () => {
 		// Simulate a malformed chunk with a stray opening brace (no complete nested JSON)
 		// This tests that when there's incomplete JSON with no valid nested objects to resync to,
 		// the data is preserved in remaining for the next parse call
@@ -1108,6 +1150,15 @@ describe("Regression tests for #6151 issues", () => {
 		const contentEvent = result2.events.find(e => e.type === "content");
 		expect(contentEvent).toBeDefined();
 		expect(contentEvent?.type).toBe("content");
+	});
+
+	test("malformed quoted envelopes resync to a valid nested event", () => {
+		const result = parseKiroApiEvents('{"bad":nope{"content":"recoverable content"}');
+
+		expect(result.events.map(event => event.type)).toEqual(["content"]);
+		const contentEvent = result.events[0];
+		expect(contentEvent?.type === "content" ? contentEvent.data : undefined).toBe("recoverable content");
+		expect(result.remaining).toBe("");
 	});
 
 	test("#4199034439: incomplete tool should NOT be emitted when reader.read() throws mid-tool", async () => {
@@ -1165,8 +1216,6 @@ describe("Regression tests for #6151 issues", () => {
 	});
 
 	test("#4199034444: 64KiB retention cap enforced for stray brace with no valid JSON", async () => {
-		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
-
 		// Create a buffer with a stray opening brace followed by 100KB of garbage
 		// This should be truncated to 64KB max when returned as remaining
 		const strayBrace = "{";
@@ -1186,8 +1235,6 @@ describe("Regression tests for #6151 issues", () => {
 	});
 
 	test("#4199282140: balanced junk wrapper around valid refusal event is rescanned", async () => {
-		const { parseKiroApiEvents } = await import("../src/providers/kiro-api-key");
-
 		// Codex finding: balanced junk wrapper around a valid event
 		// e.g. '{junk{"stopReason":"CONTENT_FILTERED",...}}' should not be discarded
 		const balancedJunkWrapper =
@@ -1245,5 +1292,1053 @@ describe("Regression tests for #6151 issues", () => {
 		expect(toolcallEnd).toBe(-1);
 		// Only error event should be present
 		expect(errorIdx).toBeGreaterThan(-1);
+	});
+});
+
+describe("P1 Regression: incomplete tool emission at tool-ID rollover", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("P1: incomplete tool is not emitted when tool ID changes", async () => {
+		const emittedEventTypes: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// First tool incomplete (no stop), then new tool ID changes
+			const tool1 = JSON.stringify({
+				toolUseId: "tool-1",
+				name: "read_file",
+				input: '{"path": "/file1"}',
+				// NOTE: no "stop": true — tool is incomplete
+			});
+			const tool2 = JSON.stringify({
+				toolUseId: "tool-2", // Different ID triggers tool-ID transition
+				name: "write_file",
+				input: '{"path": "/file2"}',
+				stop: true, // This tool IS complete
+			});
+			const responseBody = tool1 + tool2;
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEventTypes.push(event.type);
+			}
+		} catch {
+			// Errors captured
+		}
+
+		// Count toolcall events
+		// tool-1 was incomplete, so should NOT be emitted (both start AND end should be absent)
+		// tool-2 was complete (stop: true), so SHOULD be emitted
+		const toolcallStarts = emittedEventTypes.filter(e => e === "toolcall_start").length;
+		const toolcallEnds = emittedEventTypes.filter(e => e === "toolcall_end").length;
+
+		expect(toolcallStarts).toBe(1); // Only tool-2 should have toolcall_start
+		expect(toolcallEnds).toBe(1); // Only tool-2 should have toolcall_end
+	});
+
+	test("P1: incomplete tool is not emitted at stream end", async () => {
+		const emittedEventTypes: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// Tool without stop flag at stream end, with text so response is not empty
+			const text = JSON.stringify({
+				content: "I cannot complete this request.",
+			});
+			const tool = JSON.stringify({
+				toolUseId: "tool-incomplete",
+				name: "read_file",
+				input: '{"path": "/tmp/test"}',
+				// NOTE: no "stop": true — tool is incomplete
+			});
+			const completion = JSON.stringify({
+				stopReason: "COMPLETED",
+				usage: { inputTokens: 5, outputTokens: 2 },
+			});
+			const responseBody = text + tool + completion;
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEventTypes.push(event.type);
+			}
+		} catch {
+			// Errors captured
+		}
+
+		// With the P1 fix: incomplete tool should NOT emit toolcall_start/end
+		// (Without fix, incomplete tool would be forced into blocks at stream end)
+		const toolcallStart = emittedEventTypes.find(e => e === "toolcall_start");
+		const toolcallEnd = emittedEventTypes.find(e => e === "toolcall_end");
+		const done = emittedEventTypes.find(e => e === "done");
+
+		// Stream completes normally with done event
+		expect(done).toBeDefined();
+		// But incomplete tool is NOT emitted (without explicit stop flag)
+		expect(toolcallStart).toBeUndefined();
+		expect(toolcallEnd).toBeUndefined();
+	});
+
+	test("incomplete tool-only response errors at clean EOF without emitting a tool", async () => {
+		const events: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			const incompleteTool = JSON.stringify({
+				toolUseId: "tool-incomplete",
+				name: "read_file",
+				input: '{"path":"/tmp/test"}',
+			});
+			return new Response(incompleteTool, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toBe("Kiro API key stream returned no tokens");
+		expect(events.some(event => event.type === "done")).toBe(false);
+		expect(events.some(event => event.type === "toolcall_start" || event.type === "toolcall_end")).toBe(false);
+	});
+
+	test("TOOL_USE completion allows the active tool to finish but fences later content", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ stopReason: "TOOL_USE", toolUseId: "tool-continued", name: "search", input: '{"query":' }),
+			JSON.stringify({ input: '"kiro"}' }),
+			JSON.stringify({ stop: true }),
+			JSON.stringify({ content: "post-terminal text" }),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const doneEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+		expect(doneEvent?.reason).toBe("toolUse");
+		const toolCall = doneEvent?.message.content.find(block => block.type === "toolCall");
+		expect(toolCall?.type).toBe("toolCall");
+		if (toolCall?.type === "toolCall") expect(toolCall.arguments).toEqual({ query: "kiro" });
+		expect(doneEvent?.message.content.filter(block => block.type === "text")).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
+		expectToolEventsReferenceToolBlocks(events);
+	});
+
+	test("COMPLETED fences unfinished tool fragments", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ toolUseId: "tool-incomplete", name: "search", input: '{"query":' }),
+			JSON.stringify({ stopReason: "COMPLETED" }),
+			JSON.stringify({ input: '"kiro"}' }),
+			JSON.stringify({ stop: true }),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(event => event.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(events.some(event => event.type === "toolcall_start" || event.type === "toolcall_end")).toBe(false);
+	});
+});
+
+describe("P2 Probepark findings: unconfirmed text on read rejection", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("P2: unconfirmed text should NOT be emitted when read error occurs", async () => {
+		const emittedEvents: string[] = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate a response that delivers content but then errors
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					// Send only content, NO terminal metadata
+					const encoder = new TextEncoder();
+					const chunk = encoder.encode(JSON.stringify({ content: "secret_data" }));
+					controller.enqueue(chunk);
+				},
+				pull(controller) {
+					// Simulate stream error on second read
+					controller.error(new Error("Stream error"));
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event.type);
+			}
+		} catch {
+			// Errors captured in stream
+		}
+
+		// Content without terminal metadata should NOT be emitted when error occurs
+		const textDeltas = emittedEvents.filter(e => e === "text_delta");
+		expect(textDeltas).toHaveLength(0);
+
+		// Error event should be emitted
+		const errorIdx = emittedEvents.indexOf("error");
+		expect(errorIdx).toBeGreaterThan(-1);
+	});
+
+	test("usage metadata does not confirm pending text before a later read error", async () => {
+		const emittedEvents: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			// Simulate a response with content AND terminal metadata, then error
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					const encoder = new TextEncoder();
+					// Content + terminal metadata in first pull
+					const content = encoder.encode(JSON.stringify({ content: "confirmed" }));
+					const usage = encoder.encode(JSON.stringify({ usage: { inputTokens: 1, outputTokens: 1 } }));
+					controller.enqueue(content);
+					controller.enqueue(usage);
+				},
+				pull(controller) {
+					// Simulate error on second read (after confirmed metadata)
+					controller.error(new Error("Network error"));
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event);
+			}
+		} catch {
+			// Errors captured in stream
+		}
+
+		const textEvents = emittedEvents.filter(
+			event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+		);
+		expect(textEvents).toHaveLength(0);
+		const errorEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Network error");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+	});
+
+	test("unknown stopReason does not confirm pending text before a later read error", async () => {
+		const emittedEvents: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			const eventSequence = [
+				JSON.stringify({ content: "unconfirmed" }),
+				JSON.stringify({ stopReason: "FUTURE_STOP_REASON" }),
+			];
+			let emitted = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.error(new Error("Network error after unknown stop reason"));
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			emittedEvents.push(event);
+		}
+
+		const errorEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Network error after unknown stop reason");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(errorEvent?.partial).toBeUndefined();
+		expect(emittedEvents.some(event => event.type === "text_delta")).toBe(false);
+	});
+
+	test("completed text remains quarantined on an ordinary error before clean EOF", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const responseBody =
+			JSON.stringify({ content: "confirmed before error" }) +
+			JSON.stringify({ stopReason: "COMPLETED" }) +
+			JSON.stringify({ error: "ServerError", message: "failure after completion" });
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(responseBody));
+					controller.close();
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("failure after completion");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
+		expect(events.some(event => event.type === "done")).toBe(false);
+	});
+
+	test("reindexes completed-tool lifecycle events before an ordinary error", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ content: "unconfirmed text" }),
+			JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}', stop: true }),
+			JSON.stringify({ error: "server_error", message: "Temporary failure" }),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("server_error");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(errorEvent?.error.content[0]?.type).toBe("toolCall");
+		expectToolEventsReferenceToolBlocks(events);
+	});
+
+	test("reindexes completed-tool lifecycle events before a reader rejection", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ content: "unconfirmed text" }),
+			JSON.stringify({ toolUseId: "tool-1", name: "read_file", input: '{"path":"/tmp/test"}', stop: true }),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.error(new Error("Network error after completed tool"));
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Network error after completed tool");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(errorEvent?.error.content[0]?.type).toBe("toolCall");
+		expectToolEventsReferenceToolBlocks(events);
+	});
+});
+
+describe("P1 Regression: content leaking across batches", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("P1: content and refusal in same batch suppresses text", async () => {
+		const emittedEvents: Array<{ type: string }> = [];
+
+		globalThis.fetch = (async () => {
+			// Content and refusal in same JSON batch (same read)
+			const responseBody =
+				JSON.stringify({ content: "This is harmful content" }) +
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "VIOLENCE",
+							explanation: "Violent content not allowed",
+						},
+					},
+				});
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch {
+			// Errors captured
+		}
+
+		// Refusal in same batch should suppress content
+		const errorIndex = emittedEvents.findIndex(e => e.type === "error");
+		expect(errorIndex).toBeGreaterThan(-1);
+
+		const textBeforeError = emittedEvents
+			.slice(0, errorIndex)
+			.filter(e => e.type === "text_delta" || e.type === "text_start");
+
+		// Content should be suppressed because refusal was in same batch
+		expect(textBeforeError).toHaveLength(0);
+	});
+
+	test("batched refusal overrides completion and suppresses quarantined text", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ content: "quarantined answer" }),
+			JSON.stringify({ stopReason: "COMPLETED" }) +
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: { refusal: { category: "VIOLENCE", explanation: "Do not show answer" } },
+				}),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Kiro refused the request (VIOLENCE)");
+		expect(errorEvent?.error.content).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
+	});
+
+	test("a refusal in a later read suppresses text after COMPLETED", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ content: "filtered across reads" }),
+			JSON.stringify({ stopReason: "COMPLETED" }),
+			JSON.stringify({
+				stopReason: "CONTENT_FILTERED",
+				stopDetails: { refusal: { category: "VIOLENCE", explanation: "Do not show answer" } },
+			}),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Kiro refused the request (VIOLENCE)");
+		expect(errorEvent?.error.content).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
+	});
+
+	test("batched refusal takes precedence over an earlier ordinary error", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const trustedModel = kiroApiStaticModels()[0];
+		if (!trustedModel) throw new Error("Expected a registered Kiro API-key model");
+		const eventSequence = [
+			JSON.stringify({ content: "quarantined answer" }),
+			JSON.stringify({ error: "ServerError", message: "ordinary error must not win" }) +
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: { refusal: { category: "MALWARE", explanation: "Refusal must remain authoritative" } },
+				}),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const options = withProviderSafetyStopAdapterInvocation({ apiKey: "ksk_test-secret", region: "us-east-1" });
+		const stream = streamKiroApiKey(trustedModel, context, options);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Kiro refused the request (MALWARE)");
+		expect(errorEvent?.error.errorMessage).toContain("Refusal must remain authoritative");
+		expect(errorEvent?.error.errorMessage).not.toContain("ordinary error must not win");
+		expect(errorEvent?.error.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(errorEvent?.error)).toBe(true);
+		expect(errorEvent?.error.content).toHaveLength(0);
+		expect(events.some(event => event.type === "text_start" || event.type === "text_delta")).toBe(false);
+	});
+
+	test("P2: unconfirmed text not in published partials when refusal follows", async () => {
+		const events: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			const eventSequence = [
+				JSON.stringify({ content: "Harmful text here" }),
+				JSON.stringify({
+					stopReason: "CONTENT_FILTERED",
+					stopDetails: {
+						refusal: {
+							category: "VIOLENCE",
+							explanation: "Violent content not allowed",
+						},
+					},
+				}),
+			];
+			let emitted = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const escapedTextEvents = events.filter(
+			event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+		);
+		expect(escapedTextEvents).toHaveLength(0);
+		const startEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "start" }> => event.type === "start",
+		);
+		expect(startEvent?.partial.content).toHaveLength(0);
+		const refusalEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(refusalEvent?.error.errorMessage).toContain("Kiro refused the request");
+		expect(refusalEvent?.error.content).toHaveLength(0);
+	});
+
+	test("text delta partials stay empty until text_end commits content", async () => {
+		const events: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			const eventSequence = [
+				JSON.stringify({ content: "Test content" }),
+				JSON.stringify({ stopReason: "COMPLETED" }),
+			];
+			let emitted = 0;
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const startEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "start" }> => event.type === "start",
+		);
+		expect(startEvent?.partial.content).toHaveLength(0);
+		const textDeltaEvents = events.filter(
+			(event): event is Extract<AssistantMessageEvent, { type: "text_delta" }> => event.type === "text_delta",
+		);
+		expect(textDeltaEvents).toHaveLength(1);
+		expect(getTextBlocks(textDeltaEvents[0]?.partial).map(block => block.text)).toEqual([""]);
+		const doneEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+		expect(getTextBlocks(doneEvent?.message).map(block => block.text)).toEqual(["Test content"]);
+	});
+});
+
+describe("Completion event handling (probepark fix for #6451)", () => {
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("accepted completion stopReason emits a completion event", async () => {
+		const emittedEventTypes: string[] = [];
+
+		globalThis.fetch = (async () => {
+			const responseBody = JSON.stringify({ stopReason: "COMPLETED" });
+			return new Response(responseBody, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				// This test just verifies the stream completes
+				emittedEventTypes.push(event.type);
+			}
+		} catch {
+			// Error handling
+		}
+
+		// Verify we get either done or error event (not hanging)
+		const done = emittedEventTypes.includes("done");
+		const error = emittedEventTypes.includes("error");
+		expect(done || error).toBe(true);
+	});
+
+	test("content + COMPLETED, then stream error: quarantined text stays private", async () => {
+		// Completion metadata is not enough to publish text when the response fails before clean EOF.
+		const emittedEvents: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			// Create a stream that delivers content + COMPLETED, then errors on next read
+			const eventSequence = [JSON.stringify({ content: "Hello" }), JSON.stringify({ stopReason: "COMPLETED" })];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else if (emitted === eventSequence.length) {
+						// After all events, throw an error on next read
+						emitted++;
+						controller.error(new Error("Network error after completion"));
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event);
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		const errorEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Network error after completion");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(
+			emittedEvents.some(
+				event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+			),
+		).toBe(false);
+	});
+
+	test("content without COMPLETED, then stream error: no text block in error terminal", async () => {
+		// When stream contains content but NO COMPLETED event (stream is incomplete),
+		// then reader.read() throws, the error terminal should NOT include unconfirmed text.
+		// This preserves existing P2 behavior (commit 9b23344 semantics).
+		const emittedEvents: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			// Create a stream that delivers content only, then errors
+			const eventSequence = [JSON.stringify({ content: "Hello" })];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else if (emitted === eventSequence.length) {
+						// After content, throw an error (NO COMPLETED event)
+						emitted++;
+						controller.error(new Error("Network error without completion"));
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event);
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		// With no COMPLETED event, the stream should produce error event
+		const errorEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent).toBeDefined();
+
+		// Since completionSeen is false, text content should not be in the error terminal
+		// (preserves P2 behavior: unconfirmed text is not published)
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+	});
+
+	test("stopReason CONTENT_FILTERED without stopDetails.refusal: treated as refusal", async () => {
+		// Finding #1: detail-free CONTENT_FILTERED should trigger refusal handling
+		const emittedEvents: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			// Stream with content followed by CONTENT_FILTERED (no stopDetails.refusal)
+			const eventSequence = [
+				JSON.stringify({ content: "Malicious content" }),
+				JSON.stringify({ stopReason: "CONTENT_FILTERED" }),
+			];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event);
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		// Verify that CONTENT_FILTERED triggers an error (refusal), not a done
+		const errorEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toMatch(/refuse/i);
+		expect(emittedEvents.some(event => event.type === "done")).toBe(false);
+
+		// Verify that malicious content is not in the error output
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+	});
+
+	test("clean EOF publishes completion-confirmed text and fences later content", async () => {
+		// Completion metadata fences later content, but text is not published until EOF rules out a later refusal.
+		const emittedEvents: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			// Stream: content event, then completion event, then more data (which should be ignored)
+			const eventSequence = [
+				JSON.stringify({ content: "Hello world" }),
+				JSON.stringify({ stopReason: "COMPLETED" }),
+				JSON.stringify({ content: "This should not appear" }), // Extra event after completion
+			];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event);
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		// Clean EOF publishes the confirmed text as a complete lifecycle.
+		const eventTypes = emittedEvents.map(e => e.type);
+		const textLifecycle = emittedEvents.filter(
+			event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+		);
+		expect(textLifecycle.map(event => event.type)).toEqual(["text_start", "text_delta", "text_end"]);
+		expect(eventTypes.includes("done")).toBe(true);
+
+		// Verify the order: text events should come before done
+		const textStartIdx = eventTypes.indexOf("text_start");
+		const textEndIdx = eventTypes.indexOf("text_end");
+		const doneIdx = eventTypes.indexOf("done");
+		expect(textStartIdx).toBeLessThan(textEndIdx);
+		expect(textEndIdx).toBeLessThan(doneIdx);
+		const textDeltas = emittedEvents.filter(
+			(event): event is Extract<AssistantMessageEvent, { type: "text_delta" }> => event.type === "text_delta",
+		);
+		expect(textDeltas.map(event => event.delta).join("")).toBe("Hello world");
+		const doneEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+		expect(getTextBlocks(doneEvent?.message).map(block => block.text)).toEqual(["Hello world"]);
+		expect(doneEvent?.message.content.filter(block => block.type === "text")).toHaveLength(1);
+	});
+
+	test("incomplete JSON frame with nested object: no resync into nested (Finding #3)", async () => {
+		// Finding #3: Parser should not resync into nested objects within an incomplete outer frame.
+		// Stream incomplete frame like {"stopReason":"COMPLETED","usage": followed by EOF
+		// should error, not resync to find {inside the outer frame.
+		const emittedEvents: Array<{ type: string }> = [];
+		let errorThrown = false;
+
+		globalThis.fetch = (async () => {
+			// Incomplete outer frame: stopReason complete but usage object starts but never closes
+			const incompleteFrame = `${JSON.stringify({ stopReason: "COMPLETED" }).slice(0, -1)},"usage":{"inputTokens":100`; // Incomplete, never closes
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					// Deliver the incomplete frame and close (EOF with incomplete data)
+					const chunk = new TextEncoder().encode(incompleteFrame);
+					controller.enqueue(chunk);
+					controller.close(); // EOF without closing the frame
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push({ type: event.type });
+			}
+		} catch (err) {
+			// Expect error due to incomplete JSON frame at EOF
+			errorThrown = true;
+			if (err instanceof Error) {
+				expect(err.message).toMatch(/truncated|incomplete/i);
+			}
+		}
+
+		// Verify that an error was thrown (not successful completion)
+		const errorEvent = emittedEvents.find(e => e.type === "error");
+		expect(errorThrown || errorEvent).toBeTruthy();
+	});
+
+	test("incomplete refusal envelope with complete nested object is rejected at EOF", async () => {
+		const events: AssistantMessageEvent[] = [];
+		const eventSequence = [
+			JSON.stringify({ content: "unconfirmed answer" }),
+			JSON.stringify({
+				stopReason: "CONTENT_FILTERED",
+				stopDetails: { refusal: { category: "VIOLENCE", explanation: "Do not show answer" } },
+			}).slice(0, -1),
+		];
+		let emitted = 0;
+
+		globalThis.fetch = (async () => {
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						controller.enqueue(new TextEncoder().encode(eventSequence[emitted]));
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const errorEvent = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("incomplete JSON frame at EOF");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(
+			events.some(event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end"),
+		).toBe(false);
+	});
+
+	test("post-completion error in a later read still suppresses text before clean EOF", async () => {
+		const emittedEvents: AssistantMessageEvent[] = [];
+
+		globalThis.fetch = (async () => {
+			const eventSequence = [
+				JSON.stringify({ content: "Hello" }),
+				JSON.stringify({ stopReason: "COMPLETED" }),
+				JSON.stringify({ error: "Server error", message: "Internal server error" }),
+			];
+			let emitted = 0;
+
+			const body = new ReadableStream<Uint8Array>({
+				pull(controller) {
+					if (emitted < eventSequence.length) {
+						const chunk = new TextEncoder().encode(eventSequence[emitted]);
+						controller.enqueue(chunk);
+						emitted++;
+					} else {
+						controller.close();
+					}
+				},
+			});
+
+			return new Response(body, { status: 200 });
+		}) as unknown as typeof fetch;
+
+		try {
+			const stream = streamKiroApiKey(model, context, { apiKey: "ksk_test-secret", region: "us-east-1" });
+			for await (const event of stream) {
+				emittedEvents.push(event);
+			}
+		} catch {
+			// Stream error handling
+		}
+
+		const errorEvent = emittedEvents.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "error" }> => event.type === "error",
+		);
+		expect(errorEvent?.error.errorMessage).toContain("Internal server error");
+		expect(getTextBlocks(errorEvent?.error)).toHaveLength(0);
+		expect(
+			emittedEvents.some(
+				event => event.type === "text_start" || event.type === "text_delta" || event.type === "text_end",
+			),
+		).toBe(false);
 	});
 });

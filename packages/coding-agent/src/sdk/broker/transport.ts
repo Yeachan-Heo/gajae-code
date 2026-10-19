@@ -66,6 +66,7 @@ export class BrokerTransport {
 	readonly #requestedPort: number;
 	#server: Bun.Server<undefined> | null = null;
 	#port = 0;
+	readonly #clients = new Set<ServerWebSocket<unknown>>();
 	readonly #shutdownBackpressured = new WeakSet<ServerWebSocket<unknown>>();
 	#shutdownRequested = false;
 	constructor(broker: Broker, token: string, port = 0) {
@@ -76,6 +77,10 @@ export class BrokerTransport {
 	get port(): number {
 		if (!this.#server) throw new Error("Broker transport is not running");
 		return this.#port;
+	}
+	/** Sockets a client holds open right now; the broker outlives every one of them. */
+	get clientCount(): number {
+		return this.#clients.size;
 	}
 	async start(): Promise<number> {
 		if (this.#server) return this.#port;
@@ -95,7 +100,12 @@ export class BrokerTransport {
 			websocket: {
 				maxPayloadLength: MAX_BROKER_JSON_FRAME_BYTES * 2,
 				open: socket => {
+					this.#clients.add(socket);
 					send(socket, { type: "broker_hello", protocolVersion: PROTOCOL_VERSION });
+				},
+				close: socket => {
+					this.#clients.delete(socket);
+					this.#shutdownBackpressured.delete(socket);
 				},
 				message: (socket, message) => void this.#handleMessage(socket, message),
 				drain: socket => {
@@ -147,7 +157,13 @@ export class BrokerTransport {
 			sendError(socket, frame.id, "invalid_input", "idempotencyKey must be a string");
 			return;
 		}
-		if (!this.#broker.ownsDiscovery) {
+		// After initial publication, the owner retains the authenticated endpoint
+		// so it can stop this exact broker even after discovery is lost. Before
+		// publication readiness, shutdown remains unavailable.
+		if (
+			!this.#broker.ownsDiscovery &&
+			!(frame.operation === "broker.shutdown" && this.#broker.hasPublishedDiscovery)
+		) {
 			sendError(socket, frame.id, "unavailable", "broker publication is unavailable");
 			return;
 		}

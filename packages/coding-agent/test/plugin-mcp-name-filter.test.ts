@@ -232,7 +232,7 @@ describe("plugin MCP normalized name filter", () => {
 	);
 
 	test(
-		"a colliding user tool stays deselected while a unique plugin tool stays mandatory",
+		"caller-owned plugin metadata does not make unique tools mandatory and user collisions still win",
 		async () => {
 			const cwd = await mkdtemp(join(tmpdir(), "gjc-plugin-mcp-name-select-"));
 			const manager = new MCPManager(cwd);
@@ -276,9 +276,13 @@ describe("plugin MCP normalized name filter", () => {
 					mcpManager: manager,
 				});
 				session = created.session;
-				expect(session.getActiveToolNames()).toContain("mcp__safe_lookup");
+				expect(session.getActiveToolNames()).not.toContain("mcp__safe_lookup");
 				expect(session.getActiveToolNames()).not.toContain("mcp__my_server_search");
 				expect(session.getToolByName("mcp__my_other")).toBeUndefined();
+				await session.setActiveToolsByName(["read", "mcp__safe_lookup"]);
+				expect(session.getActiveToolNames()).toContain("mcp__safe_lookup");
+				await session.setActiveToolsByName(["read"]);
+				expect(session.getActiveToolNames()).not.toContain("mcp__safe_lookup");
 
 				await session.refreshMCPTools(loaded.tools, {
 					mandatoryMCPToolNames: unfilteredPluginNames,

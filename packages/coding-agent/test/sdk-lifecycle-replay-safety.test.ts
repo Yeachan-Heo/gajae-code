@@ -86,6 +86,7 @@ test.each([
 		api => {
 			// Register the production SDK handler, rather than reproducing its tag
 			// in the test. No session_start means no broker or transport is launched.
+			// broker-seam-opt-out: only agent_start is emitted; transport creation throws if reached.
 			createSdkSessionRuntimeExtension(api, {
 				agentDir: process.cwd(),
 				createTransport: () => {

@@ -325,15 +325,22 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	test.each([
 		"gjc-plugins",
 		"custom",
-	])("does not inherit caller-owned MCP tools with %s source metadata as mandatory", async provider => {
+	])("does not treat caller-owned MCP tools with %s provider and a source path as mandatory", async provider => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-forged-"));
 		tempDirs.push(cwd);
 		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
 		expect(r.ok).toBe(true);
 		const { configs } = await buildPluginMcpConfigs({ cwd });
 		const callerManager = new MCPManager(cwd);
+		const callerSourcePath = path.join(cwd, "caller-owned-mcp-config.json");
+		fs.writeFileSync(callerSourcePath, "{}");
 		const sources = {
-			domain_docs: { provider, providerName: "Caller-owned manager", level: "project" as const },
+			domain_docs: {
+				provider,
+				providerName: "Caller-owned manager",
+				path: callerSourcePath,
+				level: "project" as const,
+			},
 		};
 		const connected = await callerManager.connectServers(configs, sources as never);
 		expect(connected.errors.size).toBe(0);

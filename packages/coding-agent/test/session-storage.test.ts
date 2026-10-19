@@ -93,6 +93,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			["interrupted", "interrupted"],
 		] as const) {
@@ -139,6 +140,7 @@ describe("native publish outcome classification", () => {
 			["destination_exists", "already_exists"],
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
+			["access_denied", "access_denied"],
 			["io_failure", "io_error"],
 			// A signal landing on the no-replace rename syscall before it enters the
 			// kernel never mutates the filesystem, so a pre-mutation "interrupted"
@@ -180,6 +182,14 @@ describe("native publish outcome classification", () => {
 				...preMutation,
 				reason: "cross_device",
 				code: "cross_device",
+				phase: "preflight",
+			}).reason,
+		).toBe("unknown");
+		expect(
+			classifyNativePublishOutcome({
+				...preMutation,
+				reason: "access_denied",
+				code: "access_denied",
 				phase: "preflight",
 			}).reason,
 		).toBe("unknown");
@@ -2652,6 +2662,33 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 
 		expect(fs.existsSync(receipt)).toBe(false);
 		expect(fs.existsSync(path.join(root, "cleanup-io-error-retry"))).toBe(true);
+	});
+
+	it("retries a retained canonical receipt after a transient access-denied failure", () => {
+		const predecessorPath = path.join(root, "predecessor");
+		fs.writeFileSync(predecessorPath, "predecessor\n");
+		const predecessor = snapshot(predecessorPath);
+		const { receipt } = publishCanonicalReceipt(
+			predecessor,
+			JSON.stringify({ arbitrary: "receipt contents are advisory" }),
+		);
+		const realExactUnlink = native.exactUnlink;
+		let firstAttempt = true;
+
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, expected) => {
+			if (pathname === receipt && firstAttempt) {
+				firstAttempt = false;
+				return { ok: false, code: "access_denied" };
+			}
+			return realExactUnlink(pathname, expected);
+		});
+		replay("cleanup-access-denied-first-attempt");
+		expect(fs.existsSync(receipt)).toBe(true);
+
+		replay("cleanup-access-denied-retry");
+
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "cleanup-access-denied-retry"))).toBe(true);
 	});
 
 	it("keeps canonical receipt identity failures fail-closed", () => {

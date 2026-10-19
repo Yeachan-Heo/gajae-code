@@ -1896,10 +1896,10 @@ const EXECUTION_APPROVAL_TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_RECORD_MAX_BYTES = 16 * 1024;
 const DEEP_INTERVIEW_EXECUTION_APPROVAL_ID_MAX_LENGTH = 256;
 
+// The boundary binds approval to transcript content (prefix length/sha256, leaf, Ask call), not to
+// the file's inode: SessionManager persists full rewrites by atomic rename, which replaces the inode.
 export interface ExecutionApprovalTranscriptBoundary {
 	byte_length: number;
-	device: string;
-	inode: string;
 	leaf_id: string | null;
 	approval_tool_call_id: string;
 }
@@ -1909,10 +1909,6 @@ function isExecutionApprovalTranscriptBoundary(value: unknown): value is Executi
 		isPlainObject(value) &&
 		Number.isSafeInteger(value.byte_length) &&
 		(value.byte_length as number) > 0 &&
-		typeof value.device === "string" &&
-		/^\d+$/.test(value.device) &&
-		typeof value.inode === "string" &&
-		/^\d+$/.test(value.inode) &&
 		(value.leaf_id === null || isExecutionApprovalId(value.leaf_id)) &&
 		isExecutionApprovalId(value.approval_tool_call_id)
 	);
@@ -2037,8 +2033,6 @@ export async function captureExecutionApprovalTranscriptBoundary(
 		throw new StateCommandError(2, "execution approval transcript boundary lacks the current Ask call");
 	return {
 		byte_length: Buffer.byteLength(text),
-		device: after.dev.toString(),
-		inode: after.ino.toString(),
 		leaf_id: prefix.leaf,
 		approval_tool_call_id: approvalToolCallId,
 	};
@@ -2062,13 +2056,8 @@ export async function assertExecutionApprovalTranscriptBoundary(
 	const after = await fs.lstat(transcriptPath, { bigint: true });
 	if ((await fs.realpath(transcriptPath)) !== path.resolve(transcriptPath))
 		throw new StateCommandError(2, "execution approval transcript path is not canonical");
-	if (
-		!sameBoundedFileIdentity(before, after) ||
-		after.dev.toString() !== boundary.device ||
-		after.ino.toString() !== boundary.inode ||
-		text === undefined
-	)
-		throw new StateCommandError(2, "execution approval transcript identity changed");
+	if (!sameBoundedFileIdentity(before, after) || text === undefined)
+		throw new StateCommandError(2, "execution approval transcript changed while it was read");
 	const bytes = Buffer.from(text);
 	const prefix = bytes.subarray(0, boundary.byte_length);
 	if (prefix.length !== boundary.byte_length || createHash("sha256").update(prefix).digest("hex") !== transcriptSha256)

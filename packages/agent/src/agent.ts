@@ -541,6 +541,7 @@ export class Agent {
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#followUpBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
 	#steeringForceOneAtATime = new WeakSet<AgentMessage>();
+	#steeringBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
 	#toolInterruptPolicy: "abort_tools" | "finish_tools";
@@ -1333,6 +1334,33 @@ export class Agent {
 	}
 
 	/**
+	 * Enqueue a cohort of steering messages that one model step must receive
+	 * together.
+	 *
+	 * {@link steer} submits each message as its own unit, and the default
+	 * `one-at-a-time` mode then commits only the first of them per step. A cohort
+	 * keeps records that only make sense together — an incoming message and the
+	 * reply already sent on the model's behalf — inside a single steering unit in
+	 * either mode. Admission is all-or-nothing: either every message is queued or
+	 * none is.
+	 */
+	steerCohort(messages: readonly AgentMessage[], options?: { forceOneAtATime?: boolean }): SteerAdmission {
+		const head = messages[0];
+		if (!head) return { admitted: false, reason: "idle" };
+		assertUserImagePlaceholdersHavePayload([...messages]);
+		const runId = this.#activeRunId;
+		if (runId === undefined || !this.#state.isStreaming) return { admitted: false, reason: "idle" };
+		if (this.#abortController?.signal.aborted) return { admitted: false, reason: "aborting" };
+		for (const message of messages) {
+			if (options?.forceOneAtATime) this.#steeringForceOneAtATime.add(message);
+			this.#steeringQueue.push(message);
+		}
+		if (messages.length > 1) this.#steeringBatches.set(head, [...messages]);
+		for (const notify of [...this.#steeringWaiters]) notify();
+		return { admitted: true, runId };
+	}
+
+	/**
 	 * Resolves when a steering message is admitted AFTER this wait started, or
 	 * when `signal` aborts. The queue is not consumed and a message already
 	 * queued before the wait does not resolve it. Long observation tools use this
@@ -1384,6 +1412,26 @@ export class Agent {
 	markFollowUpBatch(messages: readonly AgentMessage[]): void {
 		const first = messages[0];
 		if (first && messages.length > 1) this.#followUpBatches.set(first, messages.slice());
+	}
+
+	/**
+	 * Delivery cohorts inside `messages`, keyed by every member. A cohort queued
+	 * together through `steer`/`steerCohort` keeps its metadata for the lifetime
+	 * of the message, so a cohort an ended run disowned (and the owner re-routed)
+	 * still reports as one unit here. A cohort counts only while its members are
+	 * still contiguous in the given order.
+	 */
+	steeringCohorts(messages: readonly AgentMessage[]): Map<AgentMessage, readonly AgentMessage[]> {
+		const cohorts = new Map<AgentMessage, readonly AgentMessage[]>();
+		for (let index = 0; index < messages.length; index++) {
+			const message = messages[index];
+			if (!message) continue;
+			const cohort = this.#steeringBatches.get(message);
+			if (!cohort || cohort.length < 2) continue;
+			if (!cohort.every((entry, offset) => messages[index + offset] === entry)) continue;
+			for (const member of cohort) cohorts.set(member, cohort);
+		}
+		return cohorts;
 	}
 
 	clearSteeringQueue() {
@@ -1449,28 +1497,43 @@ export class Agent {
 		this.#followUpQueue = snapshot.followUp.slice();
 	}
 
+	/**
+	 * Steering units in queue order, up to `limit` units. A cohort queued together
+	 * counts as one unit, so the loop commits its members in the same step even
+	 * when the steering mode would otherwise take one record at a time.
+	 */
+	#steeringUnits(limit: number): AgentMessage[][] {
+		const units: AgentMessage[][] = [];
+		let index = 0;
+		while (index < this.#steeringQueue.length && units.length < limit) {
+			const message = this.#steeringQueue[index];
+			if (!message) break;
+			const batch = this.#steeringBatches.get(message);
+			const cohort =
+				batch && batch.length > 1 && batch.every((entry, offset) => this.#steeringQueue[index + offset] === entry)
+					? batch
+					: undefined;
+			units.push(cohort ? [...cohort] : [message]);
+			index += cohort ? cohort.length : 1;
+		}
+		return units;
+	}
+
 	#dequeueSteeringMessages(): AgentMessage[] {
-		if (this.#steeringMode === "one-at-a-time") {
-			if (this.#steeringQueue.length > 0) {
-				const first = this.#steeringQueue[0];
-				this.#steeringQueue = this.#steeringQueue.slice(1);
-				return [first];
-			}
-			return [];
+		const takes: AgentMessage[][] = [];
+		for (const unit of this.#steeringUnits(Number.POSITIVE_INFINITY)) {
+			const first = unit[0];
+			// A per-message sequential mark still delivers that message on its own,
+			// mirroring the follow-up override; a cohort holding it still travels whole.
+			const sequential = first !== undefined && this.#steeringForceOneAtATime.has(first);
+			if (takes.length > 0 && (sequential || this.#steeringMode === "one-at-a-time")) break;
+			takes.push(unit);
+			if (sequential || this.#steeringMode === "one-at-a-time") break;
 		}
-		// "all" batches within ONE poll only; a per-message sequential mark still
-		// delivers that message on its own, mirroring the follow-up override.
-		const first = this.#steeringQueue[0];
-		if (!first) return [];
-		if (this.#steeringForceOneAtATime.has(first)) {
-			this.#steeringQueue = this.#steeringQueue.slice(1);
-			return [first];
-		}
-		const forcedIndex = this.#steeringQueue.findIndex(message => this.#steeringForceOneAtATime.has(message));
-		const takeCount = forcedIndex === -1 ? this.#steeringQueue.length : forcedIndex;
-		const steering = this.#steeringQueue.slice(0, takeCount);
-		this.#steeringQueue = this.#steeringQueue.slice(takeCount);
-		return steering;
+		const taken = takes.flat();
+		if (taken.length === 0) return [];
+		this.#steeringQueue = this.#steeringQueue.slice(taken.length);
+		return taken;
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {

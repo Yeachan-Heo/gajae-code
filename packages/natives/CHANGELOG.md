@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Keep local native builds from rewriting the checked-in diagnostic artifact manifest; CI and distribution builds continue updating the trusted record. Local-only embedding verifies the ignored digest without requiring a fresh release manifest, omits stale unused local variants, and keeps mixed/release builds strict. Compiled binaries carry the verified digest and refresh same-sized stale addon caches on rebuild.
+
+- Report Windows retained-replacement `STATUS_ACCESS_DENIED` as `access_denied` and retry transient access-denied or sharing-violation renames within the bounded pre-mutation retry window.
+
+- Reject encodeSixel requests above 4096 pixels on a side or 8000000 pixels in total before the image is resized.
+
+- Reject SVG image elements and bound SVG/SVGZ source size, element count, attributes, and nesting before native rasterization.
+
+- The native loader accepts Windows ARM64 and looks for `pi_natives.win32-arm64.node`.
+- On Windows, `libunwind.dll` beside the installed addon is loaded after the `.node` file is copied into the versioned cache.
+
 ## [0.18.11] - 2026-10-12
 
 ## [0.18.10] - 2026-10-12

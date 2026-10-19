@@ -3,6 +3,11 @@ import * as path from "node:path";
 import { JSON_SCHEMA_OUTPUTS, stableJson } from "./generate-json-schemas";
 import { ProfileModelSelectorPattern } from "../packages/coding-agent/src/config/models-config-schema";
 import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
+import {
+	PREFERENCE_ACCOUNT_PATTERN,
+	parseCredentialPreferenceList,
+	parsePreferenceAccount,
+} from "../packages/coding-agent/src/session/startup-auth-config";
 
 function acceptsJsonSchemaFixture(schema: unknown, value: unknown): boolean {
 	if (schema === true) return true;
@@ -125,6 +130,44 @@ describe("generated JSON Schemas", () => {
 			...completeConfig,
 			notifications: { ...completeConfig.notifications, slack: { ...completeConfig.notifications.slack, unknown: "value" } },
 		})).toBe(false);
+	});
+
+	it("emits the credential preference grammar the startup parser accepts", () => {
+		const schema = configSchema() as any;
+		const value = schema.properties.auth.properties.credentialPreferences.additionalProperties;
+		const [single, list] = value.anyOf;
+		const [account, capped] = list.items.anyOf;
+		expect(single).toEqual({ type: "string", pattern: PREFERENCE_ACCOUNT_PATTERN });
+		expect(account).toEqual(single);
+		expect(list.minItems).toBe(1);
+		// The runtime rejects an account listed twice; the schema rejects the exact repeats it can express.
+		expect(list.uniqueItems).toBe(true);
+		expect(parseCredentialPreferenceList(["me@example.com", "me@example.com"])).toBeUndefined();
+		expect(parseCredentialPreferenceList([{ "me@example.com": 75 }, { "me@example.com": 75 }])).toBeUndefined();
+		expect(capped).toMatchObject({
+			minProperties: 1,
+			maxProperties: 1,
+			propertyNames: { pattern: PREFERENCE_ACCOUNT_PATTERN },
+			additionalProperties: { type: "number", exclusiveMinimum: 0, maximum: 100 },
+		});
+
+		const pattern = new RegExp(PREFERENCE_ACCOUNT_PATTERN);
+		for (const candidate of [
+			"me@example.com",
+			"email:me@example.com",
+			"account:acct-1",
+			"id:42",
+			"me",
+			"me@@example.com",
+			"project:p-1",
+			"me @example.com",
+		]) {
+			expect(pattern.test(candidate)).toBe(parsePreferenceAccount(candidate) !== undefined);
+		}
+		for (const cap of [0, 0.5, 75, 100, 101]) {
+			const inSchema = cap > 0 && cap <= 100;
+			expect(parseCredentialPreferenceList([{ "me@example.com": cap }]) !== undefined).toBe(inSchema);
+		}
 	});
 
 	it("emits web search fallback item enum and provider webSearch enum", () => {

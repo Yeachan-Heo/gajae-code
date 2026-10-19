@@ -142,7 +142,7 @@ describe("login preset recommendation", () => {
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply codex-medium now?", "");
 		expect(session.markUserModelSelection).toHaveBeenCalledTimes(1);
 		expect(session.setModelTemporaryCalls).toEqual([{ model: codexModel, thinkingLevel: ThinkingLevel.Medium }]);
-		expect(session.setActiveModelProfile).toHaveBeenCalledWith("codex-medium");
+		expect(session.setActiveModelProfile).toHaveBeenCalledWith("codex-medium", true);
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(setCalls).not.toContainEqual({ path: "modelProfile.default", value: "codex-medium" });
 	});
@@ -186,7 +186,7 @@ describe("login preset recommendation", () => {
 
 		expect(ctx.showHookConfirm).toHaveBeenCalledWith("Apply minimax-medium now?", "");
 		expect(session.setModelTemporaryCalls).toEqual([{ model: minimaxModel, thinkingLevel: ThinkingLevel.Medium }]);
-		expect(session.setActiveModelProfile).toHaveBeenCalledWith("minimax-medium");
+		expect(session.setActiveModelProfile).toHaveBeenCalledWith("minimax-medium", true);
 	});
 
 	test("provider with no recommendation mapping does nothing", async () => {

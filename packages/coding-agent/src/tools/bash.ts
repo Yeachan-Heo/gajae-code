@@ -64,7 +64,12 @@ import { CachedOutputBlock, getOutputBlockContentWidth } from "../tui/output-blo
 import { truncateToWidth } from "../tui/utils";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
-import { checkBashAllowedPrefixes, normalizeReadOnlyBashCommand } from "./bash-allowed-prefixes";
+import { AwaitingInputDetector, type AwaitingInputSignal } from "./awaiting-input";
+import {
+	checkBashAllowedPrefixes,
+	normalizeReadOnlyBashCommand,
+	normalizeWorkflowBashCommand,
+} from "./bash-allowed-prefixes";
 import { applyBashFixups } from "./bash-command-fixup";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import { checkBashInterception } from "./bash-interceptor";
@@ -578,6 +583,12 @@ export interface BashToolDetails {
 	foldReason?: FoldReason;
 	/** The accepted model-declared activity declaration, when the call carried one. */
 	activity?: BashActivityDeclaration;
+	/**
+	 * Set on a running (partial) update when the foreground command printed an
+	 * interactive auth prompt and then went quiet. Carries only the prompt kind,
+	 * never the URL or code.
+	 */
+	awaitingInput?: AwaitingInputSignal;
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -1125,6 +1136,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 				const tailBuffer = new TailBuffer(spillThreshold);
+				// Only a foreground wait blocks the turn; once folded or started in the
+				// background the agent is free and this tool call has already settled.
+				const awaitingInput = new AwaitingInputDetector({
+					onDetect: signal => {
+						if (backgrounded) return;
+						void options.onUpdate?.({
+							content: [{ type: "text", text: latestText }],
+							details: { ...activityDetails, awaitingInput: signal },
+						});
+					},
+				});
 
 				let executionResult: BashResult | BashInteractiveResult | undefined;
 				try {
@@ -1148,18 +1170,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								spillThreshold,
 								headBytes,
 								oneShot: true,
-								ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-								disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+								ignoreShellPrefix: this.#isolateRestrictedShell(),
+								disableShellSnapshot: this.#isolateRestrictedShell(),
 								onChunk: chunk => {
 									tailBuffer.append(chunk);
 									latestText = tailBuffer.text();
 									void reportProgress(latestText, runningDetails(jobId));
 								},
-								onRawChunk: chunk => manager.appendOutput(jobId, chunk),
+								// onChunk is throttled and drops chunks inside the window; the
+								// detector must see every chunk, so it reads the raw stream.
+								onRawChunk: chunk => {
+									manager.appendOutput(jobId, chunk);
+									awaitingInput.push(chunk);
+								},
 								onMinimizedSave: async originalText =>
 									saveBashOriginalArtifact(options.artifactPublication, originalText),
 							});
 					executionResult = result;
+					awaitingInput.dispose();
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
 						notices: options.notices,
@@ -1173,6 +1201,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					await reportProgress(finalText, completedDetails(jobId));
 					return finalText;
 				} catch (error) {
+					awaitingInput.dispose();
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
 					options.onCompletion?.();
@@ -1323,6 +1352,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * helper after `AgentSession` has applied the public-tool permission gate, so
 	 * Monitor inherits Bash's cwd / env / artifact / interceptor pipeline 1:1.
 	 */
+	/** Read-only and workflow allowlists must not source a snapshot or a shell prefix. */
+	#isolateRestrictedShell(): boolean {
+		return this.session.bashRestrictionProfile === "read-only" || (this.session.bashAllowedPrefixes?.length ?? 0) > 0;
+	}
+
 	async #prepareBashExecution(
 		input: { command: string; env?: Record<string, string>; timeout?: number; cwd?: string },
 		ctx?: AgentToolContext,
@@ -1379,9 +1413,23 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (allowedPrefixes && allowedPrefixes.length > 0) {
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
+			const invocationCwd =
+				cwd && !cwd.includes("://") && !cwd.includes("local:/")
+					? resolveToCwd(cwd, this.session.cwd)
+					: this.session.cwd;
 			for (const commandToCheck of commandsToCheck) {
 				const allowlist = checkBashAllowedPrefixes(commandToCheck, allowedPrefixes, {
 					profile: this.session.bashRestrictionProfile,
+					...(this.session.bashRestrictionProfile === "read-only"
+						? {}
+						: {
+								gjcSessionBinding: {
+									sessionId: this.session.getSessionId?.() ?? null,
+									credentialSessionId: this.session.getCredentialSessionId?.() ?? null,
+									worktreeRoot: this.session.cwd,
+									invocationCwd,
+								},
+							}),
 				});
 				if (!allowlist.allowed) {
 					throw new ToolError(allowlist.reason ?? "Command blocked by restricted role-agent bash allowlist.");
@@ -1433,19 +1481,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...internalUrlOptions,
 			ensureLocalParentDirs: this.session.bashRestrictionProfile !== "read-only",
 		});
-		// Issue #5039: refuse tmux write verbs whose target resolves to this
-		// agent's own tmux pane — such bytes forge a human `user` turn in the
-		// transcript. This is after command expansion but before any spawn, so
-		// blocked attempts inject no bytes and create no transcript turn.
-		if (this.session.bashRestrictionProfile !== "read-only") {
-			const injection = await checkTmuxSelfInjection(command, {
-				env: process.env,
-				cwd: this.session.cwd,
-			});
-			if (injection.block) {
-				throw new ToolError(injection.reason ?? "Blocked: tmux self-pane injection.");
-			}
-		}
 		const expandedEnv = env
 			? Object.fromEntries(
 					await Promise.all(
@@ -1526,6 +1561,45 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes?.length ?? 0) > 0) {
 			await assertCwdInsideWorkspace(this.session.cwd, commandCwd);
+		}
+		// Issue #5039: refuse tmux write verbs whose target resolves to this
+		// agent's own tmux pane — such bytes forge a human `user` turn in the
+		// transcript. This is after command/env/cwd preparation but before any
+		// spawn, so guard discovery matches execution without trusting caller env
+		// for the agent's tmux identity.
+		if (this.session.bashRestrictionProfile !== "read-only") {
+			const shellConfigEnv = this.session.settings.getShellConfig().env;
+			const injection = await checkTmuxSelfInjection(command, {
+				env: process.env,
+				cwd: commandCwd,
+				executionEnv: { ...process.env, ...shellConfigEnv, ...resolvedEnv },
+			});
+			if (injection.block) {
+				throw new ToolError(injection.reason ?? "Blocked: tmux self-pane injection.");
+			}
+		}
+		// Direct master spawn parses the original command itself and does not source
+		// a shell snapshot. Every other restricted workflow command is rebound here,
+		// after the allowlist and interceptor have seen the caller's text.
+		if (
+			!directMasterSpawn &&
+			this.session.bashRestrictionProfile !== "read-only" &&
+			allowedPrefixes &&
+			allowedPrefixes.length > 0
+		) {
+			const normalizedWorkflowCommand = normalizeWorkflowBashCommand(command, allowedPrefixes, {
+				profile: "workflow",
+				gjcSessionBinding: {
+					sessionId: this.session.getSessionId?.() ?? null,
+					credentialSessionId: this.session.getCredentialSessionId?.() ?? null,
+					worktreeRoot: this.session.cwd,
+					invocationCwd: commandCwd,
+				},
+			});
+			if (!normalizedWorkflowCommand) {
+				throw new ToolError("Restricted role-agent bash command could not be normalized safely.");
+			}
+			command = normalizedWorkflowCommand;
 		}
 
 		const requestedTimeoutSec = input.timeout ?? 300;
@@ -1710,9 +1784,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						spillThreshold,
 						headBytes,
 						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
-						disableShellSnapshot:
-							this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
+						ignoreShellPrefix: this.#isolateRestrictedShell() || prepared.directMasterSpawn,
+						disableShellSnapshot: this.#isolateRestrictedShell() || prepared.directMasterSpawn,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							void reportProgress(tailBuffer.text(), {
@@ -2637,6 +2710,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		// Track output for streaming updates (tail only)
 		const tailBuffer = new TailBuffer(spillThreshold);
+		const awaitingInput = new AwaitingInputDetector({
+			onDetect: signal => {
+				void onUpdate?.({
+					content: [{ type: "text", text: tailBuffer.text() }],
+					details: { ...(activity === undefined ? {} : { activity }), awaitingInput: signal },
+				});
+			},
+		});
 
 		const artifactPublisher = createBashArtifactPublisher(artifactPublication);
 
@@ -2819,11 +2900,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					onOutput: chunk => {
 						ptyOutputSeen = true;
 						if (ptyJobId) ownedManager?.appendOutput(ptyJobId, chunk);
+						awaitingInput.push(chunk);
 					},
-				}).catch(error => {
-					if (ptyAdmission) ownedManager?.releaseCapacity(ptyAdmission);
-					throw error;
 				})
+					.catch(error => {
+						if (ptyAdmission) ownedManager?.releaseCapacity(ptyAdmission);
+						throw error;
+					})
+					// Completion, error, and a fold all settle this foreground wait.
+					.finally(() => awaitingInput.dispose())
 			: await executeBash(command, {
 					cwd: commandCwd,
 					settings: this.session.settings,
@@ -2837,10 +2922,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					spillThreshold,
 					headBytes,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
+					// onChunk is throttled and drops chunks; the detector needs all of them.
+					onRawChunk: chunk => awaitingInput.push(chunk),
 					onMinimizedSave: async originalText => saveBashOriginalArtifact(artifactPublication, originalText),
-					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
-					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
-				});
+					ignoreShellPrefix: this.#isolateRestrictedShell() || directMasterSpawn,
+					disableShellSnapshot: this.#isolateRestrictedShell() || directMasterSpawn,
+				}).finally(() => awaitingInput.dispose());
 		ptyFoldUnregister?.();
 		// Folded: the foreground was settled by the fold, so return the background
 		// -start result verbatim instead of presenting a half-finished command.

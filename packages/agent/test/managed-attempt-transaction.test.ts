@@ -615,6 +615,7 @@ describe("managed attempt transaction", () => {
 			const stream = new AssistantMessageEventStream();
 			void (async () => {
 				const partial = assistantMessage(mock.model);
+				partial.serviceTier = "ultrafast";
 				liveMessage = partial;
 				(partial as unknown as Record<string, unknown>).probe = () => {};
 				stream.push({ type: "start", partial });
@@ -672,7 +673,11 @@ describe("managed attempt transaction", () => {
 		for (const message of [messageUpdate!.message, messageEnd!.message, accepted, agentEnd!.messages[0], result[0]]) {
 			expect(() => structuredClone(message)).not.toThrow();
 			expect(() => JSON.stringify(message)).not.toThrow();
-			expect(message).toMatchObject({ role: "assistant", content: [{ type: "text", text: "accepted" }] });
+			expect(message).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "accepted" }],
+				serviceTier: "ultrafast",
+			});
 		}
 
 		(liveMessage!.content[0] as { type: "text"; text: string }).text = "mutated after commit";
@@ -680,6 +685,50 @@ describe("managed attempt transaction", () => {
 		for (const message of [messageUpdate!.message, messageEnd!.message, accepted, agentEnd!.messages[0], result[0]]) {
 			expect((message as AssistantMessage).content[0]).toEqual({ type: "text", text: "accepted" });
 		}
+	});
+
+	it("preserves serviceTier when a lossless snapshot drops uncloneable provider metadata", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				partial.serviceTier = "ultrafast";
+				(partial as unknown as Record<string, unknown>).providerPayload = { opaque: () => {} };
+				partial.content.push({ type: "text", text: "accepted" });
+				stream.push({ type: "start", partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const context: AgentContext = {
+			systemPrompt: ["test"],
+			messages: [{ role: "user", content: "run", timestamp: Date.now() }],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: messages =>
+				messages.filter(
+					message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+				) as Message[],
+			fallbackManaged: false,
+		};
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+		const events: AgentEvent[] = [];
+		for await (const event of stream) events.push(event);
+		await stream.result();
+
+		const messageEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		const committed = context.messages.at(-1) as AssistantMessage;
+
+		expect(messageEnd).toBeDefined();
+		expect(messageEnd!.message).toMatchObject({ serviceTier: "ultrafast" });
+		expect(committed.serviceTier).toBe("ultrafast");
+		expect(committed.providerPayload).toBeUndefined();
 	});
 
 	it("publishes JSON-serializable snapshots when structuredClone removes a payload class serializer", async () => {

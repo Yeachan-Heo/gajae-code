@@ -965,6 +965,46 @@ describe("tool descriptor compatibility gate", () => {
 		expect((normalizedBisect.parameters as any).properties?._i).toBeUndefined();
 		expect((normalizedWrite.parameters as any).properties?._i).toBeDefined();
 	});
+	for (const staleOutcome of ["resolved", "rejected"] as const) {
+		test(`session move invalidation keeps a newer load when the old load ${staleOutcome}`, async () => {
+			const first = Promise.withResolvers<AgentTool>();
+			const second = Promise.withResolvers<AgentTool>();
+			const oldTool = syntheticTool();
+			const newTool = syntheticTool();
+			let loads = 0;
+			const session = makeSession();
+			const descriptor: ToolDescriptor = {
+				metadata: { name: "synthetic" },
+				presentation: { label: "Synthetic" },
+				isAvailable: () => true,
+				load: () => (++loads === 1 ? first.promise : second.promise),
+			};
+			const lazy = new LazyAgentTool(descriptor, undefined, () => descriptor.load(session), session);
+			const oldLoad = lazy.materialize().then(
+				tool => ({ tool, error: undefined }),
+				error => ({ tool: undefined, error }),
+			);
+			await Promise.resolve();
+			expect(loads).toBe(1);
+			lazy.invalidateForSessionMove();
+			const newLoad = lazy.materialize();
+			await Promise.resolve();
+			expect(loads).toBe(2);
+			if (staleOutcome === "resolved") first.resolve(oldTool);
+			else first.reject(new Error("old context load failed"));
+			const oldResult = await oldLoad;
+			if (staleOutcome === "resolved") expect(oldResult.tool).toBe(oldTool);
+			else expect(String(oldResult.error)).toContain("old context load failed");
+			const joinedLoad = lazy.materialize();
+			await Promise.resolve();
+			expect(loads).toBe(2);
+			second.resolve(newTool);
+			expect(await newLoad).toBe(newTool);
+			expect(await joinedLoad).toBe(newTool);
+			expect(await lazy.materialize()).toBe(newTool);
+		});
+	}
+
 	test("concurrent lazy first use shares one load and cleanup registration", async () => {
 		let loads = 0;
 		let cleanupRegistrations = 0;

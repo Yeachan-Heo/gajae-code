@@ -130,6 +130,10 @@ type BoundedSourceRead =
 
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
 const final = (s: LifecycleState) => terminal(s) || s === "terminal_uncertain";
+const recordedSessionIds = (entry: LifecycleLedgerEntry): string[] =>
+	[entry.intendedSessionId, entry.resultSessionId].filter(
+		(sessionId): sessionId is string => typeof sessionId === "string" && sessionId.length > 0,
+	);
 export interface LifecycleLedgerLimits {
 	maxBytes?: number;
 	maxLineBytes?: number;
@@ -799,17 +803,42 @@ export class LifecycleLedger {
 	 * cannot establish that a different target is safe, so callers must reject
 	 * rather than create a second admission. A fresh session.create may ignore
 	 * final legacy rows: exact legacy identities are still resolved before this
-	 * check, and uncertain rows retain their session-scoped fences. Other
-	 * operations retain the legacy fence because target-bound legacy identities
-	 * cannot prove key uniqueness.
+	 * check, and uncertain rows retain their session-scoped fences.
+	 *
+	 * A session-targeted request passes `sessionTarget` to ignore terminal legacy
+	 * rows that record only other sessions, unless the row is the caller's key
+	 * reused across targets (`keyReuseIdentities`). Terminal rows recording the
+	 * target or no session, uncertain rows, and live rows keep the fence because
+	 * they cannot prove the requested target is unrelated.
 	 */
-	hasLegacyIdentity(excludedIdentities?: ReadonlySet<string>, options: { ignoreFinalRows?: boolean } = {}): boolean {
+	hasLegacyIdentity(
+		excludedIdentities?: ReadonlySet<string>,
+		options: {
+			ignoreFinalRows?: boolean;
+			sessionTarget?: { sessionId: string; keyReuseIdentities: ReadonlySet<string> };
+		} = {},
+	): boolean {
+		const target = options.sessionTarget;
+		const unrelatedTerminal = (entry: LifecycleLedgerEntry): boolean => {
+			if (!target || !terminal(entry.state) || target.keyReuseIdentities.has(entry.identity)) return false;
+			const sessionIds = recordedSessionIds(entry);
+			return sessionIds.length > 0 && !sessionIds.includes(target.sessionId);
+		};
 		return [...this.#byIdentity.values()].some(
 			entry =>
 				entry.operationKey === undefined &&
 				!(options.ignoreFinalRows && final(entry.state)) &&
+				!unrelatedTerminal(entry) &&
 				!excludedIdentities?.has(entry.identity),
 		);
+	}
+	/** Sessions recorded by terminal legacy rows, for deriving key-reuse identities. */
+	terminalLegacySessionIds(): Set<string> {
+		const sessionIds = new Set<string>();
+		for (const entry of this.#byIdentity.values())
+			if (entry.operationKey === undefined && terminal(entry.state))
+				for (const sessionId of recordedSessionIds(entry)) sessionIds.add(sessionId);
+		return sessionIds;
 	}
 	async migrateIdentity(
 		from: string,
@@ -939,6 +968,9 @@ export class LifecycleLedger {
 		return this.#mutate(async () => {
 			const previous = this.#byIdentity.get(identity);
 			if (!previous) throw new Error("Unknown lifecycle identity");
+			// Match replay validation: proven terminal records admit no successor.
+			// A late failure must not append a row that will be quarantined on reopen.
+			if (terminal(previous.state)) return previous;
 			const next = {
 				...previous,
 				...fields,

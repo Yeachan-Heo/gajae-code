@@ -2,6 +2,299 @@
 
 ## [Unreleased]
 
+## [0.18.12] - 2026-10-16
+
+### Added
+
+- Added the `task.compactSubagentPanel` setting. When it is on, live subagent await progress collapses into one summary line such as `12 subagents running · 3 idle >30s`, plus any provider-degradation warning and an expand hint, until tool output is expanded. Await progress then refreshes only when that summary changes, so redraw cost and frequency no longer grow with the number of live subagents. Final results, including timeout guidance and failure receipts, still render in full (#6774).
+
+- `--credential`, `--prefer-credential`, `/credential`, `gjc accounts pin`, and `gjc accounts logout --account` accept `org:<organization id or name>` to choose one organization of an Anthropic account that belongs to several. Account lists show the organization name next to the email, and `gjc accounts logout --account <email>` refuses when that email matches more than one organization instead of guessing.
+
+- Reload user settings and model configuration in open Linux interactive sessions with verified private configuration directories at safe request boundaries, with validated changes, preserved session overrides, and refreshed model/status displays. macOS and Windows require a session restart after configuration edits until equivalent permission verification is available.
+
+- Added global `auth.credentialPreferences`: an ordered list of preferred OAuth accounts per provider, each optionally capped by a usage percent (`- low-cost@example.com` then `- shared@example.com: 75`). The first listed account that is usable and under its cap is used; once every listed account is rate-limited or at its cap, the remaining accounts are ranked normally. Unlike `auth.credentialPins`, a preference never blocks the provider. The key is global-only and ignored in project settings. Startup fails closed when two entries name the same stored account, including through different selectors such as an email and `account:<id>`.
+- Added `gjc accounts prefer <provider> <account>[=<percent>]...` to write that list without editing YAML. It checks every account against the stored OAuth rows, stores portable email/account selectors in a form startup reads back (`email:<address>` when the bare text would not read back as the same address), and writes nothing when any account is missing, ambiguous, duplicated, or has an invalid cap. `gjc accounts prefer <provider> --clear` removes the list.
+
+- `gjc migrate` now imports Claude Code `CLAUDE.md` and Codex `AGENTS.md` into the selected GJC scope's `AGENTS.md`, with collision-aware dry-run reporting and symlink-safe destination writes.
+
+- `models.yml` accepts provider-level and per-model `streamIdleTimeoutMs` settings for OpenAI-compatible Completions and Responses models, with environment overrides retaining precedence. Provider defaults also apply to registry models without conflating per-model timeout differences with transport identity. Values above the platform timer limit and model-configured timeouts on `pi-native` transports are rejected explicitly.
+
+- Document project-scoped Parallel Search MCP setup for free, keyless web search and page fetching through the native HTTP MCP loader.
+
+- Add `/provider status` to show each configured provider's active credential source and non-active sources that are shadowed, without displaying credential values (issue #6530).
+
+- `report_issue` tool (opt-in via `reportIssue.enabled`): the model records tool behavior that contradicts the tool's description into the local `~/.gjc/tool-issues.db`. Reports are never uploaded; read them with `gjc read '~/.gjc/tool-issues.db:tool_issues'`.
+
+- Added `ultrafast` as a valid service tier value in user settings (`serviceTier` enum)
+- Added `ultrafast` to SDK protocol validation for service tier operations
+
+### Changed
+
+- Settings schema now recognizes and validates `ultrafast` alongside existing tiers (auto, default, flex, scale, priority, openai-only, claude-only)
+- Trusted local SDK controls may set `ultrafast`; model-facing and chat adapter inputs remain restricted
+
+### Fixed
+
+- Keep SDK deadline recovery leased while owned tools are pending; bounded retries wait for exact tool-settlement evidence before publishing the prompt's terminal outcome (#6508).
+
+- The Bash tool's `read` builtin now decodes valid UTF-8 as text and preserves Windows ANSI-code-page text from native pipelines instead of replacing it, so `while IFS= read -r line` loops pass non-ASCII text through intact, `read -n`/`-N` count UTF-8 characters rather than bytes, and timed-out reads retain consumed partial input (#6543).
+- `mapfile` into a readonly array now fails before reading, leaving piped input for the next reader as bash does.
+- Terminal-backed custom shell streams are now recognized by `read` and `mapfile`, preserving terminal mode and control-key handling.
+
+- Allow dead retained Python sessions to recover after unconfirmed shutdown while retaining the old kernel for explicit cleanup retries.
+
+- The embedded shell reads its own standard input without buffering, so input that a builtin such as `read -n1` did not consume is still available to the next command that inherits stdin, and `read -t` no longer times out on input that was already read into the buffer.
+
+- Session listing, including `/resume`, reads a project's retired-session tombstones once per listing instead of once per session candidate. It used to open and parse every tombstone again for each candidate, so listing slowed down as sessions were deleted. With 116 sessions and 252 tombstone files that was 29,232 file reads and 8–10 s. It is now 252 reads and 1–3 s, and the same sessions are hidden (#6757).
+
+- Report a denied Windows open of the staged update or the live `gjc.exe` during `gjc update` as `access_denied` with its NTSTATUS code instead of a misleading `owner_mismatch`, so the activation is kept pending for a safe retry (#6760).
+
+- Preserve lifecycle input refusals in public JSON and text errors with a fixed `lifecycle_input_refused` diagnostic for invalid request payloads, without exposing broker-supplied error text.
+
+- Load the multisession characterization harness's bench-mock extension from its isolated user agent directory without enabling automatic project extension imports.
+
+- Mid-run context maintenance no longer ends the turn with `Context maintenance could not commit a compaction before the next model request.` when compaction has nothing to summarize but the unchanged context still fits the model window with its reserve. It sends the request, as the end-of-turn threshold check already does. This was common on 1M-window models when a session started with one very large message (#6813).
+
+- A project `.env` declaration of `GJC_ACP_PERMISSION_MODE` no longer switches ACP gated tools to allow; a launching-shell value that does not repeat that declaration is still honored.
+
+- The python tool now uses the same ACP and SDK permission gate as eval. Prompt mode asks before it runs, and deny mode rejects it. Allow mode is unchanged, and tool names outside that gate still run without a prompt.
+
+- `gjc accounts logout --account org:<value>` and `gjc accounts pin <provider> org:<value>` prefer the organization whose id matches exactly over display-name matches, and refuse a display name shared by several organizations while listing the candidate row ids.
+
+- Execution handoff no longer treats a pre-append approval index as sanctioned while the approval transaction journal is still pending.
+
+- Ralplan and deep-interview execution approval no longer fails at the ultragoal handoff with `execution approval transcript identity changed` after the session transcript is rewritten. Session persistence replaces the transcript file by atomic rename on full rewrites, which changes its inode, so the approval boundary now binds the approved transcript content (prefix length and SHA-256, leaf, and Ask tool call) instead of the file's device and inode. Edited, rewound, or newly user-bearing transcripts are still rejected, and approval records written before this change remain readable.
+
+- Assistant SVG fences now respect `terminal.showImages`, including changes made while a message is already rendered.
+
+- `ast_edit` refuses a single-file path whose real path leaves its reference root, so a symlink cannot rewrite a file outside that root.
+
+- Preserve ordinary SDK and folded ACP completion delivery when secured output storage is unavailable, with truthful bounded previews and artifact completeness notices.
+
+- The auto-generated edit guard now blocks `*.generated.ts` names and leading `Generated by scripts/` or `Auto-generated by` stamps.
+
+- Require direct file tools to write the root `autoresearch.sh` during active research missions, rejecting symlinks and preventing compound commands from retargeting the harness; new and regular harnesses remain writable.
+
+- Keep the autorouting tier-map gate passing for new Gemini 4 Argon and India-region Bedrock catalog entries without assigning unreviewed Gemini tier ordering.
+
+- Restore fast capture of large multi-line command output with bounded column-cap batches, while preserving secret-aware clipping.
+
+- `--continue` no longer resumes a terminal breadcrumb whose session file is absent from the selected continuation inventory. A project-local session already in that inventory is still resumed ahead of a newer sibling. A breadcrumb that names a session the managed listing owns is unchanged, and an explicit session directory still prefers its own terminal breadcrumb when that file stays inside the directory.
+
+- Recover SDK broker startup when a stale lock's PID has been reused by a different process incarnation, serialize concurrent reclamation, and reap aged PID-reuse tombstones without weakening fail-closed behavior when incarnation evidence is unavailable. Lock reclamation now requires host qualification: only same-host owners are reclaimed using PID/incarnation evidence; foreign-host and host-unqualified (legacy) owners are never reclaimed from local PID evidence alone (#6719).
+
+- The Codex native hook no longer reads a session transcript from a `GJC_SESSION_FILE` value that the repository dotenv planted. An operator path the project does not declare is still used.
+
+- Codex MCP import no longer writes a resolved secret into `.gjc/mcp.json`. An import into the project config omits `bearer_token_env_var`, `env_vars`, and `env_http_headers` references, including a user config imported into the project, so a later load cannot expand a host value. An import into the global config keeps a local name as `${NAME}`. An entry whose source is not local is skipped.
+
+- Column caps in streamed tool output and file reads no longer return partial configured plain secrets across a cut, including shorter overlapping prefixes and secrets that continue across newline boundaries. Raw reads and hashline output remain unchanged.
+
+- Redact credentials in the formatted commit header and detail lines before they are passed to git commit.
+
+- Redact changelog-shaped credentials and npm tokens in generated task commit messages before the provider request and before the message is returned.
+
+- Stopped showing "Configuration watching could not start because directory ownership and privacy could not be verified" on every interactive launch on macOS and other non-Linux platforms, where configuration hot reload is unsupported; the warning now appears only when a supported platform finds untrusted configuration directories.
+
+- Prevent watcher startup and configuration application after interactive stop or shutdown, including when a directory trust check is still pending.
+- Preserve successive manual model selections, completed provider discovery, and unchanged credential discovery restrictions during configuration reload. Validate reload credentials without rejecting refreshable OAuth accounts or registering API keys that conflict with a credential pin in any live session.
+- Preserve live model, thinking-level, and newer profile-owned selection state across asynchronous reload preparation and rollback after publication failures.
+- Re-stage an immutable reload snapshot after a catalog refresh invalidates preflight, and re-arm failed directory watches so ordinary later saves are still observed.
+
+- Coordinator managed-worktree roots no longer grow from a repository `.env` `GJC_WORKTREE_DIR`. An operator value the project does not declare is unchanged.
+
+- Crash egress now refuses a leftover 40-character AWS secret or percent-encoded `sessionid` cookie that the scrubber did not mask.
+
+- Custom and MCP tools that declare `strict` or `concurrency` no longer crash MCP tool refresh with "Attempted to assign to readonly property". The adapter now sets those fields before proxying the rest of the tool.
+
+- The debug tool refuses an adapter binary controlled by the session workspace when `cwd` points at a different directory, matching the check already applied to the command cwd.
+
+- The debugpy adapter starts with `python -I`, so a repository `debugpy` package in the working directory is not imported in place of the installed adapter.
+
+- The debug tool prompt names `python -I -m debugpy.adapter`, matching the adapter command that already starts with `-I`.
+
+- A JavaScript eval cell can no longer forge a tool call or a successful result by posting on the worker `parentPort`. A tool reply from the host still returns that tool's value.
+
+- Atomic writes inside an explicit artifacts local root now use that root as the trust boundary. A symlink there whose target was moved outside is refused, and a normal file inside the root is still written.
+
+- A live session no longer leaves `sessions/index.jsonl.lock` behind when its release collides with the previous lock generation's `.removing.owner` record, which that remover clears only after its tree is gone. The collision was reported as `owner_changed`, which release treats as final, so the lock stayed on disk under a live owner until the same process acquired it again; idle sessions never did, and every other session failed with `FileLockAcquireError ... after 600 attempts ... a live owner is never displaced`. The collision is now reported as the retryable `removal_record_busy`, and a release that still fails is retried in the background (250 ms to 60 s, five attempts) with the same owner and identity checks, so it can only remove its own generation.
+- Pending release retries preserve the original root and owner-file identity instead of authorizing whatever occupies the lock path later. A replacement directory cannot inherit removal authority by copying the original owner metadata; retries also refuse removal if the initial identity capture failed.
+- A foreign host's remover record is also retryable contention when its transition directory is already gone. Successors wait for the foreign remover to clear its own record without probing its PID or deleting its metadata; an existing foreign transition remains protected.
+
+- Stop `@word` mentions that name no file (chat handles such as `(@handle)` in gateway speaker headers, email addresses) from auto-attaching an unrelated workspace file: the fuzzy fallback now requires the query to spell prefixes of path segments in order instead of any scattered subsequence.
+
+- Preserve mandatory MCP ownership for validated plugin-bundle tools across startup and late catalog updates; caller-owned source metadata cannot grant mandatory status. Keep colliding user tools selectable.
+
+- A project `.gjc` file can no longer satisfy the explicit `sdk.flushWorktreeOnDeadline` opt-in that autosaves a primary checkout when a prompt deadline fires.
+
+- `gjc gc` ignores a project `.env` value for `GJC_CODING_AGENT_DIR` and `PI_CODING_AGENT_DIR`, and still uses an operator value the project does not declare. For the process environment that decision uses the dotenv provenance captured when the environment was loaded, so deleting or rewriting the declaration afterward cannot make the loaded value trusted.
+
+- The default `/share` gist upload no longer forwards a project `.env` `GH_HOST` or `GH_CONFIG_DIR` to `gh`; an operator value the project does not declare is kept.
+
+- Grok Build ignores a project dotenv declaration of its credential base URL and unsafe opt-in, including a quoted value whose suffix follows the closing quote and a quoted value that keeps spaces inside the quotes. Other repository `.env` entries are unchanged.
+
+- A project settings file can no longer choose `hindsight.apiUrl`. The Hindsight client keeps the user config endpoint, so a repository cannot redirect the operator API token or retained conversation text.
+
+- Session HTML export scrubs credential-shaped text inside embedded session values before base64 encoding, including any value stored under a credential JSON key.
+
+- Insane public-route fetches re-validate each redirect and refuse private or loopback targets instead of following them.
+
+- Keep accepted SDK prompt terminal outcomes private until exact run/tool settlement evidence is available.
+- Preserve queued subagent owner and generation identity, plus fail-closed saturation evidence across endpoint rekeys, shutdown cancellation, and queue draining.
+
+- Keep SDK broker heartbeat checkpoint work within its monotonic budget by avoiding redundant process probes during structural projection and stopping further synchronous identity probes after the deadline expires (issue #6624).
+
+- Allow new SDK session creation past unrelated legacy `terminal_uncertain` lifecycle rows while preserving exact-key handling and session-scoped uncertainty fences (issue #6665).
+
+- Allow SDK `session.close`, `session.resume`, `session.delete`, and `session.reconcile_uncertain` requests past unrelated final legacy lifecycle rows recorded for other sessions, while keeping live, same-session, unrecorded-session, and reused-key legacy rows fenced (issue #6708).
+
+- Retry transient Windows replacement failures only while the installed binary remains published; after a retained-publication denial, restore the predecessor before returning. Preserve and reuse verified candidates, surface retained cleanup paths even during rollback, and preserve the structured error code through `doctor install.restore-binary`.
+
+- Honor broker-authorized operator terminal aborts across SDK connections so they can stop another connection's active turn without weakening terminal-settlement checks (issue #6772).
+
+- Launch worktree cleanup no longer deletes through a symlinked worktree path, or through an in-repo bucket path that resolves outside the repository.
+
+- A gitignored `.worktrees` symlink that points outside the repository is refused before launch, so `git worktree add` cannot materialize the worktree through that link.
+
+- Redact known secrets in generated changelog entries before they are written to CHANGELOG.md.
+
+- On POSIX, a managed local:// root and its temp parent are adopted only when this user owns them and they are not group- or world-writable, and a later resolve refuses that root when the directory has been replaced. A root this process recreated can finish initialization after a failed marker write. Windows does not apply the owner and mode checks.
+
+- Session title debug logs and marketplace clone debug logs scrub credential text with the existing crash redactor before they are written.
+
+- Resuming managed sessions now ignores legacy directory names that exceed the filesystem filename limit.
+
+- A project dotenv declaration no longer chooses the managed-owner recovery transcript; an operator value the project does not declare is still forwarded.
+
+- Forward MCP tool-result images and embedded image resources to image-capable models on providers that support tool-result images, using bounded built-in image resizing and source-dimension limits while preserving untrusted text markers and text-only error results. Attached images carry an explicit untrusted-content notice.
+- Honor cancellation during MCP image processing and use the detected image MIME type for mislabeled images.
+
+- MCP server tool text is marked with the same untrusted-content boundary already used for remote URL output, while the original server content stays on `rawContent` and the tool view still shows the body.
+
+- Migration refuses to write project MCP config through a symlinked `.gjc` directory.
+
+- Saving a custom model profile refuses a symlink at `models.yml`, creates the file as owner-only (`0600`), and creates a missing parent directory as mode `0700`.
+
+- Planning and autoresearch mutation checks now cover recognized eval and python writes, including the destination of a qualified `os`/`shutil` copy or rename and `renameSync`/`copyFileSync`, even when whitespace or a line continuation precedes the attribute. Dynamic path expressions and non-literal `open` modes fail closed. A `Path` write inspects every constructor argument before `write_text` or `write_bytes`. Non-mutating code and the autoresearch.sh research artifact stay allowed. Alias imports and `Path.open` are not scanned.
+
+- MCP OAuth token exchange, dynamic client registration, and authorization-server metadata requests are pinned to the validated public address and no longer follow redirects. Those fetches are refused when a proxy environment variable is set.
+
+- Patch delete checks the real parent directory before unlinking, so a directory symlink cannot remove a file outside the workspace or the session local root.
+
+- Patch create and move check the real parent directory before mkdir, so a directory symlink cannot create a directory outside the workspace or the session local root.
+
+- Planning-phase bash now allows `.gjc/_session-*` specs and plans only for the current session's encoded directory. Another session's specs and plans are refused. The current session's own specs and plans, and unscoped `.gjc/specs` and `.gjc/plans`, stay writable.
+
+- The plan review external editor now refuses to save through a symlink that leaves the session local root, while a normal plan file inside that root is still updated.
+
+- Kept a user MCP tool registered when a GJC plugin bundle server normalizes to the same name, without leaving that user tool or an omitted plugin tool on the required-name list.
+
+- Configuration reload preserves the role mappings of an active model profile, and successor profiles rebase configured agent-role bindings from the current configuration instead of stale values captured before reload. Removed configured bindings are no longer revived from an active profile's baseline.
+
+- Subagent shutdown proofs preserve queued records while their owners are fenced and restart that work after live failures reconnect the predecessor and release the fence. Queued restarts wait for prior backing executions to settle; committed purges publish terminal evidence for queued waiters, and proofs validate captured record identity and generation.
+
+- A repository `.gjc/extensions` module and a project `extensions` setting are no longer imported at session startup. An extension in the user agent directory, a user `extensions` setting, and an explicit extension path still load.
+
+- A project `.gjc/mcp.json` stdio server is no longer spawned unless the user config sets `mcp.enableProjectConfig` to true. A project settings file cannot turn that opt-out back on. A stdio server in the user `mcp.json` still starts.
+
+- A persistent Python kernel cell can no longer forge a control frame by writing a raw NDJSON line to stdout. Those bytes are cell output, and a normal runner frame still completes the cell.
+
+- Let departing Python owners finish their own cleanup without waiting for another owner's shared startup or inheriting its later cleanup errors, while retaining actual owned shutdown obligations.
+
+- Read-only bash rejects `rg --hostname-bin`, which runs an arbitrary program to supply a hostname.
+
+- Read-only bash blocks `file -C` / `--compile` and its long-option abbreviations while preserving inspection option arguments.
+
+- Avoid one redundant inventory count during read-only GC receipt verification while retaining fresh evidence checks, existing work limits and unchanged writer/deletion behavior.
+
+- The recipe tool now uses the same ACP and SDK permission gate as bash. Prompt mode asks before it runs, and deny mode rejects it. Allow mode is unchanged, and tool names outside that gate still run without a prompt.
+
+- `lsp` `rename_file` checks the source, destination, and every `willRenameFiles` edit path with the existing workspace check before it writes any of them. A Windows drive root still allows that volume and rejects another drive or share. POSIX `/` stays unchecked.
+
+- Replace-mode edits refuse auto-generated files when that guard is enabled, and a multi-entry replace is published only after every entry passes.
+
+- Debug report bundles remove credential shapes from the session, log, artifact, and subagent copies, and from environment values whose names are not already replaced.
+
+- Restricted role-agent bash binds `gjc` session selectors to the tool session or its credential session, and binds `--worktree-root` to that session's repository.
+
+- Continue file-lock acquisition after a refused orphan-transition adoption and preserve paths for every retained transition state. Keep startup-fence acquisition open through the orphan-adoption age, and retry session-index lock timeouts up to twice within the fence, releasing the spawn lock before retrying. Refuse ordinary or mismatched starts during an unexpired committed restart; authorize successors only against its matching expiry across child-fence acquisition, startup, and parent acceptance.
+- Preserve a verified successor publication when trampoline handoff release crosses its lease deadline, and return a typed startup-lock-unavailable refusal when contention outlasts that deadline.
+- Retry successor validation when its short operation deadline expires but the committed lease remains live; bound post-spawn discovery reads by lease expiry and clean up unpublished children on timeout; and consume one-shot restart credentials before the broker launches session hosts.
+
+- Wait for same-process SDK broker discovery retirement after shutdown RPC failure; keep startup blocked while the incumbent owner remains published.
+
+- SDK lifecycle sessions ignore a project dotenv `GJC_SDK_TEST_IN_MEMORY_SESSION` line, so a repository `.env` cannot disable transcript persistence; an operator value the project does not declare is still honored.
+
+- SearXNG no longer attaches an operator environment credential (`SEARXNG_TOKEN` or basic-auth username and password) to an endpoint that came from the project settings layer. A complete credential set in that project layer is still sent. An incomplete project basic-auth pair is not filled from the environment and does not fail the search. An endpoint and credential that both come from the operator environment are still sent.
+
+- Latest-session auto-detect skips an activity timestamp more than two minutes ahead, so a planted future `updated_at` cannot replace a real session.
+
+- Latest-session auto-detect skips a session directory whose name decodes to a separator or `..`, so one such directory no longer stops discovery of the other sessions.
+
+- Coordinator session state persistence no longer wedges permanently when a process is killed while an owner record is being rewritten in place. The rewrite used to `truncate(0)` before writing, so every rewrite passed through a zero-length record — and an empty record carries no `owner_host_id`, which made the leftover transition claim unattributable, unreclaimable, and fatal: every later contender timed out after 60s with `transition_claim_timeout (reclaim refused: claim_or_owner_unreadable)` and the session's runtime-state snapshot stopped advancing for good. The replacement bytes are now written over the head of the record and its previous length is preserved with trailing whitespace, which JSON ignores, so the bytes on disk always carry the full ownership preamble a later contender needs to prove the dead owner and reclaim the claim (#5159, #5216).
+- An owner record's bytes now land on the descriptor before `chmod` in the create path. `chmod` is a metadata round-trip that a File Provider, NFS, or CIFS mount can hold for seconds, and every syscall in front of the write is a window in which a freshly created record is empty and its claim unattributable; the create's own mode argument already excludes anything more permissive than `0o600`.
+
+- A repository `.gjc/settings.json` `shellMinimizer.settingsPath` no longer rewrites command output. The minimizer loads that TOML file only when a user/global `shellMinimizer.settingsHash` matches it. A settings path in the user settings file, and a runtime override of that path, are still used.
+
+- A repository `.gjc/settings.json` `shellPath` no longer selects the shell. A `shellPath` in the user settings file is still used. Bash runs that shell. The Python executor uses the shell environment from the same resolver and runs its own Python path.
+
+- A project settings file can no longer set `skills.trustProjectSkills` or the legacy `skills.enablePiProject` alias. The user config keeps that consent, so a repository cannot turn a disabled project-skill gate back on.
+
+- Pre-admission artifact spill redacts configured secrets on the full tool result before the head/tail cut, so a secret that straddles the cut is not sent to the provider as plaintext.
+
+- SQLite row updates refuse a database whose real path is outside the workspace, so a symlink inside the project cannot change an outside file.
+
+- Flatten control characters in `gjc stats --summary` labels so a session model or folder cannot forge a row or emit a terminal escape.
+
+- Crash reports scrub stderr with the existing crash redactor before the preview is trimmed to 4096 bytes, so a token that sits in that window is not stored.
+
+- Subagent receipt guidance, such as the await-timeout instruction to inspect progress before cancelling, now wraps to the terminal width instead of being cut to one 80-column preview line. At 60 or 80 columns the instruction used to end mid-sentence before `Inspect progress` or `never cancel`.
+
+- Compaction, handoff, and branch-summary requests obfuscate registered secrets in text blocks, including a stored summary copied into the next summary prompt.
+
+- Refresh built-in Task authority after committed session moves without weakening repository checks, and retain admitted execution inputs for queued and resumed work.
+
+- Keep queued and live resident Task transcripts and outputs on verified same-owner managed storage after session moves, without changing admitted child cwd, identity, or conversation.
+- Refresh derived artifact authority after physical move rollback and re-prepare pending metadata writes across verified storage-only relocation.
+
+- Task subagents now copy an enabled parent plan mode before the first prompt, so a product-file write on the child is refused the same way as on the parent. Writes outside plan mode, and writes of the plan file, stay allowed.
+
+- Resumed task runs recompute the current tier map, disabled-provider policy, and credentials, and fail closed when a matched tier has no authenticated candidate.
+
+- Task subagents now copy the parent ACP/SDK approval mode. Deny still rejects a child tool call, and prompt still asks through the parent permission callback. Allow is unchanged, and terminal or filesystem routing is not copied onto the child.
+
+- Planning-phase mutation checks ignore a project dotenv `TMPDIR` and still allow writes under the real OS temp directories.
+
+- `todo_write` returns a tool result instead of a raw `TypeError` when a task holds a non-string note (for example from a persisted session or a bridged caller), and a note body that is not a string is rejected with a message naming the `text` field instead of crashing the call.
+
+- Ultragoal no longer appends goal-mode state to a session transcript whose path a repository `.env` planted in `GJC_SESSION_FILE`. An operator-supplied path the project does not declare is still used.
+
+- Ultragoal no longer writes a goal-mode request into a session whose id a repository `.env` planted in `GJC_SESSION_ID`. An operator-supplied id the project does not declare is still used.
+
+- File identity comparisons for user-agent and containment-root isolation now use exact bigint precision end-to-end: stat calls capture full 64-bit device and inode IDs, and comparisons are direct bigint equality without rounding. This prevents a security regression on Windows where replaced directories in the same double-rounding bucket could pass isolation checks.
+
+- Windows SDK broker now uses an intermediate 'hop' process to spawn with `detached:true`, allowing the broker to survive parent tree termination (taskkill /T /F). The hop exits immediately after spawning the real broker with detached mode and windowsHide, breaking the process tree chain. This avoids cmd.exe wrapping complexity (quoting, variable expansion, discovery matching) while ensuring broker survival across force-termination scenarios (issue #6007).
+- On macOS, SDK broker startup retains its acknowledged trampoline until discovery is published, then hands the broker to launchd and uses authenticated shutdown for cleanup instead of detached-PID signaling.
+
+- Prevent Windows file-lock staging cleanup from opening live publishers' metadata, use liveness-probed legacy names when process identity is unavailable, retry sharing violations as contention, preserve permanent access-denied publication errors in file locks and managed sessions, and show a manual cleanup command for ambiguous empty locks (issue #6603).
+
+- Detect project-declared `TMPDIR` from the workflow guard caller's cwd while retaining startup dotenv declarations after `.env` is removed or the process changes directories.
+- Bound workflow-guard dotenv provenance reads to regular files no larger than 64 KiB; unsafe layers fail closed for non-system temp roots.
+
+- The YouTube scraper reads `providers.parallelFetch` from the settings of the caller that dispatched it instead of the process-global settings singleton. A runtime that never calls `Settings.init()` — the SDK/ACP host path and workflow lanes that drive `read`/`fetch` — threw `Settings not initialized. Call Settings.init() first.` on every YouTube URL before any fetch was attempted. Special handlers now receive `settings` alongside `storage`, and the registry exposes the real `handleYouTube` instead of a wrapper that dropped both trailing arguments, so Parallel extract is reachable and no scraper needs the global singleton.
+
+### Security
+
+- The computer tool now uses the same ACP and SDK permission gate as other side-effect tools. Prompt mode asks before it runs, and deny mode rejects it. Allow mode is unchanged, and tool names outside that gate still run without a prompt.
+
+### Notes
+
+The ultrafast tier works like flex/scale/priority — it's a cost and processing priority tier, not an Anthropic fast-mode tier. Fast-mode predicates (`isFastModeEnabled`, `isFastForProvider`) correctly exclude ultrafast, maintaining the semantic distinction that ultrafast is a pure cost/priority layer.
+
+Users can configure ultrafast via:
+- Settings: `serviceTier: "ultrafast"`
+- SDK: `service_tier.set` with tier value `"ultrafast"` on trusted local control routes
+- Command line: future `/fast ultrafast` or UI tier selector additions
+
 ## [0.18.11] - 2026-10-12
 
 ## [0.18.10] - 2026-10-12

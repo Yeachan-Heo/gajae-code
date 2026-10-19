@@ -1,11 +1,18 @@
 /**
- * Codex adapter: reads `~/.codex/config.toml` ([mcp_servers]) and `~/.codex/prompts`.
+ * Codex adapter: reads `~/.codex/config.toml` ([mcp_servers]), `~/.codex/prompts`,
+ * and user-level `~/.codex/AGENTS.md` instructions. Project AGENTS.md is native GJC input.
  */
 
 import * as path from "node:path";
 import { TOML } from "bun";
 import type { AdapterResult, McpCandidate, SourceDiagnostic } from "../types";
-import { type Adapter, type AdapterOptions, collectMarkdownPrompts, readSourceText } from "./index";
+import {
+	type Adapter,
+	type AdapterOptions,
+	collectInstructionFile,
+	collectMarkdownPrompts,
+	readSourceText,
+} from "./index";
 
 const SOURCE = "codex" as const;
 
@@ -40,8 +47,13 @@ function parseToml(
 
 export const codexAdapter: Adapter = {
 	source: SOURCE,
-	async collect({ homeDir }: AdapterOptions): Promise<AdapterResult> {
-		const result: AdapterResult = { mcpCandidates: [], skillCandidates: [], diagnostics: [] };
+	async collect({ homeDir, scope }: AdapterOptions): Promise<AdapterResult> {
+		const result: AdapterResult = {
+			mcpCandidates: [],
+			skillCandidates: [],
+			instructionCandidates: [],
+			diagnostics: [],
+		};
 
 		const configPath = path.join(homeDir, ".codex", "config.toml");
 		const read = await readSourceText(configPath, SOURCE, "mcp");
@@ -64,6 +76,12 @@ export const codexAdapter: Adapter = {
 		const prompts = await collectMarkdownPrompts(path.join(homeDir, ".codex", "prompts"), SOURCE);
 		result.skillCandidates.push(...prompts.candidates);
 		result.diagnostics.push(...prompts.diagnostics);
+
+		if (scope === "user") {
+			const instructions = await collectInstructionFile(path.join(homeDir, ".codex", "AGENTS.md"), SOURCE);
+			result.instructionCandidates.push(...instructions.candidates);
+			result.diagnostics.push(...instructions.diagnostics);
+		}
 
 		return result;
 	},

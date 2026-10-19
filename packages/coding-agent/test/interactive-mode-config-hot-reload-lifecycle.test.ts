@@ -61,6 +61,7 @@ describe("interactive configuration hot reload lifecycle", () => {
 		});
 		mode = new InteractiveMode(session, "test");
 		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+		vi.spyOn(configHotReloadTrust, "isConfigHotReloadSupported").mockReturnValue(true);
 	});
 
 	afterEach(async () => {
@@ -96,6 +97,32 @@ describe("interactive configuration hot reload lifecycle", () => {
 		return flushSpy;
 	}
 
+	it("skips watching without a warning on platforms that cannot verify directory privacy", async () => {
+		vi.spyOn(configHotReloadTrust, "isConfigHotReloadSupported").mockReturnValue(false);
+		const trust = vi.spyOn(configHotReloadTrust, "isConfigHotReloadTrusted");
+		const watcherStart = vi.spyOn(ConfigHotReloadWatcher.prototype, "start");
+		const showWarning = vi.spyOn(mode, "showWarning");
+
+		await mode.init();
+
+		expect(trust).not.toHaveBeenCalled();
+		expect(watcherStart).not.toHaveBeenCalled();
+		expect(showWarning).not.toHaveBeenCalledWith(expect.stringContaining("Configuration watching could not start"));
+	});
+
+	it("warns when a supported platform finds untrusted configuration directories", async () => {
+		vi.spyOn(configHotReloadTrust, "isConfigHotReloadTrusted").mockResolvedValue(false);
+		const watcherStart = vi.spyOn(ConfigHotReloadWatcher.prototype, "start");
+		const showWarning = vi.spyOn(mode, "showWarning");
+
+		await mode.init();
+
+		expect(watcherStart).not.toHaveBeenCalled();
+		expect(showWarning).toHaveBeenCalledWith(
+			"Configuration watching could not start because directory ownership and privacy could not be verified.",
+		);
+	});
+
 	it("does not start the watcher when stop wins during the trust check", async () => {
 		const trustGate = pendingTrust();
 		const trust = vi.spyOn(configHotReloadTrust, "isConfigHotReloadTrusted").mockReturnValue(trustGate.promise);
@@ -129,30 +156,34 @@ describe("interactive configuration hot reload lifecycle", () => {
 		expect(watcherStart).not.toHaveBeenCalled();
 	});
 
-	it("does not reload a candidate whose trust check finishes after shutdown", async () => {
-		const candidateTrust = pendingTrust();
-		let trustCalls = 0;
-		vi.spyOn(configHotReloadTrust, "isConfigHotReloadTrusted").mockImplementation(() => {
-			trustCalls++;
-			return trustCalls === 3 ? candidateTrust.promise : Promise.resolve(true);
-		});
-		vi.spyOn(session, "validateConfiguration").mockResolvedValue();
-		await mode.init();
-		const reload = vi.spyOn(session, "reloadConfiguration");
-		const configPath = session.settings.getGlobalConfigPath();
-		if (!configPath) throw new Error("Expected a file-backed configuration path");
+	// Production only watches on Linux; macOS fs.watch can drop an event written right after arming.
+	it.skipIf(process.platform !== "linux")(
+		"does not reload a candidate whose trust check finishes after shutdown",
+		async () => {
+			const candidateTrust = pendingTrust();
+			let trustCalls = 0;
+			vi.spyOn(configHotReloadTrust, "isConfigHotReloadTrusted").mockImplementation(() => {
+				trustCalls++;
+				return trustCalls === 3 ? candidateTrust.promise : Promise.resolve(true);
+			});
+			vi.spyOn(session, "validateConfiguration").mockResolvedValue();
+			await mode.init();
+			const reload = vi.spyOn(session, "reloadConfiguration");
+			const configPath = session.settings.getGlobalConfigPath();
+			if (!configPath) throw new Error("Expected a file-backed configuration path");
 
-		await Bun.write(configPath, "todo:\n  enabled: true\n");
-		await waitFor(() => trustCalls === 3);
-		const shutdownGate = pendingShutdown();
-		const flush = stubShutdownPersistence(shutdownGate.promise);
-		const shuttingDown = mode.shutdown();
-		await waitFor(() => flush.mock.calls.length === 1);
+			await Bun.write(configPath, "todo:\n  enabled: true\n");
+			await waitFor(() => trustCalls === 3);
+			const shutdownGate = pendingShutdown();
+			const flush = stubShutdownPersistence(shutdownGate.promise);
+			const shuttingDown = mode.shutdown();
+			await waitFor(() => flush.mock.calls.length === 1);
 
-		candidateTrust.resolve(true);
-		await Bun.sleep(0);
-		shutdownGate.resolve();
-		await shuttingDown;
-		expect(reload).not.toHaveBeenCalled();
-	});
+			candidateTrust.resolve(true);
+			await Bun.sleep(0);
+			shutdownGate.resolve();
+			await shuttingDown;
+			expect(reload).not.toHaveBeenCalled();
+		},
+	);
 });

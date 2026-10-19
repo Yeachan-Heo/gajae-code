@@ -40,17 +40,23 @@ function stripInlineShellComment(value: string): string {
 }
 
 /**
- * Strips an unquoted trailing `# comment` from a dotenv value the way Bun's
- * dotenv loader does: an unescaped `#` starts a comment regardless of the
- * preceding character (`a#b` loads as `a`), while `#` inside quotes or after a
- * backslash escape survives. Used only by `parseEnvFile`; shell files use
+ * Strips an unquoted trailing `# comment` the way Bun's dotenv loader does.
+ * Outside quotes, `#` starts a comment even after a backslash (`a\#b` loads
+ * as `a\`). A backslash before a quote does not open a quoted span
+ * (`a\"b#c` loads as `a\"b`). Inside quotes, a backslash skips the next byte,
+ * so `#` and the closer stay in the value. Shell files use
  * `stripInlineShellComment`, whose POSIX rule requires whitespace before `#`.
  */
 function stripInlineDotenvComment(value: string): string {
 	let quote: '"' | "'" | undefined;
 	for (let i = 0; i < value.length; i++) {
 		const char = value[i];
-		if (char === "\\") {
+		const next = value[i + 1];
+		if (!quote && char === "\\" && (next === '"' || next === "'")) {
+			i++;
+			continue;
+		}
+		if (quote && char === "\\") {
 			i++;
 			continue;
 		}
@@ -111,8 +117,9 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * `filterCredentialInheritedEnv`) decide provenance by comparing
  * `process.env` against this parse, so the accepted syntax must be a superset
  * of what Bun's own dotenv loader honors in `cwd/.env`: `export KEY=value`,
- * whitespace around `=` or `:`, and `#` comments after unquoted values (quotes keep
- * their `#`). Values that Bun would expand (`$VAR`, `${VAR}`, backticks,
+ * whitespace around `=` or `:`, and `#` comments after unquoted values, including
+ * a backslash before `#` (quotes keep their `#`). Values that Bun would expand
+ * (`$VAR`, `${VAR}`, backticks,
  * command substitution) are kept as their literal text: the trust rule only
  * needs the parser to see the key at all, and an operator environment value
  * cannot equal attacker-written expansion text, so a literal parse stays
@@ -165,6 +172,13 @@ export function parseEnvFileContent(content: string): Record<string, string> {
 export interface ProjectEnvSnapshot {
 	values: Record<string, string>;
 	dynamic: Set<string>;
+	/** True when at least one project dotenv layer could not be read safely. */
+	incomplete?: boolean;
+}
+
+export interface ProjectEnvSnapshotOptions {
+	/** Maximum bytes read from each dotenv layer; unsafe files mark the snapshot incomplete. */
+	maxFileBytes?: number;
 }
 
 /**
@@ -182,9 +196,10 @@ export function canonicalEnvKey(name: string): string {
  * Keys whose last declaration is not safe to value-compare.
  *
  * The line parser drops the suffix after the first unescaped closing quote,
- * matching Bun, and strips an unquoted `#` comment. Classification refuses a
- * value that parser would not store the way Bun loaded it. Other backslashes
- * stay in the compared text. The bytes inside the quotes are not decoded.
+ * matching Bun, and strips an unquoted `#` comment even when a backslash
+ * precedes the hash. Classification refuses a value that parser would not
+ * store the way Bun loaded it. Other backslashes stay in the compared text.
+ * The bytes inside the quotes are not decoded.
  */
 function quotedDeclarationKeys(content: string): Set<string> {
 	const quoted = new Set<string>();
@@ -263,24 +278,75 @@ function rawValueDisagreesWithLineParser(raw: string): boolean {
  * `.env.local` is deliberately skipped when `NODE_ENV === "test"`, matching the
  * convention that a local override file is not part of a test run.
  */
-export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
-	const nodeEnv = process.env.NODE_ENV;
+/** Files Bun overlays for a cwd. Unset NODE_ENV selects the development layer. */
+export function projectEnvLayerFiles(nodeEnv: string | undefined): string[] {
 	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
-	const files = [
+	const layer = validNodeEnv ?? (nodeEnv ? undefined : "development");
+	return [
 		".env",
-		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
-		...(validNodeEnv !== "test" ? [".env.local"] : []),
-		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
+		...(layer ? [`.env.${layer}`] : []),
+		...(layer !== "test" ? [".env.local"] : []),
+		...(layer ? [`.env.${layer}.local`] : []),
 	];
+}
+
+function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?: string; incomplete: boolean } {
+	let fileDescriptor: number | undefined;
+	try {
+		// Non-blocking open lets fstat reject FIFOs and device files before any read.
+		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+		const initialStat = fs.fstatSync(fileDescriptor);
+		if (!initialStat.isFile() || initialStat.size > maxFileBytes) return { incomplete: true };
+
+		const buffer = Buffer.allocUnsafe(maxFileBytes + 1);
+		let bytesRead = 0;
+		while (bytesRead < buffer.byteLength) {
+			const count = fs.readSync(fileDescriptor, buffer, bytesRead, buffer.byteLength - bytesRead, bytesRead);
+			if (count === 0) break;
+			bytesRead += count;
+		}
+		if (bytesRead > maxFileBytes || fs.fstatSync(fileDescriptor).size > maxFileBytes) {
+			return { incomplete: true };
+		}
+		return { content: buffer.subarray(0, bytesRead).toString("utf-8"), incomplete: false };
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+			return { incomplete: false };
+		}
+		return { incomplete: true };
+	} finally {
+		if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+	}
+}
+
+export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnapshotOptions = {}): ProjectEnvSnapshot {
+	if (
+		options.maxFileBytes !== undefined &&
+		(!Number.isSafeInteger(options.maxFileBytes) || options.maxFileBytes < 0)
+	) {
+		throw new RangeError("maxFileBytes must be a non-negative safe integer");
+	}
+	const files = projectEnvLayerFiles(process.env.NODE_ENV);
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
+	let incomplete = false;
 	for (const file of files) {
 		const filePath = path.join(cwd, file);
 		let content: string;
-		try {
-			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
-			continue;
+		if (options.maxFileBytes === undefined) {
+			try {
+				content = fs.readFileSync(filePath, "utf-8");
+			} catch {
+				continue;
+			}
+		} else {
+			const boundedRead = readBoundedEnvFile(filePath, options.maxFileBytes);
+			if (boundedRead.incomplete) {
+				incomplete = true;
+				continue;
+			}
+			if (boundedRead.content === undefined) continue;
+			content = boundedRead.content;
 		}
 		const quoted = quotedDeclarationKeys(content);
 		const seen = new Set<string>();
@@ -301,5 +367,5 @@ export function projectEnvSnapshot(cwd = process.cwd()): ProjectEnvSnapshot {
 			dynamic.add(key);
 		}
 	}
-	return { values, dynamic };
+	return incomplete ? { values, dynamic, incomplete: true } : { values, dynamic };
 }

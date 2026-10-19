@@ -314,5 +314,62 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 		}
 	}
 
+	// 4. Instructions — all selected sources target the same scoped AGENTS.md.
+	const plannedInstructions = new Set<string>();
+	for (const result of input.results) {
+		for (const candidate of result.instructionCandidates) {
+			const destination = input.destinations.instructionsPath;
+			const base = { source: candidate.source, type: "instruction" as const, name: candidate.name, destination };
+			if (plannedInstructions.has(destination)) {
+				actions.push({
+					...base,
+					operation: "skip",
+					status: "skipped_exists",
+					reason: "another selected source already targets this file; import one source at a time",
+				});
+				continue;
+			}
+
+			let exists = false;
+			try {
+				const stat = await fs.lstat(destination);
+				exists = true;
+				if (!stat.isFile() || stat.isSymbolicLink()) {
+					actions.push({
+						...base,
+						operation: input.force ? "fail" : "skip",
+						status: input.force ? "failed_invalid_destination" : "skipped_exists",
+						reason: "destination is not a regular file; refusing to replace it",
+					});
+					plannedInstructions.add(destination);
+					continue;
+				}
+			} catch (error) {
+				if (!isEnoent(error)) {
+					actions.push({
+						...base,
+						operation: "fail",
+						status: "failed_io",
+						reason: `failed to inspect destination: ${(error as Error).message}`,
+					});
+					plannedInstructions.add(destination);
+					continue;
+				}
+			}
+
+			if (exists && !input.force) {
+				actions.push({ ...base, operation: "skip", status: "skipped_exists" });
+			} else {
+				actions.push({
+					...base,
+					operation: exists ? "update" : "create",
+					status: exists ? "updated" : "imported",
+					instruction: { content: candidate.content },
+				});
+			}
+			plannedInstructions.add(destination);
+		}
+	}
+
 	return { actions, warnings };
 }

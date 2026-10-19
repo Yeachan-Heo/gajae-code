@@ -191,6 +191,12 @@ describe("CLI credential selector args", () => {
 		expect(() => parseCliCredentialSelector("openai-codex/nope")).toThrow("Invalid --credential selector");
 	});
 
+	test("parses an organization credential selector with a display name", () => {
+		const selector = parseCliCredentialSelector("anthropic/org:Acme Team");
+		expect(selector.provider).toBe("anthropic");
+		expect(selector.selector).toEqual({ kind: "org", value: "Acme Team" });
+	});
+
 	test("parses --prefer-credential for new and resumed sessions", () => {
 		expect(parseArgs(["--prefer-credential", "id:15"]).preferCredential).toBe("id:15");
 		const resumed = parseArgs(["--resume", "--prefer-credential", "anthropic/id:15"]);

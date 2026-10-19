@@ -23,7 +23,7 @@ Use `irc` for live coordination when it is available.
 {{#if customSchemaEnabled}}- `schema`: JTD schema for expected structured output (do not put format rules in assignments){{/if}}
 - `spawnPlan` (optional): required before any batch with more than 4 tasks; include whyParallel, whyNotLocal, independence, expectedReceiptShape, and maxInlineTokens.
 {{#if isolationEnabled}}- `isolated`: run in an isolated environment; REQUIRED when the user explicitly requests a worktree (for example, "use worktree"), and use when tasks edit overlapping files{{/if}}
-- `repositoryBinding`: optional authoritative repository/worktree identity. It must match the active session and cannot authorize a foreign repository from this session. For another approved repository, start a fresh session rooted there (for example, `gjc --cwd <approved-worktree>`); do not use `/move` because materialized tasks retain their original binding.
+- `repositoryBinding`: optional authoritative repository/worktree identity. It must match the session's committed cwd and cannot itself authorize relocation. After an authorized session move, new work uses the committed target; already-admitted work retains its source execution inputs. Verified storage relocation of that same parent does not change child execution cwd; a logical session switch does not substitute successor storage. For another approved repository, start a fresh session rooted there (for example, `gjc --cwd <approved-worktree>`) or use the existing user-authorized relocation surface; `move_session` still only narrows to a descendant directory.
 </parameters>
 
 <rules>

@@ -66,6 +66,7 @@ import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
 import { renderProgressReportLines, renderProgressReportText } from "./helpers/progress-report";
+import { buildProviderAuthStatusText } from "./helpers/provider-auth-status";
 import { handleSshAcp } from "./helpers/ssh";
 import { buildUsageReportText, collectCachedUsageReports } from "./helpers/usage-report";
 import type {
@@ -292,6 +293,7 @@ function providerSetupUsage(): string {
 		"Aliases include minimax, zai, alibaba, cline, command-code, goat, and ionet.",
 		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
+		"Credential status: /provider status",
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
 		"Headless OAuth callbacks can be pasted with /login <redirect URL or code>.",
 	].join("\n");
@@ -1654,7 +1656,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		aliases: ["account"],
 		description: "Switch this session's active stored account, or list accounts",
 		acpDescription: "Switch or list stored credentials for this session",
-		inlineHint: "[email:<addr>|id:<n>|account:<id>|project:<id>|provider/<selector>]",
+		inlineHint: "[email:<addr>|id:<n>|account:<id>|project:<id>|org:<id|name>|provider/<selector>]",
 		acpInputHint: "[selector]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
@@ -1900,13 +1902,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 
 	{
 		name: "provider",
-		description: "Set up API-compatible providers or login providers",
-		inlineHint: "add|login",
+		description: "Show provider credential status or set up providers",
+		inlineHint: "status|add|login",
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const args = command.args.trim();
 			if (!args || args === "help") {
 				await runtime.output(providerSetupUsage());
+				return commandConsumed();
+			}
+			if (args === "status") {
+				await runtime.output(await buildProviderAuthStatusText(runtime.session));
 				return commandConsumed();
 			}
 			if (args === "login" || args.startsWith("login ")) {
@@ -1974,6 +1980,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const args = command.args.trim();
 			if (!args) {
 				runtime.ctx.showProviderOnboarding();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (args === "status") {
+				runtime.ctx.showStatus(await buildProviderAuthStatusText(runtime.ctx.session));
 				runtime.ctx.editor.setText("");
 				return;
 			}

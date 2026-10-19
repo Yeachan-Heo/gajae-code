@@ -62,15 +62,16 @@ async function postJson(url: string, body: Record<string, string | number>): Pro
 /**
  * Decoded shape of Anthropic's `/v1/oauth/token` response (both
  * `authorization_code` exchange and `refresh_token` refresh return the same
- * envelope). The `account` block is inlined alongside the tokens, so we can
- * surface `accountId` / `email` on {@link OAuthCredentials} without a separate
- * `/api/oauth/profile` round-trip.
+ * envelope). The `account` and `organization` blocks are inlined alongside the
+ * tokens, so we can surface `accountId` / `email` / `organizationId` on
+ * {@link OAuthCredentials} without a separate `/api/oauth/profile` round-trip.
  */
 interface AnthropicTokenResponse {
 	access_token: string;
 	refresh_token: string;
 	expires_in: number;
 	account?: { uuid?: string; email_address?: string };
+	organization?: { uuid?: string; name?: string };
 }
 
 function parseOAuthTokenResponse(responseBody: string, operation: string): AnthropicTokenResponse {
@@ -83,22 +84,26 @@ function parseOAuthTokenResponse(responseBody: string, operation: string): Anthr
 	}
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
 /**
- * Lift the OAuth response's `account: { uuid, email_address }` block onto
- * {@link OAuthCredentials} so downstream identity propagation (e.g.
- * `metadata.user_id.account_uuid`, usage tracking) works without a separate
- * `/api/oauth/profile` round-trip. Returns `undefined` for either field when
- * the response omits it or carries a non-string / empty value.
+ * Lift the OAuth response's `account: { uuid, email_address }` and
+ * `organization: { uuid, name }` blocks onto {@link OAuthCredentials} so
+ * downstream identity propagation (e.g. `metadata.user_id.account_uuid`, usage
+ * tracking, one stored credential per organization) works without a separate
+ * `/api/oauth/profile` round-trip. Returns `undefined` for any field the
+ * response omits or carries as a non-string / empty value.
  */
-function extractAccountFromTokenResponse(data: AnthropicTokenResponse): {
-	accountId?: string;
-	email?: string;
-} {
-	const accountUuid = data.account?.uuid;
-	const emailAddress = data.account?.email_address;
+function extractIdentityFromTokenResponse(
+	data: AnthropicTokenResponse,
+): Pick<OAuthCredentials, "accountId" | "email" | "organizationId" | "organizationName"> {
 	return {
-		accountId: typeof accountUuid === "string" && accountUuid.length > 0 ? accountUuid : undefined,
-		email: typeof emailAddress === "string" && emailAddress.length > 0 ? emailAddress : undefined,
+		accountId: nonEmptyString(data.account?.uuid),
+		email: nonEmptyString(data.account?.email_address),
+		organizationId: nonEmptyString(data.organization?.uuid),
+		organizationName: nonEmptyString(data.organization?.name),
 	};
 }
 
@@ -182,14 +187,12 @@ export class AnthropicOAuthFlow extends OAuthCallbackFlow {
 		}
 
 		const tokenData = parseOAuthTokenResponse(responseBody, "token exchange");
-		const { accountId, email } = extractAccountFromTokenResponse(tokenData);
 
 		return {
 			refresh: tokenData.refresh_token,
 			access: tokenData.access_token,
 			expires: Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000,
-			accountId,
-			email,
+			...extractIdentityFromTokenResponse(tokenData),
 		};
 	}
 }
@@ -221,13 +224,11 @@ export async function refreshAnthropicToken(refreshToken: string): Promise<OAuth
 	}
 
 	const data = parseOAuthTokenResponse(responseBody, "token refresh");
-	const { accountId, email } = extractAccountFromTokenResponse(data);
 
 	return {
 		refresh: data.refresh_token || refreshToken,
 		access: data.access_token,
 		expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-		accountId,
-		email,
+		...extractIdentityFromTokenResponse(data),
 	};
 }

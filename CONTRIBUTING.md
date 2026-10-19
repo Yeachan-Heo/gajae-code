@@ -90,3 +90,9 @@ Merges to `dev` require one approving GitHub review from a write-access maintain
 **Release backmerge note.** `bun run release` automates the propagation of the just-published release commit from `main` into `dev` to keep them in sync. The backmerge runs after the release is tagged and published to main, and creates a pull request to bring the new release commit into dev. This PR must be reviewed and approved by a maintainer before it can be merged, following the same exact-head approval requirement as all other dev merges. The release publication is not blocked by the backmerge PR — if the PR encounters issues during creation, the release is already published and the step reports it, leaving manual synchronization for later correction.
 
 Metadata-only PR edits must not manufacture successful required checks by skipping the aggregate jobs. Dev CI validates those events through real code-validation jobs; separate metadata concurrency preserves an already-running code-validation run. Pending, failed, cancelled, or missing dependency evidence cannot satisfy the aggregate. State-gate relevance is decided before native provisioning, with runtime prompt Markdown in dependency workspaces treated as executable input rather than documentation.
+
+## Re-requesting reviews
+
+If you want reviewers to re-examine your PR after addressing feedback, comment with `/re-review`. The workflow will request reviews from all human reviewers whose latest review is `CHANGES_REQUESTED` or `COMMENTED` but are not currently requested. Authorized users are the PR author or anyone with `admin`, `maintain`, or `write` permission to the repository.
+
+**Note:** `issue_comment` workflows only activate once the triggering file (`.github/workflows/re-review.yml`) is present on the repository's default branch, `main`. Merging this PR to `dev` alone does not activate `/re-review`; the workflow will not trigger on comments until the file reaches `main`.

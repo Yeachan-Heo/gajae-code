@@ -886,7 +886,7 @@ if (cleanupFailed) throw cleanupError;
 		}
 	}, 30_000);
 
-	it("propagates an actual unconfirmed shutdown result and retries that retained physical kernel", async () => {
+	it("propagates an unconfirmed shutdown result and retries that retained physical kernel", async () => {
 		using tempDir = TempDir.createSync("@gjc-python-owner-shutdown-unconfirmed-");
 		const kernels = trackStartedKernels();
 		const readyFile = `${tempDir.path()}/unconfirmed-shutdown.ready`;
@@ -921,14 +921,20 @@ if (cleanupFailed) throw cleanupError;
 			const originalShutdown = kernel.shutdown.bind(kernel);
 			kernel.shutdown = async function (this: PythonKernel, options?: Parameters<PythonKernel["shutdown"]>[0]) {
 				const call = ++shutdownCalls;
+				if (call === 1) {
+					// The real zero-timeout result races process-exit observation; force the
+					// executor-facing result after exercising the real physical shutdown.
+					await originalShutdown({ ...options, timeoutMs: 0 });
+					firstShutdownResult = { confirmed: false };
+					return firstShutdownResult;
+				}
 				if (call === 2) {
 					secondShutdownReceiver = this;
 					secondShutdownStarted.resolve();
 					await releaseSecondShutdown.promise;
 				}
-				const result = await originalShutdown(call === 1 ? { ...options, timeoutMs: 0 } : options);
-				if (call === 1) firstShutdownResult = result;
-				else secondShutdownResult = result;
+				const result = await originalShutdown(options);
+				secondShutdownResult = result;
 				return result;
 			};
 
@@ -942,7 +948,6 @@ if (cleanupFailed) throw cleanupError;
 			expect(executionResult.cancelled).toBe(true);
 			expect(firstShutdownResult).toEqual({ confirmed: false });
 			expect(shutdownCalls).toBe(1);
-
 			await waitForProcessGone(pid);
 			retryCleanup = disposeKernelSessionsByOwner("unconfirmed-owner");
 			const retryStartTimeout = Promise.withResolvers<void>();
@@ -1162,12 +1167,8 @@ if (cleanupFailed) throw cleanupError;
 				"Cancelled creator A remained joined to the surviving B initializer",
 			);
 			expect(resultA.cancelled).toBe(true);
-			let cleanupSettled = false;
-			markSettled(ownerCleanup, () => {
-				cleanupSettled = true;
-			});
-			await flushMicrotasks();
-			expect(cleanupSettled).toBe(false);
+			await waitForRequest(ownerCleanup, 5_000, "A cleanup remained joined to surviving B startup");
+			expect(await Bun.file(readyFile).exists()).toBe(false);
 			expect(kernels).toHaveLength(1);
 			expect(kernel.isAlive()).toBe(true);
 			expect(isProcessAlive(pid)).toBe(true);
@@ -1196,7 +1197,7 @@ if (cleanupFailed) throw cleanupError;
 		}
 	}, 30_000);
 
-	it("keeps an A waiter joined through synchronous cleanup reentry while B's shared initializer survives", async () => {
+	it("finishes A waiter cleanup through synchronous reentry while B's shared initializer survives", async () => {
 		using tempDir = TempDir.createSync("@gjc-python-owner-shared-initializer-");
 		const cwd = tempDir.path();
 		const startEntered = Promise.withResolvers<void>();
@@ -1299,9 +1300,14 @@ if (cleanupFailed) throw cleanupError;
 			expect(reentrantCleanup).toBeDefined();
 			const resultA = await waitForRequest(executionA, 5_000, "Cancelled A remained joined to B's held initializer");
 			expect(resultA.cancelled).toBe(true);
-			await flushMicrotasks();
-			expect(ownerCleanupSettled).toBe(false);
-			expect(reentrantCleanupSettled).toBe(false);
+			await waitForRequest(
+				Promise.all([ownerCleanup, reentrantCleanup]),
+				5_000,
+				"Reentrant A cleanup remained joined to B's held initializer",
+			);
+			expect(ownerCleanupSettled).toBe(true);
+			expect(reentrantCleanupSettled).toBe(true);
+			expect(await Bun.file(readyPath).exists()).toBe(false);
 			expect(kernels).toHaveLength(1);
 			expect(kernel.isAlive()).toBe(true);
 			expect(isProcessAlive(pid)).toBe(true);
@@ -1342,6 +1348,174 @@ if (cleanupFailed) throw cleanupError;
 		}
 		if (bodyFailed) throw bodyError;
 		if (cleanupFailed) throw cleanupError;
+	}, 30_000);
+
+	it("joins A's independent physical shutdown without joining surviving B startup", async () => {
+		using independentDir = TempDir.createSync("@gjc-python-owner-independent-shutdown-");
+		using sharedDir = TempDir.createSync("@gjc-python-owner-independent-shared-");
+		const initialized = Promise.withResolvers<PythonKernel>();
+		const releaseStartup = Promise.withResolvers<void>();
+		const shutdownStarted = Promise.withResolvers<void>();
+		const releaseShutdown = Promise.withResolvers<void>();
+		const kernels: PythonKernel[] = [];
+		let shutdownCalls = 0;
+		let executionA: Promise<PythonResult> | undefined;
+		let executionB: Promise<PythonResult> | undefined;
+		let cleanup: Promise<void> | undefined;
+		let repeatedCleanup: Promise<void> | undefined;
+		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
+			const kernel = await originalStart(options);
+			kernels.push(kernel);
+			if (options.cwd === sharedDir.path()) {
+				initialized.resolve(kernel);
+				await releaseStartup.promise;
+			}
+			return kernel;
+		});
+		try {
+			const first = await executePython("print('independent A')", {
+				cwd: independentDir.path(),
+				sessionId: "independent-a-shutdown",
+				kernelOwnerId: "owner-a",
+			});
+			expect(first.exitCode).toBe(0);
+			const kernelA = kernels[0];
+			const shutdown = kernelA.shutdown.bind(kernelA);
+			kernelA.shutdown = async options => {
+				shutdownCalls += 1;
+				shutdownStarted.resolve();
+				await releaseShutdown.promise;
+				return await shutdown(options);
+			};
+			const sharedOptions = { cwd: sharedDir.path(), sessionId: "independent-shared-startup" };
+			executionB = executePython("print('surviving B')", { ...sharedOptions, kernelOwnerId: "owner-b" });
+			let executionBSettled = false;
+			markSettled(executionB, () => {
+				executionBSettled = true;
+			});
+			const kernelB = await initialized.promise;
+			executionA = executePython("print('A must not execute')", { ...sharedOptions, kernelOwnerId: "owner-a" });
+			cleanup = disposeKernelSessionsByOwner("owner-a");
+			await shutdownStarted.promise;
+			repeatedCleanup = disposeKernelSessionsByOwner("owner-a");
+			expect((await waitForRequest(executionA, 5_000, "A waiter did not cancel")).cancelled).toBe(true);
+			let cleanupSettled = false;
+			let repeatedSettled = false;
+			markSettled(cleanup, () => {
+				cleanupSettled = true;
+			});
+			markSettled(repeatedCleanup, () => {
+				repeatedSettled = true;
+			});
+			await flushMicrotasks();
+			expect(cleanupSettled).toBe(false);
+			expect(repeatedSettled).toBe(false);
+			expect(shutdownCalls).toBe(1);
+			expect(kernelA.isAlive()).toBe(true);
+			releaseShutdown.resolve();
+			await waitForRequest(Promise.all([cleanup, repeatedCleanup]), 5_000, "A cleanup joined B startup");
+			expect(shutdownCalls).toBe(1);
+			expect(kernelA.isAlive()).toBe(false);
+			expect(kernelB.isAlive()).toBe(true);
+			expect(executionBSettled).toBe(false);
+			expect(kernels).toHaveLength(2);
+			releaseStartup.resolve();
+			expect((await executionB).exitCode).toBe(0);
+			await disposeKernelSessionsByOwner("owner-b");
+			expect(kernelB.isAlive()).toBe(false);
+		} finally {
+			releaseShutdown.resolve();
+			releaseStartup.resolve();
+			await joinCleanupTasks([
+				...(cleanup ? [cleanup] : []),
+				...(repeatedCleanup ? [repeatedCleanup] : []),
+				...(executionA ? [executionA] : []),
+				...(executionB ? [executionB] : []),
+				disposeAllKernelSessions(),
+			]);
+		}
+	}, 30_000);
+
+	it("does not attribute surviving B startup cleanup failure to detached A", async () => {
+		using sharedDir = TempDir.createSync("@gjc-python-owner-shared-failure-");
+		using preflightDir = TempDir.createSync("@gjc-python-owner-failure-preflight-");
+		const initialized = Promise.withResolvers<PythonKernel>();
+		const releaseStartup = Promise.withResolvers<void>();
+		const preflightEntered = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		const startupError = new Error("B startup failed after A detached");
+		const shutdownError = new Error("B startup cleanup rejected");
+		const getRunnerPid = observeRunnerPid(sharedDir.path());
+		let shutdownCalls = 0;
+		let executionA: Promise<PythonResult> | undefined;
+		let executionB: Promise<PythonResult> | undefined;
+		let preflightA: Promise<PythonResult> | undefined;
+		let cleanupA: Promise<void> | undefined;
+		let executionBObserved = false;
+		holdAvailability(preflightDir.path(), releasePreflight.promise, preflightEntered.resolve);
+		vi.spyOn(PythonKernel, "start").mockImplementation(async options => {
+			const kernel = await originalStart(options);
+			if (options.cwd !== sharedDir.path()) return kernel;
+			const shutdown = kernel.shutdown.bind(kernel);
+			kernel.shutdown = async shutdownOptions => {
+				shutdownCalls += 1;
+				if (shutdownCalls === 1) throw shutdownError;
+				return await shutdown(shutdownOptions);
+			};
+			initialized.resolve(kernel);
+			await releaseStartup.promise;
+			await options.onStartupFailure?.(kernel);
+			throw startupError;
+		});
+		try {
+			const sharedOptions = { cwd: sharedDir.path(), sessionId: "shared-b-startup-failure" };
+			executionB = executePython("print('B must not execute')", { ...sharedOptions, kernelOwnerId: "owner-b" });
+			markSettled(executionB, () => undefined);
+			const kernel = await initialized.promise;
+			const pid = getRunnerPid();
+			if (pid === undefined) throw new Error("Shared initializer runner PID was not captured");
+			executionA = executePython("print('A must not execute')", { ...sharedOptions, kernelOwnerId: "owner-a" });
+			preflightA = executePython("print('preflight A must not launch')", {
+				cwd: preflightDir.path(),
+				sessionId: "independent-a-preflight",
+				kernelOwnerId: "owner-a",
+			});
+			await preflightEntered.promise;
+			cleanupA = disposeKernelSessionsByOwner("owner-a");
+			markSettled(cleanupA, () => undefined);
+			expect((await waitForRequest(executionA, 5_000, "Shared A waiter did not cancel")).cancelled).toBe(true);
+			let cleanupSettled = false;
+			markSettled(cleanupA, () => {
+				cleanupSettled = true;
+			});
+			releaseStartup.resolve();
+			await expect(executionB).rejects.toBe(startupError);
+			executionBObserved = true;
+			expect(shutdownCalls).toBe(1);
+			expect(kernel.isAlive()).toBe(true);
+			expect(isProcessAlive(pid)).toBe(true);
+			expect(cleanupSettled).toBe(false);
+			releasePreflight.resolve();
+			expect((await preflightA).cancelled).toBe(true);
+			await waitForRequest(cleanupA, 5_000, "A cleanup did not finish after its own preflight");
+			expect(shutdownCalls).toBe(1);
+			await disposeKernelSessionsByOwner("owner-b");
+			expect(shutdownCalls).toBe(2);
+			await waitForProcessGone(pid);
+			expect(kernel.isAlive()).toBe(false);
+			await disposeKernelSessionsByOwner("owner-a");
+			expect(shutdownCalls).toBe(2);
+		} finally {
+			releaseStartup.resolve();
+			releasePreflight.resolve();
+			await joinCleanupTasks([
+				...(cleanupA ? [cleanupA] : []),
+				...(executionA ? [executionA] : []),
+				...(executionB && !executionBObserved ? [executionB] : []),
+				...(preflightA ? [preflightA] : []),
+				disposeAllKernelSessions(),
+			]);
+		}
 	}, 30_000);
 
 	it("retains a real partial-start kernel when its first shutdown rejects, then retries explicitly", async () => {

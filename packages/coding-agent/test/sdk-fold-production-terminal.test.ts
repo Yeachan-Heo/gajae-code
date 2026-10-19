@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
 import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { TempDir } from "@gajae-code/utils";
@@ -23,32 +23,37 @@ describe("SDK production ACP fold path", () => {
 	let created: CreateAgentSessionResult | undefined;
 	let authStorage: AuthStorage | undefined;
 	let tempDir: TempDir | undefined;
+	let sessionManager: SessionManager | undefined;
 
 	afterEach(async () => {
 		await created?.session.dispose();
+		vi.restoreAllMocks();
 		authStorage?.close();
 		tempDir?.removeSync();
 		created = undefined;
 		authStorage = undefined;
 		tempDir = undefined;
+		sessionManager = undefined;
 		AsyncJobManager.resetForTests();
 	});
 
-	test("creates, folds, wakes, and releases through the SDK ToolSession and ACP adapter", async () => {
+	async function createSession() {
 		tempDir = TempDir.createSync("@gjc-sdk-fold-acp-");
 		registerMockApi();
 		authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
 		const mock = createMockModel({ responses: [{ content: ["wake complete"] }] });
 		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		sessionManager = SessionManager.inMemory(tempDir.path());
 		created = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
-			sessionManager: SessionManager.inMemory(tempDir.path()),
+			sessionManager,
 			authStorage,
 			settings: Settings.isolated({
 				"async.enabled": true,
 				"bash.autoBackground.enabled": false,
 				"compaction.enabled": false,
+				"tools.artifactTailBytes": 32 * 1024,
 			}),
 			model: mock.model,
 			disableExtensionDiscovery: true,
@@ -62,12 +67,56 @@ describe("SDK production ACP fold path", () => {
 			sdkHostModeSupported: false,
 			notificationHostModeSupported: false,
 		});
+		return mock;
+	}
+
+	for (const storage of ["secured", "unavailable", "refused"] as const) {
+		test(`ordinary unowned large completion queues and wakes with ${storage} storage`, async () => {
+			const mock = await createSession();
+			if (!created || !sessionManager) throw new Error("expected SDK fixture");
+			const save = vi.spyOn(sessionManager, "saveArtifact");
+			if (storage === "unavailable") save.mockResolvedValue(undefined);
+			if (storage === "refused") save.mockRejectedValue(new Error("private refusal"));
+			const manager = AsyncJobManager.instance();
+			if (!manager) throw new Error("expected SDK async manager");
+			const output = "ordinary large completion\n".repeat(1_000);
+			const callsBeforeWake = mock.calls.length;
+			manager.register("bash", "ordinary completion", async () => output);
+			await waitFor(() => created!.session.yieldQueue.has("async-result"));
+			await created.session.yieldQueue.flush("idle");
+			expect(mock.calls.length).toBe(callsBeforeWake + 1);
+			expect(save).toHaveBeenCalledWith(output, "async");
+			const wakeMessages = JSON.stringify(mock.calls[mock.calls.length - 1]?.context.messages);
+			expect(wakeMessages).toContain("ordinary large completion");
+			if (storage === "secured") {
+				const artifactId = wakeMessages.match(/artifact:\/\/([^\s"\\]+)/)?.[1];
+				if (!artifactId) throw new Error("expected secured completion receipt");
+				const artifactPath = await sessionManager.getArtifactPath(artifactId);
+				if (!artifactPath) throw new Error("expected secured completion path");
+				expect(await Bun.file(artifactPath).text()).toBe(output);
+			} else {
+				expect(wakeMessages).toContain("storage unavailable");
+				expect(wakeMessages).not.toContain("artifact://");
+				expect(wakeMessages).not.toContain("private refusal");
+			}
+		});
+	}
+
+	test.each([
+		"inline",
+		"refused",
+	] as const)("creates, folds, wakes, and releases through SDK and ACP with %s storage", async storage => {
+		const mock = await createSession();
+		if (!created || !sessionManager) throw new Error("expected SDK fixture");
+		const output = storage === "inline" ? "folded output\n" : "folded output\n".repeat(1_000);
+		const save = vi.spyOn(sessionManager, "saveArtifact");
+		if (storage === "refused") save.mockRejectedValue(new Error("private folded refusal"));
 
 		const exit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
 		let releaseCalls = 0;
 		const terminal: ClientBridgeTerminalHandle = {
 			terminalId: "sdk-acp-fold-terminal",
-			currentOutput: async () => ({ output: "folded output\n", truncated: false }),
+			currentOutput: async () => ({ output, truncated: false }),
 			waitForExit: () => exit.promise,
 			kill: async () => {},
 			release: async () => {
@@ -111,5 +160,16 @@ describe("SDK production ACP fold path", () => {
 		const wakeMessages = JSON.stringify(mock.calls[mock.calls.length - 1]?.context.messages);
 		expect(wakeMessages).toContain("folded output");
 		expect(wakeMessages).toContain("folded client-terminal wait");
+		if (storage === "refused") {
+			expect(save).toHaveBeenCalledWith(expect.stringContaining("folded output"), "async");
+			expect(wakeMessages).toContain("storage unavailable");
+			expect(wakeMessages).not.toContain("artifact://");
+			expect(wakeMessages).not.toContain("private folded refusal");
+		} else {
+			expect(save).not.toHaveBeenCalled();
+		}
+		await created.session.yieldQueue.flush("idle");
+		expect(mock.calls.length).toBe(callsBeforeWake + 1);
+		expect(releaseCalls).toBe(1);
 	});
 });

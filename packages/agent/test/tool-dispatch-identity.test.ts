@@ -454,8 +454,66 @@ describe("calls rejected before Tool.execute is entered", () => {
 
 		expect(entered()).toBe(false);
 		expectPairingOnly(observed, "call-incomplete");
-		// The retryable error result the model needs is still delivered.
-		expect(errorTexts.join("\n")).toContain("cut off before its arguments finished streaming");
+		// The retryable error result the model needs is still delivered without
+		// inventing either a decode failure or an output-token-limit cause: this
+		// call carried only the incomplete boolean on a `toolUse` turn.
+		const text = errorTexts.join("\n");
+		expect(text).toContain("incomplete before its arguments finished streaming");
+		expect(text).not.toContain("did not decode to a valid JSON object");
+		expect(text).not.toContain("output token limit");
+		expect(text).not.toContain("cut off");
+		expect(text.toLowerCase()).toContain("re-issue");
+	});
+
+	test("a call whose terminal arguments did not decode keeps its malformed reason", async () => {
+		// Reproduces a live session: the provider adapter typed the block as
+		// `malformed`, so the result must name the decode failure rather than
+		// report an output-token-limit truncation the turn never hit.
+		const { tool, entered } = executionTracker("edit");
+		const { observed, errorTexts } = await observeGate({
+			tools: [tool],
+			call: {
+				type: "toolCall",
+				id: "call-malformed",
+				name: "edit",
+				arguments: { path: "src/taxinvoiceService.ts", edits: [{}] },
+				incompleteArguments: true,
+				incompleteArgumentsReason: "malformed",
+			},
+		});
+
+		expect(entered()).toBe(false);
+		expectPairingOnly(observed, "call-malformed");
+		const text = errorTexts.join("\n");
+		expect(text).toContain("did not decode to a valid JSON object");
+		expect(text).not.toContain("output token limit");
+		expect(text).not.toContain("cut off");
+		expect(text.toLowerCase()).toContain("re-issue");
+	});
+
+	test("a call that declared conflicting arguments keeps that reason", async () => {
+		// Guard against the snapshot re-deriving an accepted call's reason: any
+		// rewrite here would send the model after the wrong defect.
+		const { tool, entered } = executionTracker("edit");
+		const { observed, errorTexts } = await observeGate({
+			tools: [tool],
+			call: {
+				type: "toolCall",
+				id: "call-conflicting",
+				name: "edit",
+				arguments: { path: "src/taxinvoiceService.ts", edits: [{}] },
+				incompleteArguments: true,
+				incompleteArgumentsReason: "conflicting",
+			},
+		});
+
+		expect(entered()).toBe(false);
+		expectPairingOnly(observed, "call-conflicting");
+		const text = errorTexts.join("\n");
+		expect(text).toContain("disagree");
+		expect(text).not.toContain("did not decode");
+		expect(text).not.toContain("output token limit");
+		expect(text.toLowerCase()).toContain("re-issue");
 	});
 
 	test("a call naming a tool the run's snapshot never had", async () => {

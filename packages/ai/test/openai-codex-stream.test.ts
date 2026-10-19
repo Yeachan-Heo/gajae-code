@@ -3432,9 +3432,9 @@ describe("openai-codex streaming", () => {
 		expect(explicitDefaultResult.usage.cost.input).toBeCloseTo(0.000005, 10);
 		expect(explicitDefaultResult.usage.cost.output).toBeCloseTo(0.000006, 10);
 		expect(explicitDefaultResult.usage.cost.total).toBeCloseTo(0.000011, 10);
-		expect(missingTierResult.usage.cost.input).toBeCloseTo(0.00001, 10);
-		expect(missingTierResult.usage.cost.output).toBeCloseTo(0.000012, 10);
-		expect(missingTierResult.usage.cost.total).toBeCloseTo(0.000022, 10);
+		expect(missingTierResult.usage.cost.input).toBeCloseTo(0.0000125, 10);
+		expect(missingTierResult.usage.cost.output).toBeCloseTo(0.000015, 10);
+		expect(missingTierResult.usage.cost.total).toBeCloseTo(0.0000275, 10);
 	});
 
 	it("fails truncated SSE streams that never emit a terminal response event", async () => {

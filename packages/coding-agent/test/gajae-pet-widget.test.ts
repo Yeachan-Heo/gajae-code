@@ -1039,7 +1039,7 @@ describe("GajaePetWidget", () => {
 			// proportional to the cell height (round(18 * 0.45) = 8 at the 18px default
 			// cell) so the sprite tracks the composer border at any font size.
 			expect(payload).toContain("\x1b_Ga=T");
-			expect(payload).toContain(",Y=8,");
+			expect(payload).toContain(",Y=8;");
 		} finally {
 			widget.dispose();
 		}
@@ -1052,13 +1052,13 @@ describe("GajaePetWidget", () => {
 		try {
 			widget.setMode("red");
 			// default 18px cell -> Y = floor(18 * 0.45) = 8
-			expect(getEmitter()?.()).toContain(",Y=8,");
+			expect(getEmitter()?.()).toContain(",Y=8;");
 			// A font/zoom change resizes the cells; the next tick must rebuild.
 			setCellDimensions({ widthPx: 9, heightPx: 30 });
 			vi.advanceTimersByTime(100);
 			// 30px cell -> Y = floor(30 * 0.45) = 13, tracking the new metrics.
-			expect(getEmitter()?.()).toContain(",Y=13,");
-			expect(getEmitter()?.()).not.toContain(",Y=8,");
+			expect(getEmitter()?.()).toContain(",Y=13;");
+			expect(getEmitter()?.()).not.toContain(",Y=8;");
 		} finally {
 			setCellDimensions(original);
 			widget.dispose();

@@ -61,6 +61,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 	const installedAgentModelOverrides = new Map<string, ModelSelectorValue>();
 	const manualModelRoles = new Set<string>();
 	const manualAgentModelOverrides = new Set<string>();
+	const configuredAgentModelOverrides = new Set<string>();
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -101,6 +102,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 				installedAgentModelOverrides: new Map(installedAgentModelOverrides),
 				manualModelRoles: new Set(manualModelRoles),
 				manualAgentModelOverrides: new Set(manualAgentModelOverrides),
+				configuredAgentModelOverrides: new Set(configuredAgentModelOverrides),
 				preProfileModel,
 			};
 		},
@@ -111,6 +113,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			installedAgentModelOverrides: ReadonlyMap<string, ModelSelectorValue>;
 			manualModelRoles: ReadonlySet<string>;
 			manualAgentModelOverrides: ReadonlySet<string>;
+			configuredAgentModelOverrides: ReadonlySet<string>;
 			preProfileModel: Model | undefined;
 		}) {
 			profileInstalledRoles.clear();
@@ -125,6 +128,8 @@ function fakeSession(initial = model("provider-a", "initial")) {
 			for (const role of state.manualModelRoles) manualModelRoles.add(role);
 			manualAgentModelOverrides.clear();
 			for (const role of state.manualAgentModelOverrides) manualAgentModelOverrides.add(role);
+			configuredAgentModelOverrides.clear();
+			for (const role of state.configuredAgentModelOverrides) configuredAgentModelOverrides.add(role);
 			preProfileModel = state.preProfileModel;
 		},
 		noteProfileInstalledOverrides(

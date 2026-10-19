@@ -45,6 +45,8 @@ export const oauthCredentialSchema = z
 		projectId: z.string().optional(),
 		email: z.string().optional(),
 		accountId: z.string().optional(),
+		organizationId: z.string().optional(),
+		organizationName: z.string().optional(),
 		mcpBinding: mcpOAuthBindingSchema.optional(),
 	})
 	.strict();

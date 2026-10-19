@@ -102,6 +102,7 @@ import {
 	registerAskAnswerSource,
 	registerWorkflowGateEmitterListener,
 } from "../../tools/ask-answer-registry";
+import type { AwaitingInputKind } from "../../tools/awaiting-input";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
@@ -117,6 +118,7 @@ import {
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
+	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
@@ -1421,6 +1423,12 @@ interface SessionRuntime {
 		string,
 		{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 	>;
+	/**
+	 * Running tool calls that reported an awaiting-input signal, keyed by tool call
+	 * id. An entry stays undelivered while notifications are inactive or policy is
+	 * provisional, and is dropped when the call ends; one notification per call.
+	 */
+	awaitingInput: Map<string, { toolName: string; kind: AwaitingInputKind; delivered: boolean }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
 	/** Disposes side-turn resources when their owning logical session becomes unavailable. */
@@ -1430,6 +1438,48 @@ interface SessionRuntime {
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
 const TOOL_SUMMARY_MAX = 280;
+
+/** The `awaitingInput` signal a running bash update carries, validated at the extension boundary. */
+function readAwaitingInput(partialResult: unknown): { kind: AwaitingInputKind } | undefined {
+	if (!partialResult || typeof partialResult !== "object") return undefined;
+	const details = (partialResult as { details?: unknown }).details;
+	if (!details || typeof details !== "object") return undefined;
+	const signal = (details as { awaitingInput?: unknown }).awaitingInput;
+	if (!signal || typeof signal !== "object") return undefined;
+	const kind = (signal as { kind?: unknown }).kind;
+	return kind === "browser_auth" || kind === "device_code" ? { kind } : undefined;
+}
+
+/**
+ * Deliver every undelivered awaiting-input notice once stable policy admits it.
+ * The notice describes the present ("a command is waiting now"), so it goes out
+ * on the live native leg only and never enters the replay ring: a client that
+ * reconnects after the command exited must not receive it. The native server
+ * still withholds it from connections without `awaiting_input_v1`.
+ */
+function deliverAwaitingInput(
+	runtime: Pick<SessionRuntime, "server" | "awaitingInput" | "notificationsActive" | "policySuspended">,
+	sessionId: string,
+): void {
+	if (!runtime.notificationsActive || runtime.policySuspended) return;
+	for (const [toolCallId, entry] of runtime.awaitingInput) {
+		if (entry.delivered) continue;
+		entry.delivered = true;
+		try {
+			runtime.server.pushFrame(
+				JSON.stringify({
+					type: "awaiting_input",
+					sessionId,
+					toolCallId,
+					toolName: entry.toolName,
+					kind: entry.kind,
+				}),
+			);
+		} catch (e) {
+			logger.warn(`notifications: awaiting_input failed: ${String(e)}`);
+		}
+	}
+}
 
 /** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
 type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
@@ -2659,6 +2709,10 @@ function sdkControlSurface(
 		// the session-wide preflight seam must not be invoked while another
 		// connection's active preflight could be cancelled by it (review P1).
 		noOtherConnectionPreflights?: () => boolean,
+		// True only for an operator terminal abort that the broker control route already
+		// authorized (`TerminalAbortInput.operator`, which a public SDK caller cannot grant):
+		// it addresses the session's active turn, not the requesting connection's own prompt.
+		operatorAuthorized?: boolean,
 	) => Promise<
 		| {
 				ok: true;
@@ -3178,6 +3232,9 @@ function sdkControlSurface(
 				// invoking it (review thread P1).
 				() =>
 					![...pendingPreflightCancellations.values()].some(entry => entry.connectionId !== requesterConnectionId),
+				// Broker-authorized operator authority is the one case where the abort
+				// addresses a turn another connection submitted (see the parameter note).
+				input.operator === true,
 			);
 			// Preflight cancellation happens ONLY for a NEWLY ADMITTED abort,
 			// after the durable admission/replay decision inside
@@ -4281,6 +4338,34 @@ export function boundedCorrelatedAgentEndFrame(frame: Record<string, unknown>): 
 	};
 }
 
+/** Connection-scoped identity of a queued prompt submission an abort may address. */
+export interface TerminalAbortSubmissionScope {
+	connectionId?: string;
+	terminal: boolean;
+}
+
+/**
+ * Whether a terminal abort addresses this prompt submission.
+ *
+ * An ordinary abort is scoped to the requesting connection's own prompt: `connectionId`
+ * identifies the connection that submitted it, and a submission that already reached a
+ * terminal state is never addressed. Broker-authorized operator authority
+ * (`TerminalAbortInput.operator`, granted only through the broker control route) is the
+ * documented exception — "operator authority changes only connection ownership, never
+ * those settlement proofs" — so it addresses the session's submission even when another
+ * connection submitted it. Without that override every operator abort issued over a
+ * second connection (the SDK client case, where each request is its own connection)
+ * reported no_active_turn while the turn was still running.
+ */
+export function terminalAbortAddressesSubmission(input: {
+	connectionId: string | undefined;
+	operatorAuthorized: boolean;
+	submission: TerminalAbortSubmissionScope;
+}): boolean {
+	if (input.submission.terminal) return false;
+	return input.operatorAuthorized || input.submission.connectionId === input.connectionId;
+}
+
 export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
@@ -5054,7 +5139,11 @@ export function createNotificationsExtension(
 		};
 
 		type HostConnectionIncarnation = { generation: number; closed: boolean };
-		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
+		type HostCapabilityCacheEntry = {
+			generation: number;
+			capabilities: ReadonlySet<string>;
+			nativeConfirmed: ReadonlySet<string>;
+		};
 		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
 		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
 		const hostAttachedConnections = new Set<string>();
@@ -5068,12 +5157,28 @@ export function createNotificationsExtension(
 			hostConnectionIncarnations.set(connectionId, incarnation);
 			return incarnation;
 		};
-		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
+		const rememberHostCapabilities = (
+			connectionId: string,
+			capabilities: readonly string[],
+			source: "replay" | "native",
+		): void => {
 			const incarnation = liveHostConnection(connectionId);
 			if (!incarnation) return;
+			const previous = hostCapCache.get(connectionId);
+			const merged =
+				previous?.generation === incarnation.generation ? new Set(previous.capabilities) : new Set<string>();
+			const nativeConfirmed =
+				previous?.generation === incarnation.generation ? new Set(previous.nativeConfirmed) : new Set<string>();
+			for (const capability of capabilities) merged.add(capability);
+			// Replay claims enable stream routing immediately, but only native snapshots
+			// can remove a socket from host demand. Merge delayed snapshots monotonically.
+			if (source === "native") {
+				for (const capability of capabilities) nativeConfirmed.add(capability);
+			}
 			hostCapCache.set(connectionId, {
 				generation: incarnation.generation,
-				capabilities: new Set(capabilities),
+				capabilities: merged,
+				nativeConfirmed,
 			});
 		};
 		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
@@ -5815,7 +5920,7 @@ export function createNotificationsExtension(
 			);
 		};
 		const emitPromptEvent = (event: AgentSessionEvent) => {
-			if (!runtime) return;
+			if (!runtime || runtime.stopping || runtime.serverStopped || runtimes.get(id) !== runtime) return;
 			cleanupPromptRecords();
 			const handle = ctx.getActivePromptHandle();
 			const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
@@ -5828,12 +5933,14 @@ export function createNotificationsExtension(
 				)
 			)
 				correlations.unshift(root);
+			const owners = new Set<string>();
 			for (const correlation of correlations) {
 				// Renewal is attributed exactly like the correlated delivery below.
 				renewPromptDeadline(correlation, event);
 				noteToolDispatchBoundary(correlation, event);
 				const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 				if (!submission || submission.abandoned) continue;
+				owners.add(submission.connectionId);
 				const frame = {
 					type: "event",
 					kind: event.type,
@@ -5845,6 +5952,25 @@ export function createNotificationsExtension(
 					continue;
 				}
 				deliverCorrelatedFrame(submission, frame);
+			}
+			// Broker-created hosts use this bus, not the SDK-only extension. Observers
+			// must opt into BOTH capabilities and receive no other client's correlation.
+			// Keep cumulative partialResult snapshots and authoritative final result
+			// intact, and off the durable lifecycle replay ring, like owner content.
+			for (const connectionId of sdkRuntime?.connectionIdsWithCapabilities([
+				TURN_STREAM_CAPABILITY,
+				SESSION_HOST_OBSERVER_CAPABILITY,
+			]) ?? []) {
+				if (owners.has(connectionId)) continue;
+				try {
+					sdkRuntime?.sendFrameTo(connectionId, {
+						type: "event",
+						kind: event.type,
+						payload: toAgentWireEventPayload(event),
+					});
+				} catch {
+					// Content delivery is best-effort and must not interrupt execution.
+				}
 			}
 		};
 		/**
@@ -6727,7 +6853,14 @@ export function createNotificationsExtension(
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
-			async (connectionId, scope, idempotencyKey, preflightCancel, noOtherConnectionPreflights) => {
+			async (
+				connectionId,
+				scope,
+				idempotencyKey,
+				preflightCancel,
+				noOtherConnectionPreflights,
+				operatorAuthorized = false,
+			) => {
 				// Capture the steering snapshot at ADMISSION (before the durable
 				// marker transaction): client steering admitted while the abort
 				// is in flight classifies as post-snapshot and is preserved at
@@ -7089,9 +7222,9 @@ export function createNotificationsExtension(
 						return "failed";
 					}
 				};
-				let active = [...promptSubmissions.entries()].find(
-					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-				);
+				const addresses = (submission: TerminalAbortSubmissionScope): boolean =>
+					terminalAbortAddressesSubmission({ connectionId, operatorAuthorized, submission });
+				let active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 				if (!active) {
 					// DURABLY reserve the key even for a no-active-turn abort: the
 					// generic idempotency cache is in-memory only, so after restart
@@ -7121,9 +7254,7 @@ export function createNotificationsExtension(
 					// and the durable no-effect row would block a same-key retry from
 					// stopping it — fall through to the pre-run / active fencing path
 					// when a submission now exists (review thread P1).
-					active = [...promptSubmissions.entries()].find(
-						([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-					);
+					active = [...promptSubmissions.entries()].find(([, submission]) => addresses(submission));
 					if (!active) {
 						// Close the remaining acceptance race: cancel the requester's
 						// preflights HERE, in the same synchronous region as the
@@ -8287,6 +8418,7 @@ export function createNotificationsExtension(
 				string,
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
+			awaitingInput: new Map(),
 			deferredInboundControls: [],
 		};
 		const initializedRuntime = runtime;
@@ -8407,6 +8539,13 @@ export function createNotificationsExtension(
 						return;
 					}
 					if (typedFrame.type === "event_replay") {
+						const capabilities = typedFrame.capabilities;
+						if (
+							Array.isArray(capabilities) &&
+							capabilities.every((capability: unknown) => typeof capability === "string")
+						) {
+							rememberHostCapabilities(inbound.connectionId, capabilities as string[], "replay");
+						}
 						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
@@ -8451,7 +8590,7 @@ export function createNotificationsExtension(
 				const negotiated = tuple?.[1] ?? capabilities;
 				if (typeof id !== "string" || !Array.isArray(negotiated)) return;
 				const normalized = negotiated.filter((capability): capability is string => typeof capability === "string");
-				rememberHostCapabilities(id, normalized);
+				rememberHostCapabilities(id, normalized, "native");
 				if (liveHostCapabilities(id) === undefined) return;
 				hostAttachedConnections.add(id);
 				negotiatedCapabilitiesHandler?.(id, normalized);
@@ -8994,8 +9133,10 @@ export function createNotificationsExtension(
 				attachedClients: () => server.clientCount(),
 				observerClients: () => {
 					if (workLease.isHeld()) return 0;
-					const observers = [...hostCapCache.keys()].filter(connectionId =>
-						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					const observers = [...hostCapCache.entries()].filter(
+						([connectionId, entry]) =>
+							liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY) &&
+							entry.nativeConfirmed.has(SESSION_HOST_OBSERVER_CAPABILITY),
 					).length;
 					return Math.min(server.clientCount(), observers);
 				},
@@ -9450,6 +9591,7 @@ export function createNotificationsExtension(
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
 			flushPendingSettled(runtime, runtime.id);
+			deliverAwaitingInput(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		reproveOwnership: async binding => {
@@ -10351,8 +10493,18 @@ export function createNotificationsExtension(
 	});
 
 	api.on("tool_execution_update", (event, ctx) => {
-		const rt = runtimes.get(sessionId(ctx));
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
+		if (!rt) return;
+		const awaitingInput = readAwaitingInput(event.partialResult);
+		if (!awaitingInput || rt.awaitingInput.has(event.toolCallId)) return;
+		// Notify-only and content-free (prompt kind only, never the URL or code), so
+		// it is delivered under redaction exactly like the idle marker. While policy
+		// is provisional it stays pending; activation delivers it if the call is
+		// still running.
+		rt.awaitingInput.set(event.toolCallId, { toolName: event.toolName, kind: awaitingInput.kind, delivered: false });
+		deliverAwaitingInput(rt, id);
 	});
 
 	api.on("tool_execution_end", (event, ctx) => {
@@ -10360,6 +10512,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.emitPromptEvent(event);
+		rt.awaitingInput.delete(event.toolCallId);
 		const inFlight = rt.inFlightTools.get(event.toolCallId);
 		if (!inFlight) return;
 		if (!rt.notificationsActive) {

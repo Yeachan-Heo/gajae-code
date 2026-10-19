@@ -237,8 +237,8 @@ function assertManagedParentSync(localRoot: string): void {
 }
 
 /**
- * Rebind a pinned root only when this call created it because the path was
- * absent. An already-present directory must still be the pinned one.
+ * Keep a pinned root unless a changed inode is validated as a settled
+ * recreation. A root created by this call may be rebound after migration.
  */
 function acceptManagedRootForInit(
 	localRoot: string,
@@ -250,6 +250,7 @@ function acceptManagedRootForInit(
 		if (sameManagedRoot(rootStat, recorded)) return;
 		const pending = pendingCreatedRoots.get(localRoot);
 		if (pending && sameManagedRoot(rootStat, pending)) return;
+		if (isSettledRecreatedManagedRoot(localRoot, rootStat)) return;
 		throw new Error("Unsafe local:// root");
 	}
 	if (recorded || adoptedExisting) {
@@ -257,6 +258,28 @@ function acceptManagedRootForInit(
 		return;
 	}
 	if (isUnsafeDirectory(rootStat)) throw new Error("Unsafe local:// root");
+}
+
+/**
+ * A pinned root whose inode changed is still ours when a gjc initializer
+ * completed it: the temp sweeper (or `gjc gc`) removed the directory and
+ * another process for the same session recreated it, writing a settled
+ * migration marker. POSIX owner and write-bit checks on the root and parent
+ * protect this exception. Windows changed-inode adoption stays fail-closed
+ * until this path validates the replacement's identity and ACLs.
+ */
+function isSettledRecreatedManagedRoot(localRoot: string, rootStat: DirectoryIdentityStat): boolean {
+	if (process.platform === "win32") return false;
+	try {
+		assertAdoptedManagedRoot(rootStat);
+		assertManagedParentSync(localRoot);
+		const marker = path.join(localRoot, LEGACY_MIGRATION_MARKER);
+		const markerStat = fsSync.lstatSync(marker);
+		if (!markerStat.isFile() || markerStat.isSymbolicLink()) return false;
+		return isSettledMigrationMarkerValue(fsSync.readFileSync(marker, "utf8"));
+	} catch {
+		return false;
+	}
 }
 
 const LEGACY_MIGRATION_MARKER = ".gjc-local-legacy-migrated-v1";
@@ -714,7 +737,9 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 				return;
 			}
 			const pending = pendingCreatedRoots.get(localRoot);
-			if (!(pending && sameManagedRoot(present, pending))) throw new Error("Unsafe local:// root");
+			if (!(pending && sameManagedRoot(present, pending)) && !isSettledRecreatedManagedRoot(localRoot, present)) {
+				throw new Error("Unsafe local:// root");
+			}
 		}
 	}
 	const scratchParent = path.dirname(localRoot);

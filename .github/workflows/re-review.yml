@@ -1,0 +1,252 @@
+name: Re-request Review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  request-review-on-comment:
+    name: Re-request review via comment
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check authorization and comment format
+        id: authorize
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          result-encoding: string
+          script: |
+            const comment = context.payload.comment;
+
+            // Check if this is a PR (issue_comment doesn't include pull_request directly)
+            // We need to fetch the PR using the issue number
+            if (!context.payload.issue.pull_request) {
+              return 'not-pr';
+            }
+
+            // Match the exact command so similarly prefixed text cannot notify reviewers.
+            if (comment.body.trim() !== '/re-review') {
+              return 'no-match';
+            }
+
+            // Fetch full PR details by issue number
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const commentAuthor = comment.user.login;
+            const prAuthor = pr.data.user?.login;
+
+            // Check if comment author is PR author
+            if (prAuthor && commentAuthor === prAuthor) {
+              return 'authorized';
+            }
+
+            // Check if comment author has admin, maintain, or write permission
+            try {
+              const collaborator = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: commentAuthor,
+              });
+
+              const permission = collaborator.data.permission;
+              if (permission === 'admin' || permission === 'maintain' || permission === 'write') {
+                return 'authorized';
+              }
+            } catch (error) {
+              if (error.status === 404) {
+                return 'unauthorized';
+              }
+              throw error;
+            }
+
+            return 'unauthorized';
+
+      - name: Get reviewers to re-request
+        if: steps.authorize.outputs.result == 'authorized'
+        id: get-reviewers
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          result-encoding: string
+          script: |
+            // Fetch full PR details by issue number
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            const prAuthor = pr.data.user?.login;
+
+            // Get all reviews on the PR with pagination
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.data.number,
+            });
+
+            // Get currently requested reviewers
+            const currentlyRequested = new Set(
+              pr.data.requested_reviewers.map(r => r.login)
+            );
+
+            // Find reviewers with CHANGES_REQUESTED or COMMENTED (latest review only)
+            function latestReviewByUser(reviews, prAuthor) {
+              const reviewerMap = new Map();
+
+              for (const review of reviews) {
+                if (!review.user) {
+                  continue;
+                }
+
+                const reviewer = review.user.login;
+
+                // GitHub does not allow a pull-request author to be requested
+                // as a reviewer, even when they submitted a self-review.
+                if (reviewer === prAuthor) {
+                  continue;
+                }
+
+                // Skip bots (check if user type is Bot)
+                if (review.user.type === 'Bot') {
+                  continue;
+                }
+
+                // Reviews are returned chronologically. Let the later response
+                // win when timestamps share the same second.
+                if (!reviewerMap.has(reviewer)) {
+                  reviewerMap.set(reviewer, review);
+                } else {
+                  const existing = reviewerMap.get(reviewer);
+                  if (new Date(review.submitted_at) >= new Date(existing.submitted_at)) {
+                    reviewerMap.set(reviewer, review);
+                  }
+                }
+              }
+
+              return reviewerMap;
+            }
+
+            const reviewerMap = latestReviewByUser(reviews, prAuthor);
+
+            // Find reviewers whose latest review is CHANGES_REQUESTED or COMMENTED
+            // and who are not currently requested
+            const reviewersToRequest = [];
+            for (const [reviewer, review] of reviewerMap) {
+              if (
+                (review.state === 'CHANGES_REQUESTED' || review.state === 'COMMENTED') &&
+                !currentlyRequested.has(reviewer)
+              ) {
+                reviewersToRequest.push(reviewer);
+              }
+            }
+
+            function canRequestReviewer(permission) {
+              return ['admin', 'maintain', 'write', 'triage', 'read'].includes(permission);
+            }
+
+            // GitHub permits review requests for users with repository read
+            // access. A single ineligible user would reject a batch,
+            // so filter candidates before submitting the request.
+            const eligibleReviewers = [];
+            for (const reviewer of reviewersToRequest) {
+              try {
+                const collaborator = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: reviewer,
+                });
+
+                if (canRequestReviewer(collaborator.data.permission)) {
+                  eligibleReviewers.push(reviewer);
+                } else {
+                  console.log(`Skipping ${reviewer}: permission ${collaborator.data.permission} cannot be requested`);
+                }
+              } catch (error) {
+                if (error.status === 404) {
+                  console.log(`Skipping ${reviewer}: no current collaborator access`);
+                  continue;
+                }
+                throw error;
+              }
+            }
+
+            console.log('Eligible reviewers to request:', eligibleReviewers);
+            return JSON.stringify(eligibleReviewers);
+
+      - name: Request reviews
+        id: request-reviewers
+        if: steps.get-reviewers.outcome == 'success' && steps.get-reviewers.outputs.result != '[]'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        env:
+          REVIEWERS_JSON: ${{ steps.get-reviewers.outputs.result }}
+        with:
+          result-encoding: string
+          script: |
+            // Fetch full PR details by issue number
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const reviewers = JSON.parse(process.env.REVIEWERS_JSON);
+
+            // GitHub's dedicated re-request endpoint returned an empty HTTP 500 for every
+            // call on this repository, so use the standard
+            // review-request endpoint, which re-notifies reviewers who already reviewed.
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.data.number,
+                reviewers,
+              });
+            } catch (error) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `Failed to re-request reviews from ${reviewers.join(', ')}: ${error.message}`,
+              });
+              throw error;
+            }
+
+      - name: React to comment on success
+        if: steps.get-reviewers.outcome == 'success' && steps.get-reviewers.outputs.result != '[]'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const comment = context.payload.comment;
+
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: comment.id,
+              content: '+1',
+            });
+
+      - name: Reply to comment on no-op
+        if: steps.get-reviewers.outcome == 'success' && steps.get-reviewers.outputs.result == '[]'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7
+        with:
+          script: |
+            const comment = context.payload.comment;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'No eligible reviewers to re-request (reviewers with pending feedback may already be requested or lack repository access).',
+            });

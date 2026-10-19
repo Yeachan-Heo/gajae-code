@@ -6,6 +6,7 @@ export type NativePublishReason =
 	| "atomic_unavailable"
 	| "cross_device"
 	| "permission_denied"
+	| "access_denied"
 	| "io_failure"
 	| "interrupted"
 	| "invalid_request"
@@ -77,6 +78,7 @@ const reasons = new Set<NativePublishReason>([
 	"atomic_unavailable",
 	"cross_device",
 	"permission_denied",
+	"access_denied",
 	"io_failure",
 	"interrupted",
 	"invalid_request",
@@ -109,6 +111,7 @@ const preMutationReasons = new Set<NativePublishReason>([
 	"atomic_unavailable",
 	"cross_device",
 	"permission_denied",
+	"access_denied",
 	"io_failure",
 	"interrupted",
 	"invalid_request",
@@ -184,11 +187,12 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 					"atomic_unavailable",
 					"cross_device",
 					"permission_denied",
+					"access_denied",
 					"io_failure",
 					"interrupted",
 				].includes(outcome.reason)) ||
 				(outcome.phase === "preflight" &&
-					!["atomic_unavailable", "cross_device", "interrupted"].includes(outcome.reason)) ||
+					!["atomic_unavailable", "cross_device", "interrupted", "access_denied"].includes(outcome.reason)) ||
 				(outcome.phase === "file_sync" && outcome.reason === "io_failure"))
 		);
 	if (outcome.mutationState === "unknown")

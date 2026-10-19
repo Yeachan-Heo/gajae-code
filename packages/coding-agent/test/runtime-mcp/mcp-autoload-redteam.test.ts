@@ -104,7 +104,8 @@ describe("red-team: conventional MCP autoload", () => {
 			agentDir,
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({}),
+			// Project stdio autoload requires an explicit user opt-in.
+			settings: Settings.isolated({ "mcp.enableProjectConfig": true }),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
 			skills: [],
@@ -227,36 +228,40 @@ describe("red-team: conventional MCP autoload", () => {
 		const fixturesRoot = path.join(import.meta.dir, "..", "fixtures", "gjc-plugins");
 		const mcpBundle = path.join(fixturesRoot, "valid-mcp-bundle");
 
-		it("--no-mcp (enableMcpAutoload: false) suppresses conventional registrations but keeps plugin-bundle MCPs", async () => {
-			const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
-			expect(r.ok).toBe(true);
-			// Conventional registration in the same project.
-			await runMCPCommand({
-				action: "add",
-				name: "solo",
-				commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
-				flags: { project: true, timeout: 5_000 },
-				cwd: projectDir,
-			});
+		it.skipIf(process.platform !== "linux")(
+			"--no-mcp (enableMcpAutoload: false) suppresses conventional registrations but keeps plugin-bundle MCPs",
+			async () => {
+				const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
+				expect(r.ok).toBe(true);
+				// Conventional registration in the same project.
+				await runMCPCommand({
+					action: "add",
+					name: "solo",
+					commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+					flags: { project: true, timeout: 5_000 },
+					cwd: projectDir,
+				});
 
-			const { session, mcpManager } = await createAgentSession({
-				...isolatedSessionOptions(),
-				enableMcpAutoload: false,
-			});
-			try {
-				// Plugin-bundle server still connects: --no-mcp only gates the
-				// conventional `.gjc` scopes.
-				expect(mcpManager).toBeDefined();
-				expect(mcpManager?.getConnectedServers()).toEqual(["domain_docs"]);
-				expect(mcpManager?.getSource("domain_docs")?.provider).toBe("gjc-plugins");
-				// The conventional registration is NOT connected.
-				expect(mcpManager?.getConnectedServers()).not.toContain("solo");
-				expect(session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
-				expect(session.getAllToolNames().filter(name => name.startsWith("mcp__solo"))).toEqual([]);
-			} finally {
-				await session.dispose();
-			}
-		}, 30_000);
+				const { session, mcpManager } = await createAgentSession({
+					...isolatedSessionOptions(),
+					enableMcpAutoload: false,
+				});
+				try {
+					// Plugin-bundle server still connects: --no-mcp only gates the
+					// conventional `.gjc` scopes.
+					expect(mcpManager).toBeDefined();
+					expect(mcpManager?.getConnectedServers()).toEqual(["domain_docs"]);
+					expect(mcpManager?.getSource("domain_docs")?.provider).toBe("gjc-plugins");
+					// The conventional registration is NOT connected.
+					expect(mcpManager?.getConnectedServers()).not.toContain("solo");
+					expect(session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
+					expect(session.getAllToolNames().filter(name => name.startsWith("mcp__solo"))).toEqual([]);
+				} finally {
+					await session.dispose();
+				}
+			},
+			30_000,
+		);
 
 		it("keeps a mixed manager reconnectable while cached conventional tools are published", async () => {
 			const pluginBundlePath = path.join(projectDir, "mixed-reconnect-plugin");
@@ -858,49 +863,54 @@ describe("red-team: conventional MCP autoload", () => {
 			}
 		});
 
-		it("plugin-bundle MCPs override conventional entries on name collisions; both load otherwise", async () => {
-			const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
-			expect(r.ok).toBe(true);
-			// Conventional entry colliding with the plugin's domain_docs, plus a
-			// non-colliding conventional entry.
-			await runMCPCommand({
-				action: "add",
-				name: "domain_docs",
-				commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
-				flags: { project: true, timeout: 5_000 },
-				cwd: projectDir,
-			});
-			await runMCPCommand({
-				action: "add",
-				name: "solo",
-				commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
-				flags: { project: true, timeout: 5_000 },
-				cwd: projectDir,
-			});
+		it.skipIf(process.platform !== "linux")(
+			"plugin-bundle MCPs override conventional entries on name collisions; both load otherwise",
+			async () => {
+				const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
+				expect(r.ok).toBe(true);
+				// Conventional entry colliding with the plugin's domain_docs, plus a
+				// non-colliding conventional entry.
+				await runMCPCommand({
+					action: "add",
+					name: "domain_docs",
+					commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+					flags: { project: true, timeout: 5_000 },
+					cwd: projectDir,
+				});
+				await runMCPCommand({
+					action: "add",
+					name: "solo",
+					commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+					flags: { project: true, timeout: 5_000 },
+					cwd: projectDir,
+				});
 
-			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
-			try {
-				expect(mcpManager).toBeDefined();
-				expect(mcpManager?.getConnectedServers().sort()).toEqual(["domain_docs", "solo"]);
-				// The winning domain_docs connection is the plugin-bundle one
-				// (adapter boundary: noInheritEnv true, cwd pinned to plugin root).
-				expect(mcpManager?.getSource("domain_docs")?.provider).toBe("gjc-plugins");
-				const connection = mcpManager?.getConnection("domain_docs");
-				expect(connection?.config.type).toBe("stdio");
-				if (connection?.config.type === "stdio") {
-					expect(connection.config.noInheritEnv).toBe(true);
-					expect(connection.config.cwd).toContain("valid-mcp-bundle");
+				const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+				try {
+					expect(mcpManager).toBeDefined();
+					expect(mcpManager?.getConnectedServers().sort()).toEqual(["domain_docs", "solo"]);
+					// The winning domain_docs connection is the plugin-bundle one
+					// (adapter boundary: noInheritEnv true, cwd pinned to plugin root).
+					expect(mcpManager?.getSource("domain_docs")?.provider).toBe("gjc-plugins");
+					const connection = mcpManager?.getConnection("domain_docs");
+					expect(connection?.config.type).toBe("stdio");
+					if (connection?.config.type === "stdio") {
+						expect(connection.config.noInheritEnv).toBe(true);
+						expect(connection.config.cwd).toContain("valid-mcp-bundle");
+					}
+					// Both servers' tools are always-on.
+					expect(session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
+					expect(session.getAllToolNames()).toContain("mcp__solo_hello");
+					// Plugin presence seals the connection set (fixed session lifetime).
+					for (let attempt = 0; attempt < 50 && !mcpManager?.isConnectionSetSealed(); attempt++)
+						await Bun.sleep(10);
+					expect(mcpManager?.isConnectionSetSealed()).toBe(true);
+				} finally {
+					await session.dispose();
 				}
-				// Both servers' tools are always-on.
-				expect(session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
-				expect(session.getAllToolNames()).toContain("mcp__solo_hello");
-				// Plugin presence seals the connection set (fixed session lifetime).
-				for (let attempt = 0; attempt < 50 && !mcpManager?.isConnectionSetSealed(); attempt++) await Bun.sleep(10);
-				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
-			} finally {
-				await session.dispose();
-			}
-		}, 30_000);
+			},
+			30_000,
+		);
 	});
 
 	describe("disabledServers / enabled:false / autoload:false at the runtime boundary", () => {
@@ -990,23 +1000,31 @@ describe("red-team: conventional MCP autoload", () => {
 	});
 
 	describe("sealed plugin sessions and re-discovery", () => {
-		it("a session manager with plugin-bundle MCPs is sealed: re-discovery (the /mcp reload surface) is refused", async () => {
-			const fixturesRoot = path.join(import.meta.dir, "..", "fixtures", "gjc-plugins");
-			const r = await installGjcBundle({ cwd: projectDir }, "project", path.join(fixturesRoot, "valid-mcp-bundle"));
-			expect(r.ok).toBe(true);
-
-			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
-			try {
-				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
-				// /mcp reload -> discoverAndConnect({ nativeOnly: true }) must not
-				// silently re-run discovery on a sealed manager.
-				await expect(mcpManager?.discoverAndConnect({ nativeOnly: true })).rejects.toThrow(
-					"connection set is sealed",
+		it.skipIf(process.platform !== "linux")(
+			"a session manager with plugin-bundle MCPs is sealed: re-discovery (the /mcp reload surface) is refused",
+			async () => {
+				const fixturesRoot = path.join(import.meta.dir, "..", "fixtures", "gjc-plugins");
+				const r = await installGjcBundle(
+					{ cwd: projectDir },
+					"project",
+					path.join(fixturesRoot, "valid-mcp-bundle"),
 				);
-			} finally {
-				await session.dispose();
-			}
-		}, 30_000);
+				expect(r.ok).toBe(true);
+
+				const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+				try {
+					expect(mcpManager?.isConnectionSetSealed()).toBe(true);
+					// /mcp reload -> discoverAndConnect({ nativeOnly: true }) must not
+					// silently re-run discovery on a sealed manager.
+					await expect(mcpManager?.discoverAndConnect({ nativeOnly: true })).rejects.toThrow(
+						"connection set is sealed",
+					);
+				} finally {
+					await session.dispose();
+				}
+			},
+			30_000,
+		);
 
 		it("a conventional-only session manager stays mutable so /mcp reload can re-discover", async () => {
 			await writeProjectConfig(".gjc/mcp.json", {

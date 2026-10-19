@@ -790,6 +790,38 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		expect(await fs.readFile(source, "utf8")).toBe("candidate-bytes");
 	});
 
+	it("reports a denied staged-source open as a pre-mutation access denial, not an owner mismatch", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged");
+		const destination = path.join(root, "published");
+		const user = process.env.USERNAME;
+		if (!user) throw new Error("Missing Windows username");
+		await fs.mkdir(source);
+		await fs.writeFile(path.join(source, "info"), "owner");
+		// Deny DELETE on the source and DELETE_CHILD on its parent so the
+		// publisher's DELETE-access source open fails with STATUS_ACCESS_DENIED.
+		await runIcacls(source, "/deny", `${user}:(DE)`);
+		await runIcacls(root, "/deny", `${user}:(DC)`);
+
+		try {
+			expect(renameNoReplacePath(source, destination)).toEqual({
+				ok: false,
+				code: "access_denied",
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "access_denied",
+				primitive: "windows_rename_noreplace",
+				phase: "rename",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			});
+		} finally {
+			await runIcacls(root, "/remove:d", user);
+			await runIcacls(source, "/remove:d", user);
+		}
+		expect(await fs.readFile(path.join(source, "info"), "utf8")).toBe("owner");
+		await expect(fs.stat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("does not delete a replacement when exact handle identity differs", async () => {
 		const root = await temporaryDirectory();
 		const file = path.join(root, "replacement.jsonl");

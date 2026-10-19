@@ -82,13 +82,14 @@ describe("issue #5497: session startup loads filesystem extension modules", () =
 		disableExtensionDiscovery?: boolean;
 		additionalExtensionPaths?: string[];
 		settingsOverrides?: Parameters<typeof Settings.isolated>[0];
+		settings?: Settings;
 		preloadedExtensions?: LoadExtensionsResult;
 	}) =>
 		await createAgentSession({
 			cwd: tempDir,
 			agentDir: sessionAgentDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(options.settingsOverrides ?? {}),
+			settings: options.settings ?? Settings.isolated(options.settingsOverrides ?? {}),
 			disableExtensionDiscovery: options.disableExtensionDiscovery,
 			additionalExtensionPaths: options.additionalExtensionPaths,
 			preloadedExtensions: options.preloadedExtensions,
@@ -194,9 +195,21 @@ describe("issue #5497: session startup loads filesystem extension modules", () =
 		}
 	}, 30_000);
 
-	it("loads a project-scope module from <cwd>/.gjc/extensions", async () => {
+	it("does not import a repository module from <cwd>/.gjc/extensions", async () => {
 		const entry = installProbe(path.join(tempDir, ".gjc"));
 		const { session, extensionsResult } = await createSession({});
+
+		try {
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).not.toContain(entry);
+			expect(session.extensionRunner?.hasHandlers("input")).not.toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("still loads an explicit path under <cwd>/.gjc/extensions", async () => {
+		const entry = installProbe(path.join(tempDir, ".gjc"));
+		const { session, extensionsResult } = await createSession({ additionalExtensionPaths: [entry] });
 
 		try {
 			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).toContain(entry);
@@ -206,6 +219,44 @@ describe("issue #5497: session startup loads filesystem extension modules", () =
 			});
 		} finally {
 			await session.dispose();
+		}
+	}, 30_000);
+
+	const projectNamedExtension = async (): Promise<{ settings: Settings; userEntry: string; projectEntry: string }> => {
+		const userEntry = installProbe();
+		const namedDir = path.join(tempDir, "project-named");
+		fs.mkdirSync(namedDir, { recursive: true });
+		const projectEntry = path.join(namedDir, "index.ts");
+		fs.writeFileSync(projectEntry, PROBE_MODULE);
+		fs.mkdirSync(path.join(tempDir, ".gjc"), { recursive: true });
+		fs.writeFileSync(path.join(tempDir, ".gjc", "settings.json"), JSON.stringify({ extensions: [projectEntry] }));
+		const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: sessionAgentDir });
+		return { settings, userEntry, projectEntry };
+	};
+
+	it("does not import a module named only by project settings.json extensions", async () => {
+		const { settings, projectEntry } = await projectNamedExtension();
+		const { session, extensionsResult } = await createSession({ settings });
+		try {
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).not.toContain(projectEntry);
+		} finally {
+			await session.dispose();
+			await settings.close();
+		}
+	}, 30_000);
+
+	it("still loads a user agent extension when project settings.json names another module", async () => {
+		const { settings, userEntry } = await projectNamedExtension();
+		const { session, extensionsResult } = await createSession({ settings });
+		try {
+			expect(extensionsResult.extensions.map(extension => extension.resolvedPath)).toContain(userEntry);
+			await expect(session.extensionRunner?.emitInput("ooo status", undefined, "interactive")).resolves.toEqual({
+				handled: true,
+				text: HANDLED_TEXT,
+			});
+		} finally {
+			await session.dispose();
+			await settings.close();
 		}
 	}, 30_000);
 

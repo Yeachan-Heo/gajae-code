@@ -27,7 +27,12 @@ export interface BuildReportInput {
 
 export function buildReport(input: BuildReportInput): MigrateReport {
 	const total = emptyStatusCounts();
-	const byType = { mcp: emptyStatusCounts(), skill: emptyStatusCounts(), source: emptyStatusCounts() };
+	const byType = {
+		mcp: emptyStatusCounts(),
+		skill: emptyStatusCounts(),
+		instruction: emptyStatusCounts(),
+		source: emptyStatusCounts(),
+	};
 	const bySource = {} as Record<MigrateSource, StatusCounts>;
 	for (const source of input.sources) bySource[source] = emptyStatusCounts();
 
@@ -75,10 +80,22 @@ export function renderHuman(report: MigrateReport): string {
 	const mode = report.dryRun ? " (dry-run)" : "";
 	lines.push(`gjc migrate${mode}: ${report.ok ? "ok" : "completed with failures"}`);
 	lines.push(`Sources: ${report.sources.join(", ") || "none"}`);
-	lines.push(`Destination: mcp=${report.destinations.mcpConfigPath} skills=${report.destinations.skillsDir}`);
+	lines.push(
+		`Destination: mcp=${report.destinations.mcpConfigPath} skills=${report.destinations.skillsDir} instructions=${report.destinations.instructionsPath}`,
+	);
 	lines.push("");
 	lines.push(`MCP:    ${summarizeCounts(report.summary.byType.mcp)}`);
 	lines.push(`Skills: ${summarizeCounts(report.summary.byType.skill)}`);
+	lines.push(`Instructions: ${summarizeCounts(report.summary.byType.instruction)}`);
+	const instructionActions = report.actions.filter(action => action.type === "instruction");
+	if (instructionActions.length > 0) {
+		lines.push("Instruction files:");
+		for (const action of instructionActions) {
+			lines.push(
+				`  - [${action.source}] ${action.name ?? "AGENTS.md"}: ${action.status}${action.reason ? ` (${action.reason})` : ""}`,
+			);
+		}
+	}
 	if (Object.values(report.summary.byType.source).some(n => n > 0)) {
 		lines.push(`Source: ${summarizeCounts(report.summary.byType.source)}`);
 	}

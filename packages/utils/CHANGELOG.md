@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.18.12] - 2026-10-16
+
+### Fixed
+
+- Crash logs redact a stack before splitting it. When the stack starts with `name: message`, or with a name-only header for an empty message, and no credential replacement crosses that boundary, only the header is flattened and later frame lines stay. If a credential crosses the boundary, or the stack has another shape, the redacted stack is one field so the credential is still removed. The record fingerprint is computed from that stored diagnostic, so recovery can rebind it.
+
+- Crash text now masks an `AWS_SECRET_ACCESS_KEY` value, a bare 40-character AWS secret, and a percent-encoded `sessionid` cookie.
+
+- Project dotenv loading includes the development env file and its local overlay when `NODE_ENV` is unset, and the provenance snapshot uses that same file list so those values stay project-controlled. The manual fallback preserves Bun-style variable interpolation.
+
+- A project `.env` can no longer set `GJC_HARNESS_SOCKET_DIR` or `GJC_HARNESS_ROOT_REGISTRY_DIR`. A different literal shell value is kept. A shell value that matches the project declaration, or a dynamic project declaration, is dropped. A double-quoted escape Bun decodes is treated as dynamic and dropped the same way.
+
+- A project `.env` can no longer make bash tool commands run repository code. `BASH_ENV`/`ENV` and `ZDOTDIR` (shell startup files), `GIT_CONFIG_*`/`GIT_CONFIG_PARAMETERS`, `XDG_CONFIG_HOME`, `HOME`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `GIT_DIR`/`GIT_COMMON_DIR` (all of which can supply e.g. `core.fsmonitor`, which git executes during `git status`), `GIT_EXEC_PATH`, `GIT_PROXY_COMMAND`, `GIT_TEMPLATE_DIR`, and `GIT_EXTERNAL_DIFF`/`GIT_SSH`/`GIT_SSH_COMMAND`/`GIT_ASKPASS`/`GIT_SEQUENCE_EDITOR` are dropped from the bash tool's isolated shell worker chain, the in-process native shell used on Windows, and interactive PTY sessions when the project declares them. If removing a project home selector leaves `HOME` unset, GJC supplies the trusted account home when available, preventing Git for Windows from falling back to a project-controlled profile. A value exported by the launching shell is kept, except when the project declares the same key with the same value or dynamically: provenance is then ambiguous and the variable is dropped, as for credentials. Python kernels keep their documented environment.
+
+- The bash tool's shell processes now also drop project-provided `NODE_OPTIONS`, `PYTHONPATH`, `PYTHONUSERBASE`, `PYTHONSTARTUP`, `PERL5OPT`, `PERL5LIB`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, and the `DYLD_*_LIBRARY_PATH`/`DYLD_*_FRAMEWORK_PATH` search overrides when the value comes from the project `.env`, so a repository cannot make `node`, `python3`, `perl`, `java`, or any dynamically linked command run repository code; values the launching shell exported are still honored.
+
 ## [0.18.11] - 2026-10-12
 
 ## [0.18.10] - 2026-10-12

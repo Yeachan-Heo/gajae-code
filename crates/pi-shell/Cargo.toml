@@ -35,3 +35,6 @@ libc.workspace = true
 smallvec.workspace = true
 windows-sys.workspace = true
 winreg.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

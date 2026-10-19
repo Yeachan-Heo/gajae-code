@@ -791,7 +791,14 @@ export async function discoverAndLoadExtensions(
 		...(options.profileAuthority === undefined ? {} : { profileAuthority: options.profileAuthority }),
 		...(options.settings === undefined ? {} : { settings: options.settings }),
 	});
-	for (const ext of discovered.items) {
+	// Filter project modules before first-wins name deduplication. `items` has
+	// already deduplicated, so a project module could otherwise shadow the
+	// same-named user module before being rejected here.
+	const seenDiscoveredNames = new Set<string>();
+	for (const ext of discovered.all) {
+		if (ext._source.provider === "native" && ext.level === "project") continue;
+		if (seenDiscoveredNames.has(ext.name)) continue;
+		seenDiscoveredNames.add(ext.name);
 		if (ext._source.provider !== "native") continue;
 		addPath(ext.path);
 	}

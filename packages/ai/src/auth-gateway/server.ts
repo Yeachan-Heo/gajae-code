@@ -589,8 +589,9 @@ export function redactGatewayStream(events: AssistantMessageEventStream): Assist
 	async function* redactedEvents(): AsyncGenerator<AssistantMessageEvent> {
 		try {
 			for await (const event of events) {
-				if (event.type === "error") yield { ...event, error: redactGatewayMessage(event.error) };
-				else yield event;
+				if (event.type === "error") {
+					yield { type: "error", reason: event.reason, error: redactGatewayMessage(event.error) };
+				} else yield event;
 			}
 		} catch (error) {
 			throw redactGatewayError(error);

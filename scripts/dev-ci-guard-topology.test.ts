@@ -10,6 +10,7 @@ import { parse } from "yaml";
 interface WorkflowStep {
 	name?: string;
 	if?: string;
+	shell?: string;
 	uses?: string;
 	run?: string;
 	env?: Record<string, string>;
@@ -18,6 +19,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
 	name: string;
+	"runs-on"?: string | string[];
 	needs?: string[];
 	if?: string;
 	permissions?: Record<string, "read" | "write" | "none">;
@@ -55,6 +57,13 @@ function requiredJob(document: WorkflowDocument, name: string): WorkflowJob {
 	const job = document.jobs[name];
 	if (!job) throw new Error(`Missing workflow job: ${name}`);
 	return job;
+}
+
+function defaultShellForRunner(runsOn: WorkflowJob["runs-on"]): "bash" | "pwsh" | undefined {
+	const labels = typeof runsOn === "string" ? [runsOn] : (runsOn ?? []);
+	if (labels.some(label => label.toLowerCase().includes("windows"))) return "pwsh";
+	if (labels.some(label => /ubuntu|macos/i.test(label))) return "bash";
+	return undefined;
 }
 
 function requiredEnv(value: WorkflowJob | WorkflowStep): Record<string, string> {
@@ -350,16 +359,36 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		}
 		expect(offenders).toEqual([]);
 	});
-	test("every workflow bun test invocation is guarded by its own exit-code check", async () => {
-		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
-		const lines = source.split(/\r?\n/).map(line => line.trim());
+	test("workflow bun test failures cannot be masked by later PowerShell commands", async () => {
+		const document = await workflow();
 		const offenders: string[] = [];
-		for (let index = 0; index < lines.length; index++) {
-			if (!lines[index]!.startsWith("bun test ")) continue;
-			const next = lines[index + 1] ?? "";
-			// A `pwsh` run block must check $LASTEXITCODE right after each bun test;
-			// otherwise a failure is masked by the next invocation overwriting it.
-			if (next !== "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") offenders.push(lines[index]!);
+		for (const [jobName, job] of Object.entries(document.jobs)) {
+			const defaultShell = defaultShellForRunner(job["runs-on"]);
+			for (const [stepIndex, step] of job.steps.entries()) {
+				if (!step.run) continue;
+				const shell = step.shell ?? defaultShell;
+				const lines = step.run.split(/\r?\n/).map(line => line.trim());
+				if (shell === "bash") continue; // GitHub's Bash runner starts with `-e -o pipefail`.
+				if (shell !== "pwsh") {
+					if (lines.some(line => line.startsWith("bun test "))) {
+						offenders.push(`${jobName}/${step.name ?? stepIndex}: shell is not statically known`);
+					}
+					continue;
+				}
+				for (let index = 0; index < lines.length; index++) {
+					if (!lines[index]!.startsWith("bun test ")) continue;
+					const hasFollowingCommand = lines
+						.slice(index + 1)
+						.some(line => line !== "" && !line.startsWith("#"));
+					if (!hasFollowingCommand) continue; // The final command's exit code is returned by the runner.
+					const next = lines[index + 1] ?? "";
+					// A `pwsh` run block must check $LASTEXITCODE right after each bun test;
+					// otherwise a failure is masked by the next invocation overwriting it.
+					if (next !== "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }") {
+						offenders.push(`${jobName}/${step.name ?? stepIndex}: ${lines[index]}`);
+					}
+				}
+			}
 		}
 		expect(offenders).toEqual([]);
 	});

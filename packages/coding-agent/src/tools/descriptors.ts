@@ -84,6 +84,9 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 	#loader?: () => ToolDescriptorLoadResult;
 	#session?: ToolSession;
 	#loadPromise?: Promise<AgentTool<any, any, any>>;
+	#loadGeneration = 0;
+	#loadToken?: object;
+	#expectedCwd?: string;
 
 	constructor(
 		descriptor: ToolDescriptor,
@@ -97,9 +100,31 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		this.#session = session;
 	}
 
+	/** Clear a session-bound materialization after its owning session moves. */
+	invalidateForSessionMove(expectedCwd?: string): void {
+		this.#loadGeneration++;
+		this.#tool = undefined;
+		this.#loadPromise = undefined;
+		this.#loadToken = undefined;
+		this.#expectedCwd = expectedCwd;
+		if (!this.#loader && this.#session) {
+			const session = this.#session;
+			this.#loader = () => this.descriptor.load(session);
+		}
+	}
+
 	async #get(): Promise<AgentTool<any, any, any>> {
+		const sessionCwd = this.#session?.cwd;
+		if (this.#expectedCwd !== undefined && sessionCwd !== this.#expectedCwd) {
+			throw new ToolError(
+				`Tool "${this.descriptor.metadata.name}" session cwd changed outside a committed move (expected ${this.#expectedCwd}, got ${sessionCwd ?? "unknown"})`,
+			);
+		}
 		if (this.#tool) return this.#tool;
 		if (!this.#loadPromise) {
+			const generation = this.#loadGeneration;
+			const token = {};
+			this.#loadToken = token;
 			const load = this.#loader;
 			this.#loadPromise = Promise.resolve()
 				.then(() => {
@@ -108,11 +133,14 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 				})
 				.then(tool => {
 					if (!tool) throw new ToolError(`Tool "${this.descriptor.metadata.name}" failed to load`);
-					this.#tool = tool;
+					if (generation === this.#loadGeneration && this.#loadToken === token) this.#tool = tool;
 					return tool;
 				})
 				.catch(error => {
-					this.#loadPromise = undefined;
+					if (generation === this.#loadGeneration && this.#loadToken === token) {
+						this.#loadPromise = undefined;
+						this.#loadToken = undefined;
+					}
 					if (error instanceof ToolError) throw error;
 					throw new ToolError(
 						`Tool "${this.descriptor.metadata.name}" failed to load implementation: ${error instanceof Error ? error.message : String(error)}`,
@@ -123,10 +151,14 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 		return this.#loadPromise;
 	}
 
-	/** Materialize this facade for contract tests without exposing it in production dispatch. */
-	async materializeForTests(): Promise<AgentTool<any, any, any>> {
-		return await this.#get();
-	}
+	/**
+	 * Resolve the underlying implementation. Pre-dispatch hooks (TTSR `astCondition`
+	 * matching) call this to read implementation-only members such as the matcher
+	 * hooks before the first `execute` would otherwise load the tool.
+	 * An arrow property (like `execute`) so session guard proxies can forward it
+	 * without losing access to the private loader state.
+	 */
+	readonly materialize = async (): Promise<AgentTool<any, any, any>> => await this.#get();
 
 	get name(): string {
 		return this.#tool?.name ?? this.descriptor.metadata.name;
@@ -218,6 +250,14 @@ export class LazyAgentTool implements AgentTool<any, any, any> {
 	}
 	get mode() {
 		return (this.#tool as any)?.mode;
+	}
+	get matcherDigest() {
+		const digest = this.#tool?.matcherDigest;
+		return digest ? digest.bind(this.#tool) : undefined;
+	}
+	get matcherEntries() {
+		const entries = this.#tool?.matcherEntries;
+		return entries ? entries.bind(this.#tool) : undefined;
 	}
 
 	readonly execute: AgentTool<any, any, any>["execute"] = async (...args) => {

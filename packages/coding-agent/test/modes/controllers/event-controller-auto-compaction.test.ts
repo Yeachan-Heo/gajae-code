@@ -18,6 +18,7 @@ type AutoCompactionFixture = {
 	loadingStop: Mock<() => void>;
 	statusContainerClear: Mock<() => void>;
 	rebuildChatFromMessages: Mock<(policy: "replace-identity" | "reconcile-same-transcript") => void>;
+	refreshSlashCommandState: Mock<() => Promise<void>>;
 };
 
 function createFixture(): AutoCompactionFixture {
@@ -44,6 +45,9 @@ function createFixture(): AutoCompactionFixture {
 	const rebuildChatFromMessages = vi.fn((policy: "replace-identity" | "reconcile-same-transcript") => {
 		order.push(`rebuildChatFromMessages:${policy}`);
 	});
+	const refreshSlashCommandState = vi.fn(async () => {
+		order.push("refreshSlashCommandState");
+	});
 
 	const ctx = {
 		isInitialized: true,
@@ -52,7 +56,11 @@ function createFixture(): AutoCompactionFixture {
 		autoCompactionLoader: { stop: loaderStop },
 		loadingAnimation: { stop: loadingStop },
 		editor: { onEscape: () => order.push("temporaryEscape") },
-		session: { abortCompaction: vi.fn(), retryNow: vi.fn(), abortRetry: vi.fn() },
+		session: {
+			abortCompaction: vi.fn(),
+			retryNow: vi.fn(),
+			abortRetry: vi.fn(),
+		},
 		statusContainer: { clear: statusContainerClear, addChild: vi.fn() },
 		statusLine: {
 			invalidate: vi.fn(() => {
@@ -74,7 +82,11 @@ function createFixture(): AutoCompactionFixture {
 		},
 		showStatus,
 		showWarning,
+		resetIrcSidebarSession: vi.fn(() => {
+			order.push("resetIrcSidebarSession");
+		}),
 		rebuildChatFromMessages,
+		refreshSlashCommandState,
 		flushCompactionQueue,
 		reloadTodos: vi.fn(async () => {
 			order.push("reloadTodos");
@@ -92,6 +104,7 @@ function createFixture(): AutoCompactionFixture {
 		loadingStop,
 		statusContainerClear,
 		rebuildChatFromMessages,
+		refreshSlashCommandState,
 	};
 }
 
@@ -110,6 +123,28 @@ async function runEndEvent(event: AutoCompactionEndEvent): Promise<AutoCompactio
 }
 
 describe("EventController auto-compaction overflow status", () => {
+	it("presents an automatic handoff successor without refreshing metadata", async () => {
+		const fixture = await runEndEvent({
+			type: "auto_compaction_end",
+			action: "handoff",
+			result: undefined,
+			aborted: false,
+			willRetry: false,
+		});
+
+		expect(fixture.refreshSlashCommandState).not.toHaveBeenCalled();
+		expect(fixture.ctx.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+		expect(fixture.rebuildChatFromMessages).toHaveBeenCalledWith("replace-identity");
+		expect(fixture.order.indexOf("resetIrcSidebarSession")).toBeLessThan(
+			fixture.order.indexOf("rebuildChatFromMessages:replace-identity"),
+		);
+		expect(fixture.order.indexOf("rebuildChatFromMessages:replace-identity")).toBeLessThan(
+			fixture.order.indexOf("reloadTodos"),
+		);
+		expect(fixture.showStatus).toHaveBeenCalledWith("Auto-handoff completed");
+		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+	});
+
 	it("stops an active compaction loader during final disposal", () => {
 		const fixture = createFixture();
 		fixture.controller.dispose();

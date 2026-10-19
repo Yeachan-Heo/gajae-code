@@ -455,8 +455,8 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 	});
 });
 
-describe("SqliteAuthCredentialStore.close", () => {
-	it("finalizes outstanding statements before releasing the database", async () => {
+describe("SQLite auth storage disposal", () => {
+	it("finalizes caller-created statements before releasing the database", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "pi-ai-auth-close-"));
 		const database = new Database(path.join(root, "auth.db"));
 		const store = new SqliteAuthCredentialStore(database);
@@ -468,6 +468,75 @@ describe("SqliteAuthCredentialStore.close", () => {
 			outstanding.finalize();
 			store.close();
 			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("closes migrated auth storage before immediate scratch-directory removal", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "pi-ai-auth-close-"));
+		const databasePath = path.join(root, "auth.db");
+		let store: SqliteAuthCredentialStore | undefined;
+		let storage: AuthStorage | undefined;
+		try {
+			const database = new Database(databasePath);
+			try {
+				database.run(`
+					CREATE TABLE auth_schema_version (
+						id INTEGER PRIMARY KEY CHECK (id = 1),
+						version INTEGER NOT NULL
+					);
+					INSERT INTO auth_schema_version (id, version) VALUES (1, 4);
+					CREATE TABLE auth_credentials (
+						id INTEGER PRIMARY KEY AUTOINCREMENT,
+						provider TEXT NOT NULL,
+						credential_type TEXT NOT NULL,
+						data TEXT NOT NULL,
+						disabled_cause TEXT DEFAULT NULL,
+						identity_key TEXT DEFAULT NULL,
+						created_at INTEGER NOT NULL,
+						updated_at INTEGER NOT NULL
+					);
+					INSERT INTO auth_credentials (
+						provider, credential_type, data, disabled_cause, identity_key, created_at, updated_at
+					) VALUES (
+						'anthropic', 'oauth',
+						'{"access":"migration-access","refresh":"migration-refresh","expires":4102444800000,"accountId":"migration-account","email":"migration@example.com"}',
+						NULL, NULL, 1, 1
+					);
+				`);
+			} finally {
+				database.close();
+			}
+
+			const authStore = await SqliteAuthCredentialStore.open(databasePath);
+			store = authStore;
+			const authStorage = new AuthStorage(authStore);
+			storage = authStorage;
+			await authStorage.reload();
+			const migratedRows = authStore.listAuthCredentials("anthropic");
+			expect(migratedRows).toHaveLength(1);
+			expect(authStore.listCredentialRemovalTargets("anthropic")).toEqual([
+				{ id: migratedRows[0]!.id, provider: "anthropic", expectedRevision: 1 },
+			]);
+
+			authStore.saveApiKey("openai", "scratch-api-key");
+			await authStorage.reload();
+			expect(await authStorage.getApiKey("openai")).toBe("scratch-api-key");
+			const targets = authStore.listCredentialRemovalTargets("openai");
+			expect(authStore.removeAuthCredentialsHard("openai", targets)).toEqual({
+				kind: "removed",
+				ids: targets.map(target => target.id),
+			});
+
+			authStorage.close();
+			authStorage.close();
+			await fs.rm(root, { recursive: true });
+		} finally {
+			try {
+				storage?.close();
+			} finally {
+				store?.close();
+				await fs.rm(root, { recursive: true, force: true });
+			}
 		}
 	});
 });

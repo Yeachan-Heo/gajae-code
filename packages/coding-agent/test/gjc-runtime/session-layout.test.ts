@@ -191,4 +191,55 @@ describe("session-resolution (boundary)", () => {
 		const ctx = await detectLatestSession(cwd);
 		expect(ctx.gjcSessionId).toBe("marked");
 	});
+
+	it("still auto-detects a normal session directory", async () => {
+		const cwd = await tempDir();
+		await writeSessionActivityMarker(cwd, "kept", { writer: "test" });
+		const ctx = await resolveGjcSessionForRead(cwd, {});
+		expect(ctx.gjcSessionId).toBe("kept");
+		expect(ctx.source).toBe("latest");
+		expect(ctx.sessionRoot).toBe(sessionRoot(cwd, "kept"));
+	});
+
+	it("still auto-detects a session directory whose name encodes a dot", async () => {
+		const cwd = await tempDir();
+		await writeSessionActivityMarker(cwd, "a.b", { writer: "test" });
+		const ctx = await resolveGjcSessionForRead(cwd, {});
+		expect(ctx.gjcSessionId).toBe("a.b");
+		expect(ctx.source).toBe("latest");
+		expect(ctx.sessionRoot).toBe(sessionRoot(cwd, "a.b"));
+	});
+
+	it("still rejects an explicit session id that is not one path component", () => {
+		expect(() => resolveSessionIdFromSources({ flagValue: ".." })).toThrow(SessionResolutionError);
+		expect(() => resolveSessionIdFromSources({ flagValue: "a/b" })).toThrow(SessionResolutionError);
+		expect(resolveSessionIdFromSources({ flagValue: "kept" })?.gjcSessionId).toBe("kept");
+	});
+
+	it("auto-detects a normal session when a crafted session directory is present", async () => {
+		for (const crafted of ["_session-%2F", "_session-%2E%2E"]) {
+			const cwd = await tempDir();
+			await writeSessionActivityMarker(cwd, "kept", { writer: "test" });
+			await fs.mkdir(path.join(cwd, ".gjc", crafted));
+			const ctx = await resolveGjcSessionForRead(cwd, {});
+			expect(ctx.gjcSessionId).toBe("kept");
+			expect(ctx.source).toBe("latest");
+			expect(ctx.sessionRoot).toBe(sessionRoot(cwd, "kept"));
+		}
+	});
+
+	it("still rejects auto-detect when every session directory decodes unsafe", async () => {
+		for (const crafted of ["_session-%2F", "_session-%2E%2E"]) {
+			const cwd = await tempDir();
+			await fs.mkdir(path.join(cwd, ".gjc", crafted), { recursive: true });
+			let caught: unknown;
+			try {
+				await resolveGjcSessionForRead(cwd, {});
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBeInstanceOf(SessionResolutionError);
+			expect((caught as SessionResolutionError).code).toBe("unsafe_session");
+		}
+	});
 });

@@ -8,7 +8,8 @@
  * - Hooks: Claude `.claude/hooks/<pre|post>/<file>` and Codex flat
  *   `.codex/hooks/<phase>-<tool>.ts|js` conventions, normalized through the
  *   canonical hook IR (`normalizeDirectoryHook`, #4286/#4289) and written to
- *   the runtime-discovered `<root>/hooks/<pre|post>/` layout.
+ *   the canonical `<root>/hooks/<pre|post>/` layout. Project-scope hooks are
+ *   stored-only; ordinary sessions do not load repository hook modules.
  * - MCPs: `normalizeClaudeMcpJson` / `normalizeCodexMcpToml` plus
  *   `validateMCPCompatServer` (#4284 bounded compatibility adapters), merged
  *   through the canonical atomic config writer.
@@ -351,6 +352,11 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 	const entries: ImportPreviewEntry[] = [];
 	const payloads: (NormalizedPayload | undefined)[] = [];
 	const warnings: string[] = [];
+	if (surfaces.includes("hooks") && options.destinationScope === "project") {
+		warnings.push(
+			"Project-scope hooks are stored-only: ordinary sessions do not load repository hook modules. Import hooks into Global .gjc or configure an explicit hook path to activate them.",
+		);
+	}
 	const productName = productLabel(options.product);
 	const sourceLabel = `${productName} ${sourceScopeLabel(options.sourceScope)}`;
 

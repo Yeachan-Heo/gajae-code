@@ -13,7 +13,7 @@
 set -eo pipefail
 
 # Tools expected on PATH (imagemagick is satisfied by `convert` or `magick`).
-required_path_tools=(fd rg tmux gh)
+required_path_tools=(fd rg tmux gh zsh)
 # Development libraries verified via dpkg.
 required_dpkg_libs=(libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev)
 
@@ -46,13 +46,13 @@ fi
 echo "system-deps: missing dependencies detected; installing."
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
    sudo apt-get update
-   sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
+   sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh zsh
    sudo ln -sf $(which fdfind) /usr/local/bin/fd
    sudo ln -sf /usr/bin/convert /usr/local/bin/magick
 else
    echo "sudo unavailable on this runner; skipping apt-based system dependency install."
    echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
-   for tool in fd rg convert tmux gh; do
+   for tool in fd rg convert tmux gh zsh; do
       if ! command -v "$tool" >/dev/null 2>&1; then
          echo "warning: optional helper not on PATH: $tool"
       fi

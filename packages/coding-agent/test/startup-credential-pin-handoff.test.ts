@@ -70,6 +70,7 @@ function snapshot(
 		credentialPinStoreIdentity: pinStoreIdentity,
 		credentialRankingMode: "balanced",
 		credentialPins: { [provider]: pin },
+		credentialPreferences: {},
 	};
 }
 

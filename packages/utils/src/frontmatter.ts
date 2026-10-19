@@ -69,7 +69,12 @@ function normalizeKeys<T>(obj: T): T {
 	for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
 		const nk = key.includes("-") ? kebabToCamel(key) : key;
 		const nv = normalizeKeys(value);
-		result[nk] = nv;
+		// Assignment would route "__proto__" through Object.prototype's setter.
+		if (nk === "__proto__") {
+			Object.defineProperty(result, nk, { value: nv, writable: true, enumerable: true, configurable: true });
+		} else {
+			result[nk] = nv;
+		}
 		if (nk !== key || nv !== value) changed = true;
 	}
 	return (changed ? result : obj) as T;

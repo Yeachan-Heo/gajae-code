@@ -12,12 +12,14 @@ import {
 } from "@gajae-code/natives";
 import { getAgentDir, logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
+import { projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
-import { FileLockAcquireError } from "../config/file-lock";
+import { FileLockAcquireError, isFileLockAcquireTimeout } from "../config/file-lock";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
+import { trustedCoordinatorEnv } from "../gjc-runtime/sidecar-bootstrap-env";
 import { usePostmortemSignalExitAuthority } from "../lsp/client";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
@@ -29,7 +31,11 @@ import {
 	type BrokerStartupExitWriteStatus,
 	writeBrokerStartupExitRecordBounded,
 } from "../sdk/broker/broker-exit";
-import { readBrokerDiscovery } from "../sdk/broker/discovery";
+import {
+	type BrokerRestartIntentWithIdentity,
+	readBrokerDiscovery,
+	readBrokerRestartIntent,
+} from "../sdk/broker/discovery";
 import { type EndpointFileRead, readEndpointFile } from "../sdk/broker/endpoint-authority";
 import {
 	BROKER_DISCOVERY_BUDGET,
@@ -90,11 +96,17 @@ export async function lifecycleArgs(
 	if (targetScope.kind !== "resolved") throw new Error(`Lifecycle session scope is invalid: ${targetScope.message}`);
 	const forkSessionDir =
 		request.operation === "session.fork" ? SessionManager.getDefaultSessionDir(cwd, agentDir) : undefined;
+	// Bun has already copied the project dotenv into process.env. A matching or
+	// dynamic declaration must not select an in-memory session. The exact "1"
+	// check stays; an operator value the project does not declare is still honored.
+	const inMemorySession =
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION === "1" &&
+		trustedCoordinatorEnv("GJC_SDK_TEST_IN_MEMORY_SESSION", process.env, projectEnvSnapshot(cwd)) === "1";
 	return {
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
-		...(process.env.GJC_SDK_TEST_IN_MEMORY_SESSION === "1" ? { noSession: true } : {}),
+		...(inMemorySession ? { noSession: true } : {}),
 		...(request.operation === "session.resume" ? { resume: request.sessionPath } : {}),
 		...(request.modelPreset ? { mpreset: request.modelPreset } : {}),
 		// Explicit model pin (#4707): coordinator-resolved `provider/model`
@@ -1715,6 +1727,34 @@ export default class Sdk extends Command {
 	}
 }
 
+/** Captures and removes one-shot restart credentials before the broker forks descendants. */
+export function consumeBrokerRestartEnvironment(environment: NodeJS.ProcessEnv): {
+	requestIdEnv: string | undefined;
+	restartDeadlineAt: number | undefined;
+} {
+	const restartRequestEnv = environment.GJC_BROKER_RESTART_REQUEST;
+	const restartDeadlineEnv = environment.GJC_BROKER_RESTART_DEADLINE;
+	delete environment.GJC_BROKER_RESTART_REQUEST;
+	delete environment.GJC_BROKER_RESTART_DEADLINE;
+	const requestIdEnv =
+		typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
+			? restartRequestEnv
+			: undefined;
+	let restartDeadlineAt: number | undefined;
+	if (restartDeadlineEnv !== undefined) {
+		const parsedDeadlineAt = Number(restartDeadlineEnv);
+		if (
+			requestIdEnv === undefined ||
+			!/^[0-9]{1,16}$/.test(restartDeadlineEnv) ||
+			!Number.isSafeInteger(parsedDeadlineAt) ||
+			parsedDeadlineAt <= Date.now()
+		)
+			throw new Error("Invalid SDK broker restart deadline; refusing successor startup.");
+		restartDeadlineAt = parsedDeadlineAt;
+	}
+	return { requestIdEnv, restartDeadlineAt };
+}
+
 /**
  * Runs one parsed SDK internal entry point. `publicBrokerRun` is set only by
  * the stable `gjc sdk broker run` contract, which must report a lost ownership
@@ -1853,7 +1893,13 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		if (startupExitLogged) return;
 		startupExitLogged = true;
 		const level = record.exitCode === 1 ? "error" : "warn";
-		if (record.exitCode === 1) logger.error("sdk broker: startup watchdog forcing exit", record);
+		if (record.exitCode === 1)
+			logger.error(
+				record.reason === "startup-deadline"
+					? "sdk broker: startup watchdog forcing exit"
+					: "sdk broker: startup refused",
+				record,
+			);
 		else logger.warn("sdk broker: startup interrupted", record);
 		process.stderr.write(`${JSON.stringify({ level, message, ...record })}\n`);
 	};
@@ -1873,9 +1919,11 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		const message =
 			reason === "startup-lock-blocked" && blockingLockPath
 				? `SDK broker startup blocked by retained removal transition ${blockingLockPath}.`
-				: reason === "startup-deadline"
-					? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
-					: `SDK broker startup interrupted by ${signal} before readiness.`;
+				: reason === "startup-lock-unavailable"
+					? `SDK broker startup could not acquire ${blockingLockPath ?? "a required lock"}.`
+					: reason === "startup-deadline"
+						? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
+						: `SDK broker startup interrupted by ${signal} before readiness.`;
 		writeStartupExitLog(exitRecord, message);
 		startupExitTask = (async () => {
 			const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
@@ -1929,33 +1977,124 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 		await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
 		return true;
 	};
+	let startupFenceAcquired = false;
 	try {
+		const { requestIdEnv, restartDeadlineAt } = consumeBrokerRestartEnvironment(process.env);
+		const MAX_SESSION_INDEX_TIMEOUT_RETRIES = 2;
+		let sessionIndexTimeoutRetries = 0;
+		let activeStartupDeadlineAt = 0;
 		const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
+			for (;;) {
+				activeStartupDeadlineAt = deadline;
+				try {
+					return await singleStartupAttempt(deadline);
+				} catch (error) {
+					if (
+						!isFileLockAcquireTimeout(error) ||
+						!startupFenceAcquired ||
+						path.resolve(error.filePath) !==
+							path.resolve(path.join(agentDir, "sdk", "sessions", "index.jsonl")) ||
+						sessionIndexTimeoutRetries >= MAX_SESSION_INDEX_TIMEOUT_RETRIES
+					)
+						throw error;
+					sessionIndexTimeoutRetries++;
+					const backoffMs = 100 * 2 ** (sessionIndexTimeoutRetries - 1);
+					if (Date.now() + backoffMs >= activeStartupDeadlineAt) throw error;
+					const failedBroker = broker;
+					if (failedBroker) {
+						try {
+							await failedBroker.stop({ kind: "startup-failure" });
+						} catch (cleanupError) {
+							throw new AggregateError(
+								[error, cleanupError],
+								"Session-index startup retry could not clean up the failed broker candidate.",
+							);
+						}
+						if (broker === failedBroker) broker = undefined;
+						if (runningBroker === failedBroker) runningBroker = undefined;
+					}
+					candidateStartTask = undefined;
+					logger.debug("sdk broker: session-index lock timeout, retrying startup", {
+						reason: "session-index-timeout-retry",
+						attempt: sessionIndexTimeoutRetries,
+						backoffMs,
+					});
+					await Bun.sleep(backoffMs);
+				}
+			}
+		};
+		const singleStartupAttempt = async (deadline: number): Promise<Broker | undefined> => {
 			const remainingMs = Math.max(1, deadline - Date.now());
 			const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
-			const watchdogMs =
+			const ordinaryWatchdogMs =
 				Number.isSafeInteger(testWatchdogMs) && testWatchdogMs > 0 && testWatchdogMs <= remainingMs
 					? testWatchdogMs
 					: remainingMs;
-			const startupCheckpointDeadline = performance.now() + watchdogMs - 1_000;
-			const startupWatchdog = setTimeout(() => {
-				startupAbortController.abort();
-				void exitDuringStartup("startup-deadline", 1, null, watchdogMs).then(async started => {
-					if (!started) {
-						// A prior startup signal owns the exit cause; its postmortem callback
-						// returns after bounded cleanup and preserves the signal status.
-						return;
-					}
-					await waitForStartupAbortCleanup();
-					process.exit(1);
-				});
-			}, watchdogMs);
+			let restartRequestId: string | undefined;
+			let startupDeadlineAt = deadline;
+			let effectiveWatchdogMs = ordinaryWatchdogMs;
+			let startupCheckpointDeadline = performance.now() + Math.max(1, effectiveWatchdogMs - 1_000);
+			const armStartupWatchdog = (): NodeJS.Timeout =>
+				setTimeout(() => {
+					startupAbortController.abort();
+					void exitDuringStartup("startup-deadline", 1, null, effectiveWatchdogMs).then(async started => {
+						if (!started) {
+							// A prior startup signal owns the exit cause; its postmortem callback
+							// returns after bounded cleanup and preserves the signal status.
+							return;
+						}
+						await waitForStartupAbortCleanup();
+						process.exit(1);
+					});
+				}, effectiveWatchdogMs);
+			let startupWatchdog = armStartupWatchdog();
 			try {
+				let restartIntent: BrokerRestartIntentWithIdentity | null;
+				try {
+					restartIntent = await readBrokerRestartIntent(agentDir);
+				} catch (error) {
+					throw new Error("Could not validate SDK broker restart intent; refusing untagged startup.", {
+						cause: error,
+					});
+				}
+				// A committed request survives the prior owner's exit. Ordinary or
+				// mismatched starts must not publish ahead of its exact successor.
+				if (
+					restartIntent?.phase === "committed" &&
+					restartIntent.expiresAt > Date.now() &&
+					restartIntent.requestId !== requestIdEnv
+				)
+					throw new Error("A committed SDK broker restart is active; startup requires its exact request ID.");
+				if (
+					restartDeadlineAt !== undefined &&
+					(restartIntent?.phase !== "committed" ||
+						restartIntent.requestId !== requestIdEnv ||
+						restartIntent.expiresAt !== restartDeadlineAt)
+				)
+					throw new Error("Could not validate SDK broker restart deadline; refusing successor startup.");
+				if (requestIdEnv !== undefined && restartIntent?.requestId === requestIdEnv) {
+					if (restartIntent.phase !== "committed")
+						throw new Error("SDK broker restart intent is not committed; refusing successor startup.");
+					const remainingSuccessorMs = restartIntent.expiresAt - Date.now();
+					if (remainingSuccessorMs <= 0)
+						throw new Error("SDK broker restart intent expired; refusing untagged startup.");
+					restartRequestId = requestIdEnv;
+					startupDeadlineAt = restartDeadlineAt ?? restartIntent.expiresAt;
+					activeStartupDeadlineAt = startupDeadlineAt;
+					effectiveWatchdogMs =
+						Number.isSafeInteger(testWatchdogMs) && testWatchdogMs > 0 && testWatchdogMs <= remainingSuccessorMs
+							? testWatchdogMs
+							: remainingSuccessorMs;
+					clearTimeout(startupWatchdog);
+					startupCheckpointDeadline = performance.now() + Math.max(1, effectiveWatchdogMs - 1_000);
+					startupWatchdog = armStartupWatchdog();
+				}
+				if (startupAbortController.signal.aborted) return undefined;
 				// `gjc sdk broker run` never retires another owner, even one this generation cannot
 				// reuse: any live incumbent is a refusal. Autostart repairs unusable generations.
 				const existing = publicBrokerRun
 					? ((await readBrokerDiscovery(agentDir)) ?? undefined)
-					: await reconcileBrokerGenerationForStartup({ agentDir }, deadline);
+					: await reconcileBrokerGenerationForStartup({ agentDir }, startupDeadlineAt);
 				if (startupAbortController.signal.aborted) return undefined;
 				if (existing) {
 					logger.info("sdk broker: startup reused an existing owner", {
@@ -1992,11 +2131,9 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				// launcher-supplied environment variable; it is validated here and handed
 				// to Broker as a typed setting, never read a second time inside broker.ts
 				// from process.env directly.
-				const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
-				const restartRequestId =
-					typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
-						? restartRequestEnv
-						: undefined;
+				// Restart authorization is revalidated before constructing the broker; the
+				// watchdog was already armed before any intent-file I/O.
+				const effectiveCheckpointDeadline = startupCheckpointDeadline;
 				const testPostPublicationDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS ?? 0);
 				const startupPostPublicationDelayMs =
 					Number.isSafeInteger(testPostPublicationDelayMs) &&
@@ -2034,14 +2171,19 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 								}
 							}
 						: undefined;
+				const brokerSettings = await Settings.loadForScope({ cwd: process.cwd(), agentDir });
 				const candidate = new Broker({
 					agentDir,
 					startupAbortSignal: startupAbortController.signal,
-					startupCheckpointDeadline,
+					startupCheckpointDeadline: effectiveCheckpointDeadline,
 					onStartupReady: () => clearTimeout(startupWatchdog),
-					masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
-						"sdk.masterOrphanGraceMs",
-					),
+					masterOrphanGraceMs: brokerSettings.get("sdk.masterOrphanGraceMs"),
+					abandonedGraceMs: brokerSettings.get("sdk.brokerAbandonedGraceMs"),
+					// Only the detached autostart entry retires itself when nobody is left to
+					// use it. A supervised `gjc sdk broker run` service is owned by its
+					// operator's process manager, which reads an owned-root completion as a
+					// clean exit and would not restart it.
+					reapWhenAbandoned: !publicBrokerRun,
 					resolveDirectoryMigration: async cwd => {
 						const settings = await Settings.loadForScope({ cwd, agentDir });
 						try {
@@ -2073,7 +2215,11 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			}
 		};
 		broker = await withBrokerStartupLock(agentDir, startupOperation, {
-			onAcquired: () => void emitBrokerStartupTestSignal("fence-acquired"),
+			...(restartDeadlineAt === undefined ? {} : { deadlineAt: restartDeadlineAt }),
+			onAcquired: () => {
+				startupFenceAcquired = true;
+				void emitBrokerStartupTestSignal("fence-acquired");
+			},
 			onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
 		});
 	} catch (error) {
@@ -2081,9 +2227,14 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 			await finishPendingStartupSignal();
 			return;
 		}
-		// A retained removal transition is an explicit acquire failure, not only
-		// an exhausted ordinary contention timeout.
-		if (error instanceof FileLockAcquireError && error.orphanPath) {
+		// Only a retained transition on the outer startup fence gets its own
+		// blocked reason. Nested resource-lock failures are retryable unavailability.
+		if (
+			error instanceof FileLockAcquireError &&
+			!startupFenceAcquired &&
+			error.code === "orphan_transition" &&
+			error.orphanPath
+		) {
 			await exitDuringStartup(
 				"startup-lock-blocked",
 				1,
@@ -2091,6 +2242,9 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 				BROKER_DISCOVERY_BUDGET.startupLockWaitMs,
 				error.orphanPath,
 			);
+		} else if (error instanceof FileLockAcquireError) {
+			// Nested lock failures or non-orphan-transition errors
+			await exitDuringStartup("startup-lock-unavailable", 1, null, undefined, error.orphanPath ?? error.lockPath);
 		}
 		if (broker) {
 			try {

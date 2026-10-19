@@ -125,6 +125,17 @@ describe("getOpenAIStreamIdleTimeoutMs()", () => {
 		expect(getOpenAIStreamIdleTimeoutMs("openai")).toBe(120_000);
 		expect(getOpenAIStreamIdleTimeoutMs()).toBe(120_000);
 	});
+	it("uses configured model timeout before built-in floors while preserving env precedence", () => {
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "anthropic/claude-opus-5-5", 300_000)).toBe(300_000);
+		expect(getOpenAIStreamIdleTimeoutMs("xai", "grok-4.6", 180_000)).toBe(180_000);
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "moonshotai/kimi-k3", 0)).toBeUndefined();
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "invalid";
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "claude-opus-5-5", 300_000)).toBe(300_000);
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "77";
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "claude-opus-5-5", 300_000)).toBe(77);
+		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "0";
+		expect(getOpenAIStreamIdleTimeoutMs("openrouter", "claude-opus-5-5", 300_000)).toBeUndefined();
+	});
 
 	it("falls back to the legacy PI_OPENAI_STREAM_IDLE_TIMEOUT_MS alias", () => {
 		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
@@ -175,6 +186,26 @@ describe("resolveOpenAISdkRequestTimeoutMs(provider, override)", () => {
 
 	it("floors non-fallback providers at the shared first-event window", () => {
 		expect(resolveOpenAISdkRequestTimeoutMs("openai", 5_000)).toBe(120_000);
+	});
+
+	it("uses configured model idle timeouts to bound OpenAI SDK setup", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, "claude-opus-5-5", 300_000)).toBe(300_000);
+	});
+
+	it("uses a longer request idle timeout for SDK setup instead of the model fallback", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, "claude-opus-5-5", 120_000, 300_000)).toBe(
+			300_000,
+		);
+	});
+
+	it("caps SDK request deadlines at the maximum platform timer delay", () => {
+		const maxTimerDelayMs = 2 ** 31 - 1;
+		expect(resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, undefined, maxTimerDelayMs + 1)).toBe(
+			maxTimerDelayMs,
+		);
+		expect(
+			resolveOpenAISdkRequestTimeoutMs("custom-proxy", undefined, undefined, 120_000, Number.MAX_SAFE_INTEGER),
+		).toBe(maxTimerDelayMs);
 	});
 
 	it("disables the SDK request timeout when the first-event watchdog is explicitly off", () => {

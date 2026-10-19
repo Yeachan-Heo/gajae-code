@@ -357,7 +357,9 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 
 	const payloadResult = await fetchUsagePayload(url, headers, ctx, params.signal);
 	if (!payloadResult || !isRecord(payloadResult.payload)) return null;
-	const { payload, orgId } = payloadResult;
+	const { payload } = payloadResult;
+	// Limits are per organization, and one account can sign in to several of them.
+	const orgId = payloadResult.orgId ?? credential.organizationId;
 
 	const fiveHour = parseBucket(payload.five_hour);
 	const sevenDay = parseBucket(payload.seven_day);
@@ -408,7 +410,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 	].filter((limit): limit is UsageLimit => limit !== null);
 
 	if (limits.length === 0) return null;
-	const identity = extractUsageIdentity(payload, orgId);
+	const identity = extractUsageIdentity(payload, payloadResult.orgId);
 	let accountId = identity.accountId ?? credential.accountId;
 	let email = identity.email ?? credential.email;
 	if ((!accountId || !email) && !params.signal?.aborted) {

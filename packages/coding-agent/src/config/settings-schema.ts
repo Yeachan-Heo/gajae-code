@@ -1,5 +1,6 @@
 import type { Effort } from "@gajae-code/ai/model-thinking";
 import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
+import { type CredentialPreferenceEntryValue, parseCredentialPreferenceList } from "../session/startup-auth-config";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS, EDIT_MODES, type EditMode } from "../utils/edit-mode";
@@ -214,7 +215,11 @@ interface ArrayDef<T> {
 type RecordValueDef =
 	| { type: "model-selector-value" }
 	| { type: "string-enum"; values: readonly string[] }
-	| { type: "credential-selector" };
+	| { type: "credential-selector" }
+	| { type: "credential-preference-list" };
+
+/** A provider's `auth.credentialPreferences` value: one account or a non-empty ordered list of entries. */
+export type CredentialPreferenceSettingValue = string | CredentialPreferenceEntryValue[];
 
 interface ConstrainedRecordValueDef {
 	type: "autorouting-selector-value";
@@ -452,6 +457,13 @@ export const SETTINGS_SCHEMA = {
 		valueSchema: { type: "credential-selector" } as const,
 	},
 	"auth.credentialPinStoreIdentity": { type: "string", default: undefined },
+	// Ordered soft per-provider OAuth account preferences with optional per-entry usage caps. Global-only, like pins;
+	// read at startup.
+	"auth.credentialPreferences": {
+		type: "record",
+		default: {} as Record<string, CredentialPreferenceSettingValue>,
+		valueSchema: { type: "credential-preference-list" } as const,
+	},
 	"session.directoryMigration": {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
@@ -491,6 +503,13 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 120_000,
 		description: "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
+	},
+	"sdk.brokerAbandonedGraceMs": {
+		type: "number",
+		default: 120_000,
+		description:
+			"Grace before a detached broker with no client connection, no live session host, and no open spawn authority exits on its own. A supervised `gjc sdk broker run` service never reaps itself.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
 	},
 
@@ -1470,19 +1489,30 @@ export const SETTINGS_SCHEMA = {
 
 	serviceTier: {
 		type: "enum",
-		values: ["none", "auto", "default", "flex", "scale", "priority", "openai-only", "claude-only"] as const,
+		values: [
+			"none",
+			"auto",
+			"default",
+			"flex",
+			"scale",
+			"priority",
+			"ultrafast",
+			"openai-only",
+			"claude-only",
+		] as const,
 		default: "none",
 		ui: {
 			tab: "model",
 			label: "Service Tier",
 			description:
-				'Processing priority hint (none = omit). OpenAI accepts the tier values directly; Anthropic realizes `priority` as `speed: "fast"` on supported Opus models. Scoped values target one family.',
+				'Processing priority hint (none = omit). OpenAI accepts the tier values directly; ultrafast is a 6x premium tier. Anthropic realizes `priority` as `speed: "fast"` on supported Opus models. Scoped values target one family.',
 			options: [
 				{ value: "none", label: "None", description: "Omit service_tier parameter" },
 				{ value: "auto", label: "Auto", description: "Use provider default tier selection (OpenAI)" },
 				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
 				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
 				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{ value: "ultrafast", label: "Ultrafast", description: "Ultrafast processing at a 6x premium (OpenAI)" },
 				{
 					value: "priority",
 					label: "Priority",
@@ -1512,6 +1542,7 @@ export const SETTINGS_SCHEMA = {
 			"flex",
 			"scale",
 			"priority",
+			"ultrafast",
 			"openai-only",
 			"claude-only",
 		] as const,
@@ -1532,6 +1563,7 @@ export const SETTINGS_SCHEMA = {
 				{ value: "default", label: "Default", description: "Standard priority processing (OpenAI)" },
 				{ value: "flex", label: "Flex", description: "Flexible capacity tier when available (OpenAI)" },
 				{ value: "scale", label: "Scale", description: "Scale Tier credits when available (OpenAI)" },
+				{ value: "ultrafast", label: "Ultrafast", description: "Ultrafast processing at a 6x premium (OpenAI)" },
 				{
 					value: "priority",
 					label: "Priority",
@@ -2821,6 +2853,12 @@ export const SETTINGS_SCHEMA = {
 		type: "string",
 		default: undefined,
 	},
+	// xxHash64 hex pin for settingsPath. Only the user/global value is a pin;
+	// a project file cannot authorize the TOML path it names.
+	"shellMinimizer.settingsHash": {
+		type: "string",
+		default: undefined,
+	},
 	"shellMinimizer.only": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.except": { type: "array", default: EMPTY_STRING_ARRAY },
 	"shellMinimizer.maxCaptureBytes": {
@@ -3791,6 +3829,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.compactSubagentPanel": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Compact Subagent Panel",
+			description:
+				"Collapse awaited subagents into one summary line (expand tool output to see each one) and refresh only when the summary changes",
+		},
+	},
+
 	"task.enableLsp": {
 		type: "boolean",
 		default: false,
@@ -4369,6 +4418,9 @@ function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean 
 				/^account:\S+$/.test(value))
 		);
 	}
+	if (valueSchema.type === "credential-preference-list") {
+		return parseCredentialPreferenceList(value) !== undefined;
+	}
 	return typeof value === "string" && valueSchema.values.includes(value);
 }
 
@@ -4711,6 +4763,7 @@ export interface BashInterceptorRule {
 export interface ShellMinimizerSettings {
 	enabled: boolean;
 	settingsPath: string | undefined;
+	settingsHash: string | undefined;
 	only: string[];
 	except: string[];
 	maxCaptureBytes: number;
