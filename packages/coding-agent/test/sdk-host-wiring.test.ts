@@ -3061,7 +3061,11 @@ test("bus keeps an accepted staged image charged through producer settlement bef
 	}
 });
 
-test("bus retains a promoted staged image until agent_start adopts its run", async () => {
+test.each([
+	"own-run",
+	"aborted-own-run",
+	"removed",
+] as const)("bus retains a promoted staged image until agent_start adopts its run (%s)", async mode => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-promotion-adoption-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-image-promotion-adoption-${Date.now()}`;
@@ -3075,6 +3079,7 @@ test("bus retains a promoted staged image until agent_start adopts its run", asy
 	};
 	const promotionReady = Promise.withResolvers<void>();
 	let promote: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	let promotedAfterAbort = false;
 	let releases = 0;
 	const cleanupReservations: Array<() => void> = [];
 	const originalRedeem = PromptImageUploadStore.prototype.redeem;
@@ -3098,8 +3103,19 @@ test("bus retains a promoted staged image until agent_start adopts its run", asy
 		sessionContext,
 		settings,
 		async (_content, options) => {
+			options?.onDispatchDisposition?.({ startsOwnRun: false });
 			await firePreflightAccept(options);
 			promote = options?.onQueuedPromoted;
+			if (mode === "aborted-own-run") {
+				options?.preflightSignal?.addEventListener(
+					"abort",
+					() => {
+						promotedAfterAbort = options.preflightSignal?.aborted === true;
+						promote?.({ startsOwnRun: true });
+					},
+					{ once: true },
+				);
+			}
 			promotionReady.resolve();
 		},
 		true,
@@ -3121,9 +3137,15 @@ test("bus retains a promoted staged image until agent_start adopts its run", asy
 		await Bun.sleep(0);
 		// The queue-enqueue producer has settled; promotion creates an adoption
 		// interval before the next agent_start supplies the exact run owner.
-		promote?.({ startsOwnRun: true });
+		if (mode === "aborted-own-run") {
+			expect(await client.control("turn.abort", {})).toMatchObject({ ok: true });
+			expect(promotedAfterAbort).toBe(true);
+		} else if (mode === "removed") {
+			promote?.({ startsOwnRun: false, removed: true });
+			await waitFor(() => releases === 1, "authoritative queued image removal");
+		} else promote?.({ startsOwnRun: true });
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-		expect(releases).toBe(0);
+		expect(releases).toBe(mode === "removed" ? 1 : 0);
 	} finally {
 		await client?.close();
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);

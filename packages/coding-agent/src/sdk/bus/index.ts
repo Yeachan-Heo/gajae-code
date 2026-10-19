@@ -5379,8 +5379,7 @@ export function createNotificationsExtension(
 					}
 				},
 				promoted: promotion => {
-					reservation.awaitingAdoption =
-						promotion.startsOwnRun === true && promotion.removed !== true && !reservation.preflightSignal.aborted;
+					reservation.awaitingAdoption = promotion.startsOwnRun === true && promotion.removed !== true;
 					if (!reservation.awaitingAdoption && reservation.releaseRequested) retireAcceptedImage(key);
 				},
 			};
