@@ -370,8 +370,9 @@ export async function loadProjectContextFiles(
 }
 
 /**
- * Load the effective system prompt customization from SYSTEM.md.
- * Project-level SYSTEM.md overrides user-level SYSTEM.md.
+ * Load the user system prompt customization from SYSTEM.md.
+ * A repository SYSTEM.md is untrusted project text. It must not replace the
+ * user file or become the customization block.
  */
 export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {}): Promise<string | null> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
@@ -383,11 +384,6 @@ export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {
 	});
 
 	if (result.items.length === 0) return null;
-
-	const projectLevel = result.items.find(item => item.level === "project");
-	if (projectLevel) {
-		return projectLevel.content;
-	}
 
 	const userLevel = result.items.find(item => item.level === "user");
 	return userLevel?.content ?? null;
@@ -784,11 +780,17 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		};
 	});
 
-	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
+	const rawSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
 	]);
-	const promptSources = [effectiveSystemPromptCustomization, resolvedCustomPrompt, resolvedAppendPrompt];
+	// Encode after dedupe so rule matching still sees the file text. The customization
+	// template is noEscape; the same encoder used for context files keeps a file from
+	// closing <system-prompt-customization> or forging a sibling marker.
+	const effectiveSystemPromptCustomization = rawSystemPromptCustomization
+		? sanitizeEmbeddedPromptContent(rawSystemPromptCustomization)
+		: "";
+	const promptSources = [rawSystemPromptCustomization, resolvedCustomPrompt, resolvedAppendPrompt];
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
 
 	const environment = await logger.time("getEnvironmentInfo", getEnvironmentInfo);
@@ -803,6 +805,17 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		path: escapePromptMetadata(rule.path),
 		content: sanitizeEmbeddedPromptContent(rule.content),
 	}));
+	// Both rulebook templates compile with noEscape. Encode the fields they interpolate
+	// so repository frontmatter cannot close <rules> or the name attribute.
+	const sanitizedRulebookRules = (rules ?? []).map(rule => ({
+		...rule,
+		name: escapePromptMetadata(rule.name),
+		description:
+			rule.description === undefined
+				? undefined
+				: escapePromptMetadata(rule.description, { preserveNewlines: true }),
+		globs: rule.globs?.map(glob => escapePromptMetadata(glob)),
+	}));
 	const data = {
 		systemPromptCustomization: effectiveSystemPromptCustomization,
 		customPrompt: resolvedCustomPrompt,
@@ -816,7 +829,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles: sanitizedContextFiles,
 		agentsMdSearch: { files: agentsMdFiles.map(file => escapePromptMetadata(file)) },
 		workspaceTree,
-		rules: rules ?? [],
+		rules: sanitizedRulebookRules,
 		alwaysApplyRules: sanitizedAlwaysApplyRules,
 		cwd: promptCwd,
 		intentTracing: !!intentField,

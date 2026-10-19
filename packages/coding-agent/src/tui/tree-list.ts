@@ -3,10 +3,24 @@
  */
 
 import { replaceTabs } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import type { Theme } from "../modes/theme/theme";
 import { formatMoreItems } from "../tools/render-utils";
 import type { TreeContext } from "./types";
 import { getTreeBranch, getTreeContinuePrefix } from "./utils";
+
+/**
+ * Tool renderers pass raw match lines or line groups into `renderItem`, which
+ * then applies theme colors. Strip controls first so OSC bytes are not wrapped
+ * into the styled string. Objects (file entries, todos) are left unchanged.
+ */
+function sanitizeTreeItem<T>(item: T): T {
+	if (typeof item === "string") return sanitizeText(item) as T;
+	if (Array.isArray(item)) {
+		return item.map(part => (typeof part === "string" ? sanitizeText(part) : part)) as T;
+	}
+	return item;
+}
 
 export interface TreeListOptions<T> {
 	items: T[];
@@ -32,7 +46,7 @@ export function renderTreeList<T>(options: TreeListOptions<T>, theme: Theme): st
 	// renderItem implementations MUST NOT vary line count based on isLast.
 	const preRendered: string[][] = [];
 	for (let i = 0; i < maxItems; i++) {
-		const rendered = renderItem(items[i], {
+		const rendered = renderItem(sanitizeTreeItem(items[i]!), {
 			index: i,
 			isLast: false,
 			depth: 0,

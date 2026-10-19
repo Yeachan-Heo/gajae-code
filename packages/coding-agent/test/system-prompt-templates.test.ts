@@ -354,11 +354,13 @@ describe("system Handlebars prompt templates", () => {
 	});
 	test("buildSystemPrompt wires SYSTEM.md customization without replacing the base prompt", async () => {
 		await withTempDir(async dir => {
-			await fs.mkdir(path.join(dir, ".gjc"), { recursive: true });
-			await fs.writeFile(path.join(dir, ".gjc", "SYSTEM.md"), "Project system sentinel.");
+			const agentDir = path.join(dir, "agent");
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(path.join(agentDir, "SYSTEM.md"), "User system sentinel.");
 
 			const { systemPrompt } = await buildSystemPrompt({
 				cwd: dir,
+				agentDir,
 				contextFiles: [],
 				skills: [],
 				rules: [],
@@ -377,7 +379,7 @@ describe("system Handlebars prompt templates", () => {
 			expect(systemPrompt[0]).toContain("<soul>");
 			expect(systemPrompt[0]).toContain("The Boss’s Orders = Absolute Obedience");
 			expect(systemPrompt[0]).toContain("<system-prompt-customization>");
-			expect(systemPrompt[0]).toContain("Project system sentinel.");
+			expect(systemPrompt[0]).toContain("User system sentinel.");
 		});
 	});
 

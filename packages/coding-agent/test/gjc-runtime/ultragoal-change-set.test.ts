@@ -6,6 +6,7 @@ import {
 	__setRepositoryStateWitnessTestHookForTests,
 	computeCheckpointChangeSet,
 	computeUltragoalReviewSourceHash,
+	GIT_EMPTY_TREE_SHA,
 	mergeChangeSetPaths,
 	parseGitNameStatus,
 	parseGitUntrackedPaths,
@@ -189,6 +190,23 @@ describe("ultragoal change-set extraction", () => {
 				status: "added",
 				category: "other",
 			});
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the empty tree as the authoritative base for an unborn repository", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-unborn-change-set-"));
+		try {
+			expect(await Bun.spawn(["git", "init"], { cwd: root, stdout: "ignore", stderr: "ignore" }).exited).toBe(0);
+			await Bun.write(path.join(root, "feature.ts"), "export const unborn = true;\n");
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.baseRef).toBe(GIT_EMPTY_TREE_SHA);
+			expect(changeSet?.mergeBase).toBeUndefined();
+			expect(changeSet?.paths).toContainEqual({ path: "feature.ts", status: "added", category: "other" });
+			expect(changeSet?.untrackedContentHash).toMatch(/^sha256:/);
+			expect(changeSet?.captureIncomplete ?? true).toBe(false);
+			expect(computeUltragoalReviewSourceHash(changeSet)).toMatch(/^sha256:/);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

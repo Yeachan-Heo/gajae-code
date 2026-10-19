@@ -152,6 +152,13 @@ export async function spawnText(
 	}
 }
 
+/**
+ * The canonical empty tree object. A repository with no commits has no refs and
+ * no merge base, so the empty tree is the only authoritative baseline: every
+ * tracked, staged, and untracked file is an addition on top of it.
+ */
+export const GIT_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 export async function resolveGitBase(cwd: string, branch?: string): Promise<string> {
 	if (branch) {
 		const exists = await spawnText(["git", "rev-parse", "--verify", branch], { cwd, timeoutMs: 3000 });
@@ -285,16 +292,26 @@ export async function computeCheckpointChangeSet(cwd: string): Promise<Ultragoal
 	}
 	const captureWitness = await repositoryStateWitness(cwd);
 	await repositoryStateWitnessTestHook?.("after-initial", cwd);
-	const baseRef = await resolveGitBase(cwd);
+	// A freshly initialized repository has no commits, so `HEAD`, every branch
+	// candidate, and any merge base are unresolvable. The empty tree is the only
+	// authoritative baseline there; refusing outright would strand a run whose
+	// implementation is entirely untracked. Everything on disk then counts as an
+	// addition, which is hashed like any other added file and never committed.
+	const headPresent = await spawnText(["git", "rev-parse", "--verify", "HEAD"], { cwd, timeoutMs: 3000 });
+	const unborn = !headPresent.ok;
+	const baseRef = unborn ? GIT_EMPTY_TREE_SHA : await resolveGitBase(cwd);
 	const base = baseRef;
-	const mergeBase = await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
+	const mergeBase = unborn
+		? { ok: false, stdout: "", stderr: "repository has no commits" }
+		: await spawnText(["git", "merge-base", "HEAD", baseRef], { cwd, timeoutMs: 3000 });
+	const diffRange = unborn ? baseRef : `${base}...HEAD`;
 	const [committed, unstaged, staged, untracked, stat, committedDiff, unstagedDiff, stagedDiff] = await Promise.all([
-		spawnText(["git", "diff", "--name-status", "-z", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--name-status", "-z", unborn ? baseRef : diffRange], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached", "--name-status", "-z"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", "--stat", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
-		spawnText(["git", "diff", `${base}...HEAD`], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", "--stat", diffRange], { cwd, timeoutMs: 5000 }),
+		spawnText(["git", "diff", diffRange], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "diff", "--cached"], { cwd, timeoutMs: 5000 }),
 	]);
@@ -382,7 +399,10 @@ async function repositoryStateWitness(cwd: string): Promise<string | undefined> 
 		spawnText(["git", "ls-files", "-z"], { cwd, timeoutMs: 5000 }),
 		spawnText(["git", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, timeoutMs: 5000 }),
 	]);
-	if (!head.ok || !status.ok || !tracked.ok || !untracked.ok) return undefined;
+	// An unborn repository has no HEAD yet; the remaining reads still describe its
+	// full state, so witness it as an empty head rather than failing the capture.
+	if (!status.ok || !tracked.ok || !untracked.ok) return undefined;
+	const headToken = head.ok ? head.stdout.trim() : "unborn";
 	const paths = [
 		...new Set([
 			...parseGitUntrackedPaths(tracked.stdout).map(row => row.path),
@@ -417,7 +437,7 @@ async function repositoryStateWitness(cwd: string): Promise<string | undefined> 
 	} catch {
 		return undefined;
 	}
-	return `${head.stdout.trim()}\u0000${status.stdout}\u0000sha256:${content.digest("hex")}`;
+	return `${headToken}\u0000${status.stdout}\u0000sha256:${content.digest("hex")}`;
 }
 
 export function parseUnifiedDiffPaths(diff: string): UltragoalChangeSetPath[] {

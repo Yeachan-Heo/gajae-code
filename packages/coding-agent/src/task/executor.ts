@@ -76,6 +76,7 @@ import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { validateAllocatedTaskId } from "./id";
 import { classifyProviderRetryFromTransport, providerNameFromModel } from "./provider-retry-status";
+import { containSubagentRoleBody } from "./role-body";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
@@ -2086,14 +2087,15 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					promptTemplates: options.promptTemplates,
 					workspaceTree: options.workspaceTree,
 					systemPrompt: defaultPrompt => {
-						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-							agent: prompt.render(agent.systemPrompt, {
-								// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
-								ultragoalRedTeam: resolveUltragoalRedTeamActivation({
-									executionMode: options.executionMode,
-									assignment: options.assignment ?? task,
-								}),
+						const renderedRole = prompt.render(agent.systemPrompt, {
+							// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
+							ultragoalRedTeam: resolveUltragoalRedTeamActivation({
+								executionMode: options.executionMode,
+								assignment: options.assignment ?? task,
 							}),
+						});
+						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+							agent: containSubagentRoleBody(renderedRole),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
 							outputSchema: normalizedOutputSchema,
