@@ -666,12 +666,15 @@ export class ExtensionUiController {
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
 			navigateTree: async (targetId, navOptions) => {
 				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				if (!result.cancelled) await this.ctx.session.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
 				await this.ctx.session.reload();
+				if (this.#isStopped()) return;
+				await this.ctx.session.notifySessionIdentityChanged();
 				if (this.#isStopped()) return;
 				const sessionIdentityChanged = previousSessionId !== this.ctx.sessionManager.getSessionId();
 				if (sessionIdentityChanged) this.ctx.resetIrcSidebarSession();
@@ -896,6 +899,7 @@ export class ExtensionUiController {
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
 			navigateTree: async (targetId, navOptions) => {
 				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				if (!result.cancelled) await this.ctx.session.notifySessionIdentityChanged();
 				return { cancelled: result.cancelled };
 			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
@@ -905,6 +909,8 @@ export class ExtensionUiController {
 				}
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
 				await this.ctx.session.reload();
+				if (this.#isStopped()) return;
+				await this.ctx.session.notifySessionIdentityChanged();
 				if (this.#isStopped()) return;
 				const sessionIdentityChanged = previousSessionId !== this.ctx.sessionManager.getSessionId();
 				if (sessionIdentityChanged) this.ctx.resetIrcSidebarSession();

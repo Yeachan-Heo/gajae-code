@@ -4800,7 +4800,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// epoch additionally fences overlapping rebuilds, so a slower earlier
 			// pass cannot publish over a newer one.
 			const gjcPassEpoch = gjcRuntimeStore.beginPass();
-			toolContextStore.setToolNames(toolNames);
 			const promptTools = (() => {
 				const previousPromptMetadataModel = promptMetadataModel;
 				promptMetadataModel = candidateModel;
@@ -5467,6 +5466,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			taskDepth,
 			workflowGatePublication: isCanonicalSubSession ? "local" : "endpoint",
 			toolRegistry,
+			onToolNamesChanged: toolNames => toolContextStore.setToolNames(toolNames),
 			builtinToolIdentities,
 			workflowGateToolSession: toolSession,
 			transformContext,

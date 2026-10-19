@@ -3241,6 +3241,16 @@ export class SelectorController {
 						// cancelled transition or roll it back to the parent's UI.
 						branchFailure = error;
 					}
+					if (
+						this.ctx.sessionManager.getSessionId() !== openedSessionId ||
+						this.ctx.sessionManager.getSessionFile() !== openedSessionFile
+					) {
+						try {
+							await this.ctx.refreshSlashCommandState();
+						} catch (error) {
+							branchFailure ??= error;
+						}
+					}
 
 					try {
 						onCommitted?.();

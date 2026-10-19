@@ -2172,14 +2172,19 @@ async function runSdkInternal(internal: SdkInternalArgv, publicBrokerRun = false
 								}
 							}
 						: undefined;
+				const brokerSettings = await Settings.loadForScope({ cwd: process.cwd(), agentDir });
 				const candidate = new Broker({
 					agentDir,
 					startupAbortSignal: startupAbortController.signal,
 					startupCheckpointDeadline: effectiveCheckpointDeadline,
 					onStartupReady: () => clearTimeout(startupWatchdog),
-					masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
-						"sdk.masterOrphanGraceMs",
-					),
+					masterOrphanGraceMs: brokerSettings.get("sdk.masterOrphanGraceMs"),
+					abandonedGraceMs: brokerSettings.get("sdk.brokerAbandonedGraceMs"),
+					// Only the detached autostart entry retires itself when nobody is left to
+					// use it. A supervised `gjc sdk broker run` service is owned by its
+					// operator's process manager, which reads an owned-root completion as a
+					// clean exit and would not restart it.
+					reapWhenAbandoned: !publicBrokerRun,
 					resolveDirectoryMigration: async cwd => {
 						const settings = await Settings.loadForScope({ cwd, agentDir });
 						try {

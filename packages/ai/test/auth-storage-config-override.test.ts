@@ -162,6 +162,64 @@ describe("AuthStorage config-override apiKey", () => {
 			expect(await authStorage.peekApiKey("anthropic")).toBe("stored-login-key");
 		});
 	});
+	test("env-sourced override allows explicit selection of stored API-key rows, unlike a literal pin", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await authStorage.set("anthropic", [
+				{ type: "api_key", key: "stored-login-key-1" },
+				{ type: "api_key", key: "stored-login-key-2" },
+			]);
+			authStorage.setConfigApiKey("anthropic", "stale-env-key", { envSourced: true });
+			const secondRow = authStorage
+				.exportSnapshot()
+				.credentials.find(
+					entry =>
+						entry.provider === "anthropic" &&
+						entry.credential.type === "api_key" &&
+						entry.credential.key === "stored-login-key-2",
+				);
+			if (!secondRow) throw new Error("test setup did not create the second stored API key");
+
+			expect(
+				await authStorage.getApiKey("anthropic", undefined, {
+					credentialSelector: { kind: "id", value: String(secondRow.id) },
+				}),
+			).toBe("stored-login-key-2");
+
+			authStorage.setConfigApiKey("anthropic", "literal-config-key");
+			await expect(
+				authStorage.getApiKey("anthropic", undefined, {
+					credentialSelector: { kind: "id", value: String(secondRow.id) },
+				}),
+			).rejects.toThrow("config API key override is active");
+		});
+	});
+	test("env-sourced override fails closed when an explicitly selected stored API key cannot resolve", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!store) throw new Error("test setup failed");
+			const resolvedKeys: string[] = [];
+			authStorage = new AuthStorage(store, {
+				configValueResolver: async key => {
+					resolvedKeys.push(key);
+					return key === "!unavailable-command" ? undefined : key;
+				},
+			});
+			await authStorage.set("anthropic", [
+				{ type: "api_key", key: "!unavailable-command" },
+				{ type: "api_key", key: "peer-key" },
+			]);
+			authStorage.setConfigApiKey("anthropic", "env-configured-key", { envSourced: true });
+			const selectedRow = authStorage.listCredentialInventory("anthropic")[0];
+			if (!selectedRow) throw new Error("test setup did not create the selected credential");
+
+			await expect(
+				authStorage.getApiKey("anthropic", undefined, {
+					credentialSelector: { kind: "id", value: String(selectedRow.id) },
+				}),
+			).rejects.toThrow(`Selected credential for anthropic (id:${selectedRow.id}) is unavailable`);
+			expect(resolvedKeys).toEqual(["!unavailable-command"]);
+		});
+	});
 
 	test("env-sourced override applies when no stored credential exists", async () => {
 		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {

@@ -137,6 +137,10 @@ describe("SDK operation inventory", () => {
 				"test-only estimator seam, not a user-facing SDK control seam",
 			],
 			[
+				"agent_session:getActivatedModelProfile",
+				"internal model-profile activation provenance used to gate role-only materialization, not a user-facing SDK control seam",
+			],
+			[
 				"agent_session:awaitPendingContextTransformations",
 				"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 			],

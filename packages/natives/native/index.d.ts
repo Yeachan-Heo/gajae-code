@@ -1242,10 +1242,11 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
 
 /**
  * Remove a directory tree only when a fresh descriptor-relative snapshot
- * exactly equals the persisted snapshot. POSIX first no-replace detaches the
- * verified root to its deterministic `.removing` sibling; the reopened
- * detached descriptor remains authoritative throughout payload scrubbing and
- * replay.
+ * exactly equals the persisted snapshot. POSIX removal no-replace detaches the
+ * verified root to its deterministic `.removing` sibling before scrubbing. On
+ * Windows, callers that need retirement semantics must request a detach-only
+ * pass, then replay exact removal at the returned sibling; ordinary Windows
+ * removal never vacates the caller's path before scrubbing completes.
  */
 export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null, detachOnly?: boolean | undefined | null): NativeExactUnlinkResult
 

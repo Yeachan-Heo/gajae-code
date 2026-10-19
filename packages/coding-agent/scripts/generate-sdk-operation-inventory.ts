@@ -85,6 +85,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal session-scoped startup-profile recovery marker, not a user-facing SDK control seam",
 	"agent_session:getUnavailableModelProfile":
 		"internal session-scoped startup-profile recovery status for UI rendering, not a public SDK operation",
+	"agent_session:getActivatedModelProfile":
+		"internal model-profile activation provenance used to gate role-only materialization, not a user-facing SDK control seam",
 	"agent_session:getConfigurationPaths":
 		"internal config hot-reload path identity projection, not a user-facing SDK control seam",
 	"agent_session:validateConfiguration":
