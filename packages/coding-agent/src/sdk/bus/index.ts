@@ -2671,7 +2671,15 @@ function sdkControlSurface(
 	api: ExtensionAPI,
 	imageUploads: PromptImageUploadStore,
 	imageUploadsAvailable: boolean,
-	retainAcceptedImage: (correlation: { commandId: string; turnId: string }, release: () => void) => void,
+	retainAcceptedImage: (
+		correlation: { commandId: string; turnId: string },
+		release: () => void,
+		preflightSignal: AbortSignal,
+		submissionSettled: Promise<void>,
+	) => {
+		accepted: () => void;
+		promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+	},
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void,
 	isBusy: () => boolean,
 	onPromptAccepted: (
@@ -2974,7 +2982,14 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation = false,
-		onCorrelation?: (correlation: { commandId: string; turnId: string }) => void,
+		onCorrelation?: (
+			correlation: { commandId: string; turnId: string },
+			preflightSignal: AbortSignal,
+			submissionSettled: Promise<void>,
+		) => {
+			accepted: () => void;
+			promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		} | void,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
@@ -3037,7 +3052,6 @@ function sdkControlSurface(
 				: text;
 		const commandId = crypto.randomUUID();
 		const turnId = crypto.randomUUID();
-		onCorrelation?.({ commandId, turnId });
 		const sdkRunToken = deliverAs === "followUp" ? crypto.randomUUID() : undefined;
 		type PreflightTerminalResult = { status: "accepted" } | { status: "rejected"; error: unknown };
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
@@ -3052,6 +3066,7 @@ function sdkControlSurface(
 		const submissionSettled = Promise.withResolvers<void>();
 		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		const imageLifecycle = onCorrelation?.(correlation, preflightController.signal, submissionSettled.promise);
 		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
 			if (preflightSettled) return;
@@ -3102,6 +3117,8 @@ function sdkControlSurface(
 			admission.accepted();
 			accepting = false;
 			accepted = true;
+			// A late durable acceptance after direct abort cannot end image retention.
+			if (!preflightController.signal.aborted) imageLifecycle?.accepted();
 			if (effectiveDeliverAs !== undefined) onPromptDiverted(correlation);
 			// #4743: an accepted run owns a durable terminal publication when it
 			// settles; teardown joins it via this latch (never-accepted preflights
@@ -3129,8 +3146,10 @@ function sdkControlSurface(
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
 					onQueuedPromoted: promotion => {
+						if (promotion.startsOwnRun === true) imageLifecycle?.promoted(promotion);
 						admission.hooks.onQueuedPromoted(promotion);
 						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
+						if (promotion.startsOwnRun !== true) imageLifecycle?.promoted(promotion);
 						if (promotion.removed) releaseAcceptedImage(correlation);
 					},
 					onDispatchDisposition: disposition => {
@@ -3206,9 +3225,10 @@ function sdkControlSurface(
 					requesterConnectionId,
 					clientRef,
 					true,
-					current => {
+					(current, preflightSignal, submissionSettled) => {
 						correlation = current;
-						if (reservation) retainAcceptedImage(current, reservation.release);
+						if (reservation)
+							return retainAcceptedImage(current, reservation.release, preflightSignal, submissionSettled);
 					},
 				);
 			} catch (error) {
@@ -5272,20 +5292,35 @@ export function createNotificationsExtension(
 		const OWNED_SETTLEMENT_GRACE_MS = 500;
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
-		const acceptedImages = new Map<string, () => void>();
+		type AcceptedImageReservation = {
+			release: () => void;
+			preflightSignal: AbortSignal;
+			/** The producer can still retain ImageContent until settlement or exact run adoption. */
+			submissionPending: boolean;
+			/** A promoted queue entry needs its own run's proof before release authority transfers. */
+			awaitingAdoption: boolean;
+			accepted: boolean;
+			releaseRequested: boolean;
+		};
+		const acceptedImages = new Map<string, AcceptedImageReservation>();
 		// Absence means never consumed; a present undefined owner means execution
 		// started without exact ownership evidence and must remain charged.
 		const acceptedImageRunOwners = new Map<string, AgentTerminalOwnerContext | undefined>();
 		const retiringImages = new Set<string>();
 		const retireAcceptedImage = (key: string): void => {
-			const release = acceptedImages.get(key);
-			if (!release || retiringImages.has(key)) return;
+			const reservation = acceptedImages.get(key);
+			if (!reservation) return;
+			if (reservation.submissionPending || reservation.awaitingAdoption) {
+				reservation.releaseRequested = true;
+				return;
+			}
+			if (retiringImages.has(key)) return;
 			const discard = (): void => {
-				if (acceptedImages.get(key) !== release) return;
+				if (acceptedImages.get(key) !== reservation) return;
 				acceptedImages.delete(key);
 				acceptedImageRunOwners.delete(key);
 				retiringImages.delete(key);
-				release();
+				reservation.release();
 			};
 			const owner = acceptedImageRunOwners.get(key);
 			if (!owner) {
@@ -5303,9 +5338,50 @@ export function createNotificationsExtension(
 			retirePromptImageReservation(
 				owner.resourceRunId,
 				getProof,
-				() => acceptedImages.get(key) === release,
+				() => acceptedImages.get(key) === reservation,
 				discard,
 			);
+		};
+		const settleAcceptedImageSubmission = (key: string, reservation: AcceptedImageReservation): void => {
+			if (acceptedImages.get(key) !== reservation || !reservation.submissionPending) return;
+			reservation.submissionPending = false;
+			if (reservation.releaseRequested) retireAcceptedImage(key);
+		};
+		const retainAcceptedImage = (
+			correlation: { commandId: string; turnId: string },
+			release: () => void,
+			preflightSignal: AbortSignal,
+			submissionSettled: Promise<void>,
+		): {
+			accepted: () => void;
+			promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		} => {
+			const key = promptSubmissionKey(correlation);
+			const reservation: AcceptedImageReservation = {
+				release,
+				preflightSignal,
+				submissionPending: true,
+				awaitingAdoption: false,
+				accepted: false,
+				releaseRequested: false,
+			};
+			acceptedImages.set(key, reservation);
+			void submissionSettled.then(() => settleAcceptedImageSubmission(key, reservation));
+			return {
+				accepted: () => {
+					reservation.accepted = true;
+					if (reservation.preflightSignal.aborted) return;
+					if (acceptedImageRunOwners.get(key) && !reservation.awaitingAdoption) {
+						settleAcceptedImageSubmission(key, reservation);
+						if (reservation.releaseRequested) retireAcceptedImage(key);
+					}
+				},
+				promoted: promotion => {
+					reservation.awaitingAdoption =
+						promotion.startsOwnRun === true && promotion.removed !== true && !reservation.preflightSignal.aborted;
+					if (!reservation.awaitingAdoption && reservation.releaseRequested) retireAcceptedImage(key);
+				},
+			};
 		};
 		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }): void =>
 			retireAcceptedImage(promptSubmissionKey(correlation));
@@ -6433,6 +6509,16 @@ export function createNotificationsExtension(
 				const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
 				if (handle && domain) acceptedImageRunOwners.set(key, { resourceRunId: handle, domain });
 			}
+			const imageReservation = acceptedImages.get(key);
+			if (
+				imageReservation?.accepted &&
+				!imageReservation.preflightSignal.aborted &&
+				acceptedImageRunOwners.get(key)
+			) {
+				imageReservation.awaitingAdoption = false;
+				settleAcceptedImageSubmission(key, imageReservation);
+				if (imageReservation.releaseRequested) retireAcceptedImage(key);
+			}
 		};
 		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
@@ -6895,7 +6981,7 @@ export function createNotificationsExtension(
 			api,
 			imageUploads,
 			imageUploadsAvailable,
-			(correlation, release) => acceptedImages.set(promptSubmissionKey(correlation), release),
+			retainAcceptedImage,
 			releaseAcceptedImage,
 			() =>
 				runtime?.busy === true ||

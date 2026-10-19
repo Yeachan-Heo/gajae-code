@@ -3173,6 +3173,7 @@ function createControlSurface(
 	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	publishLifecycleFrame?: (frame: SdkFrame) => void,
 	retainAcceptedImage?: (correlation: InvocationCorrelation, release: () => void) => void,
+	settleAcceptedImageSubmission?: (correlation: InvocationCorrelation) => void,
 	releaseAcceptedImage?: (correlation: InvocationCorrelation) => void,
 	acceptedQueueCancellations: Map<string, AcceptedQueueCancellation> = new Map(),
 ): ControlSurface {
@@ -3400,6 +3401,7 @@ function createControlSurface(
 		};
 		let accepted = false;
 		let settled = false;
+		let submission: Promise<unknown> | undefined;
 		const cancelPreflight = () => {
 			preflightController.abort();
 			if (settled) return;
@@ -3460,7 +3462,7 @@ function createControlSurface(
 			acceptedQueueCancellations.set(`${correlation.commandId}:${correlation.turnId}`, queueCancellation);
 		let promotionStartsOwnRun: boolean | undefined;
 		try {
-			const submission = Promise.resolve(
+			submission = Promise.resolve(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
 					preflightSignal: preflightController.signal,
@@ -3524,6 +3526,7 @@ function createControlSurface(
 			);
 			void submission.then(
 				result => {
+					settleAcceptedImageSubmission?.(correlation);
 					if (settled) {
 						// A resolved submission after preflight acceptance means the work is over
 						// for every kind. `noteTransition` ignores an already-terminal record, so
@@ -3603,6 +3606,7 @@ function createControlSurface(
 					);
 				},
 				error => {
+					settleAcceptedImageSubmission?.(correlation);
 					if (settled) {
 						releaseAcceptedImage?.(correlation);
 						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
@@ -3727,6 +3731,7 @@ function createControlSurface(
 			};
 		} catch (error) {
 			if (!accepted) preflightController.abort();
+			if (!submission) settleAcceptedImageSubmission?.(correlation);
 			releaseAcceptedImage?.(correlation);
 			retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
@@ -5109,13 +5114,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			release: () => void;
 			handle?: string;
 			executionStarted?: boolean;
+			submissionPending?: boolean;
+			awaitingAdoption?: boolean;
+			releaseRequested?: boolean;
 			retiring?: boolean;
 		}
 	>();
 	const imageKey = (correlation: InvocationCorrelation): string => `${correlation.commandId}:${correlation.turnId}`;
 	const retireAcceptedImage = (key: string): void => {
 		const reservation = acceptedImages.get(key);
-		if (!reservation || reservation.retiring) return;
+		if (!reservation) return;
+		if ((reservation.submissionPending || reservation.awaitingAdoption) && !reservation.executionStarted) {
+			reservation.releaseRequested = true;
+			return;
+		}
+		if (reservation.retiring) return;
 		const release = (): void => {
 			if (acceptedImages.get(key) !== reservation) return;
 			acceptedImages.delete(key);
@@ -5142,11 +5155,28 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	const releaseAcceptedImage = (correlation: InvocationCorrelation): void =>
 		retireAcceptedImage(imageKey(correlation));
+	const settleAcceptedImageSubmission = (correlation: InvocationCorrelation): void => {
+		const key = imageKey(correlation);
+		const reservation = acceptedImages.get(key);
+		if (!reservation) return;
+		reservation.submissionPending = false;
+		if (reservation.releaseRequested) {
+			reservation.releaseRequested = false;
+			retireAcceptedImage(key);
+		}
+	};
 	const bindAcceptedImage = (correlation: InvocationCorrelation, handle: string | undefined): void => {
 		const reservation = acceptedImages.get(imageKey(correlation));
 		if (!reservation) return;
+		reservation.awaitingAdoption = false;
 		reservation.executionStarted = true;
 		if (handle && reservation.handle === undefined) reservation.handle = handle;
+		if (reservation.releaseRequested) retireAcceptedImage(imageKey(correlation));
+	};
+	// Promotion commits a queued image to its next own-run before agent_start supplies the exact resource handle.
+	const awaitAcceptedImageAdoption = (correlation: InvocationCorrelation): void => {
+		const reservation = acceptedImages.get(imageKey(correlation));
+		if (reservation) reservation.awaitingAdoption = true;
 	};
 	const releaseImagesForStore = (store: PromptImageUploadStore | undefined): void => {
 		for (const [key, reservation] of acceptedImages) {
@@ -7367,6 +7397,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			steerReconciliation,
 			imageUploads,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
+				if (!promotion?.removed) {
+					if (promotion?.startsOwnRun === false)
+						bindAcceptedImage(correlation, options.terminalAbortSeams?.getActivePromptHandle());
+					else awaitAcceptedImageAdoption(correlation);
+				}
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
 					const owner = lifecycleOwnerHolder.state;
 					if (sdkRunToken && owner)
@@ -7584,8 +7619,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			},
 			(correlation, release) => {
-				if (imageUploads) acceptedImages.set(imageKey(correlation), { store: imageUploads, release });
+				if (imageUploads)
+					acceptedImages.set(imageKey(correlation), {
+						store: imageUploads,
+						release,
+						submissionPending: true,
+					});
 			},
+			settleAcceptedImageSubmission,
 			releaseAcceptedImage,
 			acceptedQueueCancellations,
 		);

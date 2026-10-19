@@ -522,6 +522,8 @@ liveness, and missed close notifications cannot extend the expiry deadline. Acce
 image capacity belongs to the consuming execution, not the socket: disconnect,
 queue residence, an unrelated terminal, or uncertainty alone cannot release it.
 Failed admission or confirmed queue removal releases never-executed capacity.
+Acceptance or cancellation does not prove an unadopted producer has stopped retaining
+images: its capacity remains charged until that submission actually settles.
 Once execution starts, an exact resource-settlement proof is required: even an
 attributed cancelled `agent_end` or transport teardown may leave tools running.
 Still-pending resources retain a bounded retry owner. The existing ledger makes

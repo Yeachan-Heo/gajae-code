@@ -2771,6 +2771,367 @@ test("SDK host privately stages large images with authenticated connection owner
 	}
 });
 
+test("bus retains staged-image capacity until a turn-aborted preflight producer settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-preflight-abort-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-preflight-abort-${Date.now()}`;
+	const producerStarted = Promise.withResolvers<void>();
+	const releaseProducer = Promise.withResolvers<void>();
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-preflight-abort")) throw new Error("Image preflight run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	let preflightSignal: AbortSignal | undefined;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (content, options) => {
+			preflightSignal = options?.preflightSignal;
+			producerStarted.resolve();
+			await releaseProducer.promise;
+			expect(content).toContainEqual(
+				expect.objectContaining({ type: "image", data: expect.any(String), mimeType: "image/png" }),
+			);
+			if (options?.preflightSignal?.aborted)
+				throw Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "image preflight cancellation endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		const prompt = client
+			.control("turn.prompt", {
+				text: "Hold this image producer before preflight acceptance.",
+				stagedImages: [{ id }],
+			})
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await producerStarted.promise;
+		expect(await client.control("turn.abort", {})).toMatchObject({
+			ok: true,
+			result: { aborted: true, disposition: "preflight_cancelled" },
+		});
+		expect(await prompt).toMatchObject({ code: "busy" });
+		expect(preflightSignal?.aborted).toBe(true);
+		expect(releases).toBe(0);
+
+		releaseProducer.resolve();
+		await waitFor(() => releases === 1, "cancelled staged-image producer settlement");
+		expect(releases).toBe(1);
+	} finally {
+		releaseProducer.resolve();
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
+test("bus retains staged-image capacity across aborted late acceptance and shutdown", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-late-acceptance-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-late-acceptance-${Date.now()}`;
+	const producerStarted = Promise.withResolvers<void>();
+	const acceptanceReturned = Promise.withResolvers<void>();
+	const releaseProducer = Promise.withResolvers<void>();
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-late-acceptance")) throw new Error("Image late-acceptance run could not open.");
+	const sessionFile = path.join(cwd, "session.jsonl");
+	await Bun.write(sessionFile, "");
+	const baseContext = context(cwd, sessionId);
+	const sessionContext = {
+		...baseContext,
+		sessionManager: {
+			...(baseContext.sessionManager as Record<string, unknown>),
+			getSessionFile: () => sessionFile,
+		},
+		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	let preflightSignal: AbortSignal | undefined;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (content, options) => {
+			preflightSignal = options?.preflightSignal;
+			producerStarted.resolve();
+			pausedCommit.arm();
+			try {
+				await firePreflightAccept(options);
+			} catch {
+				// The durable acceptance raced the abort. Keep the producer pending so
+				// shutdown cannot mistake its client-facing outcome for settlement.
+			}
+			acceptanceReturned.resolve();
+			await releaseProducer.promise;
+			expect(content).toContainEqual(
+				expect.objectContaining({ type: "image", data: expect.any(String), mimeType: "image/png" }),
+			);
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	let shutdown: Promise<unknown> | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "late-acceptance image endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		void client
+			.control("turn.prompt", {
+				text: "Hold staged-image acceptance while aborting.",
+				stagedImages: [{ id }],
+			})
+			.catch(() => undefined);
+		await producerStarted.promise;
+		await pausedCommit.started;
+		// The acknowledgement is fenced behind the held durable write. Observe
+		// cancellation admission before releasing that write instead of deadlocking.
+		const abort = client.control("turn.abort", {}).catch(error => error);
+		await waitFor(() => preflightSignal?.aborted === true, "late acceptance preflight cancellation");
+		shutdown = Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext));
+		pausedCommit.release();
+		await acceptanceReturned.promise;
+		expect(preflightSignal?.aborted).toBe(true);
+		expect(releases).toBe(0);
+
+		releaseProducer.resolve();
+		await shutdown;
+		await abort;
+		await waitFor(() => releases === 1, "late accepted staged-image shutdown release");
+		expect(releases).toBe(1);
+	} finally {
+		pausedCommit.release();
+		releaseProducer.resolve();
+		await client?.close();
+		await shutdown;
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		pausedCommit.restore();
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
+test("bus keeps an accepted staged image charged through producer settlement before run adoption", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-unadopted-shutdown-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-unadopted-shutdown-${Date.now()}`;
+	const producerStarted = Promise.withResolvers<void>();
+	const acceptanceReturned = Promise.withResolvers<void>();
+	const releaseProducer = Promise.withResolvers<void>();
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-unadopted-shutdown")) throw new Error("Image unadopted run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (content, options) => {
+			producerStarted.resolve();
+			await firePreflightAccept(options);
+			acceptanceReturned.resolve();
+			await releaseProducer.promise;
+			expect(content).toContainEqual(
+				expect.objectContaining({ type: "image", data: expect.any(String), mimeType: "image/png" }),
+			);
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	let shutdown: Promise<unknown> | undefined;
+	let shutdownSettled = false;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "unadopted image shutdown endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		const baseAttachedClients = sessionHostAttachedClients() ?? 0;
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients + 1, "image shutdown client");
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		expect(
+			await client.control("turn.prompt", {
+				text: "Accept this image before run adoption.",
+				stagedImages: [{ id }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await producerStarted.promise;
+		await acceptanceReturned.promise;
+		// No agent_start was emitted, so no exact run owner exists yet.
+		expect(releases).toBe(0);
+
+		shutdown = Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext)).then(
+			result => {
+				shutdownSettled = true;
+				return result;
+			},
+		);
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseAttachedClients,
+			"shutdown endpoint stop while image producer is held",
+		);
+		await Bun.sleep(0);
+		expect(shutdownSettled).toBe(false);
+		expect(releases).toBe(0);
+		releaseProducer.resolve();
+		await shutdown;
+		expect(releases).toBe(1);
+	} finally {
+		releaseProducer.resolve();
+		await client?.close();
+		await shutdown;
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
+test("bus retains a promoted staged image until agent_start adopts its run", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-promotion-adoption-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-promotion-adoption-${Date.now()}`;
+	const ledger = createRunResourceLedger();
+	if (!ledger.open("image-promotion-run")) throw new Error("Image promotion run could not open.");
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: () => undefined,
+	};
+	const promotionReady = Promise.withResolvers<void>();
+	let promote: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
+	let releases = 0;
+	const cleanupReservations: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanupReservations.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const settings = { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings;
+	const handlers = start(
+		sessionContext,
+		settings,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+			promote = options?.onQueuedPromoted;
+			promotionReady.resolve();
+		},
+		true,
+	);
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "queued image promotion endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		expect(
+			await client.control("turn.prompt", {
+				text: "Promote this queued image into its own run.",
+				stagedImages: [{ id }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await promotionReady.promise;
+		await Bun.sleep(0);
+		// The queue-enqueue producer has settled; promotion creates an adoption
+		// interval before the next agent_start supplies the exact run owner.
+		promote?.({ startsOwnRun: true });
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		expect(releases).toBe(0);
+	} finally {
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		redeemSpy.mockRestore();
+		for (const release of cleanupReservations) release();
+	}
+});
+
 test.each([
 	"settlement",
 	"domain",
