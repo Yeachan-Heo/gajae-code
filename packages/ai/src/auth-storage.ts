@@ -6728,11 +6728,14 @@ export class AuthStorage {
 			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
-				this.#markCredentialBlocked(
-					providerKey,
-					selection.index,
-					resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
-				);
+				const targets = this.#exhaustedLimitBlockTargets(usage, Date.now());
+				if (targets.wideUntil === undefined && targets.scoped.length > 0) {
+					for (const scoped of targets.scoped) {
+						this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
+					}
+				} else {
+					this.#markCredentialBlocked(providerKey, selection.index, resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs);
+				}
 				return undefined;
 			}
 		}
@@ -6810,11 +6813,14 @@ export class AuthStorage {
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
 					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
-					this.#markCredentialBlocked(
-						providerKey,
-						selection.index,
-						resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
-					);
+					const targets = this.#exhaustedLimitBlockTargets(usage, Date.now());
+					if (targets.wideUntil === undefined && targets.scoped.length > 0) {
+						for (const scoped of targets.scoped) {
+							this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
+						}
+					} else {
+						this.#markCredentialBlocked(providerKey, selection.index, resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs);
+					}
 					return undefined;
 				}
 			}
