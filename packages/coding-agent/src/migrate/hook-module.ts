@@ -22,7 +22,6 @@ const EVENT_MAP: Record<string, { event: string; blocking: boolean }> = {
 	PreToolUse: { event: "tool_call", blocking: true },
 	PostToolUse: { event: "tool_result", blocking: false },
 	SessionStart: { event: "session_start", blocking: false },
-	Stop: { event: "turn_end", blocking: false },
 };
 
 export function isSupportedHookEvent(event: string): boolean {
@@ -116,15 +115,20 @@ interface HookApi {
 	on(event: string, handler: (payload: unknown, context: { cwd?: string }) => unknown): void;
 }
 
+/** Maximum time (ms) to wait for a hook command to complete. Prevents indefinite hangs. */
+const HOOK_COMMAND_TIMEOUT_MS = 30000;
+
 ${blocks}
 
 function matches(matcher: string | undefined, toolName: string | undefined): boolean {
 	if (!matcher || !matcher.trim()) return true;
 	if (!toolName) return false;
+	// Normalize tool name to lowercase (Claude Code tools are capitalized, GJC tools are lowercase)
+	const normalizedName = toolName.toLowerCase();
 	try {
-		return new RegExp(\`^(?:\${matcher})$\`).test(toolName);
+		return new RegExp(\`^(?:\${matcher})$\`, "i").test(normalizedName);
 	} catch {
-		return matcher === toolName;
+		return matcher.toLowerCase() === normalizedName;
 	}
 }
 
@@ -173,6 +177,18 @@ function registerBlocking(api: HookApi, event: string, hooks: readonly ImportedH
 				tool_input: record?.input,
 				cwd: context?.cwd,
 			});
+			// Check for explicit deny in JSON response (exit 0 with permissionDecision: "deny")
+			if (result.code === 0 && result.stdout.trim()) {
+				try {
+					const response = JSON.parse(result.stdout) as { permissionDecision?: string };
+					if (response.permissionDecision === "deny") {
+						return { block: true, reason: \`denied by \${hook.event} hook\` };
+					}
+				} catch {
+					// Not JSON or parse failed; check exit code
+				}
+			}
+			// Standard Claude Code convention: exit 2 means block
 			if (result.code === 2) {
 				return { block: true, reason: result.stderr.trim() || \`blocked by imported \${hook.event} hook\` };
 			}
@@ -183,16 +199,30 @@ function registerBlocking(api: HookApi, event: string, hooks: readonly ImportedH
 
 function registerObservational(api: HookApi, event: string, hooks: readonly ImportedHook[]): void {
 	api.on(event, async (payload, context) => {
-		const record = payload as { toolName?: string; input?: unknown; turnIndex?: number };
+		const record = payload as {
+			toolName?: string;
+			input?: unknown;
+			turnIndex?: number;
+			content?: unknown;
+			isError?: boolean;
+		};
 		for (const hook of hooks) {
 			if (event === "tool_result" && !matches(hook.matcher, record?.toolName)) continue;
-			await runHook(hook, {
+			const hookPayload: Record<string, unknown> = {
 				hook_event_name: hook.event,
 				tool_name: record?.toolName,
 				tool_input: record?.input,
 				turn_index: record?.turnIndex,
 				cwd: context?.cwd,
-			});
+			};
+			// Translate tool_response fields for PostToolUse events
+			if (event === "tool_result" && record?.content !== undefined) {
+				hookPayload.tool_response = record.content;
+			}
+			if (event === "tool_result" && record?.isError !== undefined) {
+				hookPayload.tool_error = record.isError;
+			}
+			await runHook(hook, hookPayload);
 		}
 		return undefined;
 	});
