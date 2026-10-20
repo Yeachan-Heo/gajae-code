@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 const contentCache = new Map<string, string | null>();
 const dirCache = new Map<string, fs.Dirent[]>();
+let cacheGeneration = 0;
 
 /** Authority used when reading from an explicit-home discovery context. */
 export type ReadScope = "project" | "user" | "native";
@@ -283,12 +284,13 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 			if (useCache) contentCache.set(abs, null);
 			return null;
 		}
+		const generation = cacheGeneration;
 		try {
 			const content = await Bun.file(readable).text();
-			if (useCache) contentCache.set(abs, content);
+			if (useCache && generation === cacheGeneration) contentCache.set(abs, content);
 			return content;
 		} catch {
-			if (useCache) contentCache.set(abs, null);
+			if (useCache && generation === cacheGeneration) contentCache.set(abs, null);
 			return null;
 		}
 	}
@@ -298,14 +300,15 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 		if (useCache) contentCache.set(abs, null);
 		return null;
 	}
+	const generation = cacheGeneration;
 	try {
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		const content = await opened.handle.readFile({ encoding: "utf8" });
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
-		if (useCache) contentCache.set(abs, content);
+		if (useCache && generation === cacheGeneration) contentCache.set(abs, content);
 		return content;
 	} catch {
-		if (useCache) contentCache.set(abs, null);
+		if (useCache && generation === cacheGeneration) contentCache.set(abs, null);
 		return null;
 	} finally {
 		await opened.handle.close();
@@ -411,10 +414,11 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	let handle: fsPromises.FileHandle | undefined;
 	const authorized = await statAuthorizedPath(abs, options);
 	if (options?.isolatedHome && authorized === null) return [];
+	const generation = cacheGeneration;
 	try {
 		if (!options?.isolatedHome) {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
-			if (useCache) dirCache.set(abs, entries);
+			if (useCache && generation === cacheGeneration) dirCache.set(abs, entries);
 			return entries;
 		}
 		// Linux can enumerate a pinned directory descriptor through /proc. Node
@@ -425,7 +429,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (options?.isolatedHome && process.platform !== "linux") {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
 			if (!(await validateDirectoryPath(abs, options, authorized))) return [];
-			if (useCache) dirCache.set(abs, entries);
+			if (useCache && generation === cacheGeneration) dirCache.set(abs, entries);
 			return entries;
 		}
 		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
@@ -439,10 +443,10 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (!(await isHomeIdentityStable(options))) return [];
 		if (!(await isUserAgentIdentityStable(options))) return [];
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
-		if (useCache) dirCache.set(abs, entries);
+		if (useCache && generation === cacheGeneration) dirCache.set(abs, entries);
 		return entries;
 	} catch {
-		if (useCache) dirCache.set(abs, []);
+		if (useCache && generation === cacheGeneration) dirCache.set(abs, []);
 		return [];
 	} finally {
 		await handle?.close().catch(() => {});
@@ -506,11 +510,13 @@ export function cacheStats(): { content: number; dir: number } {
 }
 
 export function clearCache(): void {
+	cacheGeneration += 1;
 	contentCache.clear();
 	dirCache.clear();
 }
 
 export function invalidate(filePath: string): void {
+	cacheGeneration += 1;
 	const abs = resolvePath(filePath);
 	contentCache.delete(abs);
 	dirCache.delete(abs);

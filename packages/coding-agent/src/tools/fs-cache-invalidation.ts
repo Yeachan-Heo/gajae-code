@@ -1,4 +1,5 @@
 import type { invalidateFsScanCache as invalidateFsScanCacheFn } from "@gajae-code/natives";
+import { invalidate } from "../capability/fs";
 
 let nativeInvalidateFsScanCache: typeof invalidateFsScanCacheFn | undefined;
 
@@ -14,6 +15,7 @@ function invalidateFsScanCacheNative(path: string): void {
  */
 export function invalidateFsScanAfterWrite(path: string): void {
 	invalidateFsScanCacheNative(path);
+	invalidate(path);
 }
 
 /**
@@ -21,6 +23,7 @@ export function invalidateFsScanAfterWrite(path: string): void {
  */
 export function invalidateFsScanAfterDelete(path: string): void {
 	invalidateFsScanCacheNative(path);
+	invalidate(path);
 }
 
 /**
@@ -31,7 +34,9 @@ export function invalidateFsScanAfterDelete(path: string): void {
  */
 export function invalidateFsScanAfterRename(oldPath: string, newPath: string): void {
 	invalidateFsScanCacheNative(oldPath);
+	invalidate(oldPath);
 	if (newPath !== oldPath) {
 		invalidateFsScanCacheNative(newPath);
+		invalidate(newPath);
 	}
 }
