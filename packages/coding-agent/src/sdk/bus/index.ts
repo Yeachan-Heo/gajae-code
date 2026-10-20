@@ -71,7 +71,7 @@ import {
 	type WorkflowGateTerminalController,
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
 	createSessionWorkLease,
@@ -2679,6 +2679,7 @@ function sdkControlSurface(
 	) => {
 		accepted: () => void;
 		promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		refused: () => boolean;
 	},
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void,
 	isBusy: () => boolean,
@@ -2695,6 +2696,12 @@ function sdkControlSurface(
 		correlation: { commandId: string; turnId: string },
 		error: unknown,
 	) => void | Promise<void> = () => {},
+	onQueuedRunStartFailed: (
+		correlation: { commandId: string; turnId: string },
+		failure: QueuedRunStartFailure,
+		sdkRunToken: string | undefined,
+		refuseImage: (() => boolean) | undefined,
+	) => boolean,
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
 	onPromptDiverted: (correlation: { commandId: string; turnId: string }) => void,
 	onPromptPromoted: (
@@ -2990,6 +2997,7 @@ function sdkControlSurface(
 			| {
 					accepted: () => void;
 					promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+					refused: () => boolean;
 			  }
 			| undefined,
 		resolveImages?: () => unknown,
@@ -3071,6 +3079,7 @@ function sdkControlSurface(
 		const submissionSettled = Promise.withResolvers<void>();
 		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		let queuedRunRefused = false;
 		const imageLifecycle = onCorrelation?.(correlation, preflightController.signal, submissionSettled.promise);
 		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
@@ -3151,6 +3160,7 @@ function sdkControlSurface(
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
 					onQueuedPromoted: promotion => {
+						if (queuedRunRefused) return;
 						if (promotion.startsOwnRun === true) imageLifecycle?.promoted(promotion);
 						admission.hooks.onQueuedPromoted(promotion);
 						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
@@ -3158,8 +3168,13 @@ function sdkControlSurface(
 						if (promotion.removed) releaseAcceptedImage(correlation);
 					},
 					onDispatchDisposition: disposition => {
+						if (queuedRunRefused) return;
 						admission.hooks.onDispatchDisposition(disposition);
 						if (!disposition.startsOwnRun) onPromptDiverted(correlation);
+					},
+					onQueuedRunStartFailed: failure => {
+						if (queuedRunRefused) return;
+						queuedRunRefused = onQueuedRunStartFailed(correlation, failure, sdkRunToken, imageLifecycle?.refused);
 					},
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
@@ -3168,7 +3183,7 @@ function sdkControlSurface(
 		} catch (error) {
 			submissionSettled.resolve();
 			admission.abandon();
-			if (accepted && !preflightController.signal.aborted)
+			if (accepted && !queuedRunRefused && !preflightController.signal.aborted)
 				trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 			else settlePreflight({ status: "rejected", error });
 		}
@@ -3190,7 +3205,7 @@ function sdkControlSurface(
 				},
 				error => {
 					admission.abandon();
-					if (accepted && !preflightController.signal.aborted)
+					if (accepted && !queuedRunRefused && !preflightController.signal.aborted)
 						trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 					else settlePreflight({ status: "rejected", error });
 					submissionSettled.resolve();
@@ -5376,6 +5391,7 @@ export function createNotificationsExtension(
 		): {
 			accepted: () => void;
 			promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			refused: () => boolean;
 		} => {
 			const key = promptSubmissionKey(correlation);
 			const reservation: AcceptedImageReservation = {
@@ -5400,6 +5416,12 @@ export function createNotificationsExtension(
 				promoted: promotion => {
 					reservation.awaitingAdoption = promotion.startsOwnRun === true && promotion.removed !== true;
 					if (!reservation.awaitingAdoption && reservation.releaseRequested) retireAcceptedImage(key);
+				},
+				refused: () => {
+					if (acceptedImages.get(key) !== reservation || acceptedImageRunOwners.has(key)) return false;
+					reservation.awaitingAdoption = false;
+					retireAcceptedImage(key);
+					return true;
 				},
 			};
 		};
@@ -6945,7 +6967,7 @@ export function createNotificationsExtension(
 		};
 		const recordPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (!submission) return;
+			if (!submission || submission.terminal || submission.failed) return;
 			releaseAcceptedImage(correlation);
 			submission.failed = true;
 			removePendingPromptCorrelation(correlation);
@@ -6955,6 +6977,29 @@ export function createNotificationsExtension(
 			)
 				runtime.activePromptCorrelation = undefined;
 			await emitPromptFailure(correlation, error);
+		};
+		const recordQueuedRunStartFailure = (
+			correlation: { commandId: string; turnId: string },
+			failure: QueuedRunStartFailure,
+			sdkRunToken: string | undefined,
+			refuseImage: (() => boolean) | undefined,
+		): boolean => {
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
+			// A present undefined owner is already-started execution, not no-start evidence.
+			if (
+				failure.disposition !== "not-started" ||
+				(submission && submission.sdkRunToken !== sdkRunToken) ||
+				submission?.executionHandle !== undefined ||
+				acceptedImageRunOwners.has(key)
+			)
+				return false;
+			// Reservation proof outlives the mutable receipt. The captured lifecycle
+			// checks reservation identity and keeps the pending producer fenced.
+			if (refuseImage ? !refuseImage() : !submission) return false;
+			if (submission && !submission.terminal && !submission.failed)
+				trackReconciliationProducer(recordPromptFailure(correlation, failure.error));
+			return true;
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
 			const key = promptSubmissionKey(correlation);
@@ -7009,6 +7054,7 @@ export function createNotificationsExtension(
 				pendingPromptCorrelationsBySdkRunToken.size > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
+			recordQueuedRunStartFailure,
 			discardPromptAcceptance,
 			onPromptDiverted,
 			onPromptPromoted,

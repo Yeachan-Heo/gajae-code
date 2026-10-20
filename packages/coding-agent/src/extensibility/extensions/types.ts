@@ -50,7 +50,7 @@ import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
 import type { ProjectProgressSnapshot } from "../../progress/progress-contract";
-import type { AgentSessionEventListener } from "../../session/agent-session";
+import type { AgentSessionEventListener, QueuedRunStartFailure } from "../../session/agent-session";
 import type {
 	ClientBridge,
 	ClientBridgePermissionOption,
@@ -1347,6 +1347,8 @@ export interface ExtensionAPI {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			/** Internal positive refusal before an exact queued invocation can start. */
+			onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
@@ -1577,6 +1579,8 @@ export type SendUserMessageHandler = (
 		 * grants root abort ownership.
 		 */
 		onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		/** Internal positive refusal, not an inference from a dispatch error or missing event. */
+		onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 		/**
 		 * Fired synchronously when a plain prompt's dispatch resolves at queue
 		 * time instead of run end (diverted into an in-flight run's steering).

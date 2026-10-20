@@ -23,6 +23,7 @@ import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { ExtensionRuntime } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type {
 	AgentEndEvent,
@@ -101,7 +102,7 @@ import {
 	SdkStartupRollbackTracker,
 	sanitizeSdkStartupMessage,
 } from "../src/sdk/startup-capability";
-import { AgentSession } from "../src/session/agent-session";
+import { AgentSession, type QueuedRunStartFailure } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import type {
 	ClientBridgePermissionOption,
@@ -2567,6 +2568,7 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 			{
 				preflightSignal: expect.any(AbortSignal),
 				onQueuedPromoted: expect.any(Function),
+				onQueuedRunStartFailed: expect.any(Function),
 				onDispatchDisposition: expect.any(Function),
 			},
 		],
@@ -2575,6 +2577,7 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 			{
 				preflightSignal: expect.any(AbortSignal),
 				onQueuedPromoted: expect.any(Function),
+				onQueuedRunStartFailed: expect.any(Function),
 				onDispatchDisposition: expect.any(Function),
 			},
 		],
@@ -3104,9 +3107,235 @@ test("bus keeps an accepted staged image charged through producer settlement bef
 });
 
 test.each([
+	"returned",
+	"pending",
+	"failed-before-refusal",
+] as const)("native image refusal uses real queued Core authority (%s)", async mode => {
+	const pendingProducer = mode !== "returned";
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-native-core-image-refusal-"));
+	dirs.push(cwd);
+	const manager = SessionManager.create(cwd, cwd);
+	const sessionId = manager.getSessionId();
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled model");
+	const auth = await AuthStorage.create(path.join(cwd, "auth.db"));
+	auth.setRuntimeApiKey(model.provider, "test-key");
+	const entered = Promise.withResolvers<void>();
+	const predecessorRelease = Promise.withResolvers<void>();
+	const producerRelease = Promise.withResolvers<void>();
+	const enqueued = Promise.withResolvers<void>();
+	const refused = Promise.withResolvers<QueuedRunStartFailure>();
+	let providerCalls = 0;
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		streamFn: createMockModel({
+			responses: [
+				async () => {
+					providerCalls++;
+					entered.resolve();
+					await predecessorRelease.promise;
+					return { content: ["predecessor completed"] };
+				},
+				() => {
+					providerCalls++;
+					return { content: ["unrelated completed"] };
+				},
+			],
+		}).stream,
+	});
+	const settings = Settings.isolated({ "compaction.enabled": false });
+	settings.setModelRole("default", `${model.provider}/${model.id}`);
+	const registry = new ModelRegistry(auth, path.join(cwd, "models.yml"));
+	const runner = new ExtensionRunner([], new ExtensionRuntime(), cwd, manager, registry, undefined, settings);
+	const session = new AgentSession({
+		agent,
+		sessionManager: manager,
+		settings,
+		modelRegistry: registry,
+		extensionRunner: runner,
+	});
+	session.setConfiguredModelChain("default", [`${model.provider}/${model.id}`], "test");
+	const sourceBefore = getPromptImageProcessBudgetSnapshot().sourceBytes;
+	let releases = 0;
+	const cleanup: Array<() => void> = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		cleanup.push(reservation.release);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	const ctx = {
+		...context(cwd, sessionId),
+		sessionManager: manager,
+		isIdle: () => !session.isStreaming,
+		getActivePromptHandle: () => session.activePromptHandle,
+		getPendingMessageCounts: () => session.pendingMessageCounts,
+		getRunOwnerDomain: (handle: string) => session.getRunOwnerDomain(handle),
+		getTerminalRunOwnerForEvent: (event: object) => session.getTerminalRunOwnerForEvent(event),
+		waitForRunSettlement: (handle: string) => agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
+	};
+	let predecessor: Promise<void> | undefined;
+	const predecessorToken = `unrelated-predecessor-${sessionId}`;
+	const queuedRunCapability = createSdkRunCapability(`queued-image-${sessionId}`);
+	let callback: ((failure: QueuedRunStartFailure) => void) | undefined;
+	let latePromotion: (() => void) | undefined;
+	const handlers = start(
+		ctx,
+		undefined,
+		async (content, options) => {
+			// Real preflight race: the predecessor starts after native admission, before dispatch.
+			// Give each real execution its own SDK identity; the adapter deliberately
+			// queues this C01 dispatch instead of claiming a new public queue policy.
+			// Use the authenticated production send adapter: it translates the
+			// capability into the internal prompt token before Core acceptance.
+			predecessor = session.sendUserMessage("predecessor", {
+				sdkRunCapability: createSdkRunCapability(predecessorToken),
+			});
+			await entered.promise;
+			const delivery = options;
+			callback = options?.onQueuedRunStartFailed;
+			latePromotion = () => options?.onQueuedPromoted?.({ startsOwnRun: true });
+			await session.sendUserMessage(content, {
+				...delivery,
+				deliverAs: "followUp",
+				sdkRunCapability: queuedRunCapability,
+				onQueuedRunStartFailed: failure => {
+					// Delay only notification delivery, never fabricate Core's decision.
+					if (mode !== "failed-before-refusal") callback?.(failure);
+					refused.resolve(failure);
+				},
+			});
+			enqueued.resolve();
+			if (pendingProducer) await producerRelease.promise;
+			if (mode === "failed-before-refusal")
+				throw Object.assign(new Error("earlier enqueue producer failed"), { code: "rate_limit" });
+		},
+		true,
+	);
+	const starts: Array<string | undefined> = [];
+	const eventWrites: Promise<unknown>[] = [];
+	// Real Core/Session/native-consumer integration with forced follow-up delivery.
+	// Only the actual extension projection carries private tokens and owner authority.
+	const originalEmit = runner.emit.bind(runner);
+	const emitSpy = spyOn(runner, "emit").mockImplementation(async (event, continueWhile, scope) => {
+		const result = await originalEmit(event, continueWhile, scope);
+		if (event.type === "agent_start") starts.push(event.sdkRunToken);
+		const handler = handlers.get(event.type);
+		if (handler) {
+			const write = Promise.resolve(handler(event, ctx));
+			eventWrites.push(write);
+			await write;
+		}
+		return result;
+	});
+	let client: SdkClient | undefined;
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "real refusal endpoint");
+		const endpoint = await Bun.file(endpointFile).json();
+		client = await SdkClient.connect(endpoint.url, endpoint.token);
+		const id = await stageOverSdkClient(client, makeStagedTestPng());
+		const ack = await client.control("turn.prompt", { text: "queued image", stagedImages: [{ id }] });
+		expect(ack).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = acceptedCorrelation(ack as Record<string, unknown>);
+		await enqueued.promise;
+		expect(providerCalls).toBe(1);
+		expect(releases).toBe(0);
+		agent.setModel(undefined);
+		predecessorRelease.resolve();
+		const failure = await refused.promise;
+		expect(failure).toMatchObject({ disposition: "not-started", error: { message: "No model configured" } });
+		await predecessor;
+		await session.waitForIdle();
+		await Promise.all(eventWrites);
+		if (pendingProducer) expect(releases).toBe(0);
+		let earlierReceipt: unknown;
+		producerRelease.resolve();
+		if (mode === "failed-before-refusal") {
+			for (let attempt = 0; attempt < 100; attempt++) {
+				earlierReceipt = await client.query("turn.result", { kind: "prompt", ...correlation });
+				if ((earlierReceipt as { result?: { status?: string } }).result?.status === "failed") break;
+				await Bun.sleep(20);
+			}
+			expect(earlierReceipt).toMatchObject({ ok: true, result: { status: "failed" } });
+			expect(releases).toBe(0);
+			expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBeGreaterThan(sourceBefore);
+		}
+		callback?.(failure);
+		callback?.(failure);
+		latePromotion?.();
+		await waitFor(() => releases === 1, "real no-start image retirement");
+		expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBefore);
+		expect(providerCalls).toBe(1);
+		expect(starts).toEqual([predecessorToken]);
+		let receipt: unknown;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			receipt = await client.query("turn.result", { kind: "prompt", ...correlation });
+			if ((receipt as { result?: { status?: string } }).result?.status === "failed") break;
+			await Bun.sleep(20);
+		}
+		expect(receipt).toMatchObject({
+			ok: true,
+			result: {
+				status: "failed",
+				error: {
+					code: mode === "failed-before-refusal" ? "rate_limit" : "internal",
+					message: "Prompt submission failed.",
+				},
+				outcome: {
+					kind: "failed",
+					phase: "submission",
+					code: "prompt_failed",
+					provenance: "agent_failed",
+				},
+			},
+		});
+		if (mode === "failed-before-refusal")
+			expect((receipt as { result: unknown }).result).toEqual((earlierReceipt as { result: unknown }).result);
+		agent.setModel(model);
+		await session.prompt("later unrelated run");
+		await session.waitForIdle();
+		await Promise.all(eventWrites);
+		callback?.(failure);
+		expect(starts).toEqual([predecessorToken, undefined]);
+		expect(providerCalls).toBe(2);
+		expect(releases).toBe(1);
+		// The same session store can reserve again after the refused adoption.
+		const nextId = await stageOverSdkClient(client, makeStagedTestPng());
+		expect(await client.control("turn.image.discard", { id: nextId })).toMatchObject({ ok: true });
+		expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBefore);
+	} finally {
+		predecessorRelease.resolve();
+		producerRelease.resolve();
+		await predecessor;
+		await client?.close();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		emitSpy.mockRestore();
+		await session.dispose();
+		auth.close();
+		redeemSpy.mockRestore();
+		for (const release of cleanup) release();
+	}
+});
+
+test.each([
 	"own-run",
 	"aborted-own-run",
 	"removed",
+	"generic-same-text",
+	"post-start",
+	"post-start-unknown",
 ] as const)("bus retains a promoted staged image until agent_start adopts its run (%s)", async mode => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-promotion-adoption-"));
 	dirs.push(cwd);
@@ -3115,11 +3344,14 @@ test.each([
 	if (!ledger.open("image-promotion-run")) throw new Error("Image promotion run could not open.");
 	const sessionContext = {
 		...context(cwd, sessionId),
+		getActivePromptHandle: () => (mode === "post-start" ? "image-promotion-run" : undefined),
 		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
 		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: () => undefined,
 	};
 	const promotionReady = Promise.withResolvers<void>();
+	const genericFailure = Promise.withResolvers<void>();
+	let refuse: ((failure: QueuedRunStartFailure) => void) | undefined;
 	let promote: ((promotion: { startsOwnRun?: boolean; removed?: boolean }) => void) | undefined;
 	let promotedAfterAbort = false;
 	let releases = 0;
@@ -3148,6 +3380,7 @@ test.each([
 			options?.onDispatchDisposition?.({ startsOwnRun: false });
 			await firePreflightAccept(options);
 			promote = options?.onQueuedPromoted;
+			refuse = options?.onQueuedRunStartFailed;
 			if (mode === "aborted-own-run") {
 				options?.preflightSignal?.addEventListener(
 					"abort",
@@ -3159,6 +3392,10 @@ test.each([
 				);
 			}
 			promotionReady.resolve();
+			if (mode === "generic-same-text") {
+				await genericFailure.promise;
+				throw new Error("No model configured");
+			}
 		},
 		true,
 	);
@@ -3185,10 +3422,21 @@ test.each([
 		} else if (mode === "removed") {
 			promote?.({ startsOwnRun: false, removed: true });
 			await waitFor(() => releases === 1, "authoritative queued image removal");
-		} else promote?.({ startsOwnRun: true });
+		} else {
+			promote?.({ startsOwnRun: true });
+			if (mode === "generic-same-text") {
+				genericFailure.resolve();
+				await Bun.sleep(0);
+			} else if (mode.startsWith("post-start")) {
+				await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+				refuse?.({ disposition: "not-started", error: new Error("No model configured") });
+				refuse?.({ disposition: "not-started", error: new Error("duplicate") });
+			}
+		}
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 		expect(releases).toBe(mode === "removed" ? 1 : 0);
 	} finally {
+		genericFailure.resolve();
 		await client?.close();
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 		redeemSpy.mockRestore();
@@ -4220,6 +4468,7 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 				preflightSignal: expect.any(AbortSignal),
 				sdkRunCapability: expect.any(Object),
 				onQueuedPromoted: expect.any(Function),
+				onQueuedRunStartFailed: expect.any(Function),
 				onDispatchDisposition: expect.any(Function),
 			},
 		],

@@ -1,15 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
-import type { AgentMessage } from "@gajae-code/agent-core";
+import type { AgentMessage, AgentQueuedRunStartDecision } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel, type TextContent } from "@gajae-code/ai";
 import { createMockModel, type MockHandler } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type QueuedRunStartFailure } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
+import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 
 function isRetryableRemoveError(error: unknown): boolean {
 	if (typeof error !== "object" || error === null) return false;
@@ -103,6 +104,255 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			await Bun.sleep(5);
 		}
 	}
+
+	it("isolates a throwing failure observer within a real all-mode own-run batch", async () => {
+		const evalRelease = Promise.withResolvers<void>();
+		const refused = Promise.withResolvers<void>();
+		const observerError = new Error("first queued failure observer failed");
+		const firstFailures: QueuedRunStartFailure[] = [];
+		const secondFailures: QueuedRunStartFailure[] = [];
+		const siblingFailures: QueuedRunStartFailure[] = [];
+		const promotions: Array<{ startsOwnRun?: boolean; removed?: boolean }> = [];
+		const siblingCancellation = new AbortController();
+		let providerCalls = 0;
+		session = buildSession([
+			() => {
+				providerCalls += 1;
+				return { content: ["seed"] };
+			},
+			() => {
+				providerCalls += 1;
+				return { content: ["restored"] };
+			},
+		]);
+		await session.prompt("seed");
+		session.setFollowUpMode("all");
+		const model = session.agent.state.model;
+		const decisions: AgentQueuedRunStartDecision[] = [];
+		const sessionDecisionHook = session.agent.onQueuedRunStartDecision;
+		session.agent.onQueuedRunStartDecision = decision => {
+			decisions.push(decision);
+			sessionDecisionHook?.(decision);
+		};
+		const evaluation = session.trackEvalExecution(evalRelease.promise, new AbortController());
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await session.sendUserMessage("first selected", {
+				deliverAs: "followUp",
+				queuePolicy: "respect-mode",
+				onQueuedPromoted: promotion => promotions.push(promotion),
+				onQueuedRunStartFailed: failure => {
+					firstFailures.push(failure);
+					throw observerError;
+				},
+			});
+			await session.sendUserMessage("second selected", {
+				deliverAs: "followUp",
+				queuePolicy: "respect-mode",
+				onQueuedPromoted: promotion => promotions.push(promotion),
+				onQueuedRunStartFailed: failure => {
+					secondFailures.push(failure);
+					refused.resolve();
+				},
+			});
+			await session.sendUserMessage("outside selected batch", {
+				deliverAs: "followUp",
+				sdkRunCapability: createSdkRunCapability("outside-refused-batch"),
+				preflightSignal: siblingCancellation.signal,
+				onQueuedRunStartFailed: failure => siblingFailures.push(failure),
+			});
+			const selected = session.agent.snapshotFollowUp();
+			expect(selected).toHaveLength(2);
+			expect(session.getQueuedMessages().followUp).toEqual([
+				"first selected",
+				"second selected",
+				"outside selected batch",
+			]);
+			session.agent.setModel(undefined);
+			evalRelease.resolve();
+			await evaluation;
+			await refused.promise;
+			expect(firstFailures).toHaveLength(1);
+			expect(secondFailures).toHaveLength(1);
+			const refusal = secondFailures[0]?.error;
+			if (!(refusal instanceof Error)) throw new Error("Expected queued model-guard refusal", { cause: refusal });
+			expect(firstFailures[0]).toEqual({ disposition: "not-started", error: secondFailures[0]?.error });
+			expect(secondFailures[0]?.error).toMatchObject({ message: "No model configured" });
+			expect(secondFailures[0]?.error).not.toBe(observerError);
+			expect(decisions).toEqual([
+				{
+					disposition: "not-started",
+					consumedQueuedMessages: selected,
+					error: refusal,
+				},
+			]);
+			expect(decisions[0]?.consumedQueuedMessages[0]).toBe(selected[0]);
+			expect(decisions[0]?.consumedQueuedMessages[1]).toBe(selected[1]);
+			expect(promotions).toEqual([{ startsOwnRun: true }, { startsOwnRun: true }]);
+			expect(session.agent.snapshotFollowUp()).toEqual([]);
+			expect(session.getQueuedMessages().followUp).toEqual(["outside selected batch"]);
+			expect(siblingFailures).toEqual([]);
+			expect(providerCalls).toBe(1);
+			expect(warn).toHaveBeenCalledWith("Queued run start failure callback failed", { error: observerError });
+			siblingCancellation.abort();
+			await session.waitForIdle();
+			session.agent.setModel(model);
+			await session.prompt("restored");
+			expect(firstFailures).toHaveLength(1);
+			expect(secondFailures).toHaveLength(1);
+			expect(siblingFailures).toEqual([]);
+			expect(session.queuedMessageCount).toBe(0);
+			expect(userTexts(session)).toEqual(["seed", "restored"]);
+		} finally {
+			evalRelease.resolve();
+			siblingCancellation.abort();
+			warn.mockRestore();
+		}
+	});
+
+	it("relays an actual queued no-model refusal after enqueue returns without retaining the failed SDK token", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const refused = Promise.withResolvers<QueuedRunStartFailure>();
+		const restoredEntered = Promise.withResolvers<void>();
+		const restoredRelease = Promise.withResolvers<void>();
+		let providerCalls = 0;
+		session = buildSession([
+			async () => {
+				providerCalls += 1;
+				entered.resolve();
+				await release.promise;
+				return { content: ["predecessor"] };
+			},
+			async () => {
+				providerCalls += 1;
+				restoredEntered.resolve();
+				await restoredRelease.promise;
+				return { content: ["restored"] };
+			},
+		]);
+		const model = session.agent.state.model;
+		const failures: QueuedRunStartFailure[] = [];
+		const siblingFailures: QueuedRunStartFailure[] = [];
+		const siblingPromotions: Array<{ startsOwnRun?: boolean; removed?: boolean }> = [];
+		const siblingCancellation = new AbortController();
+		const coreDecisions: unknown[] = [];
+		const sessionDecisionHook = session.agent.onQueuedRunStartDecision;
+		session.agent.onQueuedRunStartDecision = decision => {
+			coreDecisions.push(decision);
+			sessionDecisionHook?.(decision);
+		};
+		const predecessor = session.prompt("predecessor");
+		await entered.promise;
+		await session.sendUserMessage("same text", {
+			deliverAs: "followUp",
+			sdkRunCapability: createSdkRunCapability("failed-queued-owner"),
+			onQueuedRunStartFailed: failure => {
+				failures.push(failure);
+				refused.resolve(failure);
+			},
+		});
+		await session.sendUserMessage("same text", {
+			deliverAs: "followUp",
+			sdkRunCapability: createSdkRunCapability("removed-sibling-owner"),
+			preflightSignal: siblingCancellation.signal,
+			onQueuedPromoted: promotion => siblingPromotions.push(promotion),
+			onQueuedRunStartFailed: failure => siblingFailures.push(failure),
+		});
+		expect(failures).toEqual([]);
+		siblingCancellation.abort();
+		session.agent.setModel(undefined);
+		release.resolve();
+		const failure = await refused.promise;
+		await predecessor;
+		await session.waitForIdle();
+		expect(failure.disposition).toBe("not-started");
+		expect(failure.error).toBeInstanceOf(Error);
+		expect(coreDecisions).toEqual([expect.objectContaining({ disposition: "not-started", error: failure.error })]);
+		expect(failures).toHaveLength(1);
+		expect(siblingFailures).toEqual([]);
+		expect(siblingPromotions).toEqual([{ startsOwnRun: true, removed: true }]);
+		expect(providerCalls).toBe(1);
+		expect(session.queuedMessageCount).toBe(0);
+		session.agent.setModel(model);
+		const restored = session.prompt("restored");
+		await restoredEntered.promise;
+		try {
+			const staleSteerOptions = { deliverAs: "steer" as const, expectedSdkRunToken: "failed-queued-owner" };
+			await expect(session.sendUserMessage("stale steer", staleSteerOptions)).rejects.toMatchObject({
+				code: "turn_not_active",
+			});
+		} finally {
+			restoredRelease.resolve();
+			await restored;
+		}
+		expect(failures).toHaveLength(1);
+		expect(siblingFailures).toEqual([]);
+		expect(providerCalls).toBe(2);
+		expect(userTexts(session)).toEqual(["predecessor", "restored"]);
+	});
+
+	it("never downgrades a started queued run to not-started on a provider error", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const failures: QueuedRunStartFailure[] = [];
+		session = buildSession([
+			async () => {
+				entered.resolve();
+				await release.promise;
+				return { content: ["predecessor"] };
+			},
+			{ content: ["successor"] },
+		]);
+		const predecessor = session.prompt("predecessor");
+		await entered.promise;
+		await session.sendUserMessage("queued", {
+			deliverAs: "followUp",
+			sdkRunCapability: createSdkRunCapability("started-queued-owner"),
+			onQueuedRunStartFailed: failure => failures.push(failure),
+		});
+		let successorCalls = 0;
+		session.agent.streamFn = () => {
+			successorCalls += 1;
+			throw new Error("No model configured");
+		};
+		release.resolve();
+		await predecessor;
+		await session.waitForIdle();
+		expect(successorCalls).toBeGreaterThan(0);
+		expect(failures).toEqual([]);
+		expect(userTexts(session)).toEqual(["predecessor", "queued"]);
+	});
+
+	it("retires the failure channel when a steer joins an already executing run", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const failures: QueuedRunStartFailure[] = [];
+		const promotions: Array<{ startsOwnRun?: boolean; removed?: boolean }> = [];
+		session = buildSession([
+			async () => {
+				entered.resolve();
+				await release.promise;
+				return { content: ["first response"] };
+			},
+		]);
+		const running = session.prompt("active run");
+		await entered.promise;
+		await session.sendUserMessage("in-run steer", {
+			deliverAs: "steer",
+			onQueuedPromoted: promotion => promotions.push(promotion),
+			onQueuedRunStartFailed: failure => failures.push(failure),
+		});
+		session.agent.streamFn = () => {
+			throw new Error("No model configured");
+		};
+		release.resolve();
+		await running;
+		await session.waitForIdle();
+		expect(promotions).toEqual([{ startsOwnRun: false }]);
+		expect(failures).toEqual([]);
+		expect(userTexts(session)).toEqual(["active run", "in-run steer"]);
+	});
 
 	it("rejects persisted queue modes before changing the live agent", () => {
 		const settings = Settings.isolated({

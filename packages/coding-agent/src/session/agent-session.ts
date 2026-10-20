@@ -29,6 +29,7 @@ import {
 	type AgentEvent,
 	type AgentLoopConfig,
 	type AgentMessage,
+	type AgentQueuedRunStartDecision,
 	type AgentState,
 	type AgentTerminalOwnerContext,
 	type AgentTool,
@@ -1220,6 +1221,8 @@ export interface PromptOptions {
 	sdkRunCapability?: unknown;
 }
 
+export type QueuedRunStartFailure = { readonly disposition: "not-started"; readonly error: unknown };
+
 export interface SendUserMessageOptions {
 	deliverAs?: QueuedInputDelivery;
 	/** Preserve a busy SDK dispatch as queued work across an admission fence. */
@@ -1230,6 +1233,8 @@ export interface SendUserMessageOptions {
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	/** Internal SDK ownership callback. */
 	onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+	/** Internal positive core refusal, never a provider or teardown failure. */
+	onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 	/** Internal dispatch disposition used before actual queue consumption. */
 	onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 	preflightSignal?: AbortSignal;
@@ -2263,6 +2268,7 @@ type QueueFollowUpOptions = {
 	forceOneAtATime?: boolean;
 	claimsGenuineUserIntent?: boolean;
 	onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+	onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 	sdkRunToken?: string;
 	onQueued?: (message: AgentMessage) => void;
 	scheduleNonAdmittedWake?: boolean;
@@ -3050,6 +3056,8 @@ export class AgentSession {
 		AgentMessage,
 		(promotion: { startsOwnRun?: boolean; removed?: boolean }) => void
 	>();
+	/** Exact-message callbacks survive promotion until the core's authoritative start decision. */
+	readonly #queuedRunStartFailureHooks = new WeakMap<AgentMessage, (failure: QueuedRunStartFailure) => void>();
 	/** Deferred follow-ups held outside Agent's live queue until the active run ends. */
 	#deferredSdkFollowUps: AgentMessage[] = [];
 	/** Per-message delivery policy for deferred follow-ups; WeakSet metadata survives array snapshots. */
@@ -3298,6 +3306,7 @@ export class AgentSession {
 	#fireQueuedRemovalHooks(messages: readonly AgentMessage[]): void {
 		let callbackError: unknown;
 		for (const message of messages) {
+			this.#queuedRunStartFailureHooks.delete(message);
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
 				this.#steerPromotionHooks.delete(message);
@@ -3528,9 +3537,33 @@ export class AgentSession {
 			}
 		}
 	}
+	#handleQueuedRunStartDecision(decision: AgentQueuedRunStartDecision): void {
+		let callbackError: unknown;
+		for (const message of decision.consumedQueuedMessages) {
+			const hook = this.#queuedRunStartFailureHooks.get(message);
+			this.#queuedRunStartFailureHooks.delete(message);
+			if (decision.disposition === "accepted") continue;
+			const token = this.#sdkRunTokensByQueuedMessage.get(message);
+			this.#sdkRunTokensByQueuedMessage.delete(message);
+			if (token !== undefined && this.#activeSdkRunToken === token) this.#activeSdkRunToken = undefined;
+			this.#steerPromotionHooks.delete(message);
+			this.#followUpPromotionHooks.delete(message);
+			this.#freshRootLineageRequests.delete(message);
+			this.#deepInterviewGenuineUserMessageEpochs.delete(message);
+			this.#steeringMessages = this.#steeringMessages.filter(entry => entry.message !== message);
+			this.#followUpMessages = this.#followUpMessages.filter(entry => entry.message !== message);
+			try {
+				hook?.({ disposition: "not-started", error: decision.error });
+			} catch (error) {
+				callbackError ??= error;
+			}
+		}
+		if (callbackError !== undefined) logger.warn("Queued run start failure callback failed", { error: callbackError });
+	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
 		let callbackError: unknown;
 		for (const message of messages) {
+			if (promotion?.startsOwnRun === false) this.#queuedRunStartFailureHooks.delete(message);
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
 				this.#steerPromotionHooks.delete(message);
@@ -6230,6 +6263,7 @@ export class AgentSession {
 		// actual resume admission — when the loop dequeues the follow-up for the
 		// next turn, the previously streaming turn has ended, so mutating the
 		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
+		this.agent.onQueuedRunStartDecision = decision => this.#handleQueuedRunStartDecision(decision);
 		this.agent.onFollowUpConsumed = (messages, promotion = { startsOwnRun: false }) => {
 			// A follow-up whose owned-completion origin is DENIED — an owned
 			// scope landed after the result was queued, or the tuple is
@@ -6287,7 +6321,10 @@ export class AgentSession {
 			// Dropped or in-run follow-ups have no later own-run acceptance callback;
 			// delete those tokens now. Own-run messages stay mapped until
 			// #scheduleAgentContinue.onRunAccepted binds the new attempt scope.
-			for (const message of dropped) this.#sdkRunTokensByQueuedMessage.delete(message);
+			for (const message of dropped) {
+				this.#sdkRunTokensByQueuedMessage.delete(message);
+				this.#queuedRunStartFailureHooks.delete(message);
+			}
 			if (promotion.startsOwnRun !== true)
 				for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
 		};
@@ -15544,6 +15581,7 @@ export class AgentSession {
 		options?: {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 			onQueued?: (message: AgentMessage) => void;
 			onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
 			external?: boolean;
@@ -15578,6 +15616,7 @@ export class AgentSession {
 				forceOneAtATime: options?.forceOneAtATime,
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
 				onPromoted: options?.onPromoted,
+				onQueuedRunStartFailed: options?.onQueuedRunStartFailed,
 				sdkRunToken: options?.sdkRunToken,
 				scheduleNonAdmittedWake: false,
 				onQueued: message => {
@@ -15592,6 +15631,8 @@ export class AgentSession {
 			return queuedFollowUp;
 		}
 		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
+		if (options?.onQueuedRunStartFailed)
+			this.#queuedRunStartFailureHooks.set(message, options.onQueuedRunStartFailed);
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
@@ -15738,6 +15779,8 @@ export class AgentSession {
 		if (displayEntry) this.#followUpMessages.push(displayEntry);
 		if (options?.trackExternalFollowUp !== false) this.#externalFollowUps.add(message);
 		if (options?.onPromoted) this.#followUpPromotionHooks.set(message, options.onPromoted);
+		if (options?.onQueuedRunStartFailed)
+			this.#queuedRunStartFailureHooks.set(message, options.onQueuedRunStartFailed);
 		if (options?.sdkRunToken || options?.onQueuedAfterAdmission) {
 			this.#queuedAdmissionSeq.set(message, ++this.#queuedAdmissionSequence);
 		}
@@ -16699,6 +16742,7 @@ export class AgentSession {
 					claimsGenuineUserIntent: true,
 					forceOneAtATime: Boolean(options?.queuedAtDispatch || options?.queuePolicy === "sequential"),
 					onPromoted: onQueuedPromoted,
+					onQueuedRunStartFailed: options?.onQueuedRunStartFailed,
 					sdkRunToken: internalOptions?.sdkRunToken,
 					onQueuedAfterAdmission: onTrackedQueued,
 					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
@@ -16726,6 +16770,7 @@ export class AgentSession {
 				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
 					onPromoted: onQueuedPromoted,
+					onQueuedRunStartFailed: options?.onQueuedRunStartFailed,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
 					expectedSdkRunToken: internalOptions?.expectedSdkRunToken,
@@ -16763,6 +16808,7 @@ export class AgentSession {
 				const queuedSteer = await this.#queueSteer(text, images, {
 					claimsGenuineUserIntent: true,
 					onPromoted: onQueuedPromoted,
+					onQueuedRunStartFailed: options?.onQueuedRunStartFailed,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
 				});
@@ -18300,6 +18346,7 @@ export class AgentSession {
 									this.#steeringMessages = [...heldSteeringDisplays, ...this.#steeringMessages];
 								}
 								if (committedSelection) {
+									this.#queuedRunStartFailureHooks.delete(message);
 									this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
 									this.#settleTrackedOwnRunPromotions(handle);
 								}

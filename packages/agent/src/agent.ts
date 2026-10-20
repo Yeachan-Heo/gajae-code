@@ -278,6 +278,14 @@ export class AgentBusyError extends Error {
 		this.name = "AgentBusyError";
 	}
 }
+export type AgentQueuedRunStartDecision =
+	| { readonly consumedQueuedMessages: readonly AgentMessage[]; readonly disposition: "accepted" }
+	| {
+			readonly consumedQueuedMessages: readonly AgentMessage[];
+			readonly disposition: "not-started";
+			readonly error: Error;
+	  };
+
 export interface AgentOptions {
 	initialState?: Partial<AgentState>;
 
@@ -450,6 +458,8 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn (reassignable). */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	/** Definitive start disposition for an exact dequeued own-run batch. */
+	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
 	/** Invoked with the steering messages dequeued mid-run for the current turn (reassignable). */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
@@ -648,6 +658,7 @@ export class Agent {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn. Reassign at any time. */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
 	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
@@ -694,6 +705,7 @@ export class Agent {
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.onFollowUpConsumed = opts.onFollowUpConsumed;
+		this.onQueuedRunStartDecision = opts.onQueuedRunStartDecision;
 		this.onSteeringConsumed = opts.onSteeringConsumed;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
@@ -1922,6 +1934,18 @@ export class Agent {
 		throw new Error("No queued messages to continue");
 	}
 
+	#notifyQueuedRunStartDecision(
+		consumedQueuedMessages: readonly AgentMessage[] | undefined,
+		decision: { disposition: "accepted" } | { disposition: "not-started"; error: Error },
+	): void {
+		if (!consumedQueuedMessages?.length) return;
+		try {
+			this.onQueuedRunStartDecision?.({ ...decision, consumedQueuedMessages });
+		} catch (error) {
+			logger.warn("Queued run start decision callback failed", { error });
+		}
+	}
+
 	/**
 	 * Run the agent loop.
 	 * If messages are provided, starts a new conversation turn with those messages.
@@ -1935,11 +1959,17 @@ export class Agent {
 		},
 	) {
 		const model = this.#state.model;
-		if (!model) throw new Error("No model configured");
+		if (!model) {
+			const error = new Error("No model configured");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
+		}
 
 		const maintenanceContinuation = options?.maintenanceContinuation === true;
 		if (maintenanceContinuation && this.#managedLogicalRunOwner === undefined) {
-			throw new Error("Maintenance continuation ownership is unavailable");
+			const error = new Error("Maintenance continuation ownership is unavailable");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
 		}
 		let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
 
@@ -1975,13 +2005,16 @@ export class Agent {
 			this.#runningPrompt = undefined;
 			this.#resolveRunningPrompt = undefined;
 			resolve();
-			throw new Error("Prompt resource cancellation domain is unavailable");
+			const error = new Error("Prompt resource cancellation domain is unavailable");
+			this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "not-started", error });
+			throw error;
 		}
 		const logicalRunId = managedLogicalRunOwner ?? runId;
 		const scope = this.#attemptAuthority.mintMain();
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
+		this.#notifyQueuedRunStartDecision(options?.consumedQueuedMessages, { disposition: "accepted" });
 		options?.onRunAccepted?.(handle, {
 			consumedQueuedMessages: options.consumedQueuedMessages ?? [],
 		});

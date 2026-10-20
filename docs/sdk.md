@@ -542,6 +542,15 @@ expose retained process source/accepted and transient charges. The existing ledg
 irreversible, so quarantined executions remain charged for this process's lifetime
 rather than claiming their tombstones prove settlement. An adopted execution
 without an exact resource handle or owning domain also stays charged.
+
+Promotion into an own-run is not itself proof that execution started. If the
+execution producer positively refuses that exact queued invocation before it can
+start, its image reservation retires only after the enqueue producer returns.
+This is a failed prompt, not queue cancellation; normal durable-publication
+rules still apply. Missing lifecycle events, a generic error, or teardown do not
+provide this no-start authority. Started or ambiguous executions still require
+their exact settlement proof.
+
 An ambiguous prompt response must not be replayed: recover the original `clientRef`
 through the correlated `turn.result` contract. Reusing a retained
 `clientRef` returns `client_ref_conflict` before staged-image redemption, not a second

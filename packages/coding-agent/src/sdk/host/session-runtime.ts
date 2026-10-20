@@ -44,7 +44,7 @@ import { tagSdkLifecycleObserver } from "../../extensibility/extensions/function
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
 import type { SdkRunCapability } from "../../session/sdk-run-capability";
 import {
 	boundTerminalRetentionState,
@@ -3176,6 +3176,11 @@ function createControlSurface(
 	settleAcceptedImageSubmission?: (correlation: InvocationCorrelation) => void,
 	releaseAcceptedImage?: (correlation: InvocationCorrelation) => void,
 	acceptedQueueCancellations: Map<string, AcceptedQueueCancellation> = new Map(),
+	onQueuedRunStartFailed?: (
+		kind: InvocationKind,
+		correlation: InvocationCorrelation,
+		failure: QueuedRunStartFailure,
+	) => boolean,
 ): ControlSurface {
 	const normalizePromptImages = (value: unknown): ImageContent[] => {
 		if (!Array.isArray(value)) return [];
@@ -3196,6 +3201,7 @@ function createControlSurface(
 	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
 		sdkRunCapability?: SdkRunCapability;
 		expectedSdkRunToken?: string;
+		onQueuedRunStartFailed?: (failure: QueuedRunStartFailure) => void;
 	};
 	type InternalSdkApi = Omit<ExtensionAPI, "sendUserMessage"> & {
 		sendUserMessage: (
@@ -3206,7 +3212,7 @@ function createControlSurface(
 	const internalApi = api as InternalSdkApi;
 	const sendSdkUserMessage = (
 		content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
-		options?: Record<string, unknown>,
+		options?: InternalSendOptions,
 	): Promise<void> => internalApi.sendUserMessage(content, options);
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -3349,6 +3355,7 @@ function createControlSurface(
 			onDispatchDisposition: (promotion: { startsOwnRun: boolean }) => void;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
 			onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			onQueuedRunStartFailed: (failure: QueuedRunStartFailure) => void;
 			queuedAtDispatch: boolean;
 		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
@@ -3461,6 +3468,7 @@ function createControlSurface(
 		if (kind === "prompt")
 			acceptedQueueCancellations.set(`${correlation.commandId}:${correlation.turnId}`, queueCancellation);
 		let promotionStartsOwnRun: boolean | undefined;
+		let queuedRunStartRefused = false;
 		try {
 			submission = Promise.resolve(
 				run({
@@ -3469,6 +3477,7 @@ function createControlSurface(
 					sdkRunCapability,
 					onPreflightAcceptCommit: accept,
 					onDispatchDisposition: promotion => {
+						if (queuedRunStartRefused) return;
 						promotionStartsOwnRun = promotion.startsOwnRun;
 						if (promotion.startsOwnRun === false) {
 							queueCancellation.queueCandidate = true;
@@ -3488,6 +3497,7 @@ function createControlSurface(
 					// created at promotion so the submitting connection can
 					// terminal-abort that turn (review threads P1/P2).
 					onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => {
+						if (queuedRunStartRefused) return;
 						promotionStartsOwnRun = promotion?.startsOwnRun;
 						if (promotion?.removed) {
 							queueCancellation.disposition = "removed";
@@ -3521,12 +3531,29 @@ function createControlSurface(
 						}
 						void onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion);
 					},
+					onQueuedRunStartFailed: failure => {
+						if (
+							queuedRunStartRefused ||
+							!accepted ||
+							!queueCancellation.queueCandidate ||
+							failure.disposition !== "not-started"
+						)
+							return;
+						// Only the private Core decision for this selected queue entry is proof.
+						// The lifecycle owner rejects contradictory decisions after adoption.
+						queuedRunStartRefused = onQueuedRunStartFailed?.(kind, correlation, failure) === true;
+						if (queuedRunStartRefused) {
+							queueCancellation.disposition = "consumed";
+							queueCancellation.resolveDisposition("consumed");
+						}
+					},
 					queuedAtDispatch,
 				}),
 			);
 			void submission.then(
 				result => {
 					settleAcceptedImageSubmission?.(correlation);
+					if (queuedRunStartRefused) return;
 					if (settled) {
 						// A resolved submission after preflight acceptance means the work is over
 						// for every kind. `noteTransition` ignores an already-terminal record, so
@@ -3537,7 +3564,9 @@ function createControlSurface(
 						// a delayed preflight diverted to steering fires onQueuedPromoted
 						// with startsOwnRun:false and is now attached to the in-flight run.
 						// Do not terminalize from the stale snapshot — the run will.
-						if (!queuedAtDispatch && promotionStartsOwnRun !== false) {
+						// Remember actual diversion even after own-run promotion changes
+						// promotionStartsOwnRun: enqueue completion is still not run completion.
+						if (!queueCancellation.queueCandidate && promotionStartsOwnRun !== false) {
 							// The accepted work settled without its own run still pending:
 							// retire the pending ownership entry (and with it the
 							// acceptance-anchored deadline lease, #4668 review) BEFORE
@@ -3607,6 +3636,7 @@ function createControlSurface(
 				},
 				error => {
 					settleAcceptedImageSubmission?.(correlation);
+					if (queuedRunStartRefused) return;
 					if (settled) {
 						releaseAcceptedImage?.(correlation);
 						retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
@@ -7630,6 +7660,36 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			settleAcceptedImageSubmission,
 			releaseAcceptedImage,
 			acceptedQueueCancellations,
+			(kind, correlation, failure) => {
+				const record = reconciliation.lookup(kind, correlation) as { status?: string };
+				const reservation = acceptedImages.get(imageKey(correlation));
+				const terminal = record.status === "terminal_ok" || record.status === "failed";
+				if (record.status !== "accepted" && !(terminal && reservation)) return false;
+				// A known execution/handle retains exact-ledger authority even if a
+				// contradictory callback arrives later. Never downgrade adoption.
+				if (reservation?.executionStarted || reservation?.handle) return false;
+				const adopted = active?.openLifecycleBatches.some(batch =>
+					[...batch.invocations, ...batch.attachedInvocations].some(
+						entry => entry.kind === kind && imageKey(entry.correlation) === imageKey(correlation),
+					),
+				);
+				if (adopted) return false;
+				const index = pending.findIndex(entry => entry.kind === kind && entry.correlation === correlation);
+				if (index >= 0) {
+					const [removed] = pending.splice(index, 1);
+					if (removed) lifecycleRunOwners.delete(removed.sdkRunToken);
+				}
+				if (reservation) {
+					reservation.awaitingAdoption = false;
+					// Ordinary retirement still waits for an outstanding enqueue producer.
+					retireAcceptedImage(imageKey(correlation));
+				}
+				// Keep the existing durable-first failure/recovery owner; this is not
+				// queue removal, and cannot publish cancellation or synthetic success.
+				if (!terminal)
+					void terminalizeAbandonedSubmission(kind, correlation, rejectionRecoveryIntent(failure.error));
+				return true;
+			},
 		);
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
