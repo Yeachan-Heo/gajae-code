@@ -1896,9 +1896,7 @@ export class Settings implements NotificationSettingsReader {
 			if (this.#schemaMigrationPending)
 				this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
 
-			// Project settings are reloaded from disk on every settings load. The
-			// capability filesystem cache is intentionally retained for discovery,
-			// but an ordinary configuration reload must observe external edits.
+			// A normal settings load must observe external edits to project files.
 			this.#project = await this.#loadProjectSettings(true);
 
 			await this.#normalizeAfterLoad();
