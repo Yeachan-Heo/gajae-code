@@ -1029,11 +1029,15 @@ fn exact_replace_open_error_code(code: Option<&str>) -> &str {
 
 #[cfg(any(windows, test))]
 /// True only for pre-mutation Windows failures that are transient and safe to
-/// retry at the exact-replace destination open. Sharing violations happen
-/// before anything was renamed or unlinked, so retrying cannot publish twice;
-/// permission, path, disk-full, and identity failures are never retried.
+/// retry at the exact-replace destination open. Sharing violations and access
+/// denials are raised by the open itself, before anything was renamed or
+/// unlinked, so a bounded retry cannot publish twice; path, disk-full, and
+/// identity failures are never retried. A denial during a binary replace is the
+/// status a scanner or a briefly held image lock produces (#6760), and the
+/// budget below already documents it as the denial allowance, so the open now
+/// retries it exactly like the rename does.
 const fn is_retryable_exact_replace_status(status: i32) -> bool {
-	status == STATUS_SHARING_VIOLATION
+	status == STATUS_SHARING_VIOLATION || status == STATUS_ACCESS_DENIED
 }
 
 #[cfg(windows)]
@@ -1119,12 +1123,15 @@ mod exact_replace_windows_retry_policy_tests {
 	};
 
 	#[test]
-	fn retry_policy_accepts_only_sharing_violations() {
+	fn retry_policy_accepts_only_pre_mutation_transient_statuses() {
 		assert!(is_retryable_exact_replace_status(STATUS_SHARING_VIOLATION));
-		// Permission, path-not-found, disk-full, and identity failures are never
-		// retried: none of them is a transient holder release.
+		// A denied open happens before any rename, so it retries inside the same
+		// bounded budget the rename path already grants it (#6760).
+		assert!(is_retryable_exact_replace_status(STATUS_ACCESS_DENIED));
+		assert!(is_retryable_exact_replace_rename_status(STATUS_ACCESS_DENIED));
+		// Path-not-found, disk-full, and identity failures are never retried: none
+		// of them is a transient holder release.
 		for status in [
-			0xc000_0022u32 as i32,
 			0xc000_0034u32 as i32,
 			0xc000_003au32 as i32,
 			0xc000_007fu32 as i32,
@@ -1256,14 +1263,25 @@ mod exact_replace_windows_retry_policy_tests {
 	}
 
 	#[test]
+	fn denied_opens_consume_the_bounded_retry_budget() {
+		let attempts = std::cell::Cell::new(0);
+		let opened: Result<u8, i32> = open_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			Err(STATUS_ACCESS_DENIED)
+		});
+		assert_eq!(opened, Err(STATUS_ACCESS_DENIED));
+		assert_eq!(attempts.get(), EXACT_REPLACE_RETRY_LIMIT);
+	}
+
+	#[test]
 	fn non_retryable_failures_return_without_retrying() {
 		let attempts = std::cell::Cell::new(0);
 		let opened: Result<u8, i32> = open_with_transient_retry(|| {
 			attempts.set(attempts.get() + 1);
-			Err(0xc000_0022u32 as i32)
+			Err(0xc000_007fu32 as i32)
 		});
-		assert_eq!(opened, Err(0xc000_0022u32 as i32));
-		assert_eq!(attempts.get(), 1, "non-sharing failures are never retried");
+		assert_eq!(opened, Err(0xc000_007fu32 as i32));
+		assert_eq!(attempts.get(), 1, "disk-full and other non-transient failures are never retried");
 	}
 }
 
