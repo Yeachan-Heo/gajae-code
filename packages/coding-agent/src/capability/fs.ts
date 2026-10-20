@@ -286,38 +286,40 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	}
 	if (abs === null) return null;
 	if (!(await isCurrentIsolatedPath(abs, options))) return null;
-	const readable = !options?.isolatedHome ? await containedReadPath(abs, options) : abs;
-	if (readable === null) return null;
-	const key = cacheKey(readable, options);
+	const key = cacheKey(abs, options);
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
-	const readGeneration = cacheGeneration;
 	if (useCache && contentCache.has(key)) {
 		return contentCache.get(key) ?? null;
 	}
 	if (!options?.isolatedHome) {
+		const readable = await containedReadPath(abs, options);
+		if (readable === null) {
+			if (useCache) contentCache.set(key, null);
+			return null;
+		}
 		try {
 			const content = await Bun.file(readable).text();
-			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, content);
+			if (useCache) contentCache.set(key, content);
 			return content;
 		} catch {
-			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
+			if (useCache) contentCache.set(key, null);
 			return null;
 		}
 	}
 
 	const opened = await openIsolatedFile(abs, options);
 	if (!opened) {
-		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
+		if (useCache) contentCache.set(key, null);
 		return null;
 	}
 	try {
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		const content = await opened.handle.readFile({ encoding: "utf8" });
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
-		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, content);
+		if (useCache) contentCache.set(key, content);
 		return content;
 	} catch {
-		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
+		if (useCache) contentCache.set(key, null);
 		return null;
 	} finally {
 		await opened.handle.close();
@@ -417,7 +419,6 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	if (!(await isCurrentIsolatedPath(abs, options))) return [];
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
 	const key = cacheKey(abs, options);
-	const readGeneration = cacheGeneration;
 	if (useCache && dirCache.has(key)) {
 		return dirCache.get(key) ?? [];
 	}
@@ -428,7 +429,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	try {
 		if (!options?.isolatedHome) {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
-			if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
+			if (useCache) dirCache.set(key, entries);
 			return entries;
 		}
 		// Linux can enumerate a pinned directory descriptor through /proc. Node
@@ -439,7 +440,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (options?.isolatedHome && process.platform !== "linux") {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
 			if (!(await validateDirectoryPath(abs, options, authorized))) return [];
-			if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
+			if (useCache) dirCache.set(key, entries);
 			return entries;
 		}
 		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
@@ -453,10 +454,10 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (!(await isHomeIdentityStable(options))) return [];
 		if (!(await isUserAgentIdentityStable(options))) return [];
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
-		if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
+		if (useCache) dirCache.set(key, entries);
 		return entries;
 	} catch {
-		if (useCache && cacheGeneration === readGeneration) dirCache.set(key, []);
+		if (useCache) dirCache.set(key, []);
 		return [];
 	} finally {
 		await handle?.close().catch(() => {});
@@ -530,15 +531,6 @@ export function invalidate(filePath: string): void {
 	const abs = resolvePath(filePath);
 	invalidateCacheEntries(contentCache, abs);
 	invalidateCacheEntries(dirCache, abs);
-	try {
-		const physical = fs.realpathSync(abs);
-		if (physical !== abs) {
-			invalidateCacheEntries(contentCache, physical);
-			invalidateCacheEntries(dirCache, physical);
-		}
-	} catch {
-		// Lexical invalidation still covers paths that were deleted.
-	}
 	const parent = path.dirname(abs);
 	if (parent !== abs) {
 		invalidateCacheEntries(dirCache, parent);
