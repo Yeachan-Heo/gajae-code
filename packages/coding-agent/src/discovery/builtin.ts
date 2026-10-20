@@ -69,10 +69,16 @@ async function canonicalBuiltinPath(ctx: LoadContext, filePath: string, scope: R
 	return (await canonicalizePathWithinHome(ctx, filePath, undefined, scope)) ?? null;
 }
 
-async function readBuiltinFile(ctx: LoadContext, filePath: string, scope: ReadScope): Promise<string | null> {
+async function readBuiltinFile(
+	ctx: LoadContext,
+	filePath: string,
+	scope: ReadScope,
+	bypassCache = false,
+): Promise<string | null> {
 	const canonicalPath = await canonicalBuiltinPath(ctx, filePath, scope);
 	if (!canonicalPath) return null;
-	return readFile(canonicalPath, getReadOptions(ctx, scope));
+	const options = getReadOptions(ctx, scope);
+	return readFile(canonicalPath, bypassCache ? { ...options, bypassCache: true } : options);
 }
 
 function getProjectStopDirectory(ctx: LoadContext): string | undefined {
@@ -996,7 +1002,9 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	for (const { dir, level } of await getConfigDirs(ctx)) {
 		const scope = readScopeForLevel(level);
 		const settingsPath = await canonicalBuiltinPath(ctx, path.join(dir, "settings.json"), scope);
-		const settingsContent = settingsPath ? await readBuiltinFile(ctx, settingsPath, scope) : null;
+		const settingsContent = settingsPath
+			? await readBuiltinFile(ctx, settingsPath, scope, level === "project")
+			: null;
 		if (settingsContent && settingsPath) {
 			const data = tryParseJson<Record<string, unknown>>(settingsContent);
 			if (data) {
@@ -1013,7 +1021,7 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 
 		const configPath = await canonicalBuiltinPath(ctx, path.join(dir, "config.yml"), scope);
 		if (!configPath) continue;
-		const configContent = await readBuiltinFile(ctx, configPath, scope);
+		const configContent = await readBuiltinFile(ctx, configPath, scope, level === "project");
 		if (!configContent) continue;
 
 		const data = parseYamlSettings(configContent, configPath);
