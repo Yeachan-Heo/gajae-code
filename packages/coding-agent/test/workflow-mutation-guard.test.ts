@@ -2941,6 +2941,33 @@ describe("bash scanner quoting model", () => {
 		expect(decision.blocked).toBe(true);
 	});
 
+	it("blocks Node preload (--require=) equals-form bypass", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		// Node --require=/path loads code before -e, which is not scanned
+		// The equals-form (--require=/path) must be caught just like space-separated (-r /path)
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: `node --require=/tmp/payload.cjs -e 'process.stdout.write("status")'` },
+		});
+		expect(decision.blocked).toBe(true);
+	});
+
+	it("blocks Bun preload (--require=) equals-form", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ultragoal", "planning");
+		// Bun --require=/path also loads code that cannot be scanned
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("bash"),
+			args: { command: `bun --require=/tmp/hack.js script.ts` },
+		});
+		expect(decision.blocked).toBe(true);
+	});
+
 	it("blocks aliased stdout stream mutations", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
