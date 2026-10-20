@@ -2349,33 +2349,32 @@ export class Agent {
 						}
 						break;
 
-					case "agent_end":
-						if (fallbackManaged && managedOutcome) {
-							continue;
-						}
-						this.#state.isStreaming = false;
-						this.#state.streamMessage = null;
-						// A maintenance checkpoint is only non-terminal while a committed rewrite
-						// will continue. Failed or aborted maintenance yields none. Because the loop runs with
-						// `resourceSealOwner: "caller"` it deliberately leaves sealing to us, so
-						// treating it as a checkpoint here would leave the run open forever and make
-						// every cancel report `run_not_sealed`.
-						if (
-							event.stopReason === "maintenance" &&
-							isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)
-						) {
-							this.#managedLogicalRunOwner ??= managedLogicalRunOwner ?? runId;
-							maintenanceInterrupted = true;
-							this.#emit(event);
-							continue;
-						}
-						this.#finalizeRun(managedLogicalRunOwner ?? runId, event);
+				case "agent_end":
+					if (fallbackManaged && managedOutcome) {
 						continue;
-				}
-
-				// Emit to listeners
-				this.#emit(event);
+					}
+					this.#state.isStreaming = false;
+					this.#state.streamMessage = null;
+					// A maintenance checkpoint is only non-terminal while a committed rewrite
+					// will continue. Failed or aborted maintenance yields none. Because the loop runs with
+					// `resourceSealOwner: "caller"` it deliberately leaves sealing to us, so
+					// treating it as a checkpoint here would leave the run open forever and make
+					// every cancel report `run_not_sealed`.
+					if (
+						event.stopReason === "maintenance" &&
+						isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)
+					) {
+						this.#managedLogicalRunOwner ??= managedLogicalRunOwner ?? runId;
+						maintenanceInterrupted = true;
+						this.#emit(event);
+						continue;
+					}
+					this.#finalizeRun(managedLogicalRunOwner ?? runId, event, undefined, this.#activeResourceCancellationDomain);
+					continue;
 			}
+
+			// Emit to listeners
+			this.#emit(event);
 
 			if (this.#activeRunId !== runId) {
 				return;
@@ -2386,7 +2385,7 @@ export class Agent {
 				} else if (managedOutcome.type === "run_terminal") {
 					this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: managedOutcome.reason });
 				} else if (managedDecision?.type !== "retry" && managedDecision?.type !== "maintenance") {
-					this.#finalizeRun(managedLogicalRunOwner ?? runId);
+					this.#finalizeRun(managedLogicalRunOwner ?? runId, undefined, undefined, this.#activeResourceCancellationDomain);
 				}
 			}
 
