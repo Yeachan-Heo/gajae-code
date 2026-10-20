@@ -258,7 +258,13 @@ describe.skipIf(process.platform !== "linux")("managed artifact reads stay bound
 			return fd;
 		}) as typeof fs.openSync);
 
-		await expect(manager.readRange(id)).rejects.toThrow("managed_range_generation_mismatch");
+		// Which source-binding refusal fires first depends on whether this read
+		// captures the expected descriptor before or after the swap: a leaf that is
+		// re-checked by name reports `source_changed`, and a descriptor bound against
+		// the previously retained identity reports
+		// `managed_range_generation_mismatch`. Both refuse, and the outside file must
+		// never be read either way, so assert the refusal set rather than the winner.
+		await expect(manager.readRange(id)).rejects.toThrow(/^(?:source_changed|managed_range_generation_mismatch)$/);
 		expect(replaced).toBe(true);
 		expect(await fsp.readFile(outside, "utf8")).toBe("path-backed outside secret");
 	});
