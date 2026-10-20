@@ -9,6 +9,7 @@ import { matchesKey, type OverlayHandle, Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import { clearCache as clearCapabilityFsCache } from "../../capability/fs";
 import type { SourceMeta } from "../../capability/types";
+import { clearCache as clearCapabilityFsCache } from "../../capability/fs";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
 import { listTools } from "../../runtime-mcp/client";
 import {
