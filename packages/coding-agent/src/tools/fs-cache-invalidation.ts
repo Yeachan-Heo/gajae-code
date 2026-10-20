@@ -8,7 +8,6 @@ function invalidateFsScanCacheNative(path: string): void {
 		require("@gajae-code/natives") as { invalidateFsScanCache: typeof invalidateFsScanCacheFn }
 	).invalidateFsScanCache;
 	nativeInvalidateFsScanCache(path);
-	invalidateCapabilityFsCache(path);
 }
 
 /**
@@ -16,6 +15,7 @@ function invalidateFsScanCacheNative(path: string): void {
  */
 export function invalidateFsScanAfterWrite(path: string): void {
 	invalidateFsScanCacheNative(path);
+	invalidateCapabilityFsCache(path);
 }
 
 /**
@@ -23,6 +23,7 @@ export function invalidateFsScanAfterWrite(path: string): void {
  */
 export function invalidateFsScanAfterDelete(path: string): void {
 	invalidateFsScanCacheNative(path);
+	invalidateCapabilityFsCache(path);
 }
 
 /**
@@ -33,7 +34,9 @@ export function invalidateFsScanAfterDelete(path: string): void {
  */
 export function invalidateFsScanAfterRename(oldPath: string, newPath: string): void {
 	invalidateFsScanCacheNative(oldPath);
+	invalidateCapabilityFsCache(oldPath);
 	if (newPath !== oldPath) {
 		invalidateFsScanCacheNative(newPath);
+		invalidateCapabilityFsCache(newPath);
 	}
 }
