@@ -255,6 +255,19 @@ export class RuntimeOwner {
 		});
 		this.#leaseHeld = true;
 		this.#leaseEpoch = lease.leaseEpoch;
+		// Start heartbeat immediately to refresh the lease before the initial TTL window.
+		// Under CI load, waiting for setInterval's first tick (10s default) can cause the lease
+		// to expire before the first renewal fires, since TTL defaults to 30s.
+		const initialHeartbeat = this.#opts
+			.leaseHeartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock)
+			.catch(err => {
+				if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop().catch(() => {});
+			});
+		this.#heartbeatInFlight.add(initialHeartbeat);
+		void initialHeartbeat.finally(() => {
+			this.#heartbeatInFlight.delete(initialHeartbeat);
+		});
+		// Set up periodic heartbeat renewal after the initial refresh.
 		this.#heartbeatTimer = setInterval(() => {
 			// Once teardown fences the heartbeat we must never start a renewal again:
 			// a renewal here would contend the lease mutation lock with the release

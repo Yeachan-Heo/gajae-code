@@ -791,9 +791,28 @@ export default class Harness extends Command {
 				process.removeListener("SIGINT", stop);
 				resolve();
 			};
+			// Track consecutive failures to distinguish genuine lease loss from transient read issues.
+			// Under CI load, a single poll showing !live could be a stale read or heartbeat delay (issue #5399).
+			// Only stop if: (1) lease is genuinely lost (different ownerId/epoch), or (2) consecutive failures.
+			let consecutiveFailures = 0;
 			const timer = setInterval(() => {
 				void resolveOwner(root, sessionId).then(resolved => {
-					if (!resolved.live) stop();
+					// Lease is genuinely lost if ownerId or epoch changed (owner was replaced or superseded).
+					const leaseLost =
+						resolved.lease && resolved.lease.ownerId !== info.ownerId
+							? true
+							: resolved.lease && resolved.lease.leaseEpoch !== info.leaseEpoch
+								? true
+								: false;
+					if (leaseLost) {
+						consecutiveFailures = 2; // Immediately stop on genuine lease loss.
+					} else if (!resolved.live) {
+						consecutiveFailures++;
+					} else {
+						consecutiveFailures = 0; // Reset on any success.
+					}
+					// Only stop after 2 consecutive failures to filter transient issues.
+					if (consecutiveFailures >= 2) stop();
 				});
 			}, 500);
 			timer.unref?.();
