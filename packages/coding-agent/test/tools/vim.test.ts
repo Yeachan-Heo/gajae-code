@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { clearCache, readFile } from "@gajae-code/coding-agent/capability/fs";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
@@ -258,6 +259,7 @@ describe("vim tool", () => {
 
 	beforeEach(async () => {
 		resetSettingsForTest();
+		clearCache();
 		tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "vim-tool-"));
 		await Settings.init({ inMemory: true, cwd: tmpDir });
 	});
@@ -274,6 +276,20 @@ describe("vim tool", () => {
 		const saved = await Bun.file(filePath).text();
 		expect(saved).toContain("bar = 1;");
 		expect(saved).toContain("bar = foo + 1;");
+	});
+
+	it("invalidates bounded capability reads after saving", async () => {
+		const filePath = path.join(tmpDir, "rule.md");
+		await Bun.write(filePath, "before\n");
+		const tool = new VimTool(createSession(tmpDir));
+		const options = { containmentRoot: tmpDir };
+
+		expect(await readFile(filePath, options)).toBe("before\n");
+		await tool.execute("open", { file: "rule.md" });
+		await tool.execute("edit", { file: "rule.md", steps: [step(["cc"], "after")] });
+		await tool.execute("save", { file: "rule.md", steps: [step([":w<CR>"])] });
+
+		expect(await readFile(filePath, options)).toBe("after\n");
 	});
 
 	it("keeps the cursor line visible after large jumps", async () => {
