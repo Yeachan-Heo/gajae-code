@@ -304,6 +304,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				const zipBuffer = zipSync(zipEntries);
 				await writeFileAtomically(resolvedArchivePath.absolutePath, zipBuffer);
 			} catch (error) {
+				invalidateFsScanAfterWrite(resolvedArchivePath.absolutePath);
 				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
 		} else {
@@ -335,6 +336,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				const archiveBytes = await archive.bytes();
 				await writeFileAtomically(resolvedArchivePath.absolutePath, archiveBytes);
 			} catch (error) {
+				invalidateFsScanAfterWrite(resolvedArchivePath.absolutePath);
 				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
 		}
@@ -470,6 +472,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
 			return toolResult<WriteToolDetails>({}).text(resultText).sourcePath(resolvedSqlitePath.absolutePath).done();
 		} catch (error) {
+			invalidateFsScanAfterWrite(resolvedSqlitePath.absolutePath);
 			if (isEnoent(error)) {
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
