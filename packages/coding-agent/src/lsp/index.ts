@@ -7,6 +7,7 @@ import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { FileWriteNotPublishedError, writeFileAtomically } from "../tools/atomic-file-write";
+import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -758,12 +759,17 @@ export async function writethroughNoop(
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
-	if (file !== undefined) {
-		await file.write(content);
+	try {
+		if (file !== undefined) {
+			await file.write(content);
+			return undefined;
+		}
+		await writeFileAtomically(dst, content);
 		return undefined;
+	} finally {
+		// A publication may be followed by a reported close/cleanup failure.
+		invalidateFsScanAfterWrite(dst);
 	}
-	await writeFileAtomically(dst, content);
-	return undefined;
 }
 
 interface PendingWritethrough {
@@ -941,6 +947,10 @@ async function runLspWritethrough(
 			else await writeFileAtomically(dst, value);
 			publishedContent = true;
 		} catch (error) {
+			// Publication can succeed before a later close/cleanup failure is
+			// reported. Invalidate even for rejected attempts so discovery cannot
+			// retain bytes from before this write.
+			invalidateFsScanAfterWrite(dst);
 			if (error instanceof FileWriteNotPublishedError) {
 				if (publishedContent) {
 					throw new FileWriteNotPublishedError(dst, error.cause, {
@@ -951,6 +961,8 @@ async function runLspWritethrough(
 				throw error;
 			}
 			throw error;
+		} finally {
+			invalidateFsScanAfterWrite(dst);
 		}
 	};
 	const getWritePromise = once(() => writeContent(finalContent));

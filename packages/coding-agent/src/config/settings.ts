@@ -1896,7 +1896,8 @@ export class Settings implements NotificationSettingsReader {
 			if (this.#schemaMigrationPending)
 				this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
 
-			this.#project = await this.#loadProjectSettings();
+			// A normal settings load must observe external edits to project files.
+			this.#project = await this.#loadProjectSettings(true);
 
 			await this.#normalizeAfterLoad();
 			if (this.#schemaReport.issues.length > 0) {

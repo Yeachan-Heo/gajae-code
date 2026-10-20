@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 const contentCache = new Map<string, string | null>();
 const dirCache = new Map<string, fs.Dirent[]>();
+let cacheGeneration = 0;
 
 /** Authority used when reading from an explicit-home discovery context. */
 export type ReadScope = "project" | "user" | "native";
@@ -263,6 +264,19 @@ async function containedReadPath(abs: string, options?: ReadFileOptions): Promis
 	}
 }
 
+function cacheKey(abs: string, options?: ReadFileOptions): string {
+	const root = options?.containmentRoot;
+	return root ? `${path.resolve(root)}\0${abs}` : abs;
+}
+
+function invalidateCacheEntries<T>(cache: Map<string, T>, abs: string): void {
+	cache.delete(abs);
+	const suffix = `\0${abs}`;
+	for (const key of cache.keys()) {
+		if (key.endsWith(suffix)) cache.delete(key);
+	}
+}
+
 export async function readFile(filePath: string, options?: ReadFileOptions): Promise<string | null> {
 	let abs: string | null;
 	try {
@@ -272,40 +286,38 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	}
 	if (abs === null) return null;
 	if (!(await isCurrentIsolatedPath(abs, options))) return null;
-	// A contained read must not share the lexical cache with a different boundary.
-	const useCache = !options?.bypassCache && !options?.isolatedHome && !options?.containmentRoot;
-	if (useCache && contentCache.has(abs)) {
-		return contentCache.get(abs) ?? null;
+	const readable = !options?.isolatedHome ? await containedReadPath(abs, options) : abs;
+	if (readable === null) return null;
+	const key = cacheKey(readable, options);
+	const useCache = !options?.bypassCache && !options?.isolatedHome;
+	const readGeneration = cacheGeneration;
+	if (useCache && contentCache.has(key)) {
+		return contentCache.get(key) ?? null;
 	}
 	if (!options?.isolatedHome) {
-		const readable = await containedReadPath(abs, options);
-		if (readable === null) {
-			if (useCache) contentCache.set(abs, null);
-			return null;
-		}
 		try {
 			const content = await Bun.file(readable).text();
-			if (useCache) contentCache.set(abs, content);
+			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, content);
 			return content;
 		} catch {
-			if (useCache) contentCache.set(abs, null);
+			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
 			return null;
 		}
 	}
 
 	const opened = await openIsolatedFile(abs, options);
 	if (!opened) {
-		if (useCache) contentCache.set(abs, null);
+		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
 		return null;
 	}
 	try {
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		const content = await opened.handle.readFile({ encoding: "utf8" });
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
-		if (useCache) contentCache.set(abs, content);
+		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, content);
 		return content;
 	} catch {
-		if (useCache) contentCache.set(abs, null);
+		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
 		return null;
 	} finally {
 		await opened.handle.close();
@@ -404,8 +416,10 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	if (abs === null) return [];
 	if (!(await isCurrentIsolatedPath(abs, options))) return [];
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
-	if (useCache && dirCache.has(abs)) {
-		return dirCache.get(abs) ?? [];
+	const key = cacheKey(abs, options);
+	const readGeneration = cacheGeneration;
+	if (useCache && dirCache.has(key)) {
+		return dirCache.get(key) ?? [];
 	}
 
 	let handle: fsPromises.FileHandle | undefined;
@@ -414,7 +428,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	try {
 		if (!options?.isolatedHome) {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
-			if (useCache) dirCache.set(abs, entries);
+			if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
 			return entries;
 		}
 		// Linux can enumerate a pinned directory descriptor through /proc. Node
@@ -425,7 +439,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (options?.isolatedHome && process.platform !== "linux") {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
 			if (!(await validateDirectoryPath(abs, options, authorized))) return [];
-			if (useCache) dirCache.set(abs, entries);
+			if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
 			return entries;
 		}
 		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
@@ -439,10 +453,10 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (!(await isHomeIdentityStable(options))) return [];
 		if (!(await isUserAgentIdentityStable(options))) return [];
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
-		if (useCache) dirCache.set(abs, entries);
+		if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
 		return entries;
 	} catch {
-		if (useCache) dirCache.set(abs, []);
+		if (useCache && cacheGeneration === readGeneration) dirCache.set(key, []);
 		return [];
 	} finally {
 		await handle?.close().catch(() => {});
@@ -506,16 +520,27 @@ export function cacheStats(): { content: number; dir: number } {
 }
 
 export function clearCache(): void {
+	cacheGeneration += 1;
 	contentCache.clear();
 	dirCache.clear();
 }
 
 export function invalidate(filePath: string): void {
+	cacheGeneration += 1;
 	const abs = resolvePath(filePath);
-	contentCache.delete(abs);
-	dirCache.delete(abs);
+	invalidateCacheEntries(contentCache, abs);
+	invalidateCacheEntries(dirCache, abs);
+	try {
+		const physical = fs.realpathSync(abs);
+		if (physical !== abs) {
+			invalidateCacheEntries(contentCache, physical);
+			invalidateCacheEntries(dirCache, physical);
+		}
+	} catch {
+		// Lexical invalidation still covers paths that were deleted.
+	}
 	const parent = path.dirname(abs);
 	if (parent !== abs) {
-		dirCache.delete(parent);
+		invalidateCacheEntries(dirCache, parent);
 	}
 }

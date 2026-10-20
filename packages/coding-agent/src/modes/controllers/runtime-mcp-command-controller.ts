@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai/core";
 import { matchesKey, type OverlayHandle, Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
+import { clearCache as clearCapabilityFsCache } from "../../capability/fs";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
 import { listTools } from "../../runtime-mcp/client";
@@ -1562,6 +1563,7 @@ export class MCPCommandController {
 	async #handleReload(): Promise<void> {
 		try {
 			this.#showMessage(["", theme.fg("muted", "Reloading MCP servers and runtime tools..."), ""].join("\n"));
+			clearCapabilityFsCache();
 			await this.#reloadMCP();
 			const connectedCount = this.ctx.mcpManager?.getConnectedServers().length ?? 0;
 			this.#showMessage(
