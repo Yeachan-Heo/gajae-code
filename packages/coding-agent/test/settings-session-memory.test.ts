@@ -172,7 +172,7 @@ describe("Settings.snapshotForCwd", () => {
 		}
 	});
 
-	it("loads different target directories and refreshes an edited cached target file", async () => {
+	it("loads different target directories and reads an edited target file fresh", async () => {
 		const root = await createTemporaryRoot();
 		const targetA = path.join(root, "target-a");
 		const targetB = path.join(root, "target-b");
@@ -199,8 +199,11 @@ describe("Settings.snapshotForCwd", () => {
 			cwd: targetA,
 			includeDisabledProviders: true,
 		});
-		const cachedItemA = ordinaryReload.items.find(item => item.level === "project" && item.path === settingsAPath);
-		expect(cachedItemA?.data.ask).toEqual({ timeout: 30_000 });
+		const reloadedItemA = ordinaryReload.items.find(item => item.level === "project" && item.path === settingsAPath);
+		// A project-scope read is containment-bounded, and a bounded read never
+		// shares the lexical content cache (a repository symlink must not be served
+		// as a cached target), so an edit is visible on the very next load.
+		expect(reloadedItemA?.data.ask).toEqual({ timeout: 60_000 });
 
 		const snapshotA = await parent.snapshotForCwd(targetA);
 		const snapshotB = await parent.snapshotForCwd(targetB);
