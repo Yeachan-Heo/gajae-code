@@ -286,18 +286,15 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	}
 	if (abs === null) return null;
 	if (!(await isCurrentIsolatedPath(abs, options))) return null;
-	const key = cacheKey(abs, options);
+	const readable = !options?.isolatedHome ? await containedReadPath(abs, options) : abs;
+	if (readable === null) return null;
+	const key = cacheKey(readable, options);
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
 	const readGeneration = cacheGeneration;
 	if (useCache && contentCache.has(key)) {
 		return contentCache.get(key) ?? null;
 	}
 	if (!options?.isolatedHome) {
-		const readable = await containedReadPath(abs, options);
-		if (readable === null) {
-			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
-			return null;
-		}
 		try {
 			const content = await Bun.file(readable).text();
 			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, content);
@@ -533,6 +530,15 @@ export function invalidate(filePath: string): void {
 	const abs = resolvePath(filePath);
 	invalidateCacheEntries(contentCache, abs);
 	invalidateCacheEntries(dirCache, abs);
+	try {
+		const physical = fs.realpathSync(abs);
+		if (physical !== abs) {
+			invalidateCacheEntries(contentCache, physical);
+			invalidateCacheEntries(dirCache, physical);
+		}
+	} catch {
+		// Lexical invalidation still covers paths that were deleted.
+	}
 	const parent = path.dirname(abs);
 	if (parent !== abs) {
 		invalidateCacheEntries(dirCache, parent);
