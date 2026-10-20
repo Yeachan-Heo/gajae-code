@@ -39,6 +39,7 @@ import {
 	replaceBinaryForUpdate,
 	resolveGjcPathForTest,
 	resolveNpmManagedTargetForTest,
+	resolveProjectLocalPackageInstallForTest,
 	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
@@ -565,6 +566,30 @@ describe("update-cli install target detection", () => {
 		);
 
 		expect(target).toBeUndefined();
+	});
+
+	it("recognizes a project-local node_modules/.bin install on every platform", () => {
+		// #6842: on Windows the dependency-installed CLI is a real .exe, so the
+		// .cmd/.ps1 shim rules never matched it and `gjc update` tried to replace a
+		// package-manager-owned file.
+		expect(resolveProjectLocalPackageInstallForTest("C:\\proj\\node_modules\\.bin\\gjc.exe", "win32")).toEqual({
+			packageRoot: "C:\\proj\\node_modules",
+		});
+		expect(resolveProjectLocalPackageInstallForTest("/proj/node_modules/.bin/gjc", "linux")).toEqual({
+			packageRoot: "/proj/node_modules",
+		});
+	});
+
+	it("does not treat a global or standalone install as project-local", () => {
+		for (const candidate of [
+			"/usr/local/bin/gjc",
+			"/home/me/.gjc/bin/gjc",
+			"C:\\Users\\me\\AppData\\Local\\gjc\\gjc.exe",
+			"/proj/node_modules/.bin/other",
+			"/proj/node_modules/gjc",
+		]) {
+			expect(resolveProjectLocalPackageInstallForTest(candidate, "linux")).toBeUndefined();
+		}
 	});
 
 	it("keeps non-Windows package-manager-like shims on the existing bun/binary classifier", () => {

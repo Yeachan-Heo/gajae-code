@@ -108,6 +108,7 @@ Interactive startup checks GitHub releases for a newer GJC version in the backgr
 
 - Standalone binary or former Bun/npm install on a supported platform → `gjc update` installs the matching GitHub release binary. Existing standalone binaries are atomically replaced. Package-manager installs migrate to a separate user binary path, even at the same version; shims are neither overwritten nor uninstalled. A target that already passes release-checksum, version, and smoke-test verification is reused without downloading the binary again (unless `--force` is set).
 - Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow. `gjc update` refuses to self-overwrite it.
+- Project dependency install (`<project>/node_modules/.bin/gjc`, including the real `.exe` that Windows dependency installs place there) → update the dependency, not the file: `gjc update` refuses with package-manager instructions because that file belongs to the project's lockfile, and replacing it fails on Windows ACLs (#6842).
 - Unsupported platform or unknown target → rerun the documented platform installer.
 
 Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
