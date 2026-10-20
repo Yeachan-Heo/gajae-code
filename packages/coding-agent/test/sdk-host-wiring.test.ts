@@ -90,7 +90,7 @@ import {
 	SESSION_HOST_OBSERVER_CAPABILITY,
 	SessionSdkHost,
 } from "../src/sdk/host";
-import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
@@ -339,7 +339,7 @@ function start(
 	if (lifecycle) attachLifecycleStartupCapability(api, lifecycle.startupCapability);
 	const effectiveSettings =
 		settings ??
-		(lifecycle || typeof ctx.getRunSettlementProof === "function"
+		(lifecycle || typeof ctx.waitForRunSettlement === "function"
 			? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings)
 			: undefined);
 	createOrchestrationNotificationsExtension(
@@ -351,10 +351,10 @@ function start(
 					ensureProviderDaemon,
 					controller,
 					terminalAbortSeams: {
-						...(typeof ctx.getRunSettlementProof === "function"
+						...(typeof ctx.waitForRunSettlement === "function"
 							? {
-									getRunSettlementProof: (handle: string) =>
-										(ctx.getRunSettlementProof as (handle: string) => Promise<RunSettlementProof>)(handle),
+									waitForRunSettlement: (handle: string) =>
+										(ctx.waitForRunSettlement as (handle: string) => Promise<RunSettlementProof>)(handle),
 								}
 							: {}),
 						...(typeof ctx.getTerminalRunOwnerForEvent === "function"
@@ -2669,7 +2669,7 @@ test("SDK host privately stages large images with authenticated connection owner
 		getActivePromptHandle: () => activeHandle,
 		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: () => ({ resourceRunId: "image-wire-run", domain }),
-		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
 	};
 	const allowAcceptance = Promise.withResolvers<void>();
 	const producer = Promise.withResolvers<void>();
@@ -2823,7 +2823,7 @@ test("bus retains staged-image capacity until a turn-aborted preflight producer 
 	if (!ledger.open("image-preflight-abort")) throw new Error("Image preflight run could not open.");
 	const sessionContext = {
 		...context(cwd, sessionId),
-		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
 		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: () => undefined,
 	};
@@ -2918,7 +2918,7 @@ test("bus retains staged-image capacity across aborted late acceptance and shutd
 			...(baseContext.sessionManager as Record<string, unknown>),
 			getSessionFile: () => sessionFile,
 		},
-		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
 		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: () => undefined,
 	};
@@ -3018,7 +3018,7 @@ test("bus keeps an accepted staged image charged through producer settlement bef
 	if (!ledger.open("image-unadopted-shutdown")) throw new Error("Image unadopted run could not open.");
 	const sessionContext = {
 		...context(cwd, sessionId),
-		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
 		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: () => undefined,
 	};
@@ -3115,7 +3115,7 @@ test.each([
 	if (!ledger.open("image-promotion-run")) throw new Error("Image promotion run could not open.");
 	const sessionContext = {
 		...context(cwd, sessionId),
-		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		waitForRunSettlement: (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
 		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: () => undefined,
 	};
@@ -3209,8 +3209,8 @@ test.each([
 	if (!domain) throw new Error("Image authority run could not open.");
 	const sessionContext = {
 		...context(cwd, sessionId),
-		getRunSettlementProof:
-			missing === "settlement" ? undefined : (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		waitForRunSettlement:
+			missing === "settlement" ? undefined : (handle: string) => ledger.waitForSettlement(handle, { graceMs: null }),
 		getRunOwnerDomain: missing === "domain" ? undefined : (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: missing === "terminal" ? undefined : () => ({ resourceRunId: "image-run", domain }),
 	};
@@ -3238,6 +3238,8 @@ test.each([
 test.each([
 	"settled",
 	"pending",
+	"slow-pending",
+	"shutdown-slow-pending",
 	"quarantined",
 	"missing-handle-pending",
 	"missing-handle-quarantined",
@@ -3245,6 +3247,7 @@ test.each([
 	"missing-domain-quarantined",
 ] as const)("bus staged-image capacity survives disconnect and an unrelated run terminal (%s)", async mode => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-domain-"));
+	const sourceBytesBefore = getPromptImageProcessBudgetSnapshot().sourceBytes;
 	dirs.push(cwd);
 	const sessionId = `sdk-image-domain-${Date.now()}`;
 	const missingOwner = mode.startsWith("missing-");
@@ -3257,6 +3260,8 @@ test.each([
 	if (mode !== "settled") ledger.track("image-run", "tool", "abort-ignoring-tool", tool.promise);
 	const cleanupReservations: Array<() => void> = [];
 	const owners = new WeakMap<object, AgentTerminalOwnerContext>();
+	const proofAttempted = Promise.withResolvers<void>();
+	const proofHandles: string[] = [];
 	const sessionContext = {
 		...context(cwd, sessionId, "main", live),
 		getActivePromptHandle: () => (mode.startsWith("missing-handle") ? undefined : live.handle),
@@ -3264,7 +3269,11 @@ test.each([
 		getRunOwnerDomain: (handle: string) =>
 			mode.startsWith("missing-domain") ? undefined : ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: (event: object) => owners.get(event),
-		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
+		waitForRunSettlement: (handle: string) => {
+			proofHandles.push(handle);
+			proofAttempted.resolve();
+			return ledger.waitForSettlement(handle, { graceMs: null });
+		},
 		abortPromptAndWait: async () => {
 			throw new Error("The image producer is held until its exact terminal.");
 		},
@@ -3340,7 +3349,21 @@ test.each([
 		if (mode.endsWith("quarantined")) ledger.quarantine("image-run");
 		await handlers.get("agent_end")?.(ended, sessionContext);
 		if (mode !== "settled") {
-			await Bun.sleep(150);
+			if (mode.includes("slow")) {
+				await proofAttempted.promise;
+				const chargedBytes = getPromptImageProcessBudgetSnapshot().sourceBytes;
+				expect(chargedBytes).toBeGreaterThan(sourceBytesBefore);
+				await handlers.get("agent_end")?.(ended, sessionContext);
+				if (mode.startsWith("shutdown")) {
+					releaseRun.resolve();
+					await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+					await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+				}
+				// Exceed the retired helper's entire 100 x 100 ms polling window.
+				await Bun.sleep(10_100);
+				expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(chargedBytes);
+				expect(proofHandles).toEqual(["image-run"]);
+			} else await Bun.sleep(150);
 			expect(releases).toBe(0);
 			tool.resolve();
 		}
@@ -3356,6 +3379,10 @@ test.each([
 		}
 		await waitFor(() => releases === 1, "exact image resource settlement");
 		expect(releases).toBe(1);
+		if (mode.includes("slow")) {
+			expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBytesBefore);
+			expect(proofHandles).toEqual(["image-run"]);
+		}
 		releaseRun.resolve();
 		await handlers.get("agent_end")?.(ended, sessionContext);
 		expect(releases).toBe(1);
@@ -3370,7 +3397,7 @@ test.each([
 			for (const release of cleanupReservations) release();
 		}
 	}
-});
+}, 20_000);
 
 test.each([
 	"fatal",

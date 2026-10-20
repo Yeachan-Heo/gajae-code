@@ -79,8 +79,8 @@ export async function startProductionSdkHost(
 									abortPromptAndWaitWithTerminal: (handle, seamOptions) =>
 										session.abortPromptAndWait(handle, seamOptions),
 									pendingToolExecutions: handle => session.pendingToolExecutions(handle),
-									getRunSettlementProof: handle =>
-										session.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 }),
+									waitForRunSettlement: handle =>
+										session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
 								},
 								onSdkRequest: (kind, _connectionId, frame) => {
 									const operation = kind === "control" ? frame.operation : frame.query;

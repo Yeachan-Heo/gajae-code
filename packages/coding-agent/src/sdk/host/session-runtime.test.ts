@@ -52,7 +52,7 @@ import {
 import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TOOL_ACTIVITY_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
-import { PromptImageUploadStore } from "./prompt-image-upload";
+import { getPromptImageProcessBudgetSnapshot, PromptImageUploadStore } from "./prompt-image-upload";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	type CreateSdkSessionRuntimeOptions,
@@ -4789,7 +4789,7 @@ async function invocationHarness(
 						cancelPendingPreflightForTerminalAbort: () => {},
 						abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
 						...(hooks.connectionLiveness
-							? { getRunSettlementProof: async () => ({ status: "settled" as const }) }
+							? { waitForRunSettlement: async () => ({ status: "settled" as const }) }
 							: {}),
 						...(interceptorStore ? { getReconciliationStore: () => interceptorStore } : {}),
 						...(hooks.onPersistenceInstrumentation
@@ -4969,7 +4969,7 @@ test.each([
 		harness = await invocationHarness("sdk-no-image-transport", cwd, {
 			connectionLiveness: missing !== "liveness",
 			terminalAbortSeams: {
-				getRunSettlementProof: missing === "settlement" ? undefined : async () => ({ status: "settled" }),
+				waitForRunSettlement: missing === "settlement" ? undefined : async () => ({ status: "settled" }),
 			},
 		});
 		harness.connect("client");
@@ -5032,8 +5032,8 @@ test("SDK-only private staged images are connection-owned, one-shot, and reach t
 			connectionLiveness: true,
 			terminalAbortSeams: {
 				getActivePromptHandle: () => real.session.activePromptHandle,
-				getRunSettlementProof: handle =>
-					real.session.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 }),
+				waitForRunSettlement: handle =>
+					real.session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null }),
 			},
 			sendUserMessage: (content, options) => send(content, options),
 		});
@@ -5559,7 +5559,7 @@ test("SDK-only queued image promotion retains quota through shutdown until exact
 	const released = Promise.withResolvers<void>();
 	const promotionReady = Promise.withResolvers<void>();
 	let activeHandle: string | undefined;
-	let settled = false;
+	const settlement = Promise.withResolvers<{ status: "settled" }>();
 	let releases = 0;
 	let promoted: PreflightHooks["onQueuedPromoted"];
 	const proofHandles: string[] = [];
@@ -5586,10 +5586,10 @@ test("SDK-only queued image promotion retains quota through shutdown until exact
 			isIdle: () => false,
 			terminalAbortSeams: {
 				getActivePromptHandle: () => activeHandle,
-				getRunSettlementProof: async handle => {
+				waitForRunSettlement: handle => {
 					proofHandles.push(handle);
 					proofAttempted.resolve();
-					return settled ? { status: "settled" } : { status: "unfenced", reason: "run_not_sealed", pending: [] };
+					return settlement.promise;
 				},
 			},
 			sendUserMessage: async (content, options) => {
@@ -5618,14 +5618,16 @@ test("SDK-only queued image promotion retains quota through shutdown until exact
 		activeHandle = "queued-image-run";
 		await harness.emit("agent_start");
 		await proofAttempted.promise;
-		expect(proofHandles).toContain("queued-image-run");
+		expect(proofHandles).toEqual(["queued-image-run"]);
 		expect(releases).toBe(0);
 
-		settled = true;
+		await harness.stop();
+		expect(proofHandles).toEqual(["queued-image-run"]);
+		settlement.resolve({ status: "settled" });
 		await released.promise;
 		expect(releases).toBe(1);
 	} finally {
-		settled = true;
+		settlement.resolve({ status: "settled" });
 		await harness?.stop().catch(() => undefined);
 		redeemSpy.mockRestore();
 		await rm(cwd, { recursive: true, force: true });
@@ -5634,12 +5636,15 @@ test("SDK-only queued image promotion retains quota through shutdown until exact
 
 test.each([
 	"pending",
+	"slow-pending",
+	"shutdown-slow-pending",
 	"quarantined",
 	"held-start-pending",
 	"held-start-quarantined",
 	"held-start-missing-handle",
 ] as const)("SDK-only forced image terminals retain unsettled producer capacity (%s)", async mode => {
 	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-image-forced-"));
+	const sourceBytesBefore = getPromptImageProcessBudgetSnapshot().sourceBytes;
 	const ledger = createRunResourceLedger();
 	ledger.open("image-run");
 	const tool = Promise.withResolvers<void>();
@@ -5648,6 +5653,8 @@ test.each([
 	const startEntered = Promise.withResolvers<void>();
 	const releaseStart = Promise.withResolvers<void>();
 	const holdStart = mode.startsWith("held-start");
+	const proofAttempted = Promise.withResolvers<void>();
+	const proofHandles: string[] = [];
 	let drainTimeouts = 0;
 	ledger.track("image-run", "tool", "abort-ignoring-tool", tool.promise);
 	let releases = 0;
@@ -5684,7 +5691,11 @@ test.each([
 				: {}),
 			terminalAbortSeams: {
 				getActivePromptHandle: () => (mode.endsWith("missing-handle") ? undefined : "image-run"),
-				getRunSettlementProof: handle => ledger.waitForSettlement(handle, { graceMs: 0 }),
+				waitForRunSettlement: handle => {
+					proofHandles.push(handle);
+					proofAttempted.resolve();
+					return ledger.waitForSettlement(handle, { graceMs: null });
+				},
 			},
 			sendUserMessage: async (_content, options) => {
 				await options?.onPreflightAcceptCommit?.();
@@ -5707,12 +5718,32 @@ test.each([
 			expect(releases).toBe(0);
 			releaseStart.resolve();
 		} else await harness.emit("agent_end", { stopReason: "cancelled" });
-		await Bun.sleep(150);
+		if (mode.includes("slow")) {
+			await proofAttempted.promise;
+			const chargedBytes = getPromptImageProcessBudgetSnapshot().sourceBytes;
+			expect(chargedBytes).toBeGreaterThan(sourceBytesBefore);
+			await harness.emit("agent_end", { stopReason: "cancelled" });
+			if (mode.startsWith("shutdown")) {
+				run.resolve();
+				await harness.stop();
+				await harness.stop();
+			}
+			// Exceed the retired helper's entire 100 x 100 ms polling window.
+			await Bun.sleep(10_100);
+			expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(chargedBytes);
+			expect(proofHandles).toEqual(["image-run"]);
+		} else await Bun.sleep(150);
 		expect(releases).toBe(0);
 		tool.resolve();
 		if (mode.endsWith("pending")) {
 			await released.promise;
 			expect(releases).toBe(1);
+			if (mode.includes("slow")) {
+				expect(getPromptImageProcessBudgetSnapshot().sourceBytes).toBe(sourceBytesBefore);
+				await harness.stop();
+				expect(proofHandles).toEqual(["image-run"]);
+				expect(releases).toBe(1);
+			}
 		} else {
 			await harness.stop();
 			await Bun.sleep(150);

@@ -1238,7 +1238,7 @@ export class PresentationArbiter {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
-	imageUploads: PromptImageUploadStore;
+	imageUploads: PromptImageUploadStore | undefined;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
 	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
 	releaseAcceptedImages: () => void;
@@ -2669,7 +2669,7 @@ function sdkControlSurface(
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
 	gatePresentations: PresentationArbiter | undefined,
 	api: ExtensionAPI,
-	imageUploads: PromptImageUploadStore,
+	imageUploads: PromptImageUploadStore | undefined,
 	imageUploadsAvailable: boolean,
 	retainAcceptedImage: (
 		correlation: { commandId: string; turnId: string },
@@ -3237,6 +3237,10 @@ function sdkControlSurface(
 					stagedImages === undefined
 						? undefined
 						: () => {
+								if (!imageUploads)
+									throw Object.assign(new Error("Staged images are unavailable."), {
+										code: "image_upload_unavailable",
+									});
 								reservation = imageUploads.redeem(requesterConnectionId, stagedImages);
 								return reservation.images;
 							},
@@ -3247,10 +3251,14 @@ function sdkControlSurface(
 				throw error;
 			}
 		},
-		imageBegin: input => imageUploads.begin(controlRequesterContext.getStore(), input),
-		imageAppend: input => imageUploads.append(controlRequesterContext.getStore(), input),
-		imageFinish: input => imageUploads.finish(controlRequesterContext.getStore(), input),
-		imageDiscard: input => imageUploads.discard(controlRequesterContext.getStore(), input),
+		...(imageUploads
+			? {
+					imageBegin: (input: unknown) => imageUploads.begin(controlRequesterContext.getStore(), input),
+					imageAppend: (input: unknown) => imageUploads.append(controlRequesterContext.getStore(), input),
+					imageFinish: (input: unknown) => imageUploads.finish(controlRequesterContext.getStore(), input),
+					imageDiscard: (input: unknown) => imageUploads.discard(controlRequesterContext.getStore(), input),
+				}
+			: {}),
 		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
@@ -4473,7 +4481,8 @@ export function createNotificationsExtension(
 		 * preflight outside the durable admission path (review thread P2).
 		 */
 		terminalAbortSeams?: {
-			getRunSettlementProof?: (handle: string) => Promise<RunSettlementProof>;
+			/** Definitive event-driven observation; never mutates the owning run. */
+			waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
 			getRunOwnerDomain?: (handle: string) => RunCancellationDomain | undefined;
 			getTerminalTurnEpoch: () => number | undefined;
@@ -4763,7 +4772,7 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
-			requestedRuntime.imageUploads.close();
+			requestedRuntime.imageUploads?.close();
 			requestedRuntime.retireJoinedPromptOwners();
 			requestedRuntime.abortEphemeralTurns();
 		}
@@ -5278,15 +5287,17 @@ export function createNotificationsExtension(
 			hostCapCache.delete(connectionId);
 			hostAttachedConnections.delete(connectionId);
 		};
-		const imageUploads = new PromptImageUploadStore(connectionId => {
-			const incarnation = hostConnectionIncarnations.get(connectionId);
-			return incarnation !== undefined && !incarnation.closed;
-		});
 		const imageUploadsAvailable =
-			typeof terminalAbortSeams?.getRunSettlementProof === "function" &&
+			typeof terminalAbortSeams?.waitForRunSettlement === "function" &&
 			typeof terminalAbortSeams.getRunOwnerDomain === "function" &&
 			typeof terminalAbortSeams.getTerminalRunOwnerForEvent === "function" &&
 			typeof ctx.getActivePromptHandle === "function";
+		const imageUploads = imageUploadsAvailable
+			? new PromptImageUploadStore(connectionId => {
+					const incarnation = hostConnectionIncarnations.get(connectionId);
+					return incarnation !== undefined && !incarnation.closed;
+				})
+			: undefined;
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -5342,12 +5353,12 @@ export function createNotificationsExtension(
 				discard();
 				return;
 			}
-			const getProof = terminalAbortSeams?.getRunSettlementProof;
-			if (!getProof) return;
+			const waitForSettlement = terminalAbortSeams?.waitForRunSettlement;
+			if (!waitForSettlement) return;
 			retiringImages.add(key);
 			retirePromptImageReservation(
 				owner.resourceRunId,
-				getProof,
+				waitForSettlement,
 				() => acceptedImages.get(key) === reservation,
 				discard,
 			);
@@ -6480,7 +6491,7 @@ export function createNotificationsExtension(
 					logger.warn(`sdk: failed to cancel fenced preflight: ${String(error)}`),
 				);
 			fencedConnections.add(submission.connectionId);
-			imageUploads.disconnect(submission.connectionId);
+			imageUploads?.disconnect(submission.connectionId);
 			host?.handleDisconnect(submission.connectionId);
 			for (const [key, owned] of promptSubmissions)
 				if (owned.connectionId === submission.connectionId) {
@@ -8819,7 +8830,7 @@ export function createNotificationsExtension(
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				closeHostConnection(connectionId);
-				imageUploads.disconnect(connectionId);
+				imageUploads?.disconnect(connectionId);
 				connectionCloseHandler?.(connectionId);
 				void controlSurface
 					.cancelPendingPreflightsForConnection(connectionId)

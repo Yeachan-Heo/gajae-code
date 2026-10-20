@@ -492,8 +492,10 @@ the Router as usual; do not discover endpoints or credentials yourself.
 
 When installed, `runtime.capabilities` lists `turn.image.begin`, `turn.image.append`,
 `turn.image.finish`, and `turn.image.discard`. A custom host transport must provide
-authoritative live-connection membership and the host's internal read-only exact-run
-settlement observer; otherwise the controls are not installed.
+authoritative live-connection membership and the host's internal read-only definitive
+exact-run settlement observer; otherwise the controls are not installed. This observer
+waits for ledger settlement events independently of socket or host lifetime, not a
+bounded snapshot or polling loop.
 The notifications host also requires its internal run-domain and terminal-owner
 observers and active-handle accessor before advertising staging.
 Model-facing and chat adapters cannot invoke these machine-only controls.
@@ -531,12 +533,12 @@ Acceptance or cancellation does not prove an unadopted producer has stopped reta
 images: its capacity remains charged until that submission actually settles.
 Once execution starts, an exact resource-settlement proof is required: even an
 attributed cancelled `agent_end` or transport teardown may leave tools running.
-Still-pending resources receive at most 100 settlement observations within 10 seconds.
-Unknown runs, quarantine, and observation failures stop the observer immediately.
-When observation stops without proof, capacity stays charged and a process-level
-warning identifies the reason; it is not reclaimed merely because a retry budget
-or session lifetime ended. Internal budget snapshots expose retained process
-source/accepted and transient charges. The existing ledger makes quarantine
+Each retiring reservation has one event-driven settlement continuation, with no
+polling or observation cutoff. A late exact settlement releases its capacity even
+after transport or host teardown; shutdown does not wait for a still-live producer.
+Unknown runs, quarantine, and observer failures retain capacity and produce a
+process-level diagnostic rather than claiming settlement. Internal budget snapshots
+expose retained process source/accepted and transient charges. The existing ledger makes quarantine
 irreversible, so quarantined executions remain charged for this process's lifetime
 rather than claiming their tombstones prove settlement. An adopted execution
 without an exact resource handle or owning domain also stays charged.

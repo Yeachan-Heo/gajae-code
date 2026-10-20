@@ -1,7 +1,7 @@
 import { expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
-import type { RunSettlementProof } from "@gajae-code/agent-core";
+import { createRunResourceLedger, type RunSettlementProof } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 import {
 	getPromptImageProcessBudgetSnapshot,
@@ -18,9 +18,11 @@ const STATIC_GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==
 test.each([
 	"unknown_run",
 	"quarantined",
+	"run_not_sealed",
+	"resources_pending",
 	"throw",
 	"reject",
-] as const)("retirement stops on %s with one permanent-charge diagnostic and no release", async reason => {
+] as const)("retirement retains on %s with one diagnostic and no retry", async reason => {
 	vi.useFakeTimers();
 	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 	const release = vi.fn();
@@ -37,7 +39,11 @@ test.each([
 		expect(getProof).toHaveBeenCalledTimes(1);
 		expect(release).not.toHaveBeenCalled();
 		expect(warning).toHaveBeenCalledTimes(1);
-		expect(warning.mock.calls[0]?.[0]).toContain("permanently retained");
+		expect(warning.mock.calls[0]?.[0]).toContain("capacity retained");
+		expect(warning.mock.calls[0]?.[1]).toMatchObject({
+			reason: reason === "throw" || reason === "reject" ? "observation_failed" : reason,
+			...(reason === "run_not_sealed" || reason === "resources_pending" ? { contractViolation: true } : {}),
+		});
 		expect(vi.getTimerCount()).toBe(0);
 	} finally {
 		vi.useRealTimers();
@@ -45,36 +51,7 @@ test.each([
 	}
 });
 
-test("retirement exhausts 100 observations without freeing a potentially live producer", async () => {
-	vi.useFakeTimers();
-	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
-	const release = vi.fn();
-	const getProof = vi.fn(
-		async (): Promise<RunSettlementProof> => ({
-			status: "unfenced",
-			reason: "resources_pending",
-			pending: [],
-		}),
-	);
-	try {
-		retirePromptImageReservation("run", getProof, () => true, release);
-		for (let attempt = 0; attempt < 100; attempt++) {
-			await Promise.resolve();
-			vi.advanceTimersByTime(100);
-		}
-		vi.advanceTimersByTime(60_000);
-		expect(getProof).toHaveBeenCalledTimes(100);
-		expect(release).not.toHaveBeenCalled();
-		expect(warning).toHaveBeenCalledTimes(1);
-		expect(warning.mock.calls[0]?.[1]).toMatchObject({ reason: "observation_count_exhausted" });
-		expect(vi.getTimerCount()).toBe(0);
-	} finally {
-		vi.useRealTimers();
-		warning.mockRestore();
-	}
-});
-
-test("retirement's fixed window terminates a hung getter and ignores its late settlement", async () => {
+test("retirement waits beyond the former cutoff without timers and releases on one definitive proof", async () => {
 	vi.useFakeTimers();
 	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 	const proof = Promise.withResolvers<RunSettlementProof>();
@@ -82,13 +59,18 @@ test("retirement's fixed window terminates a hung getter and ignores its late se
 	const release = vi.fn();
 	try {
 		retirePromptImageReservation("run", getProof, () => true, release);
-		vi.advanceTimersByTime(10_000);
-		expect(warning).toHaveBeenCalledTimes(1);
-		expect(warning.mock.calls[0]?.[1]).toMatchObject({ reason: "observation_window_exhausted" });
+		expect(getProof).toHaveBeenCalledWith("run");
+		expect(vi.getTimerCount()).toBe(0);
+		vi.advanceTimersByTime(60_000);
+		await Promise.resolve();
+		expect(release).not.toHaveBeenCalled();
+		expect(warning).not.toHaveBeenCalled();
+		expect(vi.getTimerCount()).toBe(0);
 		proof.resolve({ status: "settled" });
 		await Promise.resolve();
 		expect(getProof).toHaveBeenCalledTimes(1);
-		expect(release).not.toHaveBeenCalled();
+		expect(release).toHaveBeenCalledTimes(1);
+		expect(warning).not.toHaveBeenCalled();
 		expect(vi.getTimerCount()).toBe(0);
 	} finally {
 		vi.useRealTimers();
@@ -96,20 +78,15 @@ test("retirement's fixed window terminates a hung getter and ignores its late se
 	}
 });
 
-test.each([false, true])("retirement stops when ownership changes (pending proof: %s)", async pending => {
+test.each([
+	false,
+	true,
+])("retirement cannot release a stale reservation (initially current: %s)", async initiallyCurrent => {
 	vi.useFakeTimers();
 	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
-	let current = true;
+	let current = initiallyCurrent;
 	const proof = Promise.withResolvers<RunSettlementProof>();
-	const getProof = vi.fn(() =>
-		pending
-			? proof.promise
-			: Promise.resolve<RunSettlementProof>({
-					status: "unfenced",
-					reason: "resources_pending",
-					pending: [],
-				}),
-	);
+	const getProof = vi.fn(() => proof.promise);
 	const release = vi.fn();
 	try {
 		retirePromptImageReservation("run", getProof, () => current, release);
@@ -118,7 +95,7 @@ test.each([false, true])("retirement stops when ownership changes (pending proof
 		proof.resolve({ status: "settled" });
 		await Promise.resolve();
 		vi.advanceTimersByTime(60_000);
-		expect(getProof).toHaveBeenCalledTimes(1);
+		expect(getProof).toHaveBeenCalledTimes(initiallyCurrent ? 1 : 0);
 		expect(release).not.toHaveBeenCalled();
 		expect(warning).not.toHaveBeenCalled();
 		expect(vi.getTimerCount()).toBe(0);
@@ -128,7 +105,7 @@ test.each([false, true])("retirement stops when ownership changes (pending proof
 	}
 });
 
-test("settlement proof releases accepted capacity and all process counters recover after close", async () => {
+test("late ledger resource settlement releases accepted capacity after close without timers", async () => {
 	const baseline = getPromptImageProcessBudgetSnapshot();
 	const store = new PromptImageUploadStore(alwaysConnected);
 	const bytes = tinyPng();
@@ -136,37 +113,40 @@ test("settlement proof releases accepted capacity and all process counters recov
 	const accepted = store.redeem("sender", [{ id }]);
 	const retained = getPromptImageProcessBudgetSnapshot();
 	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const ledger = createRunResourceLedger();
+	const resource = Promise.withResolvers<void>();
+	ledger.open("run");
+	ledger.track("run", "post_prompt", "late image producer", resource.promise);
+	ledger.seal("run");
 	try {
 		expect(retained.sourceBytes - baseline.sourceBytes).toBe(bytes.length + Math.ceil(bytes.length / 3) * 4);
 		store.close();
 		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
 		vi.useFakeTimers();
-		let settled = false;
 		const release = vi.fn(accepted.release);
-		retirePromptImageReservation(
-			"run",
-			async () =>
-				settled
-					? { status: "settled" }
-					: {
-							status: "unfenced",
-							reason: "resources_pending",
-							pending: [],
-						},
-			() => true,
-			release,
-		);
+		const waitForRunSettlement = vi.fn((handle: string) => ledger.waitForSettlement(handle, { graceMs: null }));
+		retirePromptImageReservation("run", waitForRunSettlement, () => true, release);
 		await Promise.resolve();
 		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
-		settled = true;
-		vi.advanceTimersByTime(100);
+		expect(vi.getTimerCount()).toBe(0);
+		vi.advanceTimersByTime(60_000);
 		await Promise.resolve();
+		expect(release).not.toHaveBeenCalled();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
+		expect(warning).not.toHaveBeenCalled();
+		expect(vi.getTimerCount()).toBe(0);
+		resource.resolve();
+		await resource.promise;
+		await Promise.resolve();
+		expect(waitForRunSettlement).toHaveBeenCalledTimes(1);
 		expect(release).toHaveBeenCalledTimes(1);
 		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
-		expect(retained.sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+		accepted.release();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
 		expect(warning).not.toHaveBeenCalled();
 		expect(vi.getTimerCount()).toBe(0);
 	} finally {
+		resource.resolve();
 		accepted.release();
 		store.close();
 		vi.useRealTimers();
@@ -409,30 +389,37 @@ test("a session has one decoder slot and recovers it after finishing", async () 
 	}
 });
 
-test("a permanently unfenced accepted image stays charged after close and observation ends", async () => {
+test.each([
+	"unknown_run",
+	"quarantined",
+	"throw",
+	"reject",
+] as const)("accepted image stays charged after close on %s", async reason => {
 	const baseline = getPromptImageProcessBudgetSnapshot();
 	const store = new PromptImageUploadStore(alwaysConnected);
 	const id = await stage(store, "sender", tinyPng());
 	const accepted = store.redeem("sender", [{ id }]);
 	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const ledger = createRunResourceLedger();
+	if (reason === "quarantined") {
+		ledger.open("run");
+		ledger.quarantine("run");
+	}
 	try {
 		const retained = getPromptImageProcessBudgetSnapshot();
 		expect(retained.sourceBytes).toBeGreaterThan(baseline.sourceBytes);
 		vi.useFakeTimers();
 		const release = vi.fn(accepted.release);
-		retirePromptImageReservation(
-			"run",
-			async () => ({
-				status: "unfenced",
-				reason: "quarantined",
-				pending: [],
-			}),
-			() => true,
-			release,
-		);
+		const waitForRunSettlement = vi.fn((handle: string): Promise<RunSettlementProof> => {
+			if (reason === "throw") throw new Error("ledger unavailable");
+			if (reason === "reject") return Promise.reject(new Error("ledger unavailable"));
+			return ledger.waitForSettlement(handle, { graceMs: null });
+		});
+		retirePromptImageReservation("run", waitForRunSettlement, () => true, release);
 		store.close();
 		await Promise.resolve();
 		vi.advanceTimersByTime(60_000);
+		expect(waitForRunSettlement).toHaveBeenCalledTimes(1);
 		expect(release).not.toHaveBeenCalled();
 		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
 		expect(warning).toHaveBeenCalledTimes(1);

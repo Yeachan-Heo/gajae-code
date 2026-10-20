@@ -19,62 +19,37 @@ const MAX_PROCESS_BYTES = 256 * 1024 * 1024;
 // Each session gets one decoder slot; byte reservations remain process-wide.
 const MAX_CONCURRENT_FINISHES = 1;
 const LEASE_MS = 120_000;
-const SETTLEMENT_OBSERVATIONS = 100;
-const SETTLEMENT_WINDOW_MS = 10_000;
 
-/** An attributed terminal is not a proof that an abort-ignoring producer stopped. */
+/** One definitive event-driven wait; teardown and elapsed time are not settlement proof. */
 export function retirePromptImageReservation(
 	handle: string,
-	getProof: (handle: string) => Promise<RunSettlementProof>,
+	waitForRunSettlement: (handle: string) => Promise<RunSettlementProof>,
 	isCurrent: () => boolean,
 	release: () => void,
 ): void {
-	let stopped = false;
-	let observations = 0;
-	let retry: NodeJS.Timeout | undefined;
-	const stop = (reason?: string, error?: unknown): void => {
-		if (stopped) return;
-		stopped = true;
-		clearTimeout(deadline);
-		if (retry) clearTimeout(retry);
-		if (reason)
-			logger.warn("SDK image settlement observation ended; capacity permanently retained without settlement proof", {
-				handle,
-				reason,
-				observations,
-				error,
-			});
-	};
-	// Neither exhaustion nor teardown proves producer settlement. Stop observing,
-	// retain the charge, and leave one process-level diagnostic, even for a hung getter.
-	const deadline = setTimeout(
-		() => stop(isCurrent() ? "observation_window_exhausted" : undefined),
-		SETTLEMENT_WINDOW_MS,
-	);
-	deadline.unref();
-	const check = async (): Promise<void> => {
-		if (stopped) return;
-		if (!isCurrent()) return stop();
-		observations++;
+	if (!isCurrent()) return;
+	void (async (): Promise<void> => {
 		try {
-			const proof = await getProof(handle);
-			if (stopped) return;
-			if (!isCurrent()) return stop();
+			const proof = await waitForRunSettlement(handle);
+			if (!isCurrent()) return;
 			if (proof.status === "settled") {
-				stop();
 				release();
 				return;
 			}
-			if (proof.reason === "quarantined" || proof.reason === "unknown_run") return stop(proof.reason);
+			logger.warn("SDK image settlement observer returned unfenced proof; capacity retained", {
+				handle,
+				reason: proof.reason,
+				contractViolation: proof.reason === "run_not_sealed" || proof.reason === "resources_pending",
+			});
 		} catch (error) {
-			return stop(isCurrent() ? "observation_failed" : undefined, error);
+			if (isCurrent())
+				logger.warn("SDK image settlement observation failed; capacity retained without settlement proof", {
+					handle,
+					reason: "observation_failed",
+					error,
+				});
 		}
-		if (!isCurrent()) return stop();
-		if (observations >= SETTLEMENT_OBSERVATIONS) return stop("observation_count_exhausted");
-		retry = setTimeout(() => void check(), 100);
-		retry.unref();
-	};
-	void check();
+	})();
 }
 const MAX_BATCH_ID_LENGTH = 128;
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;

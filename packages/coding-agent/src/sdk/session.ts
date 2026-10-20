@@ -4123,9 +4123,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.pendingToolExecutions(handle);
 								},
-								getRunSettlementProof: handle => {
+								waitForRunSettlement: handle => {
 									if (!session) throw new Error("Image owner session is not initialized.");
-									return session.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+									return session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null });
 								},
 							},
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
@@ -4221,9 +4221,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.pendingToolExecutions(handle);
 								},
-								getRunSettlementProof: handle => {
+								waitForRunSettlement: handle => {
 									if (!session) throw new Error("Image owner session is not initialized.");
-									return session.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+									return session.agent.resourceLedger.waitForSettlement(handle, { graceMs: null });
 								},
 							},
 						});

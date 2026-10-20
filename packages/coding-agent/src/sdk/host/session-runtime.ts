@@ -452,8 +452,8 @@ export interface SdkOnlyReconciliationStore {
 }
 
 export interface SdkOnlyTerminalAbortSeams {
-	/** Pure observation: never abort, seal or quarantine an execution to reclaim images. */
-	getRunSettlementProof?: (handle: string) => Promise<RunSettlementProof>;
+	/** Definitive event-driven observation: never abort, seal or quarantine a run to reclaim images. */
+	waitForRunSettlement?: (handle: string) => Promise<RunSettlementProof>;
 	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
 	getTerminalTurnEpoch: () => number | undefined;
 	getActivePromptHandle: () => string | undefined;
@@ -5144,12 +5144,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			release();
 			return;
 		}
-		const getProof = options.terminalAbortSeams?.getRunSettlementProof;
-		if (!getProof) return;
+		const waitForSettlement = options.terminalAbortSeams?.waitForRunSettlement;
+		if (!waitForSettlement) return;
 		reservation.retiring = true;
 		retirePromptImageReservation(
 			reservation.handle,
-			getProof,
+			waitForSettlement,
 			() => acceptedImages.get(key) === reservation,
 			release,
 		);
@@ -7200,7 +7200,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			api,
 			imageUploadsAvailable:
 				typeof transport.isConnectionOpen === "function" &&
-				typeof options.terminalAbortSeams?.getRunSettlementProof === "function",
+				typeof options.terminalAbortSeams?.waitForRunSettlement === "function",
 			reconciliation,
 			turnResultLookup: selector => reconciliation.lookupResult(selector.kind, selector),
 			steerStatusLookup: selector => steerReconciliation.lookupSteer(selector),
@@ -7356,7 +7356,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// establish that the authenticated connection still exists at redemption.
 		const imageUploads =
 			typeof transport.isConnectionOpen === "function" &&
-			typeof options.terminalAbortSeams?.getRunSettlementProof === "function"
+			typeof options.terminalAbortSeams?.waitForRunSettlement === "function"
 				? new PromptImageUploadStore(connectionId => transport.isConnectionOpen?.(connectionId) === true)
 				: undefined;
 		currentImageUploads = imageUploads;
