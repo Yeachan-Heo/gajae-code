@@ -1,13 +1,178 @@
 import { expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
-import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import type { RunSettlementProof } from "@gajae-code/agent-core";
+import { logger } from "@gajae-code/utils";
+import {
+	getPromptImageProcessBudgetSnapshot,
+	PromptImageUploadStore,
+	retirePromptImageReservation,
+} from "../src/sdk/host/prompt-image-upload";
 import { REQUEST_FRAME_BYTES } from "../src/sdk/transport/relay";
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MAX_CHUNK_BYTES = 96 * 1024;
 const alwaysConnected = (_owner: string): boolean => true;
 const STATIC_GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
+
+test.each([
+	"unknown_run",
+	"quarantined",
+	"throw",
+	"reject",
+] as const)("retirement stops on %s with one permanent-charge diagnostic and no release", async reason => {
+	vi.useFakeTimers();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const release = vi.fn();
+	const getProof = vi.fn((): Promise<RunSettlementProof> => {
+		if (reason === "throw") throw new Error("ledger unavailable");
+		if (reason === "reject") return Promise.reject(new Error("ledger unavailable"));
+		return Promise.resolve({ status: "unfenced", reason, pending: [] });
+	});
+	try {
+		retirePromptImageReservation("run", getProof, () => true, release);
+		await Promise.resolve();
+		vi.advanceTimersByTime(60_000);
+		await Promise.resolve();
+		expect(getProof).toHaveBeenCalledTimes(1);
+		expect(release).not.toHaveBeenCalled();
+		expect(warning).toHaveBeenCalledTimes(1);
+		expect(warning.mock.calls[0]?.[0]).toContain("permanently retained");
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		vi.useRealTimers();
+		warning.mockRestore();
+	}
+});
+
+test("retirement exhausts 100 observations without freeing a potentially live producer", async () => {
+	vi.useFakeTimers();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const release = vi.fn();
+	const getProof = vi.fn(
+		async (): Promise<RunSettlementProof> => ({
+			status: "unfenced",
+			reason: "resources_pending",
+			pending: [],
+		}),
+	);
+	try {
+		retirePromptImageReservation("run", getProof, () => true, release);
+		for (let attempt = 0; attempt < 100; attempt++) {
+			await Promise.resolve();
+			vi.advanceTimersByTime(100);
+		}
+		vi.advanceTimersByTime(60_000);
+		expect(getProof).toHaveBeenCalledTimes(100);
+		expect(release).not.toHaveBeenCalled();
+		expect(warning).toHaveBeenCalledTimes(1);
+		expect(warning.mock.calls[0]?.[1]).toMatchObject({ reason: "observation_count_exhausted" });
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		vi.useRealTimers();
+		warning.mockRestore();
+	}
+});
+
+test("retirement's fixed window terminates a hung getter and ignores its late settlement", async () => {
+	vi.useFakeTimers();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const proof = Promise.withResolvers<RunSettlementProof>();
+	const getProof = vi.fn(() => proof.promise);
+	const release = vi.fn();
+	try {
+		retirePromptImageReservation("run", getProof, () => true, release);
+		vi.advanceTimersByTime(10_000);
+		expect(warning).toHaveBeenCalledTimes(1);
+		expect(warning.mock.calls[0]?.[1]).toMatchObject({ reason: "observation_window_exhausted" });
+		proof.resolve({ status: "settled" });
+		await Promise.resolve();
+		expect(getProof).toHaveBeenCalledTimes(1);
+		expect(release).not.toHaveBeenCalled();
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		vi.useRealTimers();
+		warning.mockRestore();
+	}
+});
+
+test.each([false, true])("retirement stops when ownership changes (pending proof: %s)", async pending => {
+	vi.useFakeTimers();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	let current = true;
+	const proof = Promise.withResolvers<RunSettlementProof>();
+	const getProof = vi.fn(() =>
+		pending
+			? proof.promise
+			: Promise.resolve<RunSettlementProof>({
+					status: "unfenced",
+					reason: "resources_pending",
+					pending: [],
+				}),
+	);
+	const release = vi.fn();
+	try {
+		retirePromptImageReservation("run", getProof, () => current, release);
+		await Promise.resolve();
+		current = false;
+		proof.resolve({ status: "settled" });
+		await Promise.resolve();
+		vi.advanceTimersByTime(60_000);
+		expect(getProof).toHaveBeenCalledTimes(1);
+		expect(release).not.toHaveBeenCalled();
+		expect(warning).not.toHaveBeenCalled();
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		vi.useRealTimers();
+		warning.mockRestore();
+	}
+});
+
+test("settlement proof releases accepted capacity and all process counters recover after close", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const bytes = tinyPng();
+	const id = await stage(store, "sender", bytes);
+	const accepted = store.redeem("sender", [{ id }]);
+	const retained = getPromptImageProcessBudgetSnapshot();
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		expect(retained.sourceBytes - baseline.sourceBytes).toBe(bytes.length + Math.ceil(bytes.length / 3) * 4);
+		store.close();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
+		vi.useFakeTimers();
+		let settled = false;
+		const release = vi.fn(accepted.release);
+		retirePromptImageReservation(
+			"run",
+			async () =>
+				settled
+					? { status: "settled" }
+					: {
+							status: "unfenced",
+							reason: "resources_pending",
+							pending: [],
+						},
+			() => true,
+			release,
+		);
+		await Promise.resolve();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
+		settled = true;
+		vi.advanceTimersByTime(100);
+		await Promise.resolve();
+		expect(release).toHaveBeenCalledTimes(1);
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+		expect(retained.sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+		expect(warning).not.toHaveBeenCalled();
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		accepted.release();
+		store.close();
+		vi.useRealTimers();
+		warning.mockRestore();
+	}
+});
 
 function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
 	const name = Buffer.from(type, "ascii");
@@ -143,6 +308,240 @@ function fillNearLimit(store: PromptImageUploadStore): string[] {
 	return ids;
 }
 
+test("every store mutation requires an authenticated connection", async () => {
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const id = upload(store, "sender", tinyPng());
+		for (const mutate of [
+			() => store.begin(undefined, descriptor(tinyPng())),
+			() => store.append(undefined, { id, sequence: 1, data: "AA==" }),
+			() => store.discard(undefined, { id }),
+			() => store.redeem(undefined, [{ id }]),
+		])
+			expect(mutate).toThrow(expect.objectContaining({ code: "operation_prohibited" }));
+		await expect(store.finish(undefined, { id })).rejects.toMatchObject({ code: "operation_prohibited" });
+		await store.finish("sender", { id });
+		store.redeem("sender", [{ id }]).release();
+	} finally {
+		store.close();
+	}
+});
+
+test("16 concurrent leases are admitted, a 17th is denied, and discard recovers the slot", () => {
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const ids = Array.from({ length: 16 }, () => store.begin("sender", descriptor(tinyPng())).id);
+		expect(new Set(ids).size).toBe(16);
+		expect(() => store.begin("sender", descriptor(tinyPng()))).toThrow(expect.objectContaining({ code: "busy" }));
+		store.discard("sender", { id: ids[0] });
+		const replacement = store.begin("sender", descriptor(tinyPng()));
+		expect(ids).not.toContain(replacement.id);
+	} finally {
+		store.close();
+	}
+});
+
+test("redemption rejects 17 IDs before lookup or consuming a valid lease", async () => {
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const id = await stage(store, "sender", tinyPng());
+		const ids = [{ id }, ...Array.from({ length: 16 }, (_, index) => ({ id: `missing-${index}` }))];
+		expect(() => store.redeem("sender", ids)).toThrow(expect.objectContaining({ code: "invalid_input" }));
+		store.redeem("sender", [{ id }]).release();
+	} finally {
+		store.close();
+	}
+});
+
+test.each(["", 1, null, undefined, "a".repeat(129)])("invalid batch ID %j does not consume a lease", batchId => {
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		expect(() => store.begin("sender", { ...descriptor(tinyPng()), batchId })).toThrow(
+			expect.objectContaining({ code: "invalid_input" }),
+		);
+		for (let index = 0; index < 16; index++)
+			store.begin("sender", { ...descriptor(tinyPng()), batchId: "a".repeat(128) });
+	} finally {
+		store.close();
+	}
+});
+
+test("same-ID concurrent finish is rejected without changing the first decoder's reservation", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const id = upload(store, "sender", tinyPng());
+		const finishing = store.finish("sender", { id });
+		const active = getPromptImageProcessBudgetSnapshot();
+		expect(active.concurrentFinishes).toBe(baseline.concurrentFinishes + 1);
+		const duplicate = store.finish("sender", { id });
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(active);
+		await Promise.all([
+			expect(duplicate).rejects.toMatchObject({ code: "invalid_input" }),
+			expect(finishing).resolves.toMatchObject({ id }),
+		]);
+		store.redeem("sender", [{ id }]).release();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	} finally {
+		store.close();
+	}
+});
+
+test("a session has one decoder slot and recovers it after finishing", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const first = upload(store, "sender", tinyPng());
+		const second = upload(store, "sender", tinyPng(31));
+		const finishing = store.finish("sender", { id: first });
+		const active = getPromptImageProcessBudgetSnapshot();
+		const competing = store.finish("sender", { id: second });
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(active);
+		await Promise.all([
+			expect(competing).rejects.toMatchObject({ code: "busy" }),
+			expect(finishing).resolves.toMatchObject({ id: first }),
+		]);
+		await store.finish("sender", { id: second });
+		store.redeem("sender", [{ id: first }, { id: second }]).release();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	} finally {
+		store.close();
+	}
+});
+
+test("a permanently unfenced accepted image stays charged after close and observation ends", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	const id = await stage(store, "sender", tinyPng());
+	const accepted = store.redeem("sender", [{ id }]);
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const retained = getPromptImageProcessBudgetSnapshot();
+		expect(retained.sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+		vi.useFakeTimers();
+		const release = vi.fn(accepted.release);
+		retirePromptImageReservation(
+			"run",
+			async () => ({
+				status: "unfenced",
+				reason: "quarantined",
+				pending: [],
+			}),
+			() => true,
+			release,
+		);
+		store.close();
+		await Promise.resolve();
+		vi.advanceTimersByTime(60_000);
+		expect(release).not.toHaveBeenCalled();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(retained);
+		expect(warning).toHaveBeenCalledTimes(1);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		// Test-owned cleanup only; production teardown must not release a live producer.
+		accepted.release();
+		store.close();
+		vi.useRealTimers();
+		warning.mockRestore();
+	}
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+});
+
+test("one prompt can redeem exactly 64 MiB, while staging cannot supply a larger prompt", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const original = tinyPng();
+	const image = Buffer.concat([
+		original.subarray(0, -12),
+		pngChunk("ruSt", Buffer.alloc(16 * 1024 * 1024 - original.length - 12)),
+		original.subarray(-12),
+	]);
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const ids: string[] = [];
+		for (let index = 0; index < 4; index++) ids.push(await stage(store, "sender", image));
+		const excess = store.begin("sender", descriptor(tinyPng()));
+		expect(() => store.append("sender", { id: excess.id, sequence: 0, data: "AA==" })).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		const accepted = store.redeem(
+			"sender",
+			ids.map(id => ({ id })),
+		);
+		try {
+			expect(accepted.images.reduce((total, content) => total + Buffer.byteLength(content.data, "base64"), 0)).toBe(
+				64 * 1024 * 1024,
+			);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		store.close();
+	}
+	expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+}, 60_000);
+
+test("close during finish retains decoder-owned bytes until completion, then counters recover", async () => {
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const id = upload(store, "sender", tinyPng());
+		const finishing = store.finish("sender", { id });
+		const active = getPromptImageProcessBudgetSnapshot();
+		expect(active.sourceBytes).toBeGreaterThan(baseline.sourceBytes);
+		expect(active.transientBytes).toBeGreaterThan(baseline.transientBytes);
+		store.close();
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(active);
+		expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	} finally {
+		store.close();
+	}
+});
+
+test("unknown, cross-owner and consumed IDs share an image-specific error, not a session error", async () => {
+	let connected = true;
+	const store = new PromptImageUploadStore(() => connected);
+	try {
+		const id = await stage(store, "sender", tinyPng());
+		for (const [owner, requested] of [
+			["sender", "missing"],
+			["other", id],
+		])
+			expect(() => store.redeem(owner, [{ id: requested }])).toThrow(
+				expect.objectContaining({ code: "image_upload_unavailable" }),
+			);
+		store.redeem("sender", [{ id }]).release();
+		expect(() => store.redeem("sender", [{ id }])).toThrow(
+			expect.objectContaining({ code: "image_upload_unavailable" }),
+		);
+		connected = false;
+		expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+	} finally {
+		store.close();
+	}
+});
+
+test("decoded dimension mismatches retain their specific validation error and recover counters", async () => {
+	const bytes = tinyPng();
+	const metadata = await new Bun.Image(bytes).metadata();
+	const decode = vi.spyOn(Bun.Image.prototype, "metadata").mockResolvedValue({ ...metadata, width: 2 });
+	const baseline = getPromptImageProcessBudgetSnapshot();
+	const store = new PromptImageUploadStore(alwaysConnected);
+	try {
+		const id = upload(store, "sender", bytes);
+		await expect(store.finish("sender", { id })).rejects.toMatchObject({
+			code: "invalid_input",
+			message: "Image dimensions do not match decoded data.",
+		});
+		store.discard("sender", { id });
+		expect(getPromptImageProcessBudgetSnapshot()).toEqual(baseline);
+	} finally {
+		decode.mockRestore();
+		store.close();
+	}
+});
+
 test("a valid original image larger than 256 KiB survives chunk upload and one-shot redemption byte for byte", async () => {
 	const bytes = originalLargePng();
 	expect(bytes.length).toBeGreaterThan(256 * 1024);
@@ -154,7 +553,9 @@ test("a valid original image larger than 256 KiB survives chunk upload and one-s
 			expect(accepted.images).toHaveLength(1);
 			expect(accepted.images[0]?.mimeType).toBe("image/png");
 			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
-			expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+			expect(() => store.redeem("sender", [{ id }])).toThrow(
+				expect.objectContaining({ code: "image_upload_unavailable" }),
+			);
 			accepted.release();
 			accepted.release();
 		} finally {
@@ -281,12 +682,14 @@ test("redemption is atomic, ordered and connection-owned; discard and disconnect
 	try {
 		const first = await stage(store, "sender", firstBytes);
 		const second = await stage(store, "sender", secondBytes);
-		expect(() => store.redeem("other", [{ id: first }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(() => store.redeem("other", [{ id: first }])).toThrow(
+			expect.objectContaining({ code: "image_upload_unavailable" }),
+		);
 		expect(() => store.redeem("sender", [{ id: first }, { id: first }])).toThrow(
 			expect.objectContaining({ code: "invalid_input" }),
 		);
 		expect(() => store.redeem("sender", [{ id: first }, { id: "missing" }])).toThrow(
-			expect.objectContaining({ code: "resource_gone" }),
+			expect.objectContaining({ code: "image_upload_unavailable" }),
 		);
 		const accepted = store.redeem("sender", [{ id: second }, { id: first }]);
 		try {
@@ -298,7 +701,9 @@ test("redemption is atomic, ordered and connection-owned; discard and disconnect
 			accepted.release();
 		}
 		for (const id of [first, second])
-			expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+			expect(() => store.redeem("sender", [{ id }])).toThrow(
+				expect.objectContaining({ code: "image_upload_unavailable" }),
+			);
 
 		const discarded = store.begin("sender", descriptor(firstBytes));
 		expect(store.discard("sender", { id: discarded.id })).toEqual({ discarded: true });
@@ -308,7 +713,7 @@ test("redemption is atomic, ordered and connection-owned; discard and disconnect
 		const disconnected = store.begin("sender", descriptor(firstBytes));
 		store.disconnect("sender");
 		expect(() => store.redeem("sender", [{ id: disconnected.id }])).toThrow(
-			expect.objectContaining({ code: "resource_gone" }),
+			expect.objectContaining({ code: "image_upload_unavailable" }),
 		);
 	} finally {
 		store.close();
@@ -353,7 +758,9 @@ test("finish rechecks transport liveness after decoding even without a disconnec
 		live.delete("sender");
 		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
 		live.add("sender");
-		expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(() => store.redeem("sender", [{ id }])).toThrow(
+			expect.objectContaining({ code: "image_upload_unavailable" }),
+		);
 		const replacement = await stage(store, "sender", tinyPng());
 		store.redeem("sender", [{ id: replacement }]).release();
 	} finally {
@@ -382,7 +789,10 @@ test.each([
 			await expect(store.finish("sender", { id })).rejects.toMatchObject({ code: "resource_gone" });
 		else if (operation === "discard")
 			expect(() => store.discard("sender", { id })).toThrow(expect.objectContaining({ code: "resource_gone" }));
-		else expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		else
+			expect(() => store.redeem("sender", [{ id }])).toThrow(
+				expect.objectContaining({ code: "image_upload_unavailable" }),
+			);
 	} finally {
 		store.close();
 		clock.mockRestore();
@@ -424,10 +834,10 @@ test("batch lease renewal stays within its owner and batch", async () => {
 		const accepted = store.redeem("owner", [{ id: sameBatch }]);
 		accepted.release();
 		expect(() => store.redeem("owner", [{ id: otherBatch }])).toThrow(
-			expect.objectContaining({ code: "resource_gone" }),
+			expect.objectContaining({ code: "image_upload_unavailable" }),
 		);
 		expect(() => store.redeem("other-owner", [{ id: otherOwner }])).toThrow(
-			expect.objectContaining({ code: "resource_gone" }),
+			expect.objectContaining({ code: "image_upload_unavailable" }),
 		);
 	} finally {
 		store.close();
@@ -435,7 +845,7 @@ test("batch lease renewal stays within its owner and batch", async () => {
 	}
 });
 
-test("discard during decoding cannot resurrect a lease or leak the shared decoder slot", async () => {
+test("discard during decoding cannot resurrect a lease or block another session's decoder", async () => {
 	const bytes = originalLargePng();
 	const firstStore = new PromptImageUploadStore(alwaysConnected);
 	const secondStore = new PromptImageUploadStore(alwaysConnected);
@@ -445,9 +855,10 @@ test("discard during decoding cannot resurrect a lease or leak the shared decode
 		const finishing = firstStore.finish("sender", { id: first });
 		firstStore.discard("sender", { id: first });
 		const competing = secondStore.finish("sender", { id: second });
-		await expect(competing).rejects.toMatchObject({ code: "busy" });
-		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
-		await secondStore.finish("sender", { id: second });
+		await Promise.all([
+			expect(finishing).rejects.toMatchObject({ code: "resource_gone" }),
+			expect(competing).resolves.toMatchObject({ id: second }),
+		]);
 		const accepted = secondStore.redeem("sender", [{ id: second }]);
 		try {
 			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
@@ -500,7 +911,9 @@ test("finish crossing an elapsed lease deadline rejects and releases decoder res
 		const finishing = store.finish("sender", { id });
 		now += 120_000;
 		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
-		expect(() => store.redeem("sender", [{ id }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(() => store.redeem("sender", [{ id }])).toThrow(
+			expect.objectContaining({ code: "image_upload_unavailable" }),
+		);
 		const replacement = await stage(store, "sender", bytes);
 		store.redeem("sender", [{ id: replacement }]).release();
 	} finally {
@@ -519,7 +932,9 @@ test("batch renewal cannot revive a peer expiring between admission sweep and re
 		now += 119_999;
 		clock.mockImplementationOnce(() => now++);
 		const fresh = store.begin("sender", { ...descriptor(bytes), batchId: "same-batch" });
-		expect(() => store.redeem("sender", [{ id: peer }])).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(() => store.redeem("sender", [{ id: peer }])).toThrow(
+			expect.objectContaining({ code: "image_upload_unavailable" }),
+		);
 		store.append("sender", { id: fresh.id, sequence: 0, data: bytes.toString("base64") });
 		await store.finish("sender", { id: fresh.id });
 		const accepted = store.redeem("sender", [{ id: fresh.id }]);

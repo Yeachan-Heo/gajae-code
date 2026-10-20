@@ -4658,17 +4658,20 @@ function createControlSurface(
 				throw Object.assign(new Error("Direct and staged images cannot be mixed."), { code: "invalid_input" });
 			if (stagedImages !== undefined && !imageUploads)
 				throw Object.assign(new Error("Image uploads are unavailable."), { code: "operation_prohibited" });
-			const reservation =
-				stagedImages === undefined
-					? undefined
-					: imageUploads!.redeem(sdkControlRequesterContext.getStore(), stagedImages);
+			let reservation: { images: ImageContent[]; release: () => void } | undefined;
 			let imageCorrelation: InvocationCorrelation | undefined;
 			try {
 				return await submit(
 					"prompt",
 					clientRef,
-					({ queuedAtDispatch, sdkRunCapability, ...options }) =>
-						sendSdkUserMessage(
+					({ queuedAtDispatch, sdkRunCapability, ...options }) => {
+						// submit has reserved reconciliation/clientRef before consuming staged IDs.
+						if (stagedImages !== undefined) {
+							reservation = imageUploads!.redeem(sdkControlRequesterContext.getStore(), stagedImages);
+							if (imageCorrelation && retainAcceptedImage)
+								retainAcceptedImage(imageCorrelation, reservation.release);
+						}
+						return sendSdkUserMessage(
 							typeof images === "undefined" && !reservation
 								? text
 								: ([{ type: "text", text }, ...(reservation?.images ?? normalizePromptImages(images))] as [
@@ -4676,15 +4679,13 @@ function createControlSurface(
 										...ImageContent[],
 									]),
 							{ ...options, sdkRunCapability, ...(queuedAtDispatch ? { queuedAtDispatch: true } : {}) },
-						),
+						);
+					},
 					undefined,
 					false,
 					false,
 					correlation => {
-						if (reservation && retainAcceptedImage) {
-							retainAcceptedImage(correlation, reservation.release);
-							imageCorrelation = correlation;
-						}
+						if (retainAcceptedImage) imageCorrelation = correlation;
 					},
 				);
 			} catch (error) {

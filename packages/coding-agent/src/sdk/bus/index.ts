@@ -2992,6 +2992,7 @@ function sdkControlSurface(
 					promoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			  }
 			| undefined,
+		resolveImages?: () => unknown,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
@@ -3037,6 +3038,8 @@ function sdkControlSurface(
 						code: "busy",
 					},
 				);
+			// Staged bytes are one-shot: reserve reconciliation before consuming them.
+			if (resolveImages) images = resolveImages();
 		} catch (error) {
 			admission.abandon();
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
@@ -3214,13 +3217,12 @@ function sdkControlSurface(
 			if (stagedImages !== undefined && images !== undefined)
 				throw Object.assign(new Error("Direct and staged images cannot be mixed."), { code: "invalid_input" });
 			const requesterConnectionId = controlRequesterContext.getStore();
-			const reservation =
-				stagedImages === undefined ? undefined : imageUploads.redeem(requesterConnectionId, stagedImages);
+			let reservation: { images: ImageContent[]; release: () => void } | undefined;
 			let correlation: { commandId: string; turnId: string } | undefined;
 			try {
 				return await submitPrompt(
 					text,
-					reservation?.images ?? images,
+					images,
 					false,
 					undefined,
 					true,
@@ -3232,6 +3234,12 @@ function sdkControlSurface(
 						if (reservation)
 							return retainAcceptedImage(current, reservation.release, preflightSignal, submissionSettled);
 					},
+					stagedImages === undefined
+						? undefined
+						: () => {
+								reservation = imageUploads.redeem(requesterConnectionId, stagedImages);
+								return reservation.images;
+							},
 				);
 			} catch (error) {
 				if (correlation) releaseAcceptedImage(correlation);

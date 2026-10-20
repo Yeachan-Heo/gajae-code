@@ -514,8 +514,11 @@ Model-facing and chat adapters cannot invoke these machine-only controls.
    be mixed. Provider input retains the original bytes and MIME without transcoding or
    byte loss.
 
-There are at most 16 outstanding uploads and 16 images per prompt, bounded session
-source/accepted budgets of 64 MiB, and process-wide memory/decode budgets. Uploads
+There are at most 16 outstanding uploads and 16 images per prompt. Each session has
+separate 64 MiB upload-source and accepted-source admission limits; accepted base64
+storage is charged in addition to source bytes against the shared 256 MiB process
+budget, along with transient decode memory. Each session permits one in-flight
+`finish`; another session can decode concurrently when process capacity permits. Uploads
 expire after 120 seconds without valid progress; optional same-owner `batchId`
 progress renews only live peers. Stock hosts remove unredeemed leases on
 disconnect. Custom transports should forward close notifications for immediate
@@ -528,12 +531,20 @@ Acceptance or cancellation does not prove an unadopted producer has stopped reta
 images: its capacity remains charged until that submission actually settles.
 Once execution starts, an exact resource-settlement proof is required: even an
 attributed cancelled `agent_end` or transport teardown may leave tools running.
-Still-pending resources retain a bounded retry owner. The existing ledger makes
-quarantine irreversible, so quarantined executions remain charged for this
-process's lifetime rather than claiming their tombstones prove settlement.
-An adopted execution without an exact resource handle or owning domain also stays charged.
-An ambiguous prompt response
-must not be replayed; use the ordinary correlated `turn.result` contract.
+Still-pending resources receive at most 100 settlement observations within 10 seconds.
+Unknown runs, quarantine, and observation failures stop the observer immediately.
+When observation stops without proof, capacity stays charged and a process-level
+warning identifies the reason; it is not reclaimed merely because a retry budget
+or session lifetime ended. Internal budget snapshots expose retained process
+source/accepted and transient charges. The existing ledger makes quarantine
+irreversible, so quarantined executions remain charged for this process's lifetime
+rather than claiming their tombstones prove settlement. An adopted execution
+without an exact resource handle or owning domain also stays charged.
+An ambiguous prompt response must not be replayed: recover the original `clientRef`
+through the correlated `turn.result` contract. Reusing a retained
+`clientRef` returns `client_ref_conflict` before staged-image redemption, not a second
+acknowledgement or execution. Missing or consumed staged IDs return
+`image_upload_unavailable`; a closed session or connection still returns `resource_gone`.
 
 ACP's public contract remains `session/prompt` with `ContentBlock.image`
 (`type: "image"`, base64 `data`, and `mimeType`), negotiated through

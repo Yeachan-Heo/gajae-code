@@ -82,6 +82,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-event-replay-redact.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-file-redaction.test.ts"
 			]
 		},

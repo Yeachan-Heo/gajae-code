@@ -284,7 +284,13 @@ function controlErrors(id: string): string[] {
 		// C01/C05 submit a prompt and therefore run the prompt preflight, which
 		// refuses a session with no selected model before admission. The code is
 		// appended: ACP machine-only mapping reads errorCodes[0].
-		C01: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed", "model_not_selected"],
+		C01: [
+			"client_ref_conflict",
+			"reconciliation_capacity",
+			"reconciliation_persist_failed",
+			"model_not_selected",
+			"image_upload_unavailable",
+		],
 		C02: ["turn_not_active", "client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C06: ["action_claimed"],

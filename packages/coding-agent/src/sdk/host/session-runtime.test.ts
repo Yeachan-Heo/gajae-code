@@ -5048,7 +5048,7 @@ test("SDK-only private staged images are connection-owned, one-shot, and reach t
 			text: "A different authenticated connection cannot redeem this image.",
 			stagedImages: [{ id }],
 		});
-		expect(forgedOwnerPrompt).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+		expect(forgedOwnerPrompt).toMatchObject({ ok: false, error: { code: "image_upload_unavailable" } });
 		const mixedPrompt = await harness.controlAs("image-owner", "turn.prompt", {
 			text: "Direct and staged image blocks cannot be mixed.",
 			images: [{ data: "cG5n", mimeType: "image/png" }],
@@ -5077,7 +5077,7 @@ test("SDK-only private staged images are connection-owned, one-shot, and reach t
 				text: "The image descriptor is one-shot.",
 				stagedImages: [{ id }],
 			}),
-		).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+		).toMatchObject({ ok: false, error: { code: "image_upload_unavailable" } });
 
 		const rejectedId = await stageRuntimeImage(harness, bytes, "image-owner");
 		expect(
@@ -5087,7 +5087,11 @@ test("SDK-only private staged images are connection-owned, one-shot, and reach t
 				stagedImages: [{ id: rejectedId }],
 			}),
 		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
-		expect(releaseCalls).toHaveLength(2);
+		// Invalid clientRef admission must not consume or release staged bytes.
+		expect(releaseCalls).toHaveLength(1);
+		expect(await harness.controlAs("image-owner", "turn.image.discard", { id: rejectedId })).toMatchObject({
+			ok: true,
+		});
 
 		const disconnectedId = await stageRuntimeImage(harness, bytes, "image-owner");
 		harness.disconnect("image-owner");
@@ -5102,6 +5106,94 @@ test("SDK-only private staged images are connection-owned, one-shot, and reach t
 		authStorage?.close();
 		redeemSpy.mockRestore();
 		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only staged prompts reconcile clientRef before redeeming during preflight and in-flight execution", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-staged-client-ref-"));
+	const allowAcceptance = Promise.withResolvers<void>();
+	const producer = Promise.withResolvers<void>();
+	const entered = Promise.withResolvers<void>();
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	let releases = 0;
+	let sends = 0;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases++;
+				reservation.release();
+			},
+		};
+	});
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("staged-client-ref", cwd, {
+			connectionLiveness: true,
+			sendUserMessage: async (_content, options) => {
+				sends++;
+				entered.resolve();
+				await allowAcceptance.promise;
+				await options?.onPreflightAcceptCommit?.();
+				await producer.promise;
+			},
+		});
+		harness.connect("image-owner");
+		harness.connect("reconnecting-client");
+		const id = await stageRuntimeImage(harness, makeTestPng(), "image-owner");
+		const input = { text: "Original staged producer", clientRef: "staged-ref", stagedImages: [{ id }] };
+		const first = harness.controlAs("image-owner", "turn.prompt", input);
+		void first.catch(() => {});
+		await entered.promise;
+		// Ordered controls serialize per session, even on separate connections.
+		// A retry arriving during preflight cannot finish before the first receipt.
+		const duplicate = harness.controlAs("reconnecting-client", "turn.prompt", input);
+		void duplicate.catch(() => {});
+		expect(redeemSpy.mock.calls).toHaveLength(1);
+		expect(sends).toBe(1);
+		expect(releases).toBe(0);
+		allowAcceptance.resolve();
+		const accepted = await first;
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "staged-ref" } });
+		expect(await duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
+		await harness.emit("agent_start");
+		// The original receipt may have been lost. Reconnection never replays it,
+		// and cannot replace the original producer's retained image ownership.
+		expect(await harness.controlAs("image-owner", "turn.prompt", input)).toMatchObject({
+			ok: false,
+			error: { code: "client_ref_conflict" },
+		});
+		expect(await harness.query("turn.result", { kind: "prompt", clientRef: "staged-ref" })).toMatchObject({
+			result: { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId, status: "in_flight" },
+		});
+		expect(redeemSpy.mock.calls).toHaveLength(1);
+		expect(sends).toBe(1);
+		expect(releases).toBe(0);
+		await harness.emit("agent_end", {
+			messages: [{ role: "assistant", stopReason: "stop", content: "done" }],
+		});
+		producer.resolve();
+		await settledStatus(harness, "turn.result", { kind: "prompt", clientRef: "staged-ref" });
+		expect(await harness.controlAs("image-owner", "turn.prompt", input)).toMatchObject({
+			ok: false,
+			error: { code: "client_ref_conflict" },
+		});
+		expect(redeemSpy.mock.calls).toHaveLength(1);
+		expect(sends).toBe(1);
+	} finally {
+		allowAcceptance.resolve();
+		producer.resolve();
+		try {
+			await harness?.stop();
+		} finally {
+			redeemSpy.mockRestore();
+			await rm(cwd, { recursive: true, force: true });
+		}
 	}
 });
 
@@ -9608,6 +9700,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
 		let boundaryWaitStarted = false;
 		let abortCalls = 0;
+		let sends = 0;
 		let harness: InvocationHarness | undefined;
 		try {
 			harness = await invocationHarness(sessionId, cwd, {
@@ -9618,6 +9711,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
+					sends++;
 					await options?.onPreflightAcceptCommit?.();
 					await neverSettlingPromise();
 				},
@@ -9650,6 +9744,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const id = await stageRuntimeImage(harness, bytes);
 			const accepted = await harness.control("turn.prompt", {
 				text: "capture uncertain end",
+				clientRef: "captured-uncertain-image",
 				stagedImages: [{ id }],
 			});
 			expect(accepted.ok).toBe(true);
@@ -9682,6 +9777,17 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				deadlineRecoveryPending: true,
 				pendingOutcome: { kind: "stopped", reason: "cancelled" },
 			});
+			// An uncertain retained outcome is reconciliation-only, never replayable.
+			expect(
+				await harness.control("turn.prompt", {
+					text: "capture uncertain end",
+					clientRef: "captured-uncertain-image",
+					stagedImages: [{ id }],
+				}),
+			).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
+			expect(redeemSpy.mock.calls).toHaveLength(1);
+			expect(sends).toBe(1);
+			expect(releaseCalls).toEqual([]);
 			const reopened = createInvocationReconciliation({
 				store: createReconciliationStore({ sessionFile, sessionId }),
 			});

@@ -7,18 +7,20 @@ import {
 	MAX_PASTED_IMAGE_DIMENSION,
 	MAX_PASTED_IMAGE_PIXELS,
 	MAX_PASTED_IMAGE_SOURCE_BYTES,
+	MAX_STAGED_PROMPT_IMAGES,
 } from "../../utils/image-limits";
 import { isAnimatedImage } from "../../utils/pasted-image-loading";
 import { TypedControlError } from "./control/dispatch";
 
 const MAX_CHUNK_BYTES = 96 * 1024;
 const MIN_RETAINED_BUFFER_BYTES = 4 * 1024;
-const MAX_IMAGES = 16;
-const MAX_UPLOADS = 16;
 const MAX_ACCEPTED_BYTES = 64 * 1024 * 1024;
 const MAX_PROCESS_BYTES = 256 * 1024 * 1024;
+// Each session gets one decoder slot; byte reservations remain process-wide.
 const MAX_CONCURRENT_FINISHES = 1;
 const LEASE_MS = 120_000;
+const SETTLEMENT_OBSERVATIONS = 100;
+const SETTLEMENT_WINDOW_MS = 10_000;
 
 /** An attributed terminal is not a proof that an abort-ignoring producer stopped. */
 export function retirePromptImageReservation(
@@ -27,31 +29,50 @@ export function retirePromptImageReservation(
 	isCurrent: () => boolean,
 	release: () => void,
 ): void {
-	let reportedFailure = false;
+	let stopped = false;
+	let observations = 0;
+	let retry: NodeJS.Timeout | undefined;
+	const stop = (reason?: string, error?: unknown): void => {
+		if (stopped) return;
+		stopped = true;
+		clearTimeout(deadline);
+		if (retry) clearTimeout(retry);
+		if (reason)
+			logger.warn("SDK image settlement observation ended; capacity permanently retained without settlement proof", {
+				handle,
+				reason,
+				observations,
+				error,
+			});
+	};
+	// Neither exhaustion nor teardown proves producer settlement. Stop observing,
+	// retain the charge, and leave one process-level diagnostic, even for a hung getter.
+	const deadline = setTimeout(
+		() => stop(isCurrent() ? "observation_window_exhausted" : undefined),
+		SETTLEMENT_WINDOW_MS,
+	);
+	deadline.unref();
 	const check = async (): Promise<void> => {
-		if (!isCurrent()) return;
+		if (stopped) return;
+		if (!isCurrent()) return stop();
+		observations++;
 		try {
 			const proof = await getProof(handle);
-			if (!isCurrent()) return;
+			if (stopped) return;
+			if (!isCurrent()) return stop();
 			if (proof.status === "settled") {
+				stop();
 				release();
 				return;
 			}
-			if (proof.reason === "quarantined") {
-				// Quarantine is deliberately irreversible in the current ledger. Keep
-				// this process budget charged: a tombstone cannot prove later settlement.
-				logger.warn("SDK image capacity retained for a quarantined execution", { handle });
-				return;
-			}
+			if (proof.reason === "quarantined" || proof.reason === "unknown_run") return stop(proof.reason);
 		} catch (error) {
-			if (!reportedFailure) {
-				reportedFailure = true;
-				logger.warn("SDK image settlement observation failed; capacity remains charged", { handle, error });
-			}
+			return stop(isCurrent() ? "observation_failed" : undefined, error);
 		}
-		if (!isCurrent()) return;
-		const timer = setTimeout(() => void check(), 100);
-		timer.unref();
+		if (!isCurrent()) return stop();
+		if (observations >= SETTLEMENT_OBSERVATIONS) return stop("observation_count_exhausted");
+		retry = setTimeout(() => void check(), 100);
+		retry.unref();
 	};
 	void check();
 }
@@ -60,6 +81,18 @@ const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9
 let processBytes = 0;
 let transientBytes = 0;
 let concurrentFinishes = 0;
+
+export interface PromptImageProcessBudgetSnapshot {
+	/** Retained upload and accepted source bytes, including accepted base64 copies. */
+	readonly sourceBytes: number;
+	readonly transientBytes: number;
+	readonly concurrentFinishes: number;
+}
+
+/** Internal process diagnostics only; not an SDK operation or a release capability. */
+export function getPromptImageProcessBudgetSnapshot(): PromptImageProcessBudgetSnapshot {
+	return Object.freeze({ sourceBytes: processBytes, transientBytes, concurrentFinishes });
+}
 
 type Upload = {
 	owner: string;
@@ -102,6 +135,7 @@ export class PromptImageUploadStore {
 	#closed = false;
 	#uploadBytes = 0;
 	#acceptedBytes = 0;
+	#concurrentFinishes = 0;
 
 	/** The host supplies live socket membership; standalone callers must choose an explicit policy. */
 	constructor(isConnectionOpen: (connectionId: string) => boolean) {
@@ -133,7 +167,7 @@ export class PromptImageUploadStore {
 			invalid("Image batchId must be a nonempty string of at most 128 characters.");
 		const now = Date.now();
 		for (const [uploadId, upload] of this.#uploads) this.#expire(uploadId, upload, now);
-		if (this.#uploads.size >= MAX_UPLOADS) busy("Too many concurrent image uploads.");
+		if (this.#uploads.size >= MAX_STAGED_PROMPT_IMAGES) busy("Too many concurrent image uploads.");
 		const id = crypto.randomUUID();
 		const timer = setTimeout(() => this.#remove(id), LEASE_MS);
 		timer.unref?.();
@@ -239,11 +273,12 @@ export class PromptImageUploadStore {
 		if (upload.length !== upload.byteLength) invalid("Image upload is incomplete.");
 		// Claim the lease, decoder slot and copy capacity before the first allocation or await.
 		if (
-			concurrentFinishes >= MAX_CONCURRENT_FINISHES ||
+			this.#concurrentFinishes >= MAX_CONCURRENT_FINISHES ||
 			processBytes + transientBytes + upload.length > MAX_PROCESS_BYTES
 		)
 			busy("Image finalization capacity exceeded.");
 		upload.finishing = true;
+		this.#concurrentFinishes++;
 		concurrentFinishes++;
 		transientBytes += upload.length;
 		let transientReservation = upload.length;
@@ -274,7 +309,8 @@ export class PromptImageUploadStore {
 				if (decoded.width !== metadata.width || decoded.height !== metadata.height)
 					invalid("Image dimensions do not match decoded data.");
 				await new Bun.Image(bytes).resize(1, 1).png().bytes();
-			} catch {
+			} catch (error) {
+				if (error instanceof TypedControlError) throw error;
 				invalid("Image cannot be decoded.");
 			}
 			// A custom transport may attest liveness without delivering a close
@@ -302,6 +338,7 @@ export class PromptImageUploadStore {
 			}
 			transientBytes -= transientReservation;
 			concurrentFinishes--;
+			this.#concurrentFinishes--;
 			upload.finishing = false;
 		}
 	}
@@ -318,8 +355,8 @@ export class PromptImageUploadStore {
 		this.#assertOpen();
 		const owner = ownerId(connectionId);
 		this.#assertConnected(owner);
-		if (!Array.isArray(value) || value.length === 0 || value.length > MAX_IMAGES)
-			invalid("stagedImages must contain 1–16 image IDs.");
+		if (!Array.isArray(value) || value.length === 0 || value.length > MAX_STAGED_PROMPT_IMAGES)
+			invalid(`stagedImages must contain 1–${MAX_STAGED_PROMPT_IMAGES} image IDs.`);
 		const seen = new Set<string>();
 		const entries: Array<[string, Upload]> = [];
 		let bytes = 0;
@@ -331,7 +368,7 @@ export class PromptImageUploadStore {
 			seen.add(id);
 			const entry = this.#uploads.get(id);
 			if (!entry || entry.owner !== owner || this.#expire(id, entry))
-				throw new TypedControlError("resource_gone", "Image upload is unavailable.");
+				throw new TypedControlError("image_upload_unavailable", "Image upload is unavailable or already consumed.");
 			if (!entry.finished) invalid("Image upload is not finished.");
 			bytes += entry.length;
 			entries.push([id, entry]);

@@ -2663,14 +2663,29 @@ test("SDK host privately stages large images with authenticated connection owner
 	const ledger = createRunResourceLedger();
 	const domain = ledger.open("image-wire-run");
 	if (!domain) throw new Error("Image wire run could not open.");
+	let activeHandle: string | undefined = "image-wire-run";
 	const sessionContext = {
 		...context(cwd, sessionId),
-		getActivePromptHandle: () => "image-wire-run",
+		getActivePromptHandle: () => activeHandle,
 		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
 		getTerminalRunOwnerForEvent: () => ({ resourceRunId: "image-wire-run", domain }),
 		getRunSettlementProof: (handle: string) => ledger.waitForSettlement(handle, { graceMs: 0 }),
 	};
-	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, args[0], args[1]));
+	const allowAcceptance = Promise.withResolvers<void>();
+	const producer = Promise.withResolvers<void>();
+	const producerReturned = Promise.withResolvers<void>();
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			captureInternalSend(sent, content, options);
+			await allowAcceptance.promise;
+			await firePreflightAccept(options);
+			await producer.promise;
+			producerReturned.resolve();
+		},
+		true,
+	);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -2680,6 +2695,7 @@ test("SDK host privately stages large images with authenticated connection owner
 	const releaseFinish = Promise.withResolvers<void>();
 	const finishHandlerSettled = Promise.withResolvers<void>();
 	const originalFinish = PromptImageUploadStore.prototype.finish;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem");
 	let holdNextFinish = false;
 	let finishStarted = false;
 	const finishSpy = spyOn(PromptImageUploadStore.prototype, "finish").mockImplementation(async function (
@@ -2716,7 +2732,7 @@ test("SDK host privately stages large images with authenticated connection owner
 				text: "Cross-connection redemption is forbidden.",
 				stagedImages: [{ id }],
 			}),
-		).rejects.toMatchObject({ code: "resource_gone" });
+		).rejects.toMatchObject({ code: "image_upload_unavailable" });
 		await expect(
 			owner.control("turn.prompt", {
 				text: "Direct and staged image inputs cannot be combined.",
@@ -2724,20 +2740,40 @@ test("SDK host privately stages large images with authenticated connection owner
 				stagedImages: [{ id }],
 			}),
 		).rejects.toMatchObject({ code: "invalid_input" });
-		expect(
-			await owner.control("turn.prompt", { text: "Use the staged image once.", stagedImages: [{ id }] }),
-		).toMatchObject({ ok: true, result: { accepted: true } });
+		const input = { text: "Use the staged image once.", clientRef: "image-wire-ref", stagedImages: [{ id }] };
+		const first = owner.control("turn.prompt", input);
+		void first.catch(() => {});
 		await waitFor(() => sent.length === 1, "staged prompt dispatch");
+		const redemptionCount = redeemSpy.mock.calls.length;
+		// Ordered controls share a session-wide dispatch chain, across connections.
+		// Queue a retry during preflight, but release acceptance before awaiting it.
+		const duplicate = observer.control("turn.prompt", input);
+		void duplicate.catch(() => {});
+		allowAcceptance.resolve();
+		expect(await first).toMatchObject({ ok: true, result: { accepted: true, clientRef: "image-wire-ref" } });
+		await expect(duplicate).rejects.toMatchObject({ code: "client_ref_conflict" });
+		expect(redeemSpy.mock.calls).toHaveLength(redemptionCount);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		// A caller missing its acknowledgement must reconcile, not replay a receipt
+		// or consume bytes on another connection while execution is in flight.
+		await expect(owner.control("turn.prompt", input)).rejects.toMatchObject({ code: "client_ref_conflict" });
+		expect(redeemSpy.mock.calls).toHaveLength(redemptionCount);
+		expect(sent).toHaveLength(1);
 		expect(sent[0]?.[0]).toEqual([
 			{ type: "text", text: "Use the staged image once." },
 			{ type: "image", data: bytes.toString("base64"), mimeType: "image/png" },
 		]);
+		// Production emits agent_end before sealing: sealing an empty ledger
+		// retires its domain, which would make this event look like a foreign run.
+		expect(ledger.lookupDomain("image-wire-run")).toBe(domain);
+		await handlers.get("agent_end")?.({ type: "agent_end", stopReason: "completed" }, sessionContext);
+		ledger.seal("image-wire-run");
+		producer.resolve();
+		await producerReturned.promise;
+		activeHandle = undefined;
 		await expect(
 			owner.control("turn.prompt", { text: "The staged descriptor is one-shot.", stagedImages: [{ id }] }),
-		).rejects.toMatchObject({ code: "resource_gone" });
-		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-		ledger.seal("image-wire-run");
-		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		).rejects.toMatchObject({ code: "image_upload_unavailable" });
 
 		const disconnectedId = await stageOverSdkClient(owner, bytes, false);
 		holdNextFinish = true;
@@ -2761,13 +2797,19 @@ test("SDK host privately stages large images with authenticated connection owner
 				text: "A disconnected owner cannot transfer an unfinished lease.",
 				stagedImages: [{ id: disconnectedId }],
 			}),
-		).rejects.toMatchObject({ code: "resource_gone" });
+		).rejects.toMatchObject({ code: "image_upload_unavailable" });
 	} finally {
+		allowAcceptance.resolve();
+		producer.resolve();
 		releaseFinish.resolve();
-		if (finishStarted) await finishHandlerSettled.promise;
-		finishSpy.mockRestore();
-		await Promise.all(clients.map(client => client.close()));
-		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		try {
+			if (finishStarted) await finishHandlerSettled.promise;
+			await Promise.all(clients.map(client => client.close()));
+			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		} finally {
+			finishSpy.mockRestore();
+			redeemSpy.mockRestore();
+		}
 	}
 });
 

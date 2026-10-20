@@ -1,3 +1,5 @@
+import { MAX_STAGED_PROMPT_IMAGES } from "../../utils/image-limits";
+
 const RELOAD_COMPONENTS = new Set(["config", "models", "skills", "extensions", "tools"]);
 const SERVICE_TIERS = new Set([
 	"none",
@@ -74,7 +76,7 @@ function hasUsablePromptImage(value: unknown): boolean {
 }
 
 function hasValidStagedPromptImages(value: unknown): boolean {
-	if (!Array.isArray(value) || value.length === 0 || value.length > 16) return false;
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_STAGED_PROMPT_IMAGES) return false;
 	const ids = new Set<string>();
 	return value.every(descriptor => {
 		if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)) return false;
@@ -93,7 +95,10 @@ export function validateRequiredPromptText(operation: string, input: Input): Ada
 		if (input.images !== undefined)
 			return { code: "invalid_input", message: "Direct and staged images cannot be mixed." };
 		if (!hasValidStagedPromptImages(input.stagedImages))
-			return { code: "invalid_input", message: "stagedImages must contain 1–16 valid image IDs." };
+			return {
+				code: "invalid_input",
+				message: `stagedImages must contain 1–${MAX_STAGED_PROMPT_IMAGES} valid image IDs.`,
+			};
 	}
 	const hasUsableImage =
 		operation === "turn.prompt" &&
