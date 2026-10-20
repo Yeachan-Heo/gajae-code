@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 const contentCache = new Map<string, string | null>();
 const dirCache = new Map<string, fs.Dirent[]>();
+let cacheGeneration = 0;
 
 /** Authority used when reading from an explicit-home discovery context. */
 export type ReadScope = "project" | "user" | "native";
@@ -287,38 +288,39 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	if (!(await isCurrentIsolatedPath(abs, options))) return null;
 	const key = cacheKey(abs, options);
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
+	const readGeneration = cacheGeneration;
 	if (useCache && contentCache.has(key)) {
 		return contentCache.get(key) ?? null;
 	}
 	if (!options?.isolatedHome) {
 		const readable = await containedReadPath(abs, options);
 		if (readable === null) {
-			if (useCache) contentCache.set(key, null);
+			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
 			return null;
 		}
 		try {
 			const content = await Bun.file(readable).text();
-			if (useCache) contentCache.set(key, content);
+			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, content);
 			return content;
 		} catch {
-			if (useCache) contentCache.set(key, null);
+			if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
 			return null;
 		}
 	}
 
 	const opened = await openIsolatedFile(abs, options);
 	if (!opened) {
-		if (useCache) contentCache.set(key, null);
+		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
 		return null;
 	}
 	try {
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		const content = await opened.handle.readFile({ encoding: "utf8" });
 		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
-		if (useCache) contentCache.set(key, content);
+		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, content);
 		return content;
 	} catch {
-		if (useCache) contentCache.set(key, null);
+		if (useCache && cacheGeneration === readGeneration) contentCache.set(key, null);
 		return null;
 	} finally {
 		await opened.handle.close();
@@ -418,6 +420,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	if (!(await isCurrentIsolatedPath(abs, options))) return [];
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
 	const key = cacheKey(abs, options);
+	const readGeneration = cacheGeneration;
 	if (useCache && dirCache.has(key)) {
 		return dirCache.get(key) ?? [];
 	}
@@ -428,7 +431,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	try {
 		if (!options?.isolatedHome) {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
-			if (useCache) dirCache.set(key, entries);
+			if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
 			return entries;
 		}
 		// Linux can enumerate a pinned directory descriptor through /proc. Node
@@ -439,7 +442,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (options?.isolatedHome && process.platform !== "linux") {
 			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
 			if (!(await validateDirectoryPath(abs, options, authorized))) return [];
-			if (useCache) dirCache.set(key, entries);
+			if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
 			return entries;
 		}
 		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
@@ -453,10 +456,10 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (!(await isHomeIdentityStable(options))) return [];
 		if (!(await isUserAgentIdentityStable(options))) return [];
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
-		if (useCache) dirCache.set(key, entries);
+		if (useCache && cacheGeneration === readGeneration) dirCache.set(key, entries);
 		return entries;
 	} catch {
-		if (useCache) dirCache.set(key, []);
+		if (useCache && cacheGeneration === readGeneration) dirCache.set(key, []);
 		return [];
 	} finally {
 		await handle?.close().catch(() => {});
@@ -520,11 +523,13 @@ export function cacheStats(): { content: number; dir: number } {
 }
 
 export function clearCache(): void {
+	cacheGeneration += 1;
 	contentCache.clear();
 	dirCache.clear();
 }
 
 export function invalidate(filePath: string): void {
+	cacheGeneration += 1;
 	const abs = resolvePath(filePath);
 	invalidateCacheEntries(contentCache, abs);
 	invalidateCacheEntries(dirCache, abs);
