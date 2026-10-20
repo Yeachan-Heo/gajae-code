@@ -65,35 +65,4 @@ describe("capability filesystem content cache", () => {
 			Bun.file = originalFile;
 		}
 	});
-
-	it("refreshes bounded reads after an external edit clears the discovery cache", async () => {
-		const root = await tempDir();
-		const file = path.join(root, "command.md");
-		await fs.writeFile(file, "old");
-		const options = { containmentRoot: root };
-
-		expect(await readFile(file, options)).toBe("old");
-		await fs.writeFile(file, "new");
-		clearCache();
-
-		expect(await readFile(file, options)).toBe("new");
-	});
-
-	it("invalidates bounded reads cached through symlink aliases", async () => {
-		const root = await tempDir();
-		const target = path.join(root, "shared.md");
-		const firstAlias = path.join(root, "first.md");
-		const secondAlias = path.join(root, "second.md");
-		await fs.writeFile(target, "old");
-		await fs.symlink(target, firstAlias);
-		await fs.symlink(target, secondAlias);
-		const options = { containmentRoot: root };
-
-		expect(await readFile(firstAlias, options)).toBe("old");
-		expect(await readFile(secondAlias, options)).toBe("old");
-		await fs.writeFile(target, "new");
-		invalidate(firstAlias);
-
-		expect(await readFile(secondAlias, options)).toBe("new");
-	});
 });

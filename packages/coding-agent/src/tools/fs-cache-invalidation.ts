@@ -8,6 +8,7 @@ function invalidateFsScanCacheNative(path: string): void {
 		require("@gajae-code/natives") as { invalidateFsScanCache: typeof invalidateFsScanCacheFn }
 	).invalidateFsScanCache;
 	nativeInvalidateFsScanCache(path);
+	invalidateCapabilityFsCache(path);
 }
 
 /**
