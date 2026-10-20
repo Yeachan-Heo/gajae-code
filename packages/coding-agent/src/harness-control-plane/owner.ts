@@ -245,6 +245,11 @@ export class RuntimeOwner {
 		const eventsPath = sessionPaths(root, sessionId).events;
 		const existing = await readEvents(root, sessionId, 0);
 		this.#cursor = existing.reduce((max, e) => Math.max(max, e.cursor), 0);
+		// Start socket server listening BEFORE acquiring the lease. This ensures the socket
+		// endpoint is actually reachable before the lease registers it. Without this order,
+		// a client could find the lease with a socket endpoint but fail to connect because
+		// the socket isn't listening yet, creating a race condition (#5399).
+		await this.#server.listen();
 		const { lease } = await acquireLease(root, sessionId, {
 			ownerId: this.ownerId,
 			pid: process.pid,
@@ -276,7 +281,6 @@ export class RuntimeOwner {
 			});
 		}, this.#opts.heartbeatMs);
 		this.#heartbeatTimer.unref?.();
-		await this.#server.listen();
 		await this.#emit("info", "owner_started", { ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch });
 		if (this.#opts.transport.onEventFrame) {
 			this.#unsubscribeFrames = this.#opts.transport.onEventFrame(frame => this.#handleFrame(frame));
