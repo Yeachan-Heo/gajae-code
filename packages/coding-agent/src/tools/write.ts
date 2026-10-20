@@ -785,6 +785,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				try {
 					await bridgePromise;
 				} catch (error) {
+					// The bridge may publish before reporting a cleanup failure.
+					invalidateFsScanAfterWrite(absolutePath);
 					throw new ToolError(formatFileWriteError(error, absolutePath));
 				}
 				invalidateFsScanAfterWrite(absolutePath);
@@ -801,6 +803,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
 			} catch (error) {
+				// A failed writethrough can still have published the destination.
+				invalidateFsScanAfterWrite(absolutePath);
 				throw new ToolError(formatFileWriteError(error, absolutePath));
 			}
 			invalidateFsScanAfterWrite(absolutePath);

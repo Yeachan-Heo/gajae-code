@@ -26,6 +26,7 @@ import type { ToolSession } from ".";
 import { parseArchivePathCandidates } from "./archive-reader";
 import { assertEditableFile } from "./auto-generated-guard";
 import { isReadableUrlPath } from "./fetch";
+import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
 import { enforcePlanModeWrite } from "./plan-mode-guard";
 import { formatDiagnostics, replaceTabs } from "./render-utils";
@@ -504,6 +505,7 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 		}
 		const content = `${buffer.getText()}${buffer.trailingNewline ? "\n" : ""}`;
 		const diagnostics = (await this.#writethrough(buffer.filePath, content)) as FileDiagnosticsResult | undefined;
+		invalidateFsScanAfterWrite(buffer.filePath);
 		const loaded = await this.#loadBuffer(buffer.displayPath);
 		return { loaded, diagnostics };
 	}

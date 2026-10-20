@@ -7,7 +7,7 @@
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as z from "zod/v4";
-import type { WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
+import type { FileDiagnosticsResult, WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
 import { assertEditableFile, assertEditableFileContent } from "../../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
@@ -721,15 +721,14 @@ async function executeReplaceSingleUnderLock(
 		path,
 		bom + restoreLineEndings(result.content, originalEnding),
 	);
-	const diagnostics = await writethrough(
-		absolutePath,
-		finalContent,
-		signal,
-		Bun.file(absolutePath),
-		batchRequest,
-		dst => (dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined),
-	);
-	invalidateFsScanAfterWrite(absolutePath);
+	let diagnostics: FileDiagnosticsResult | undefined;
+	try {
+		diagnostics = await writethrough(absolutePath, finalContent, signal, Bun.file(absolutePath), batchRequest, dst =>
+			dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined,
+		);
+	} finally {
+		invalidateFsScanAfterWrite(absolutePath);
+	}
 
 	const diffResult = generateDiffString(normalizedContent, result.content);
 	const resultText =
@@ -858,15 +857,14 @@ async function executeReplaceEntriesUnderLock(
 		path,
 		bom + restoreLineEndings(normalizedContent, originalEnding),
 	);
-	const diagnostics = await writethrough(
-		absolutePath,
-		finalContent,
-		signal,
-		Bun.file(absolutePath),
-		batchRequest,
-		dst => (dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined),
-	);
-	invalidateFsScanAfterWrite(absolutePath);
+	let diagnostics: FileDiagnosticsResult | undefined;
+	try {
+		diagnostics = await writethrough(absolutePath, finalContent, signal, Bun.file(absolutePath), batchRequest, dst =>
+			dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined,
+		);
+	} finally {
+		invalidateFsScanAfterWrite(absolutePath);
+	}
 
 	const diffResult = generateDiffString(originalNormalized, normalizedContent);
 	const meta = outputMeta()
