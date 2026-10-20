@@ -2974,15 +2974,98 @@ describe("bash scanner quoting model", () => {
 	it("detects imported os.system callable aliases in Python", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
-		// from os import system as run; run(...) should be detected
-		const decision = await getWorkflowMutationDecision({
-			cwd,
-			sessionId: "session-a",
-			tool: tool("bash"),
-			args: {
-				command: `python3 -c 'from os import system as run; run("printf PWNED > src/product.ts")'`,
-			},
-		});
-		expect(decision.blocked).toBe(true);
+		const call = `run("printf PWNED > src/product.ts")`;
+		const scripts = [
+			`from os import system as run; ${call}`,
+			`from os import system as unused; from os import system as run; ${call}`,
+			`from os import system as run; from os import system as unused; ${call}`,
+			`from os import system as unused\nfrom os import system as run\n${call}`,
+			`from os import system as unused, system as run; ${call}`,
+			`from os import getcwd, system as run, system as unused; ${call}`,
+			`from os import (system as unused,\n # another alias\n system as run,); ${call}`,
+			`from os import system as unused; from os import system; system("printf PWNED > src/product.ts")`,
+			`from os import *; system("printf PWNED > src/product.ts")`,
+			`# from os import system as unused\nfrom os import system as run; ${call}`,
+			`note = "from os import system as unused"; from os import system as run; ${call}`,
+			`from os import system as unused; from os import system as run; run(command)`,
+			`from os import system as run\nprint(f"""{run("printf PWNED > src/product.ts")}""")`,
+			`from os import system as run\nprint(f"""{run\\\n("printf PWNED > src/product.ts")}""")`,
+			`from os import system as run\nprint(f"""{42:{run("printf PWNED > src/product.ts")}}""")`,
+			`from os import system as run\nprint(f"""{f"{"x"}{run('printf PWNED > src/product.ts')}"}""")`,
+			`note = """escaped \\""" marker"""; from os import system as run; ${call}`,
+			`from os import system as unused, \\\n    system as run\n${call}`,
+		];
+		for (const script of scripts) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: `python3 -c ${quoteBashSingle(script)}` },
+			});
+			expect({ script, blocked: decision.blocked, reason: decision.reason }).toEqual({
+				script,
+				blocked: true,
+				reason: "unknown-target",
+			});
+		}
+	});
+
+	it("allows unused Python system imports and inert alias calls", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const script of [
+			`from os import system as unused; from os import system as run; print("status")`,
+			`from os import system as run; # run(command)\nprint("status")`,
+			`from os import system as run; print("run(command)")`,
+			`from os import system as run; note = """run(command)"""; print(note)`,
+			`note = "from os import system as run"; print("run(command)")`,
+			`# from os import system as run\nrun = print; run("status")`,
+			`from os import getcwd as run; print(run())`,
+			`from os import system as unused, \\\n    system as run\nprint("status")`,
+			`note = """escaped \\""" from os import system as run; run(command)"""; print(note)`,
+			`from os import system as run; print(f"run(command)")`,
+			`from os import system as run; print(f"{{run(command)}}")`,
+			`from os import system as run; print(f"{42}: run(command)")`,
+			`from os import system as run; print(f"""{'run(command)'}""")`,
+			`from os import system as run; print(f"{42:run(command)}")`,
+			`from os import system as run; print(f"{run}{(42)}")`,
+			`from os import system as run; print(f"""{f"{"x"}{42}"}""")`,
+			`from os import system as run; print(f"""{f"{'run(command)'}"}""")`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: `python3 -c ${quoteBashSingle(script)}` },
+			});
+			expect({ script, blocked: decision.blocked }).toEqual({ script, blocked: false });
+		}
+	});
+
+	it("keeps generated Python system aliases blocked at every import position", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(6947);
+		for (let sample = 0; sample < 12; sample++) {
+			const names = Array.from({ length: 3 }, () => `alias_${seededToken(random, 8)}`);
+			for (const name of names) {
+				for (const imports of [
+					names.map(alias => `from os import system as ${alias}`).join("; "),
+					`from os import (${names.map(alias => `system as ${alias}`).join(", ")})`,
+					`from os import ${names.map(alias => `system as ${alias}`).join(", \\\n    ")}`,
+				]) {
+					const script = `${imports}; ${name}("printf data > src/generated-${sample}.ts")`;
+					const decision = await getWorkflowMutationDecision({
+						cwd,
+						sessionId: "session-a",
+						guardContext,
+						tool: tool("bash"),
+						args: { command: `python3 -c ${quoteBashSingle(script)}` },
+					});
+					expect({ script, blocked: decision.blocked }).toEqual({ script, blocked: true });
+				}
+			}
+		}
 	});
 });

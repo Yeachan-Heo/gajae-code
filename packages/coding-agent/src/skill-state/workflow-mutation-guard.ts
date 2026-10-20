@@ -1830,6 +1830,53 @@ function interpreterStatementEnd(command: string, start: number): number {
 	return index;
 }
 
+function pythonFStringExecutableCode(source: string, start: number): { code: string; end: number } {
+	const quoteLength = source.startsWith('"""', start) || source.startsWith("'''", start) ? 3 : 1;
+	const quote = source.slice(start, start + quoteLength);
+	const fields: { brackets: number; format: boolean }[] = [];
+	let code = "";
+	for (let index = start + quoteLength; index < source.length; index++) {
+		const character = source[index];
+		const field = fields.at(-1);
+		if (!field && source.startsWith(quote, index)) return { code, end: index + quoteLength };
+		if (!field || field.format) {
+			if (!field && character === "\\" && (source[index + 1] === quote[0] || source[index + 1] === "\\")) {
+				index++;
+			} else if (!field && (source.startsWith("{{", index) || source.startsWith("}}", index))) {
+				index++;
+			} else if (character === "{") {
+				fields.push({ brackets: 0, format: false });
+				code += ";";
+			} else if (field && character === "}") {
+				fields.pop();
+				code += ";";
+			}
+			continue;
+		}
+		const isFString =
+			(character === "'" || character === '"') &&
+			/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(source.slice(Math.max(0, index - 3), index));
+		const nested = isFString ? pythonFStringExecutableCode(source, index) : undefined;
+		const end = nested?.end ?? skipNoise(source, index, "py");
+		if (end !== index) {
+			code += nested ? `;${nested.code};` : " ";
+			index = end - 1;
+			continue;
+		}
+		if (character === "}" && field.brackets === 0) {
+			fields.pop();
+			code += ";";
+		} else if (character === ":" && field.brackets === 0) {
+			field.format = true;
+		} else {
+			if (character === "(" || character === "[" || character === "{") field.brackets++;
+			if (character === ")" || character === "]" || character === "}") field.brackets--;
+			code += character;
+		}
+	}
+	return { code, end: source.length };
+}
+
 function pythonSystemCallArguments(script: string): { starts: number[]; unclassifiable: boolean } {
 	const starts: number[] = [];
 	let quote: "'" | '"' | null = null;
@@ -1898,13 +1945,32 @@ function pythonSystemCallArguments(script: string): { starts: number[]; unclassi
 	if (systemCalls > osSystemCalls) unclassifiable = true;
 	if (/\b[A-Za-z_]\w*\s*=\s*(?:os\s*\.\s*(?:system|popen)|subprocess\s*\.\s*\w+)\b/.test(script))
 		unclassifiable = true;
-	// Detect `from os import system as <name>` and then calls to `<name>(...)`
-	const fromOsImport = /\bfrom\s+os\s+import\s+system\s+as\s+([A-Za-z_]\w*)\b/.exec(script);
-	if (fromOsImport) {
-		const importedName = fromOsImport[1];
-		const importedCalls = new RegExp(`\\b${importedName}\\s*\\(`, "g");
-		if (importedCalls.test(script)) {
-			unclassifiable = true;
+	// Reuse the interpreter lexer so inert import/call text cannot shadow live aliases.
+	let code = "";
+	let interpolatedCode = "";
+	for (let index = 0; index < script.length; ) {
+		const isFString =
+			(script[index] === "'" || script[index] === '"') &&
+			/(?:^|[^\w])(?:[rR]?[fF]|[fF][rR])$/.test(script.slice(Math.max(0, index - 3), index));
+		const fString = isFString ? pythonFStringExecutableCode(script, index) : undefined;
+		const end = fString?.end ?? skipNoise(script, index, "py");
+		if (end !== index) {
+			const source = script.slice(index, end);
+			if (fString) interpolatedCode += `;${fString.code};`;
+			code += source.replace(/[^\n]/g, " ");
+			index = end;
+		} else {
+			code += script[index];
+			index++;
+		}
+	}
+	code = code.replace(/\\\r?\n/g, " ");
+	const callableCode = `${code}\n${interpolatedCode}`.replace(/\\\r?\n/g, " ");
+	for (const imported of code.matchAll(/\bfrom\s+os\s+import\s+(?:\(([^)]*)\)|([^;\n]+))/g)) {
+		const names = imported[1] ?? imported[2] ?? "";
+		for (const name of names.matchAll(/(?:^|,)\s*(?:system(?:\s+as\s+([A-Za-z_]\w*))?|\*)\s*(?=,|$)/g)) {
+			const importedName = name[1] ?? "system";
+			if (new RegExp(`\\b${importedName}\\s*\\(`).test(callableCode)) unclassifiable = true;
 		}
 	}
 	return { starts, unclassifiable };
@@ -3100,8 +3166,9 @@ function pythonFStringContainsDynamicExecution(code: string, start: number, end:
 function skipNoise(code: string, index: number, language: "py" | "js"): number {
 	if (language === "py" && (code.startsWith('"""', index) || code.startsWith("'''", index))) {
 		const quote = code.slice(index, index + 3);
-		const end = code.indexOf(quote, index + 3);
-		return end < 0 ? code.length : end + 3;
+		let cursor = index + 3;
+		while (cursor < code.length && !code.startsWith(quote, cursor)) cursor += code[cursor] === "\\" ? 2 : 1;
+		return Math.min(code.length, cursor + 3);
 	}
 	const character = code[index] ?? "";
 	if (character === "'" || character === '"') {
