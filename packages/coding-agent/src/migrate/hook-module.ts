@@ -15,6 +15,9 @@
 import type { HookCandidate, MigrateSource } from "./types";
 
 /** Foreign event -> gjc hook event. Blocking events are marked separately. */
+/** Maximum time (ms) to wait for a hook command to complete. Prevents indefinite hangs. */
+const HOOK_COMMAND_TIMEOUT_MS = 30000;
+
 const EVENT_MAP: Record<string, { event: string; blocking: boolean }> = {
 	PreToolUse: { event: "tool_call", blocking: true },
 	PostToolUse: { event: "tool_result", blocking: false },
@@ -143,10 +146,19 @@ async function runHook(hook: ImportedHook, payload: unknown): Promise<HookComman
 	child.stderr?.on("data", chunk => {
 		stderr += String(chunk);
 	});
-	const code = await new Promise<number>(resolve => {
-		child.on("error", () => resolve(1));
-		child.on("close", value => resolve(value ?? 1));
-	});
+	// Use Promise.race to enforce timeout
+	const code = await Promise.race<number>([
+		new Promise<number>(resolve => {
+			child.on("error", () => resolve(1));
+			child.on("close", value => resolve(value ?? 1));
+		}),
+		new Promise<number>(resolve => {
+			setTimeout(() => {
+				child.kill();
+				resolve(124); // Standard timeout exit code
+			}, HOOK_COMMAND_TIMEOUT_MS);
+		}),
+	]);
 	return { code, stdout, stderr };
 }
 
