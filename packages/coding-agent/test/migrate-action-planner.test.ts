@@ -772,3 +772,54 @@ describe("executeActions — mcp destination safety", () => {
 		expect(written.mcpServers.alpha.command).toBe("new-bin");
 	});
 });
+
+describe("planMigration — protected agent role renaming with frontmatter", () => {
+	test("renames protected role agent and rewrites frontmatter", async () => {
+		// An agent named "executor" is a protected role and must be renamed
+		const agentContent = `---
+name: executor
+description: Execute code
+tools:
+  - bash
+  - edit
+---
+You are an executor agent.`;
+
+		const input = {
+			results: [
+				{
+					source: "test-source",
+					instructions: [],
+					skillCandidates: [],
+					slashCommandCandidates: [],
+					mcpCandidates: [],
+					agentCandidates: [
+						{
+							source: "test-source",
+							name: "executor",
+							content: agentContent,
+							warnings: [],
+						},
+					],
+					diagnostics: [],
+				},
+			],
+			destinations: dest,
+			force: false,
+		};
+
+		const output = await planMigration(input);
+
+		// Should have one action for the agent
+		const agentAction = output.actions.find(a => a.type === "agent");
+		expect(agentAction).toBeDefined();
+		expect(agentAction?.name).toBe("test-source-executor");
+		expect(agentAction?.operation).toBe("create");
+
+		// The content should have updated frontmatter
+		const action = agentAction as any;
+		expect(action.agent?.content).toBeDefined();
+		expect(action.agent.content).toContain("name: test-source-executor");
+		expect(action.agent.content).toContain("You are an executor agent.");
+	});
+});
