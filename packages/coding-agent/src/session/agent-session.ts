@@ -28160,7 +28160,11 @@ export class AgentSession {
 					args.signal,
 				);
 			}
-			const context: Context = { systemPrompt: this.systemPrompt, messages: llmMessages, tools: [] };
+			const context: Context = {
+				systemPrompt: this.systemPrompt,
+				messages: normalizeMessagesForProvider(llmMessages, model),
+				tools: [],
+			};
 			const ephemeralSessionId = crypto.randomUUID();
 			const options = this.prepareSimpleStreamOptions(
 				{
