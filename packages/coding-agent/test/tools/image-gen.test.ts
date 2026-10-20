@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as os from "node:os";
+import * as path from "node:path";
 import { Readable } from "node:stream";
 import type { Model } from "@gajae-code/ai";
 import { OPENAI_HEADER_VALUES } from "@gajae-code/ai/providers/openai-codex/constants";
@@ -28,7 +29,13 @@ const generatedImagePaths: string[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	await Promise.all(generatedImagePaths.splice(0).map(imagePath => fs.rm(imagePath, { force: true })));
+	await Promise.all(
+		generatedImagePaths.splice(0).map(async imagePath => {
+			await fs.rm(imagePath, { force: true });
+			const parent = path.dirname(imagePath);
+			if (path.basename(parent).startsWith("gjc-image-")) await fs.rm(parent, { recursive: true, force: true });
+		}),
+	);
 	global.fetch = originalFetch;
 	if (originalOpenRouterKey === undefined) {
 		delete Bun.env.OPENROUTER_API_KEY;
