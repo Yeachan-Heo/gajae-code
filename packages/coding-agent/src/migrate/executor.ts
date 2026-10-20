@@ -159,6 +159,26 @@ async function writeAgentFileNoFollow(
 	}
 }
 
+/** Generated hook modules live beside the agent's own hooks, so they use the same no-follow rules. */
+async function writeHookModuleNoFollow(destination: string, content: string, createOnly: boolean): Promise<void> {
+	await ensureInstructionDirectory(path.dirname(destination), false, "hook destination");
+	const handle = await fs.open(
+		destination,
+		createOnly
+			? fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_NOFOLLOW
+			: fsSync.constants.O_WRONLY |
+					fsSync.constants.O_CREAT |
+					fsSync.constants.O_TRUNC |
+					fsSync.constants.O_NOFOLLOW,
+		0o666,
+	);
+	try {
+		await handle.writeFile(content, "utf-8");
+	} finally {
+		await handle.close();
+	}
+}
+
 async function writeCommandFileNoFollow(
 	destination: string,
 	content: string,
@@ -243,6 +263,9 @@ export async function executeActions(
 					action.instruction.content,
 					options?.project ?? false,
 				);
+				out.push(action);
+			} else if (action.type === "hook" && action.hook && action.destination) {
+				await writeHookModuleNoFollow(action.destination, action.hook.content, action.operation === "create");
 				out.push(action);
 			} else if (action.type === "agent" && action.agent && action.destination) {
 				await writeAgentFileNoFollow(

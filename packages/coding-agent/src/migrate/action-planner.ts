@@ -13,9 +13,10 @@ import { FileType, glob } from "@gajae-code/natives";
 import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
 import { readMCPConfigFile, validateServerName } from "../runtime-mcp/config-writer";
 import { PROTECTED_AGENT_NAMES } from "./adapters";
+import { isSupportedHookEvent, renderHookModule } from "./hook-module";
 import { mapMcpEntry } from "./mcp-mapper";
 import { slugify } from "./skill-normalizer";
-import type { AdapterResult, MigrateAction, MigrateDestinations, MigrateWarning } from "./types";
+import type { AdapterResult, ManualAction, MigrateAction, MigrateDestinations, MigrateWarning } from "./types";
 
 export interface PlanInput {
 	results: AdapterResult[];
@@ -26,6 +27,7 @@ export interface PlanInput {
 export interface PlanOutput {
 	actions: MigrateAction[];
 	warnings: MigrateWarning[];
+	manualActions: ManualAction[];
 }
 
 interface DestSkillIndex {
@@ -225,6 +227,8 @@ async function inspectCommandDestination(
 export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 	const actions: MigrateAction[] = [];
 	const warnings: MigrateWarning[] = [];
+	// Settings that cannot be expressed in gjc are reported, never guessed at.
+	const manualActions = input.results.flatMap(result => result.manualActions);
 
 	// 1. Source-level diagnostics become `source`-typed actions.
 	for (const result of input.results) {
@@ -237,6 +241,67 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				reason: diag.message,
 			});
 		}
+	}
+
+	// 1b. Hook commands: one generated module per source that has importable events.
+	for (const result of input.results) {
+		const importable = result.hookCandidates.filter(candidate => isSupportedHookEvent(candidate.event));
+		const unsupported = result.hookCandidates.filter(candidate => !isSupportedHookEvent(candidate.event));
+		for (const candidate of unsupported) {
+			actions.push({
+				source: candidate.source,
+				type: "hook",
+				name: `${candidate.event}`,
+				operation: "skip",
+				status: "skipped_unmappable",
+				reason: `${candidate.event} has no faithful gjc hook event; port this command by hand`,
+			});
+		}
+		const source = importable[0]?.source;
+		if (importable.length === 0 || !source) continue;
+		const destination = path.join(input.destinations.hooksDir, `migrated-${source}.ts`);
+		const content = renderHookModule(source, importable);
+		let exists = false;
+		let unsafe = false;
+		try {
+			const stat = await fs.lstat(destination);
+			exists = true;
+			unsafe = !stat.isFile() || stat.isSymbolicLink();
+		} catch (error) {
+			if (!isEnoent(error)) {
+				actions.push({
+					source,
+					type: "hook",
+					name: path.basename(destination),
+					destination,
+					operation: "fail",
+					status: "failed_io",
+					reason: `failed to inspect destination: ${(error as Error).message}`,
+				});
+				continue;
+			}
+		}
+		if (unsafe) {
+			actions.push({
+				source,
+				type: "hook",
+				name: path.basename(destination),
+				destination,
+				operation: "fail",
+				status: "failed_invalid_destination",
+				reason: "destination is not a regular file; refusing to replace it",
+			});
+			continue;
+		}
+		actions.push({
+			source,
+			type: "hook",
+			name: path.basename(destination),
+			destination,
+			operation: exists && !input.force ? "skip" : exists ? "update" : "create",
+			status: exists && !input.force ? "skipped_exists" : exists ? "updated" : "imported",
+			hook: { content },
+		});
 	}
 
 	// 2. MCP actions — read the destination config once.
@@ -821,5 +886,5 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 		}
 	}
 
-	return { actions, warnings };
+	return { actions, warnings, manualActions };
 }

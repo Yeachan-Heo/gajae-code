@@ -47,7 +47,11 @@ import {
 } from "../harness-control-plane/lifecycle-reconciliation";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner, resolveOwnerLive } from "../harness-control-plane/owner";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
-import { RECEIPT_SPOOL_DIR_ENV } from "../harness-control-plane/receipt-spool";
+import {
+	RECEIPT_SPOOL_DIR_ENV,
+	resolveReceiptSpoolDir,
+	trustedReceiptSpoolDir,
+} from "../harness-control-plane/receipt-spool";
 import { buildReceipt, requiresVanishBeforeAction, type VanishEvidence } from "../harness-control-plane/receipts";
 import { createSdkSessionTransport, spawnNormalHarnessSession } from "../harness-control-plane/sdk-transport";
 import { classifyLeaseStatus, readLease } from "../harness-control-plane/session-lease";
@@ -1004,8 +1008,9 @@ export default class Harness extends Command {
 			`${GJC_TMUX_OWNER_STATE_DIR_ENV}=${shellQuote(ownerStateDir)}`,
 			`${GJC_TMUX_OWNER_SERVER_KEY_ENV}=${shellQuote(socketKey)}`,
 		];
-		if (process.env[RECEIPT_SPOOL_DIR_ENV])
-			envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(process.env[RECEIPT_SPOOL_DIR_ENV])}`);
+		const trustedSpoolDir = resolveReceiptSpoolDir();
+		if (trustedSpoolDir) envAssignments.push(`${RECEIPT_SPOOL_DIR_ENV}=${shellQuote(trustedSpoolDir)}`);
+		else envAssignments.unshift(`-u ${RECEIPT_SPOOL_DIR_ENV}`);
 		if (process.env.GJC_HARNESS_TEST_NODE_MODULES)
 			envAssignments.push(`GJC_HARNESS_TEST_NODE_MODULES=${shellQuote(process.env.GJC_HARNESS_TEST_NODE_MODULES)}`);
 		if (process.env.GJC_SDK_DISABLE)
@@ -1203,19 +1208,20 @@ export default class Harness extends Command {
 		}
 		const fallbackReason = tmux.reason;
 		const cmd = this.#buildOwnerCommand(sessionId);
+		const trustedSpoolDir = resolveReceiptSpoolDir();
+		const childEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			GJC_HARNESS_STATE_ROOT: root,
+			...(process.env.GJC_HARNESS_TEST_NODE_MODULES
+				? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
+				: {}),
+			...(process.env.GJC_SDK_DISABLE ? { GJC_SDK_DISABLE: process.env.GJC_SDK_DISABLE } : {}),
+		};
+		if (trustedSpoolDir) childEnv[RECEIPT_SPOOL_DIR_ENV] = trustedSpoolDir;
+		else delete childEnv[RECEIPT_SPOOL_DIR_ENV];
 		const child = Bun.spawn(cmd, {
 			cwd,
-			env: {
-				...process.env,
-				GJC_HARNESS_STATE_ROOT: root,
-				...(process.env[RECEIPT_SPOOL_DIR_ENV]
-					? { [RECEIPT_SPOOL_DIR_ENV]: process.env[RECEIPT_SPOOL_DIR_ENV] }
-					: {}),
-				...(process.env.GJC_HARNESS_TEST_NODE_MODULES
-					? { GJC_HARNESS_TEST_NODE_MODULES: process.env.GJC_HARNESS_TEST_NODE_MODULES }
-					: {}),
-				...(process.env.GJC_SDK_DISABLE ? { GJC_SDK_DISABLE: process.env.GJC_SDK_DISABLE } : {}),
-			},
+			env: childEnv,
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
@@ -1374,7 +1380,11 @@ export default class Harness extends Command {
 		if (!owner.live || !owner.socketPath) return false;
 		const priorSpoolDir = input[RECEIPT_SPOOL_DIR_ENV];
 		try {
-			if (process.env[RECEIPT_SPOOL_DIR_ENV]) input[RECEIPT_SPOOL_DIR_ENV] = process.env[RECEIPT_SPOOL_DIR_ENV];
+			const fromEnv = resolveReceiptSpoolDir();
+			const fromInput = trustedReceiptSpoolDir(typeof priorSpoolDir === "string" ? priorSpoolDir : undefined);
+			const trustedSpoolDir = fromEnv ?? fromInput;
+			if (trustedSpoolDir) input[RECEIPT_SPOOL_DIR_ENV] = trustedSpoolDir;
+			else delete input[RECEIPT_SPOOL_DIR_ENV];
 			const res = (await callEndpoint(owner.socketPath, { verb, input })) as { ok?: boolean };
 			writeJson(res);
 			if (res?.ok === false) process.exitCode = 1;

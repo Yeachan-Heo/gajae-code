@@ -7,6 +7,7 @@
 import {
 	emptyStatusCounts,
 	isFailureStatus,
+	type ManualAction,
 	type MigrateAction,
 	type MigrateDestinations,
 	type MigrateReport,
@@ -20,6 +21,7 @@ export interface BuildReportInput {
 	warnings: MigrateWarning[];
 	sources: MigrateSource[];
 	destinations: MigrateDestinations;
+	manualActions: ManualAction[];
 	dryRun: boolean;
 	project: boolean;
 	force: boolean;
@@ -32,6 +34,7 @@ export function buildReport(input: BuildReportInput): MigrateReport {
 		skill: emptyStatusCounts(),
 		command: emptyStatusCounts(),
 		agent: emptyStatusCounts(),
+		hook: emptyStatusCounts(),
 		instruction: emptyStatusCounts(),
 		source: emptyStatusCounts(),
 	};
@@ -54,6 +57,7 @@ export function buildReport(input: BuildReportInput): MigrateReport {
 		sources: input.sources,
 		destinations: input.destinations,
 		summary: { total, byType, bySource },
+		manualActions: input.manualActions,
 		actions: input.actions.map(action => ({
 			source: action.source,
 			type: action.type,
@@ -83,13 +87,14 @@ export function renderHuman(report: MigrateReport): string {
 	lines.push(`gjc migrate${mode}: ${report.ok ? "ok" : "completed with failures"}`);
 	lines.push(`Sources: ${report.sources.join(", ") || "none"}`);
 	lines.push(
-		`Destination: mcp=${report.destinations.mcpConfigPath} skills=${report.destinations.skillsDir} commands=${report.destinations.commandsDir} agents=${report.destinations.agentsDir} instructions=${report.destinations.instructionsPath}`,
+		`Destination: mcp=${report.destinations.mcpConfigPath} skills=${report.destinations.skillsDir} commands=${report.destinations.commandsDir} agents=${report.destinations.agentsDir} hooks=${report.destinations.hooksDir} instructions=${report.destinations.instructionsPath}`,
 	);
 	lines.push("");
 	lines.push(`MCP:    ${summarizeCounts(report.summary.byType.mcp)}`);
 	lines.push(`Skills: ${summarizeCounts(report.summary.byType.skill)}`);
 	lines.push(`Commands: ${summarizeCounts(report.summary.byType.command)}`);
 	lines.push(`Agents: ${summarizeCounts(report.summary.byType.agent)}`);
+	lines.push(`Hooks:  ${summarizeCounts(report.summary.byType.hook)}`);
 	lines.push(`Instructions: ${summarizeCounts(report.summary.byType.instruction)}`);
 	const commandActions = report.actions.filter(action => action.type === "command");
 	if (commandActions.length > 0) {
@@ -104,6 +109,15 @@ export function renderHuman(report: MigrateReport): string {
 	if (agentActions.length > 0) {
 		lines.push("Subagents:");
 		for (const action of agentActions) {
+			lines.push(
+				`  - [${action.source}] ${action.name ?? ""}: ${action.status}${action.reason ? ` (${action.reason})` : ""}`,
+			);
+		}
+	}
+	const hookActions = report.actions.filter(action => action.type === "hook");
+	if (hookActions.length > 0) {
+		lines.push("Hooks:");
+		for (const action of hookActions) {
 			lines.push(
 				`  - [${action.source}] ${action.name ?? ""}: ${action.status}${action.reason ? ` (${action.reason})` : ""}`,
 			);
@@ -128,6 +142,14 @@ export function renderHuman(report: MigrateReport): string {
 		lines.push("Failures:");
 		for (const f of failures) {
 			lines.push(`  - [${f.source}] ${f.type} ${f.name ?? ""}: ${f.status}${f.reason ? ` (${f.reason})` : ""}`);
+		}
+	}
+
+	if (report.manualActions.length > 0) {
+		lines.push("");
+		lines.push("Manual actions:");
+		for (const m of report.manualActions) {
+			lines.push(`  - [${m.source}] ${m.area}: ${m.detail}`);
 		}
 	}
 

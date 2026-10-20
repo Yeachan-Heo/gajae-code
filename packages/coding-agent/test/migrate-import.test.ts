@@ -550,4 +550,70 @@ describe("end-to-end import", () => {
 		expect(commands).toContainEqual(expect.objectContaining({ name: "claude-code:Review" }));
 		expect(expandSlashCommand("/claude-code:Review this", commands)).toContain("Imported this.");
 	});
+
+	test("imports Claude Code hooks as a runnable module that blocks on exit 2", async () => {
+		await fs.mkdir(path.join(cwd, ".claude"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".claude", "settings.json"),
+			JSON.stringify({
+				hooks: {
+					PreToolUse: [
+						{
+							matcher: "bash",
+							hooks: [
+								{
+									type: "command",
+									command:
+										"read -r payload; printf '%s' \"$payload\" > \"$GJC_TEST_PAYLOAD\"; echo 'no bash here' >&2; exit 2",
+								},
+							],
+						},
+					],
+					Notification: [{ hooks: [{ type: "command", command: "say done" }] }],
+				},
+			}),
+			"utf-8",
+		);
+		const payloadPath = path.join(home, "payload.json");
+		process.env.GJC_TEST_PAYLOAD = payloadPath;
+		try {
+			const report = await runMigrate(opts({ from: ["claude-code"] }));
+			const hookAction = report.actions.find(action => action.type === "hook" && action.status === "imported");
+			expect(hookAction?.destination).toBe(path.join(cwd, ".gjc", "hooks", "migrated-claude-code.ts"));
+			// The unsupported event is reported instead of silently dropped.
+			expect(report.actions).toContainEqual(
+				expect.objectContaining({ type: "hook", name: "Notification", status: "skipped_unmappable" }),
+			);
+
+			const modulePath = String(hookAction?.destination);
+			const module = (await import(modulePath)) as {
+				default: (api: {
+					on: (event: string, handler: (payload: unknown, ctx: { cwd?: string }) => unknown) => void;
+				}) => void;
+			};
+			const handlers = new Map<string, (payload: unknown, ctx: { cwd?: string }) => unknown>();
+			module.default({ on: (event, handler) => handlers.set(event, handler) });
+			expect([...handlers.keys()]).toEqual(["tool_call"]);
+
+			const handler = handlers.get("tool_call");
+			if (!handler) throw new Error("no tool_call handler");
+			const decision = (await handler({ toolName: "bash", input: { command: "ls" } }, { cwd })) as {
+				block?: boolean;
+				reason?: string;
+			};
+			expect(decision.block).toBe(true);
+			expect(decision.reason).toBe("no bash here");
+			// The command received the origin-shaped payload on stdin.
+			const received = JSON.parse(await Bun.file(payloadPath).text()) as Record<string, unknown>;
+			expect(received.hook_event_name).toBe("PreToolUse");
+			expect(received.tool_name).toBe("bash");
+			expect(received.tool_input).toEqual({ command: "ls" });
+
+			// A non-matching tool never runs the command.
+			const skipped = await handler({ toolName: "read", input: {} }, { cwd });
+			expect(skipped).toBeUndefined();
+		} finally {
+			delete process.env.GJC_TEST_PAYLOAD;
+		}
+	}, 60_000);
 });

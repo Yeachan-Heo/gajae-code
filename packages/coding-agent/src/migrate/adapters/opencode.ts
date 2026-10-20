@@ -24,7 +24,9 @@ export const opencodeAdapter: Adapter = {
 			slashCommandCandidates: [],
 			agentCandidates: [],
 			instructionCandidates: [],
+			hookCandidates: [],
 			diagnostics: [],
+			manualActions: [],
 		};
 		const baseDir = path.join(homeDir, ".config", "opencode");
 

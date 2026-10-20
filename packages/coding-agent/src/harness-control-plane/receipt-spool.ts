@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { canonicalEnvKey, loadedProjectEnvSnapshot } from "@gajae-code/utils/dirs";
 import { withFileLock } from "../config/file-lock";
 import type { ReceiptEnvelope } from "./receipts";
 
@@ -21,6 +23,42 @@ export interface ReceiptSpoolAppendResult {
 const receiptSpoolDirStorage = new AsyncLocalStorage<string | undefined>();
 const spoolQueues = new Map<string, Promise<void>>();
 const noop = (): void => undefined;
+const NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
+
+/** True only when an exception's `code` is `ENOENT`. Other codes propagate. */
+export function isEnoent(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+/**
+ * Bun copies the cwd dotenv into `process.env` before module init. The startup
+ * project snapshot is the declaration set trusted directory overrides use: a
+ * path that resolves like that declaration, or a dynamic declaration, is not a
+ * spool directory. A shell or `--receipt-spool-dir` value that resolves
+ * somewhere else is kept.
+ */
+function projectDeclaredReceiptSpoolDir(raw: string): boolean {
+	const snapshot = loadedProjectEnvSnapshot();
+	const key = canonicalEnvKey(RECEIPT_SPOOL_DIR_ENV);
+	const projectValue = snapshot.values[key];
+	if (projectValue === undefined) return false;
+	if (snapshot.dynamic.has(key)) return true;
+	const declared = projectValue.trim();
+	const candidate = raw.trim();
+	if (!declared || !candidate) return declared === candidate;
+	return path.resolve(declared) === path.resolve(candidate);
+}
+
+function adoptReceiptSpoolDir(raw: string | undefined): string | undefined {
+	if (raw === undefined || projectDeclaredReceiptSpoolDir(raw)) return undefined;
+	const trimmed = raw.trim();
+	return trimmed ? path.resolve(trimmed) : undefined;
+}
+
+/** A spool directory the startup project snapshot does not declare. */
+export function trustedReceiptSpoolDir(raw: string | undefined): string | undefined {
+	return adoptReceiptSpoolDir(raw);
+}
 
 interface ReceiptSpoolCursorCache {
 	mtimeMs: number;
@@ -44,10 +82,15 @@ export function resetReceiptSpoolCursorCacheForTesting(): void {
 
 async function spoolStat(spoolFile: string): Promise<{ mtimeMs: number; size: number } | undefined> {
 	try {
-		const stats = await fs.stat(spoolFile);
-		return { mtimeMs: stats.mtimeMs, size: stats.size };
+		const handle = await fs.open(spoolFile, fsConstants.O_RDONLY | NOFOLLOW);
+		try {
+			const stats = await handle.stat();
+			return { mtimeMs: stats.mtimeMs, size: stats.size };
+		} finally {
+			await handle.close();
+		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		if (isEnoent(error)) return undefined;
 		throw error;
 	}
 }
@@ -64,15 +107,17 @@ async function cacheHighestCursor(spoolFile: string, highest: bigint): Promise<v
 export async function withReceiptSpoolDir<T>(spoolDir: string, fn: () => Promise<T>): Promise<T> {
 	const trimmed = spoolDir.trim();
 	if (!trimmed) throw new Error("receipt_spool_dir_empty");
-	const resolved = path.resolve(trimmed);
+	const resolved = adoptReceiptSpoolDir(trimmed);
+	// Owner input repeats process.env. A project-declared directory must not
+	// become the active spool via that copy.
+	if (!resolved) return fn();
 	return receiptSpoolDirStorage.run(resolved, fn);
 }
 
 export function resolveReceiptSpoolDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
 	const active = receiptSpoolDirStorage.getStore();
 	if (active !== undefined) return active;
-	const raw = env[RECEIPT_SPOOL_DIR_ENV]?.trim();
-	return raw ? path.resolve(raw) : undefined;
+	return adoptReceiptSpoolDir(env[RECEIPT_SPOOL_DIR_ENV]);
 }
 
 export function receiptSpoolPath(spoolDir: string): string {
@@ -95,30 +140,56 @@ export function formatReceiptSpoolCursor(cursor: bigint): string {
 
 export async function readHighestReceiptSpoolCursor(spoolDir: string): Promise<bigint> {
 	const spoolFile = receiptSpoolPath(spoolDir);
-	const revision = await spoolStat(spoolFile);
-	if (!revision) {
-		cursorCache.delete(spoolFile);
-		return 0n;
-	}
-	const cached = cursorCache.get(spoolFile);
-	if (cached && sameSpoolRevision(cached, revision)) return cached.highest;
-
-	fullScanCount++;
-	const raw = await fs.readFile(spoolFile, "utf8");
-	let highest = 0n;
-	for (const line of raw.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		try {
-			const parsed = JSON.parse(trimmed) as { cursor?: unknown };
-			const cursor = parseCursor(parsed.cursor);
-			if (cursor !== undefined && cursor > highest) highest = cursor;
-		} catch {
-			// A crash may leave a torn tail; a full scan ignores it and re-establishes the cache.
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(spoolFile, fsConstants.O_RDONLY | NOFOLLOW);
+	} catch (error) {
+		if (isEnoent(error)) {
+			cursorCache.delete(spoolFile);
+			return 0n;
 		}
+		throw error;
 	}
-	cursorCache.set(spoolFile, { ...revision, highest });
-	return highest;
+	try {
+		const stats = await handle.stat();
+		const revision = { mtimeMs: stats.mtimeMs, size: stats.size };
+		const cached = cursorCache.get(spoolFile);
+		if (cached && sameSpoolRevision(cached, revision)) return cached.highest;
+
+		fullScanCount++;
+		const raw = await handle.readFile({ encoding: "utf8" });
+		let highest = 0n;
+		for (const line of raw.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				const parsed = JSON.parse(trimmed) as { cursor?: unknown };
+				const cursor = parseCursor(parsed.cursor);
+				if (cursor !== undefined && cursor > highest) highest = cursor;
+			} catch {
+				// A crash may leave a torn tail; a full scan ignores it and re-establishes the cache.
+			}
+		}
+		cursorCache.set(spoolFile, { ...revision, highest });
+		return highest;
+	} finally {
+		await handle.close();
+	}
+}
+
+async function tightenSpoolDir(dir: string): Promise<void> {
+	if (process.platform === "win32") return;
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(dir, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | NOFOLLOW);
+	} catch {
+		return;
+	}
+	try {
+		await handle.chmod(0o700);
+	} finally {
+		await handle.close();
+	}
 }
 
 async function enqueueSpoolAppend<T>(spoolFile: string, task: () => Promise<T>): Promise<T> {
@@ -142,13 +213,19 @@ export async function appendReceiptToSpool(
 	const spoolFile = receiptSpoolPath(resolvedDir);
 	return enqueueSpoolAppend(spoolFile, async () => {
 		await fs.mkdir(resolvedDir, { recursive: true, mode: 0o700 });
+		await tightenSpoolDir(resolvedDir);
 		return withFileLock(
 			spoolFile,
 			async () => {
 				const cursor = formatReceiptSpoolCursor((await readHighestReceiptSpoolCursor(resolvedDir)) + 1n);
 				const record: ReceiptSpoolRecord = { cursor, envelope };
-				const handle = await fs.open(spoolFile, "a", 0o600);
+				const handle = await fs.open(
+					spoolFile,
+					fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | NOFOLLOW,
+					0o600,
+				);
 				try {
+					if (process.platform !== "win32") await handle.chmod(0o600);
 					await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
 					await handle.sync();
 				} finally {

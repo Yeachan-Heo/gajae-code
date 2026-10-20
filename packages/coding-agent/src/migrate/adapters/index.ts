@@ -85,6 +85,32 @@ export async function readSourceText(
 	}
 }
 
+/**
+ * Read an optional settings file. A missing file is expected (most setups do not
+ * have every settings file), so unlike `readSourceText` it produces no diagnostic.
+ */
+export async function readOptionalJson(
+	filePath: string,
+	source: MigrateSource,
+	type: SourceDiagnostic["type"],
+): Promise<{ data: Record<string, unknown> } | { diagnostic: SourceDiagnostic } | { absent: true }> {
+	let text: string;
+	try {
+		text = await fs.readFile(filePath, "utf-8");
+	} catch (error) {
+		if (isEnoent(error)) return { absent: true };
+		return {
+			diagnostic: {
+				source,
+				type,
+				status: "failed_io",
+				message: `failed to read ${filePath}: ${(error as Error).message}`,
+			},
+		};
+	}
+	return parseSourceJson(text, filePath, source, type);
+}
+
 /** Parse JSON text, classifying parse errors into a `failed_invalid_source` diagnostic. */
 export function parseSourceJson(
 	text: string,

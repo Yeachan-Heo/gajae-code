@@ -22,6 +22,7 @@ beforeEach(async () => {
 		skillsDir: path.join(tmp, "skills"),
 		commandsDir: path.join(tmp, ".gjc", "commands"),
 		agentsDir: path.join(tmp, ".gjc", "agents"),
+		hooksDir: path.join(tmp, ".gjc", "hooks"),
 		instructionsPath: path.join(tmp, "AGENTS.md"),
 	};
 });
@@ -49,6 +50,8 @@ function result(partial: Partial<AdapterResult>): AdapterResult {
 		slashCommandCandidates: [],
 		agentCandidates: [],
 		instructionCandidates: [],
+		hookCandidates: [],
+		manualActions: [],
 		diagnostics: [],
 		...partial,
 	};

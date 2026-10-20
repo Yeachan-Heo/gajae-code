@@ -5,7 +5,7 @@
 
 import * as path from "node:path";
 import { TOML } from "bun";
-import type { AdapterResult, McpCandidate, SourceDiagnostic } from "../types";
+import type { AdapterResult, ManualAction, McpCandidate, SourceDiagnostic } from "../types";
 import {
 	type Adapter,
 	type AdapterOptions,
@@ -45,6 +45,51 @@ function parseToml(
 	}
 }
 
+/**
+ * Describe `config.toml` settings gjc cannot import. Approvals and sandbox mode
+ * change what the agent may do, so they are reported for the user to re-express
+ * rather than translated. Environment variable names are listed; values are not.
+ */
+function describeCodexSettings(data: Record<string, unknown>): ManualAction[] {
+	const actions: ManualAction[] = [];
+	const model = data.model;
+	if (typeof model === "string" && model.trim()) {
+		actions.push({
+			source: SOURCE,
+			area: "config.toml: model",
+			detail: `model "${model}" is provider-specific and was not imported; select it with gjc config or --model.`,
+		});
+	}
+	for (const key of ["approval_policy", "sandbox_mode"] as const) {
+		const value = data[key];
+		if (typeof value !== "string" || !value.trim()) continue;
+		actions.push({
+			source: SOURCE,
+			area: `config.toml: ${key}`,
+			detail: `"${value}" has no gjc equivalent and was not imported; review gjc's tool approval and sandbox settings.`,
+		});
+	}
+	const policy = data.shell_environment_policy;
+	if (policy && typeof policy === "object" && !Array.isArray(policy)) {
+		const record = policy as Record<string, unknown>;
+		const setKeys = record.set && typeof record.set === "object" ? Object.keys(record.set as object).sort() : [];
+		const unsetKeys = Array.isArray(record.unset)
+			? record.unset.filter((key): key is string => typeof key === "string").sort()
+			: [];
+		if (setKeys.length > 0 || unsetKeys.length > 0) {
+			const parts: string[] = [];
+			if (setKeys.length > 0) parts.push(`sets ${setKeys.join(", ")}`);
+			if (unsetKeys.length > 0) parts.push(`unsets ${unsetKeys.join(", ")}`);
+			actions.push({
+				source: SOURCE,
+				area: "config.toml: shell_environment_policy",
+				detail: `shell_environment_policy ${parts.join(" and ")}; variable names were reported without values and nothing was imported.`,
+			});
+		}
+	}
+	return actions;
+}
+
 export const codexAdapter: Adapter = {
 	source: SOURCE,
 	async collect({ homeDir, scope }: AdapterOptions): Promise<AdapterResult> {
@@ -54,7 +99,9 @@ export const codexAdapter: Adapter = {
 			slashCommandCandidates: [],
 			agentCandidates: [],
 			instructionCandidates: [],
+			hookCandidates: [],
 			diagnostics: [],
+			manualActions: [],
 		};
 
 		const configPath = path.join(homeDir, ".codex", "config.toml");
@@ -72,6 +119,7 @@ export const codexAdapter: Adapter = {
 						result.mcpCandidates.push({ source: SOURCE, name, raw } satisfies McpCandidate);
 					}
 				}
+				result.manualActions.push(...describeCodexSettings(parsed.data));
 			}
 		}
 

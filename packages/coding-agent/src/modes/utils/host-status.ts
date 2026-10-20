@@ -1,22 +1,20 @@
 /**
  * Host-terminal agent status markers.
  *
- * Interactive turns announce their state as an OSC 777 sequence:
+ * Interactive turns can announce their state as an OSC 777 sequence:
  *
  *     ESC ] 777 ; notify;Terax;gjc;<event> BEL
  *
- * Terax reads the sequence to drive its per-tab agent status and header bell.
- * The marker is only emitted inside a Terax-hosted terminal, which announces
- * itself with a non-empty `TERAX_TERMINAL` in the environment of every shell
- * it spawns.
- * That gate matters because OSC 777 `notify;` is the rxvt extension, and
- * terminals that implement it (Ghostty among them) turn it into a desktop
- * notification instead of discarding it. Emitting the marker unconditionally
- * made every non-Terax host show a "Terax" notification on every turn.
+ * OSC 777 is the rxvt `notify` extension, not a private sequence: a terminal
+ * that implements it does not discard the payload, it raises a desktop
+ * notification. Ghostty parses `777;notify` in `osc/parsers/rxvt_extension.zig`
+ * and maps it to `show_desktop_notification`, so emitting it unconditionally
+ * made every turn pop notifications titled `Terax` in Ghostty and cmux.
  *
- * `notify;Terax;` is the wire identifier of the only protocol that currently
- * carries per-turn agent state, not a host check - the payload names gjc as the
- * reporting agent.
+ * Emission is therefore opt-in. A host that wants per-turn agent status exports
+ * `GJC_HOST_STATUS=terax` from its shell integration; every other host gets no
+ * escape sequence at all. `notify;Terax;` is the wire identifier of that
+ * protocol, and gjc is still named in the payload as the reporting agent.
  *
  * Interactive TUI only. Print and RPC mode stdout stays byte-for-byte parseable
  * because they never reach these controllers.
@@ -24,28 +22,25 @@
 
 export type HostStatusEvent = "working" | "attention" | "finished";
 
-/**
- * Whether the hosting terminal is Terax.
- *
- * Terax exports `TERAX_TERMINAL=1` into the shells it spawns, so the variable
- * is inherited by every process those shells start, including gjc. A terminal
- * that does not set it never receives the marker, so it never raises the
- * notification that the rxvt `notify;` extension would otherwise produce.
- */
-function teraxHost(): boolean {
-	const value = process.env.TERAX_TERMINAL;
-	return value !== undefined && value !== "";
-}
+/** The host marker value that opts a terminal into agent-status markers. */
+export const HOST_STATUS_MARKER_ENV = "GJC_HOST_STATUS";
+const HOST_STATUS_MARKER_VALUE = "terax";
 
 function marker(event: HostStatusEvent): string {
 	return `\x1b]777;notify;Terax;gjc;${event}\x07`;
 }
 
+/** Whether the current host opted in to agent-status markers. */
+export function hostStatusEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	return env[HOST_STATUS_MARKER_ENV]?.trim().toLowerCase() === HOST_STATUS_MARKER_VALUE;
+}
+
 export function emitHostStatus(
 	event: HostStatusEvent,
 	output: Pick<NodeJS.WriteStream, "write"> = process.stdout,
+	env: NodeJS.ProcessEnv = process.env,
 ): void {
-	if (!teraxHost()) return;
+	if (!hostStatusEnabled(env)) return;
 	try {
 		output.write(marker(event));
 	} catch {

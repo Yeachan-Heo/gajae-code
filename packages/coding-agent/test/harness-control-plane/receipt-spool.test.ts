@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "../../src/harness-control-plane/finalize";
@@ -17,6 +18,7 @@ import { type CompletionEvidence, validateReceipt } from "../../src/harness-cont
 import { readReceiptIndex } from "../../src/harness-control-plane/storage";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
+const DOTENV_PROBE = path.join(import.meta.dir, "..", "fixtures", "receipt-spool-dotenv-probe.ts");
 
 let root: string;
 let spoolDir: string;
@@ -293,4 +295,182 @@ if (!result.completed) {
 		expect(await readHighestReceiptSpoolCursor(spoolDir)).toBe(8n);
 		expect(receiptSpoolFullScanCountForTesting()).toBe(2);
 	});
+});
+
+function childEnv(extra: Record<string, string | undefined> = {}): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [name, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[name] = value;
+	}
+	delete env.NODE_ENV;
+	delete env[RECEIPT_SPOOL_DIR_ENV];
+	for (const [name, value] of Object.entries(extra)) {
+		if (value === undefined) delete env[name];
+		else env[name] = value;
+	}
+	return env;
+}
+
+async function runDotenvProbe(
+	cwd: string,
+	sessionRoot: string,
+	env: Record<string, string>,
+): Promise<{ exitCode: number; completed: boolean; stderr: string }> {
+	const proc = Bun.spawn([process.execPath, DOTENV_PROBE, sessionRoot], {
+		cwd,
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	const marker = stdout
+		.split("\n")
+		.map(line => line.trim())
+		.find(line => line.startsWith("RECEIPT_SPOOL_PROBE "));
+	if (exitCode !== 0 || !marker) {
+		throw new Error(`probe failed (${exitCode}): ${stderr || stdout}`);
+	}
+	const parsed = JSON.parse(marker.slice("RECEIPT_SPOOL_PROBE ".length)) as { completed: boolean };
+	return { exitCode, completed: parsed.completed, stderr };
+}
+
+describe("receipt spool project dotenv and symlink", () => {
+	const dirs: string[] = [];
+
+	async function makeDir(prefix: string): Promise<string> {
+		const dir = await mkdtemp(path.join(tmpdir(), prefix));
+		dirs.push(dir);
+		return dir;
+	}
+
+	afterEach(async () => {
+		delete process.env[RECEIPT_SPOOL_DIR_ENV];
+		await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
+	});
+
+	it("does not spool receipts into a project dotenv directory", async () => {
+		const repo = await makeDir("harness-spool-repo-");
+		const attacker = await makeDir("harness-spool-attacker-");
+		const sessionRoot = await makeDir("harness-spool-session-");
+		const home = await makeDir("harness-spool-home-");
+		await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+
+		const result = await runDotenvProbe(repo, sessionRoot, childEnv({ HOME: home, GJC_CODING_AGENT_DIR: home }));
+		expect(result.completed).toBe(true);
+		expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+	});
+
+	it("keeps a shell spool directory that disagrees with the project dotenv", async () => {
+		const repo = await makeDir("harness-spool-repo-");
+		const attacker = await makeDir("harness-spool-attacker-");
+		const operator = await makeDir("harness-spool-operator-");
+		const sessionRoot = await makeDir("harness-spool-session-");
+		const home = await makeDir("harness-spool-home-");
+		await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${attacker}\n`);
+
+		const result = await runDotenvProbe(
+			repo,
+			sessionRoot,
+			childEnv({ HOME: home, GJC_CODING_AGENT_DIR: home, [RECEIPT_SPOOL_DIR_ENV]: operator }),
+		);
+		expect(result.completed).toBe(true);
+		expect(await Bun.file(path.join(operator, RECEIPT_SPOOL_FILENAME)).exists()).toBe(true);
+		expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+	});
+
+	it("does not adopt a shell spool directory equal to the project dotenv", async () => {
+		const repo = await makeDir("harness-spool-repo-");
+		const shared = await makeDir("harness-spool-shared-");
+		const sessionRoot = await makeDir("harness-spool-session-");
+		const home = await makeDir("harness-spool-home-");
+		await writeFile(path.join(repo, ".env"), `${RECEIPT_SPOOL_DIR_ENV}=${shared}\n`);
+
+		const result = await runDotenvProbe(
+			repo,
+			sessionRoot,
+			childEnv({ HOME: home, GJC_CODING_AGENT_DIR: home, [RECEIPT_SPOOL_DIR_ENV]: shared }),
+		);
+		expect(result.completed).toBe(true);
+		expect(await Bun.file(path.join(shared, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+	});
+
+	it("does not adopt a shell spool directory when the project declaration is dynamic", async () => {
+		const repo = await makeDir("harness-spool-repo-");
+		const attacker = await makeDir("harness-spool-attacker-");
+		const operator = await makeDir("harness-spool-operator-");
+		const sessionRoot = await makeDir("harness-spool-session-");
+		const home = await makeDir("harness-spool-home-");
+		await writeFile(path.join(repo, ".env"), `ATTACK=${attacker}\n${RECEIPT_SPOOL_DIR_ENV}=$ATTACK\n`);
+
+		const result = await runDotenvProbe(
+			repo,
+			sessionRoot,
+			childEnv({
+				HOME: home,
+				GJC_CODING_AGENT_DIR: home,
+				ATTACK: attacker,
+				[RECEIPT_SPOOL_DIR_ENV]: operator,
+			}),
+		);
+		expect(result.completed).toBe(true);
+		expect(await Bun.file(path.join(operator, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+		expect(await Bun.file(path.join(attacker, RECEIPT_SPOOL_FILENAME)).exists()).toBe(false);
+	});
+
+	it.skipIf(process.platform === "win32" || fsConstants.O_NOFOLLOW === undefined)(
+		"does not append receipts through a spool.jsonl symlink",
+		async () => {
+			const sessionRoot = await makeDir("harness-spool-session-");
+			const dir = await makeDir("harness-spool-link-");
+			const outside = path.join(sessionRoot, "outside.txt");
+			await writeFile(outside, "SAFE\n");
+			await symlink(outside, path.join(dir, RECEIPT_SPOOL_FILENAME));
+			process.env[RECEIPT_SPOOL_DIR_ENV] = dir;
+
+			await expect(
+				runFinalize({
+					root: sessionRoot,
+					sessionId: SID,
+					workspace: "/ws",
+					branch: "feat/545",
+					requireTests: true,
+					requireCommit: true,
+					requirePr: true,
+					validationCommands: [{ name: "symlink", command: "true" }],
+					checks: checks(),
+				}),
+			).rejects.toThrow();
+			expect(await readFile(outside, "utf8")).toBe("SAFE\n");
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"tightens an existing spool directory and file to owner-only mode",
+		async () => {
+			const sessionRoot = await makeDir("harness-spool-session-");
+			const dir = await makeDir("harness-spool-mode-");
+			await chmod(dir, 0o755);
+			const spoolFile = path.join(dir, RECEIPT_SPOOL_FILENAME);
+			await writeFile(spoolFile, "");
+			await chmod(spoolFile, 0o666);
+			process.env[RECEIPT_SPOOL_DIR_ENV] = dir;
+
+			const res = await runFinalize({
+				root: sessionRoot,
+				sessionId: SID,
+				workspace: "/ws",
+				branch: "feat/545",
+				requireTests: true,
+				requireCommit: true,
+				requirePr: true,
+				validationCommands: [{ name: "mode", command: "true" }],
+				checks: checks(),
+			});
+
+			expect(res.completed).toBe(true);
+			expect((await lstat(dir)).mode & 0o777).toBe(0o700);
+			expect((await stat(spoolFile)).mode & 0o777).toBe(0o600);
+		},
+	);
 });

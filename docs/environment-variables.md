@@ -666,6 +666,14 @@ Devin authentication lives entirely in the Devin CLI (`devin auth login`, or `WI
 
 ---
 
+## 12b) Host-terminal agent status
+
+| Variable | Values | Default | Behavior |
+| --- | --- | --- | --- |
+| `GJC_HOST_STATUS` | `terax` | unset | Opts the interactive TUI into per-turn agent status markers (`ESC ] 777 ; notify;Terax;gjc;<working\|attention\|finished> BEL`). Unset, or set to anything else, emits no bytes. `777;notify` is the rxvt notification extension: Ghostty and cmux raise a desktop notification for it, so the marker is opt-in rather than sniffed. A host opts in by exporting this from its shell integration. |
+
+---
+
 ## 13) Removed ingress modes
 
 `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. The retired bridge-prefixed variables and `GJC_RPC_EMIT_TITLE` are not runtime configuration variables. Use the [SDK machine interface](./sdk.md) for external machine control.

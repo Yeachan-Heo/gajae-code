@@ -75,6 +75,50 @@ describe("runMigrate", () => {
 		);
 		expect(renderHuman(report)).toContain("[claude-code] /claude-code:review: imported");
 		expect(renderHuman(report)).toContain("[claude-code] CLAUDE.md: imported");
+	});
+
+	test("dry-run reports settings that need manual action", async () => {
+		await fs.mkdir(path.join(cwd, ".claude"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".claude", "settings.json"),
+			JSON.stringify({
+				model: "claude-sonnet-4-5",
+				permissions: { deny: ["Read(./.env)"] },
+				hooks: {
+					PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "npm test" }] }],
+					Notification: [{ hooks: [{ type: "command", command: "say done" }] }],
+				},
+			}),
+			"utf-8",
+		);
+		const report = await runMigrate({
+			from: ["claude-code"],
+			project: true,
+			force: false,
+			dryRun: true,
+			json: true,
+			homeDir: home,
+			cwd,
+		});
+		// Manual actions are advisory: they never turn a migration into a failure.
+		expect(report.ok).toBe(true);
+		expect(report.manualActions.map(action => action.area).sort()).toEqual([
+			"settings.json: hooks.Notification",
+			"settings.json: model",
+			"settings.json: permissions",
+		]);
+		const hookActions = report.actions.filter(action => action.type === "hook");
+		expect(hookActions.some(action => action.name === "Notification" && action.status === "skipped_unmappable")).toBe(
+			true,
+		);
+		const hookAction = hookActions.find(action => action.status === "imported");
+		expect(hookAction).toMatchObject({ name: "migrated-claude-code.ts", status: "imported" });
+		expect(hookAction?.destination).toBe(path.join(report.destinations.hooksDir, "migrated-claude-code.ts"));
+		expect(report.summary.byType.hook.imported).toBe(1);
+		const rendered = renderHuman(report);
+		expect(rendered).toContain("Manual actions:");
+		expect(rendered).toContain("[claude-code] migrated-claude-code.ts: imported");
+		expect(rendered).toContain("[claude-code] settings.json: hooks.Notification:");
 		expect(await exists(path.join(cwd, ".gjc", "mcp.json"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "skills"))).toBe(false);
 		expect(await exists(path.join(cwd, ".gjc", "AGENTS.md"))).toBe(false);
