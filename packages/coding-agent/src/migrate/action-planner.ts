@@ -812,11 +812,11 @@ export async function planMigration(input: PlanInput): Promise<PlanOutput> {
 				name = `${candidate.source}-${name}`;
 				warnings.push(
 					`renamed agent "${candidate.name}" to "${name}" so the bundled ${candidate.name} role stays authoritative`,
-				// Rewrite the frontmatter to reflect the new name
-			const { frontmatter, body } = parseFrontmatter(agentContent);
-			frontmatter.name = name;
-			agentContent = `---\n${YAML.stringify(frontmatter, null, 2)}---\n${body}`;
 				);
+				// Rewrite the frontmatter to reflect the new name
+				const { frontmatter, body } = parseFrontmatter(agentContent);
+				frontmatter.name = name;
+				agentContent = `---\n${YAML.stringify(frontmatter, null, 2)}---\n${body}`;
 			}
 			if (!validAgentName.test(name)) {
 				actions.push({
