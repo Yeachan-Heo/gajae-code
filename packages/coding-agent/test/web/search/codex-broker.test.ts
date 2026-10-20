@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as os from "node:os";
 import type { AuthStorage } from "@gajae-code/ai";
 import { OPENAI_HEADER_VALUES } from "@gajae-code/ai/providers/openai-codex/constants";
@@ -25,13 +25,15 @@ function makeSseResponse(): string {
 		"",
 		`data: ${JSON.stringify({
 			type: "response.completed",
-			response: { id: "resp_codex_broker", model: "gpt-5-codex-mini" },
+			response: { id: "resp_codex_broker", model: "gpt-6.1-sol" },
 		})}`,
 		"",
 	].join("\n");
 }
 
 describe("Codex web search broker auth", () => {
+	afterEach(() => vi.restoreAllMocks());
+
 	it("uses AuthStorage.getOAuthAccess for token + account metadata without opening AgentStorage", async () => {
 		const getOAuthAccess = vi.fn(async () => ({
 			accessToken: "broker-refreshed-access-token",
@@ -40,8 +42,16 @@ describe("Codex web search broker auth", () => {
 		const authStorage = { getOAuthAccess } as unknown as AuthStorage;
 		const openSpy = vi.spyOn(AgentStorage, "open");
 		let requestHeaders: Headers | undefined;
+		const modelDiscoveryHeaders: Headers[] = [];
 
-		using _hook = hookFetch(async (_url, init) => {
+		using _hook = hookFetch(async (url, init) => {
+			if (init?.method === "GET") {
+				if (url.toString().startsWith("https://registry.npmjs.org/")) {
+					return Response.json({ version: "0.153.4" });
+				}
+				modelDiscoveryHeaders.push(new Headers(init.headers));
+				return Response.json({ models: [{ slug: "gpt-6.1-sol" }] });
+			}
 			requestHeaders = new Headers(init?.headers);
 			return new Response(makeSseResponse(), { status: 200, headers: { "Content-Type": "text/event-stream" } });
 		});
@@ -56,7 +66,11 @@ describe("Codex web search broker auth", () => {
 		const result = await searchCodex(params);
 
 		expect(result.provider).toBe("codex");
+		expect(result.model).toBe("gpt-6.1-sol");
 		expect(getOAuthAccess).toHaveBeenCalledWith("openai-codex", "codex-broker-session", { signal: undefined });
+		expect(modelDiscoveryHeaders).toHaveLength(1);
+		expect(modelDiscoveryHeaders[0]?.get("authorization")).toBe("Bearer broker-refreshed-access-token");
+		expect(modelDiscoveryHeaders[0]?.get("chatgpt-account-id")).toBe("broker-account-id");
 		expect(requestHeaders?.get("authorization")).toBe("Bearer broker-refreshed-access-token");
 		expect(requestHeaders?.get("chatgpt-account-id")).toBe("broker-account-id");
 		expect(openSpy).not.toHaveBeenCalled();
@@ -73,7 +87,14 @@ describe("Codex web search broker auth", () => {
 		const authStorage = { getOAuthAccess } as unknown as AuthStorage;
 		let userAgent: string | undefined;
 
-		using _hook = hookFetch(async (_url, init) => {
+		using _hook = hookFetch(async (url, init) => {
+			if (init?.method === "GET") {
+				return Response.json(
+					url.toString().startsWith("https://registry.npmjs.org/")
+						? { version: "0.153.4" }
+						: { models: [{ slug: "gpt-6.1-sol" }] },
+				);
+			}
 			const headers = new Headers(init?.headers);
 			userAgent = headers.get("User-Agent") ?? undefined;
 			return new Response(makeSseResponse(), { status: 200, headers: { "Content-Type": "text/event-stream" } });

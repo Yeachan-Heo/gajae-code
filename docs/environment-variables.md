@@ -442,6 +442,10 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `SEARXNG_ENDPOINT`, `SEARXNG_TOKEN`                 | SearXNG endpoint and optional bearer token                    |
 | `SEARXNG_BASIC_USERNAME`, `SEARXNG_BASIC_PASSWORD`  | SearXNG HTTP Basic Auth credentials                           |
 
+Codex web search prefers `gpt-6.1-sol`, then `gpt-6-luna`, intersected with the current account's subscription model discovery using the existing `fetchCodexModels` helper (`GET /codex/models`, with its supported `/models` alternative). It does not use bundled model presence or a merged discovery cache as evidence of account availability. Legacy GPT-5 defaults are removed. Unavailable discovery or no advertised preferred candidate produces a provider error before search; there is no unadvertised or arbitrary model fallback. Known unsupported-model HTTP 400 errors advance only to the next advertised preferred candidate.
+
+Both preferred models have hosted web-search metadata in the [upstream Codex catalog](https://github.com/openai/codex/blob/091008729d5572712ac08964a9602eb71cf31428/codex-rs/models-manager/models.json). Subscription discovery establishes current model advertisement, not acceptance of GJC's exact `/codex/responses` search payload; account and workspace restrictions still apply. `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` (ahead of legacy `PI_CODEX_WEB_SEARCH_MODEL`) is an explicit override: it bypasses discovery and is sent once without model fallback.
+
 SearXNG also reads the equivalent `searxng.endpoint`, `searxng.token`, `searxng.basicUsername`, and `searxng.basicPassword` settings from `~/.gjc/agent/config.yml`; environment variables are fallbacks.
 
 ### Anthropic web search auth chain

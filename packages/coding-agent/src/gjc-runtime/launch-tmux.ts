@@ -71,11 +71,13 @@ import {
 } from "./tmux-owner-isolation";
 import { assertGjcTmuxStagedMutationAuthoritySync } from "./tmux-provider-context";
 import {
+	childGjcSessionIdAssignment,
 	findGjcTmuxSessionByName,
 	findGjcTmuxSessionByScope,
 	type GjcTmuxSessionStatus,
 	type ProvenTmuxSessionIdentity,
 	proveGjcTmuxSessionMutationTarget,
+	tmuxLaunchIdentityEnv,
 } from "./tmux-sessions";
 import {
 	buildWindowsPowerShellInnerCommand,
@@ -433,6 +435,8 @@ function stripRootTmuxFlag(rawArgs: string[]): string[] {
 
 export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProfileResult {
 	const env = context.env ?? process.env;
+	const cwd = context.cwd ?? process.cwd();
+	const identityEnv = tmuxLaunchIdentityEnv(env, cwd);
 	const branchSlug = context.branch ? buildGjcTmuxSessionSlug(context.branch) : (context.branchSlug ?? null);
 	// The psmux UX filter (mouse / set-clipboard / mode-style /
 	// set-window-option) now lives in buildGjcTmuxProfileCommands so every
@@ -448,8 +452,8 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 			branch: context.branch ?? null,
 			branchSlug,
 			project: context.project ?? null,
-			sessionId: context.sessionId ?? env[GJC_COORDINATOR_SESSION_ID_ENV] ?? null,
-			sessionStateFile: context.sessionStateFile ?? env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? null,
+			sessionId: context.sessionId ?? identityEnv[GJC_COORDINATOR_SESSION_ID_ENV] ?? null,
+			sessionStateFile: context.sessionStateFile ?? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? null,
 			ownerGeneration: context.ownerGeneration ?? null,
 			ownerServerKey: context.ownerServerKey ?? null,
 			version: context.version ?? null,
@@ -463,7 +467,6 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 		});
 	if (commands.length === 0) return { skipped: true, commands: [], failures: [] };
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
-	const cwd = context.cwd ?? process.cwd();
 	const options: TmuxSpawnOptions = {
 		cwd,
 		env,
@@ -1106,22 +1109,24 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	if (policy === "tmux" && !isInteractiveRootLaunch(context.parsed, tty)) return undefined;
 
 	const cwd = context.cwd ?? process.cwd();
+	const identityEnv = tmuxLaunchIdentityEnv(env, cwd);
 	const branch = context.worktreeBranch ?? context.currentBranch ?? readCurrentBranch(cwd);
 	const project = context.project ?? cwd;
-	const sessionName = buildGjcTmuxSessionName(env, { branch });
+	const sessionName = buildGjcTmuxSessionName(identityEnv, { branch });
 	// Pick the most appropriate tmux binary for this platform. On native Windows
 	// the resolver walks psmux / pmux / tmux and uses the first one present on
 	// PATH, so the default `gjc --tmux` flow lands on a real multiplexer even
 	// without an explicit GJC_TMUX_COMMAND override.
 	const resolvedBinary = resolveGjcTmuxBinary({ platform, env });
 	const tmuxCommand = resolvedBinary.command;
-	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName;
+	const sessionId = identityEnv[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName;
 	// The session ROOT is keyed by the active GJC session (GJC_SESSION_ID), NOT the
 	// coordinator/tmux identity. Fall back to the coordinator id only for standalone
-	// tmux launches with no GJC session context.
-	const gjcSessionId = env.GJC_SESSION_ID?.trim() || sessionId;
+	// tmux launches with no GJC session context. Project dotenv pins are already
+	// removed from identityEnv.
+	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const sessionStateFile =
-		env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
+		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
 		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	// Stage only the one-shot channel descriptor (path + key id). The PKCS#8 key
@@ -1136,13 +1141,13 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxUnavailableDiagnostic(platform));
 		return undefined;
 	}
-	const existingSessionName = allowsExistingTmuxAttach(context.parsed, env)
+	const existingSessionName = allowsExistingTmuxAttach(context.parsed, identityEnv)
 		? "existingBranchSessionName" in context
 			? (context.existingBranchSessionName ?? undefined)
 			: resolvedBinary.isPsmux && platform === "win32"
-				? explicitTmuxSessionName(env)
+				? explicitTmuxSessionName(identityEnv)
 				: findExistingSessionForLaunch({
-						env,
+						env: identityEnv,
 						project,
 						branch,
 					})
@@ -1154,6 +1159,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			execPath: context.execPath ?? process.execPath,
 			extraEnv: {
 				...childSigningEnv,
+				...childGjcSessionIdAssignment(env, identityEnv, cwd, gjcSessionId),
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
 				// Carry the GJC-managed session name into the child so tmux-backed
@@ -1210,6 +1216,9 @@ function trustedReplacementAuthority(
 function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
 	if (plan.ownerGeneration) return;
 	const sessionId = plan.sessionId ?? plan.sessionName;
+	const launchEnv = context.env ?? process.env;
+	const identityEnv = tmuxLaunchIdentityEnv(launchEnv, plan.cwd);
+	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
@@ -1234,6 +1243,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 							[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: plan.coordinatorSidecarBootstrap.keyId,
 						}
 					: {}),
+				...childGjcSessionIdAssignment(launchEnv, identityEnv, plan.cwd, gjcSessionId),
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: plan.sessionStateFile ?? "",
 				// The tmux server inherits the bootstrap secret as child environment;
@@ -1527,7 +1537,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		try {
 			if (plan.attachSessionName) {
 				const stateDir = env[GJC_TMUX_OWNER_STATE_DIR_ENV]?.trim();
-				const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim();
+				const sessionId = tmuxLaunchIdentityEnv(env, plan.cwd)[GJC_COORDINATOR_SESSION_ID_ENV]?.trim();
 				const generation = env[GJC_TMUX_OWNER_GENERATION_ENV]?.trim();
 				if (!stateDir || !sessionId || !generation) throw new Error("gjc_tmux_provider_authority_unavailable");
 				plan.authority = readGjcTmuxProviderAuthoritySync({ stateDir, sessionId, generation });
@@ -1596,7 +1606,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		}
 	};
 	const creationSpawn = plan.authority ? spawnSync : rawSpawnSync;
-	const spawnEnv = { ...env };
+	const spawnEnv = { ...tmuxLaunchIdentityEnv(env, plan.cwd) };
 	delete spawnEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	Object.assign(spawnEnv, signingEnv);
