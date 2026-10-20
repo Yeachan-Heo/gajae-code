@@ -6630,7 +6630,7 @@ describe("resolveGitBase nearest integration base", () => {
 		await commit(dir, "feature.txt", "feature work");
 
 		// dev is the nearest base (1 commit ahead) vs main (2 commits ahead).
-		expect(await resolveGitBase(dir)).toBe("dev");
+		expect(await resolveGitBase(dir)).toBe("refs/heads/dev");
 	});
 
 	it("honors an explicit branch argument", async () => {

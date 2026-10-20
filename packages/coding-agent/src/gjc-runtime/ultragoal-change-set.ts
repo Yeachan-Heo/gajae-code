@@ -210,14 +210,14 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 		// tripping change-scoped gates). Among existing candidates, pick the one
 		// whose merge-base with HEAD is closest to HEAD (fewest commits ahead).
 		const candidates = [
-			"origin/dev",
-			"dev",
-			"origin/develop",
-			"develop",
-			"origin/main",
-			"origin/master",
-			"main",
-			"master",
+			"refs/remotes/origin/dev",
+			"refs/heads/dev",
+			"refs/remotes/origin/develop",
+			"refs/heads/develop",
+			"refs/remotes/origin/main",
+			"refs/remotes/origin/master",
+			"refs/heads/main",
+			"refs/heads/master",
 		];
 		const currentBranch = await spawnText(["git", "symbolic-ref", "--quiet", "HEAD"], { cwd, timeoutMs: 3000 });
 		const currentRef = currentBranch.ok ? currentBranch.stdout.trim() : undefined;
@@ -228,7 +228,7 @@ export async function resolveGitBase(cwd: string, branch?: string): Promise<stri
 				cwd,
 				timeoutMs: 3000,
 			});
-			if (!exists.ok) continue;
+			if (!exists.ok || exists.stdout.trim() !== candidate) continue;
 			// Exclude only the checked-out local ref, not distinct refs at the same
 			// commit or remote-tracking refs with the same branch name. Comparing
 			// the checked-out ref to HEAD hides committed work as a complete empty
