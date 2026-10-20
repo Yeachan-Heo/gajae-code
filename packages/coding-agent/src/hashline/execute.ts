@@ -5,6 +5,7 @@ import { getFileReadCache } from "../edit/file-read-cache";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "../edit/normalize";
 import { readEditFileText, serializeEditFileText } from "../edit/read-file";
 import type { EditToolDetails } from "../edit/renderer";
+import type { FileDiagnosticsResult } from "../lsp";
 import { truncateLine } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
 import { assertEditableFileContent } from "../tools/auto-generated-guard";
@@ -271,15 +272,14 @@ async function executeHashlineSection(
 		sourcePath,
 		bom + restoreLineEndings(result.lines, originalEnding),
 	);
-	const diagnostics = await writethrough(
-		absolutePath,
-		finalContent,
-		signal,
-		Bun.file(absolutePath),
-		batchRequest,
-		dst => (dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined),
-	);
-	invalidateFsScanAfterWrite(absolutePath);
+	let diagnostics: FileDiagnosticsResult | undefined;
+	try {
+		diagnostics = await writethrough(absolutePath, finalContent, signal, Bun.file(absolutePath), batchRequest, dst =>
+			dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined,
+		);
+	} finally {
+		invalidateFsScanAfterWrite(absolutePath);
+	}
 	// The post-edit content is the freshest, most authoritative "model view"
 	// of the file: the model just received it back as the diff/preview. Cache
 	// it so a follow-up edit anchored against this state can still recover
