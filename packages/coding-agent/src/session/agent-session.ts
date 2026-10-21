@@ -6705,6 +6705,16 @@ export class AgentSession {
 		this.#standingResolveHandler = handler ?? undefined;
 	}
 
+	/**
+	 * The session file does not store resolve closures. Once switchSession commits
+	 * a different file, drop the predecessor queue (including a `-requeued` replay)
+	 * and the standing handler so ResolveTool cannot run them in the successor.
+	 */
+	#releasePredecessorResolveDispatch(): void {
+		this.#standingResolveHandler = undefined;
+		this.#toolChoiceQueue.clear();
+	}
+
 	#sdkPlanModeHandler: ((on: boolean) => Promise<PlanModeState | undefined>) | undefined;
 
 	setSdkPlanModeHandler(handler: ((on: boolean) => Promise<PlanModeState | undefined>) | null): void {
@@ -29163,6 +29173,7 @@ export class AgentSession {
 					// branch it from a missing entry, which falls back to the root.
 					this.#checkpointState = undefined;
 					this.#pendingRewindReport = undefined;
+					this.#releasePredecessorResolveDispatch();
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
