@@ -13316,7 +13316,7 @@ export class AgentSession {
 			await this.#awaitPromptPreflight(
 				generation,
 				preflightSignal,
-				Promise.resolve(hindsightState?.maybeRecallOnAgentStart()),
+				Promise.resolve(hindsightState?.maybeRecallOnAgentStart(generation)),
 			);
 			hindsightRecall = hindsightState?.getRecallSnippetForInjection();
 			if (hindsightRecall) {

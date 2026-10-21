@@ -219,6 +219,8 @@ export class HindsightSessionState {
 	/** One auto-retain may run at a time; one later agent_end is coalesced. */
 	#autoRetainInFlight?: Promise<void>;
 	#autoRetainPending = false;
+	/** Generation when the current recall operation was launched; used to fence writes across session transitions. */
+	#recallGeneration?: number;
 	readonly retainQueue: HindsightRetainQueue;
 
 	constructor(options: HindsightSessionStateOptions) {
@@ -246,6 +248,7 @@ export class HindsightSessionState {
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
 		this.lastInjectedRecallSnippetHash = undefined;
+		this.#recallGeneration = undefined;
 	}
 
 	/** Return the current recall payload, resolving subagent aliases to their primary state. */
@@ -397,8 +400,10 @@ export class HindsightSessionState {
 		}
 	}
 
-	async maybeRecallOnAgentStart(): Promise<void> {
+	async maybeRecallOnAgentStart(generation?: number): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
+		// Capture the generation when recall is launched; used to fence against session transitions.
+		this.#recallGeneration = generation;
 		const messages = extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(m => m.role === "user");
 		if (!lastUser) return;
@@ -407,6 +412,11 @@ export class HindsightSessionState {
 		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 		const { context, ok } = await this.recallForContext(truncated);
 		if (!ok) return;
+
+		// Fence: only write state if the session/generation hasn't changed.
+		// A session transition resets #recallGeneration, so stale recalls from a previous session
+		// will not pollute the current session's state.
+		if (generation !== undefined && this.#recallGeneration !== generation) return;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;

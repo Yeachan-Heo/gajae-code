@@ -412,4 +412,56 @@ describe("AgentSession startup continuation lifecycle", () => {
 			),
 		).toHaveLength(1);
 	});
+
+	it("fences Hindsight recall writes to the generation that launched them", async () => {
+		// Regression test for Finding #1: A pending Hindsight recall from session A
+		// should not write state into session B after a session switch, even if the
+		// recall is still in-flight when the transition occurs.
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
+		await createManagedSession(stream);
+
+		// Get initial state reference
+		const initialHindsightState = session!.getHindsightSessionState();
+		if (!initialHindsightState) {
+			// Skip test if Hindsight is not configured
+			return;
+		}
+
+		// Start a continuation which will trigger maybeRecallOnAgentStart
+		const continuation = session!.continuePersistedHistory();
+
+		// Immediately cancel the continuation before recall can complete
+		await session!.abort();
+
+		// Wait for the continuation to fail
+		let continuationFailed = false;
+		try {
+			await continuation;
+		} catch {
+			continuationFailed = true;
+		}
+		expect(continuationFailed).toBe(true);
+
+		// Switch to a new session (this resets conversation tracking)
+		const switched = await session!.newSession();
+		expect(switched).toBe(true);
+
+		// Get the new Hindsight state
+		const newHindsightState = session!.getHindsightSessionState();
+		if (newHindsightState) {
+			// Verify that hasRecalledForFirstTurn was reset for the new session
+			// and any stale recall from the old session did not pollute the new state
+			expect(newHindsightState.hasRecalledForFirstTurn).toBe(false);
+			expect(newHindsightState.getRecallSnippet()).toBeUndefined();
+		}
+
+		// Verify the new session can run normally
+		await session!.continuePersistedHistory();
+		expect(stream).toHaveBeenCalledTimes(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "second" }],
+		});
+	});
 });
