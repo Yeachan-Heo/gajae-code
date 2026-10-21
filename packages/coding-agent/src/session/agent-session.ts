@@ -2961,6 +2961,7 @@ export class AgentSession {
 	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#configurationReloadControllers = new Set<AbortController>();
 	#pendingSelectionFences = 0;
+	#pendingContinuationAbort: AbortSignal | null = null;
 	#selectionAwaitingMutationTransaction: symbol | undefined;
 	#authorizedClosedSelectionTransaction: symbol | undefined;
 	#selectionFenceDeferredContinuations = new Map<number, number>();
@@ -13277,11 +13278,24 @@ export class AgentSession {
 		}
 	}
 
+	/** Record a continuation abort signal before continuePersistedHistory() is called.
+	 * If abort() is called on the signal before continue(), the continuation will fail promptly.
+	 * Mode 4 fix: prevents race where abort is lost before controller is created.
+	 */
+	setPendingContinuationAbort(signal: AbortSignal): void {
+		this.#pendingContinuationAbort = signal;
+	}
+
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
 		this.#assertExternalSessionIngress();
 		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
+
+		// Mode 4 fix: Check if continuation abort was recorded before continue() was called
+		if (this.#pendingContinuationAbort?.aborted) {
+			throw new DOMException("Continuation aborted", "AbortError");
+		}
 
 		if (!canContinuePersistedHistory(this.agent.state.messages)) {
 			throw new Error("Cannot continue from persisted message history");
