@@ -8,7 +8,13 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import { createLazyService } from "@gajae-code/coding-agent/runtime/lazy-service";
+import type { WorkspaceTreeRuntime } from "@gajae-code/coding-agent/runtime/workspace-tree-service";
+import {
+	AgentSession,
+	type AgentSessionConfig,
+	type AgentSessionEvent,
+} from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -164,7 +170,11 @@ describe("AgentSession startup continuation lifecycle", () => {
 		vi.restoreAllMocks();
 	});
 
-	async function createManagedSession(streamFn: AgentOptions["streamFn"], maxAttempts = 1): Promise<void> {
+	async function createManagedSession(
+		streamFn: AgentOptions["streamFn"],
+		maxAttempts = 1,
+		config: Pick<AgentSessionConfig, "workspaceTreeService"> = {},
+	): Promise<void> {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled fallback test models");
@@ -189,6 +199,7 @@ describe("AgentSession startup continuation lifecycle", () => {
 		});
 		settings.setModelRole("default", selector(primary));
 		session = new AgentSession({
+			...config,
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
@@ -269,9 +280,13 @@ describe("AgentSession startup continuation lifecycle", () => {
 		const pending = new AssistantMessageEventStream();
 		await createManagedSession(() => pending);
 		const events: AgentSessionEvent[] = [];
-		session!.subscribe(event => events.push(event));
+		const started = Promise.withResolvers<void>();
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type === "agent_start") started.resolve();
+		});
 		const continuation = session!.continuePersistedHistory();
-		for (let index = 0; index < 20 && session!.agent.activeRunId === undefined; index += 1) await Bun.sleep(1);
+		await started.promise;
 
 		await session!.abort();
 		await continuation;
@@ -280,6 +295,100 @@ describe("AgentSession startup continuation lifecycle", () => {
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
 		expect(session!.isStreaming).toBe(false);
+	});
+
+	it("rejects promptly when aborted before the startup continuation creates a run controller", async () => {
+		const pending = new AssistantMessageEventStream();
+		const stream = vi.fn(() => pending);
+		await createManagedSession(stream);
+		const continueSpy = vi.spyOn(session!.agent, "continue");
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+		const continuation = session!.continuePersistedHistory();
+		const outcome = continuation.then(
+			() => "completed",
+			(error: unknown) => error,
+		);
+		expect(session!.agent.activeRunId).toBeUndefined();
+		const abort = session!.abort();
+		try {
+			const result = await Promise.race([outcome, Bun.sleep(500).then(() => "timed out")]);
+			expect(result).not.toBe("timed out");
+			expect(result).toMatchObject({ name: "PromptPreflightCancelledError", code: "busy" });
+			await abort;
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(stream).not.toHaveBeenCalled();
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(0);
+			expect(session!.isStreaming).toBe(false);
+		} finally {
+			await session!.abort({ timeoutMs: 20 });
+			await outcome;
+			await abort;
+		}
+	});
+
+	it("cancels blocked context preparation before Agent.continue without waiting for the service", async () => {
+		const entered = Promise.withResolvers<void>();
+		const preparation = Promise.withResolvers<WorkspaceTreeRuntime>();
+		const workspaceTreeService = createLazyService<WorkspaceTreeRuntime>({
+			id: "startup-continuation-workspace",
+			initialize: async () => {
+				entered.resolve();
+				return { value: await preparation.promise };
+			},
+		});
+		const stream = vi.fn(() => new AssistantMessageEventStream());
+		await createManagedSession(stream, 1, { workspaceTreeService });
+		const continueSpy = vi.spyOn(session!.agent, "continue");
+		const continuation = session!.continuePersistedHistory();
+		const outcome = continuation.catch((error: unknown) => error);
+		try {
+			await entered.promise;
+			expect(session!.agent.activeRunId).toBeUndefined();
+			const abort = session!.abort();
+			const result = await Promise.race([outcome, Bun.sleep(500).then(() => "timed out")]);
+			expect(result).not.toBe("timed out");
+			expect(result).toMatchObject({ name: "PromptPreflightCancelledError", code: "busy" });
+			await abort;
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(stream).not.toHaveBeenCalled();
+		} finally {
+			const snapshot = {
+				rootPath: tempDir!.path(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			};
+			preparation.resolve({ snapshot, refresh: async () => snapshot });
+			await workspaceTreeService.dispose();
+		}
+	});
+
+	it("cancels a blocked startup barrier without waiting for readiness or poisoning the next continuation", async () => {
+		const mock = createMockModel({ responses: [{ content: ["resumed after abort"] }] });
+		const stream = vi.fn((...args: Parameters<typeof mock.stream>) => mock.stream(...args));
+		await createManagedSession(stream);
+		const ready = Promise.withResolvers<void>();
+		session!.extendStartupTurnBarrier(ready.promise);
+		const continuation = session!.continuePersistedHistory();
+		const outcome = continuation.catch((error: unknown) => error);
+		try {
+			const abort = session!.abort();
+			const result = await Promise.race([outcome, Bun.sleep(500).then(() => "timed out")]);
+			expect(result).not.toBe("timed out");
+			expect(result).toMatchObject({ name: "PromptPreflightCancelledError", code: "busy" });
+			await abort;
+			expect(stream).not.toHaveBeenCalled();
+		} finally {
+			ready.resolve();
+		}
+		await session!.continuePersistedHistory();
+		expect(stream).toHaveBeenCalledTimes(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "resumed after abort" }],
+		});
 	});
 
 	it("does not duplicate terminal delivery after the agent event subscription reconnects", async () => {
