@@ -15,6 +15,7 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { readVisibleSkillActiveState, syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
@@ -22,6 +23,22 @@ import { logger, TempDir } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 const REMINDER_MARKER = "deep-interview workflow is still active";
+
+function helperSubskillActivation(parent: string, phase: string): LoadedSubskillActivation {
+	return {
+		activationArg: "assistant-helpers",
+		plugin: "test-plugin",
+		subskillName: "workflow-helper",
+		parent,
+		bindsTo: parent,
+		phase,
+		scope: "project",
+		extensionId: "test-extension",
+		expectedDigest: "a".repeat(64),
+		filePath: "/test/workflow-helper.md",
+		toolPaths: [],
+	};
+}
 
 beforeAll(async () => {
 	await initTheme(false);
@@ -67,7 +84,7 @@ describe("AgentSession deep-interview continuation", () => {
 		});
 	}
 
-	async function emitSkillPromptStart(skill: string, subskillActivation?: LoadedSubskillActivation): Promise<void> {
+	function startSkillPrompt(skill: string, subskillActivation?: LoadedSubskillActivation): void {
 		session.agent.emitExternalEvent({
 			type: "message_start",
 			message: {
@@ -80,6 +97,10 @@ describe("AgentSession deep-interview continuation", () => {
 				attribution: "agent",
 			},
 		});
+	}
+
+	async function emitSkillPromptStart(skill: string, subskillActivation?: LoadedSubskillActivation): Promise<void> {
+		startSkillPrompt(skill, subskillActivation);
 		await Bun.sleep(50);
 		await session.waitForIdle();
 	}
@@ -319,19 +340,7 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
 
 		await Bun.sleep(5);
-		await emitSkillPromptStart("assistant-helpers", {
-			activationArg: "assistant-helpers",
-			plugin: "test-plugin",
-			subskillName: "research-helper",
-			parent: "autoresearch",
-			bindsTo: "autoresearch",
-			phase: "research",
-			scope: "project",
-			extensionId: "test-extension",
-			expectedDigest: "a".repeat(64),
-			filePath: "/test/research-helper.md",
-			toolPaths: [],
-		});
+		await emitSkillPromptStart("assistant-helpers", helperSubskillActivation("autoresearch", "research"));
 		const activeState = await readVisibleSkillActiveState(tempDir.path(), sessionManager.getSessionId(), {
 			bypassCache: true,
 		});
@@ -342,6 +351,65 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(session.getActiveSkillState()).toBeUndefined();
 		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
 	});
+	it(
+		"does not restore a workflow from a helper read that finishes after durable clear",
+		async () => {
+			await emitSkillPromptStart("deep-interview");
+			await emitAssistantStop(50);
+			expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+
+			const releaseStateRead = Promise.withResolvers<void>();
+			const originalRead = activeStateModule.readVisibleSkillActiveState;
+			let staleStateReadPending = false;
+			vi.spyOn(activeStateModule, "readVisibleSkillActiveState").mockImplementation(async (...args) => {
+				const activeState = await originalRead(...args);
+				if (
+					activeState?.active_skills?.some(entry => entry.skill === "assistant-helpers") &&
+					activeState.active_skills.some(entry => entry.skill === "deep-interview")
+				) {
+					staleStateReadPending = true;
+					await releaseStateRead.promise;
+				}
+				return activeState;
+			});
+
+			try {
+				startSkillPrompt("assistant-helpers", helperSubskillActivation("deep-interview", "interview"));
+				for (let attempt = 0; attempt < 200 && !staleStateReadPending; attempt++) await Bun.sleep(10);
+				expect(staleStateReadPending).toBe(true);
+				await syncSkillActiveState({
+					cwd: tempDir.path(),
+					skill: "deep-interview",
+					active: false,
+					sessionId: sessionManager.getSessionId(),
+				});
+
+				const assistant = { ...createAssistantMessage("Round recorded."), timestamp: 100 };
+				session.agent.emitExternalEvent({ type: "turn_start" });
+				session.agent.emitExternalEvent({ type: "message_end", message: assistant });
+				session.agent.emitExternalEvent({ type: "agent_end", messages: [assistant] });
+				let terminalClearedIdentity = false;
+				for (let attempt = 0; attempt < 200 && !terminalClearedIdentity; attempt++) {
+					terminalClearedIdentity = session.getEffectiveActiveWorkflowSkillState() === undefined;
+					if (!terminalClearedIdentity) await Bun.sleep(10);
+				}
+				expect(terminalClearedIdentity).toBe(true);
+				expect(session.getActiveSkillState()).toBeUndefined();
+				expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+				expect(session.getDeepInterviewAskStage()).toBeUndefined();
+
+				releaseStateRead.resolve();
+				await session.waitForIdle();
+				await Bun.sleep(50);
+				await session.waitForIdle();
+				expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+				expect(session.getDeepInterviewAskStage()).toBeUndefined();
+			} finally {
+				releaseStateRead.resolve();
+			}
+		},
+		{ timeout: 15_000 },
+	);
 	it("restores the same active interview identity after an actual session reopen", async () => {
 		await session.dispose();
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());

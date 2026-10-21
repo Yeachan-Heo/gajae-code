@@ -13909,13 +13909,14 @@ export class AgentSession {
 				});
 				return;
 			}
-			// Fence the async read against session or prompt changes. Never attach a
-			// predecessor session's workflow state or an older turn's identity to the
-			// current prompt.
+			// Fence the async read against session, prompt, and skill-marker changes.
+			// Helper prompt start/end can leave promptGeneration unchanged, so accepting
+			// a read against a replaced marker could resurrect a cleared workflow.
 			if (
 				this.#isDisposed ||
 				this.sessionManager.getSessionId() !== sessionId ||
 				this.#promptGeneration !== promptGeneration ||
+				this.#activeSkillState !== activeSkillState ||
 				(this.#activeSkillState &&
 					(!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === sessionId) &&
 					isCanonicalGjcWorkflowSkill(this.#activeSkillState.skill))
