@@ -3824,7 +3824,16 @@ async function runLoop(
 	initialTransaction?: ManagedAttemptTransaction,
 	initialScope?: AttemptScope,
 ): Promise<void> {
-	const loopSignal = signal ?? new AbortController().signal;
+	// If signal is already aborted, use an aborted controller to preserve pre-abort state.
+	// Without this check, a fresh controller created here loses the pre-abort intent.
+	const loopSignal = signal?.aborted
+		? ((() => {
+				const aborted = new AbortController();
+				aborted.abort();
+				return aborted.signal;
+			})
+			)()
+		: signal ?? new AbortController().signal;
 
 	const telemetry = resolveTelemetry(config.telemetry, config.sessionId);
 	const invokeAgentSpan = startInvokeAgentSpan(telemetry, config.model);
