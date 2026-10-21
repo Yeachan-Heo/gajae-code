@@ -24347,6 +24347,7 @@ export class AgentSession {
 				signal,
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				rowId: failedRowId,
+				modelId: candidate.id,
 			});
 		}
 		const inventory = authStorage.listCredentialInventory(candidate.provider);
@@ -24385,6 +24386,7 @@ export class AgentSession {
 					signal,
 					owner: this.#modelRegistry.getAuthStorageOwner(),
 					rowId: peer.id,
+					modelId: candidate.id,
 				});
 				continue;
 			}
@@ -26777,6 +26779,7 @@ export class AgentSession {
 				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
+				modelId: model.id,
 			});
 			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
 			const trackedCredentialKind = credentialKind ?? beforeKind;

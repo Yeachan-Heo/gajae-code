@@ -3082,7 +3082,7 @@ export class AuthStorage {
 		// A recorded scope may name a model or a model-family tier, so match a tier
 		// against the requested model id the same way limit scoping does.
 		const entryApplies = (entryModel: string): boolean => {
-			if (wanted === undefined) return false;
+			if (wanted === undefined) return true;
 			const scope = entryModel.toLowerCase();
 			if (scope === wanted) return true;
 			return MODEL_FAMILY_TIERS.has(scope) && wanted.includes(scope);
