@@ -2956,6 +2956,88 @@ describe("bash scanner quoting model", () => {
 		expect(decision.blocked).toBe(true);
 	});
 
+	it("allows parenthesized Perl two-argument explicit reads", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const command of [
+			`perl -e 'open(F, "<input.txt"); print <F>;'`,
+			`perl -e "open(F, '<input.txt'); print <F>;"`,
+			`perl -e "open F, '<input.txt'; print <F>;"`,
+			`perl -e "open(F, '<', 'input.txt'); print <F>;"`,
+			`perl -e 'open(F, "<",\n "input.txt"); print <F>;'`,
+			`perl -e 'my %files = (input => "input.txt"); open(F, "<", $files{input}); print <F>;'`,
+			`perl -e 'if (open F, "<", "input.txt") { print <F>; }'`,
+			`perl -e 'open(my $fh, "<input.txt"); print <$fh>;'`,
+			`perl -e 'open(main::F, "<", "input.txt");'`,
+			`perl -e 'open(*F, "<", "input.txt");'`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(false);
+		}
+	});
+
+	it("preserves Perl open classification across seeded quoted delimiters", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const guardContext = await readWorkflowGuardContext(cwd, { sessionId: "session-a" });
+		const random = makeSeededRandom(0x6947);
+		for (const delimiter of [",", ")", "(", ";", "}", "\n"]) {
+			const filename = `input-${seededToken(random, 8)}${delimiter}.txt`;
+			const literal = `"${filename}"`;
+			const space = " ".repeat(1 + Math.floor(random() * 3));
+			for (const parenthesized of [false, true]) {
+				for (const threeArgs of [false, true]) {
+					for (const mode of ["<", ">", ">>", "+<", "<+", "|-"]) {
+						const args = threeArgs ? `F,${space}"${mode}", ${literal}` : `F,${space}"${mode}${filename}"`;
+						const source = parenthesized ? `open(${args}); print 1;` : `open ${args}; print 1;`;
+						const command = `perl -e ${quoteBashAnsiC(source)}`;
+						const decision = await getWorkflowMutationDecision({
+							cwd,
+							sessionId: "session-a",
+							guardContext,
+							tool: tool("bash"),
+							args: { command },
+						});
+						expect(decision.blocked, command).toBe(mode !== "<");
+					}
+				}
+			}
+		}
+	});
+
+	it("denies variable, pipe, and unparsed Perl open operands", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const source of [
+			`open(F, $mode, "input.txt");`,
+			`open(F, "<$file");`,
+			`open(F, "<@files");`,
+			`open(F, "<input.txt|");`,
+			`open(F, "<input.txt";`,
+			`open(F, "<input.txt);`,
+			`open(F, "<" . $file);`,
+			`open(F, "<input.txt",);`,
+			`open(F, q{<input.txt});`,
+			`open F, $mode or die "<";`,
+			`open(F # , "<input.txt")\n, ">src/product.ts"); print F "PWNED";`,
+			`open(q{F, "<input.txt")}, ">src/product.ts");`,
+			`open(F, "<", "input.txt";`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: `perl -e ${quoteBashSingle(source)}` },
+			});
+			expect(decision.blocked, source).toBe(true);
+		}
+	});
+
 	it("classifies Perl open mode operand, not unrelated strings", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");

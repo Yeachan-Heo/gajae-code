@@ -2251,65 +2251,61 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 	if (!/^open\b/.test(rest)) return false;
 	const parenthesized = /^open\s*\(/.exec(rest);
 	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice("open".length);
-	const statementEnd = body.search(/[;\n}]/);
-	const statement = statementEnd < 0 ? body : body.slice(0, statementEnd);
-
-	// Parse arguments properly: count commas to find the MODE position (second argument)
-	// and extract only that argument.
-	let depth = 0;
-	let inString = false;
+	const delimiters: string[] = [];
 	let stringChar = "";
-	let commaCount = 0;
 	let modeStart = -1;
 	let modeEnd = -1;
+	let end = body.length;
+	let closed = !parenthesized;
 
-	for (let i = 0; i < statement.length; i++) {
-		const ch = statement[i];
+	for (let i = 0; i < body.length; i++) {
+		const ch = body[i];
 
-		if (inString) {
-			if (ch === "\\" && i + 1 < statement.length) {
-				i++; // skip escape sequence
+		if (stringChar) {
+			if (ch === "\\" && i + 1 < body.length) {
+				i++;
 				continue;
 			}
-			if (ch === stringChar) {
-				inString = false;
-			}
+			if (ch === stringChar) stringChar = "";
 			continue;
 		}
 
 		if (ch === "'" || ch === '"') {
-			inString = true;
 			stringChar = ch;
 			continue;
 		}
 
-		if (ch === "(") depth++;
-		else if (ch === ")") depth--;
-		else if (ch === "," && depth === 0) {
-			commaCount++;
-			if (commaCount === 1) {
-				// This comma separates first and second arguments
-				modeStart = i + 1;
-			}
-			if (commaCount === 2) {
-				// This comma ends the mode argument
-				modeEnd = i;
+		if (ch === "#" || ch === "`") return false;
+		if (ch === "(" || ch === "[" || ch === "{") delimiters.push(ch);
+		else if (ch === ")" || ch === "]" || ch === "}") {
+			if (delimiters.length === 0) {
+				if (ch !== ")" && (parenthesized || ch !== "}")) return false;
+				end = i;
+				closed = ch === ")" || !parenthesized;
 				break;
 			}
+			if (delimiters.pop() !== ({ ")": "(", "]": "[", "}": "{" } as const)[ch]) return false;
+		} else if (ch === ";" && delimiters.length === 0) {
+			end = i;
+			break;
+		} else if (ch === "," && delimiters.length === 0) {
+			if (modeStart < 0) modeStart = i + 1;
+			else if (modeEnd < 0) modeEnd = i;
+			else return false;
 		}
 	}
 
-	if (modeStart === -1) return false; // Can't find MODE argument
-	if (modeEnd === -1) modeEnd = statement.length;
-
-	const modeArg = statement.slice(modeStart, modeEnd).trim();
-
-	// Extract the mode value if it's a quoted string; if it's a variable, fail closed
-	const quotedMode = /^(['"])(.*?)\1$/.exec(modeArg);
-	if (!quotedMode) return false; // Variable mode, fail closed
-
-	const mode = quotedMode[2].trim();
-	return mode.startsWith("<") && !mode.startsWith("<+");
+	if (!closed || delimiters.length !== 0 || stringChar || modeStart < 0) return false;
+	if (
+		!/^(?:(?:my|our|local)\s+)?[$*]?(?:::)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$/.test(body.slice(0, modeStart - 1).trim())
+	)
+		return false;
+	if (modeEnd >= 0 && !body.slice(modeEnd + 1, end).trim()) return false;
+	const modeArg = body.slice(modeStart, modeEnd < 0 ? end : modeEnd).trim();
+	const quotedMode = /^(?:'([^'\\]*)'|"([^"\\$@]*)")$/.exec(modeArg);
+	if (!quotedMode) return false;
+	const mode = (quotedMode[1] ?? quotedMode[2]).trim();
+	return mode.startsWith("<") && !mode.startsWith("<+") && !mode.includes("|");
 }
 
 function skipJavaScriptTemplate(script: string, index: number): number {
