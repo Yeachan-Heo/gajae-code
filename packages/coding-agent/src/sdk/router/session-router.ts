@@ -24,6 +24,7 @@ import {
 	readSdkBrokerDiscovery,
 	readSdkSessionEndpoint,
 	type SdkSessionEndpoint,
+	type SdkSessionEndpointScope,
 } from "../client/discovery";
 import {
 	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
@@ -1529,20 +1530,25 @@ export class SessionRouter {
 		indexed: IndexedSession,
 	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointIdentity } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
-		const cwd = indexed.locator.cwd;
-		const defaultStateRoot = path.join(cwd, ".gjc", "state");
-		// Locator cwd is already canonical. `stateRoot` remains the host-provided
-		// authority path, so compare filesystem identity here: case-insensitive
-		// Windows aliases match without rewriting I/O paths, while case-sensitive
-		// directories remain distinct.
+		// The endpoint lives in the state root the host published it under, which is
+		// `<workspace>/.gjc/state` (or its `chat` child) of the LAUNCH workspace. A
+		// committed session move relocates the locator cwd but never the endpoint,
+		// so the workspace is derived from `stateRoot`, not `cwd`. `stateRoot` keeps
+		// the host-provided spelling, so compare filesystem identity here:
+		// case-insensitive Windows aliases match without rewriting I/O paths, while
+		// case-sensitive directories remain distinct.
 		const indexedStateRoot = pathIdentityKey(indexed.locator.stateRoot);
-		const scope =
-			indexedStateRoot === pathIdentityKey(defaultStateRoot)
-				? "default"
-				: indexedStateRoot === pathIdentityKey(path.join(defaultStateRoot, "chat"))
-					? "chat"
+		const defaultWorkspace = path.dirname(path.dirname(indexed.locator.stateRoot));
+		const chatWorkspace = path.dirname(defaultWorkspace);
+		const endpointScope: { scope: SdkSessionEndpointScope; cwd: string } | undefined =
+			indexedStateRoot === pathIdentityKey(path.join(defaultWorkspace, ".gjc", "state"))
+				? { scope: "default", cwd: defaultWorkspace }
+				: indexedStateRoot === pathIdentityKey(path.join(chatWorkspace, ".gjc", "state", "chat"))
+					? { scope: "chat", cwd: chatWorkspace }
 					: undefined;
-		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
+		if (!endpointScope) return null;
+		const { scope, cwd } = endpointScope;
+		if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
 		const endpointPath = path.join(endpointDirectory(cwd, scope), `${indexed.sessionId}.json`);
 		const endpointIdentity = await lstatEndpoint(endpointPath);
 		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope);

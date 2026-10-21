@@ -1262,8 +1262,6 @@ interface SessionRuntime {
 	idleSeq: number;
 	/** Stops delayed session-name observation when this runtime loses authority. */
 	stopSessionNameObserver: () => void;
-	/** Deregisters the after-move listener from the session manager. */
-	unregisterAfterMoveListener?: () => void;
 	/** Interactive asks awaiting a remote answer, by action id. */
 	pendingInteractive: Map<string, PendingInteractiveAsk>;
 	/** Deregisters this session's ask answer source. */
@@ -1294,6 +1292,8 @@ interface SessionRuntime {
 	disposeGateEmitterListener: () => void;
 	/** Deregisters this session's job-fold listener (`bash_folded`). */
 	disposeFoldListener: () => void;
+	/** Deregisters the committed-move broker relocation listener. */
+	disposeSessionMoveListener: () => void;
 	/** Aborts and fences side turns while notification delivery is disabled. */
 	disableEphemeralTurns: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
@@ -4875,6 +4875,9 @@ export function createNotificationsExtension(
 		} catch {}
 		try {
 			rt.disposeFoldListener();
+		} catch {}
+		try {
+			rt.disposeSessionMoveListener();
 		} catch {}
 		rt.gatePresentations?.dispose();
 		try {
@@ -8644,6 +8647,7 @@ export function createNotificationsExtension(
 			},
 			disposeGateEmitterListener: () => {},
 			disposeFoldListener: () => {},
+			disposeSessionMoveListener: () => {},
 			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
 				await Promise.allSettled(inFlightGateResolutions);
@@ -9476,9 +9480,7 @@ export function createNotificationsExtension(
 					throwIfLifecycleStopped();
 					const index = await new SessionIndex(agentDir).open();
 					throwIfLifecycleStopped();
-					const currentLocator = {
-						value: await resolveSessionLocator(ctx.cwd, endpointStateRoot),
-					};
+					const locator = await resolveSessionLocator(ctx.cwd, endpointStateRoot);
 					const endpointPath = path.join(endpointStateRoot, "sdk", `${id}.json`);
 					const endpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
 					const endpointIdentity = fs.statSync(endpointPath, { bigint: true });
@@ -9486,7 +9488,7 @@ export function createNotificationsExtension(
 					const hostProcessIncarnation = processIncarnation(process.pid);
 					const direct = await reattestMasterSessionIdentity({
 						index,
-						locator: currentLocator.value,
+						locator,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -9496,6 +9498,35 @@ export function createNotificationsExtension(
 					});
 					throwIfLifecycleStopped();
 					let registration: SessionIndexEvent | undefined;
+					let publicationQueue: Promise<void> = Promise.resolve();
+					const serializePublication = (task: () => Promise<void>): Promise<void> => {
+						const run = publicationQueue.then(task);
+						publicationQueue = run.catch(() => {});
+						return run;
+					};
+					// A committed move republishes this registration under the new locator
+					// (SessionIndex.relocateIfCurrent) before the move returns; release is
+					// serialized with it so teardown always releases the current publication.
+					let movedCwd: string | undefined;
+					const relocate = (cwd: string): Promise<void> =>
+						serializePublication(async () => {
+							const expected = registration;
+							if (!expected) return;
+							try {
+								const relocated = await index.relocateIfCurrent(
+									expected,
+									await resolveSessionLocator(cwd, expected.locator.stateRoot),
+								);
+								if (relocated && registration === expected) registration = relocated;
+							} catch (error) {
+								logger.warn(`sdk broker relocation after session move failed: ${String(error)}`);
+							}
+						});
+					initializedRuntime.disposeSessionMoveListener =
+						ctx.onSessionMove?.(move => {
+							movedCwd = move.newCwd;
+							return relocate(move.newCwd);
+						}) ?? (() => {});
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
@@ -9512,7 +9543,7 @@ export function createNotificationsExtension(
 							registration = await index.append({
 								type: "host_registered",
 								...input,
-								locator: currentLocator.value,
+								locator,
 								pid: process.pid,
 								// A pid alone cannot survive its own reuse, and the marker that
 								// binds it lives in the workspace state root this host can outlive.
@@ -9531,13 +9562,13 @@ export function createNotificationsExtension(
 								!expected ||
 								expected.sessionId !== input.sessionId ||
 								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(currentLocator.value.stateRoot) !== path.resolve(input.stateRoot)
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
 							)
 								return;
 							await index.append({
 								type: "host_heartbeat",
 								sessionId: expected.sessionId,
-								locator: currentLocator.value,
+								locator: expected.locator,
 								endpointGeneration: expected.endpointGeneration,
 								pid: expected.pid,
 								...(expected.processIncarnation === undefined
@@ -9551,33 +9582,25 @@ export function createNotificationsExtension(
 								ts: input.activity.at,
 							});
 						},
-						unregister: async input => {
-							const expected = registration;
-							if (
-								!expected ||
-								expected.sessionId !== input.sessionId ||
-								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
-							)
-								return;
-							await index.unregisterIfCurrent(expected);
-							if (registration === expected) registration = undefined;
-						},
+						unregister: input =>
+							serializePublication(async () => {
+								const expected = registration;
+								if (
+									!expected ||
+									expected.sessionId !== input.sessionId ||
+									expected.endpointGeneration !== input.endpointGeneration ||
+									path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+								)
+									return;
+								await index.unregisterIfCurrent(expected);
+								if (registration === expected) registration = undefined;
+							}),
 					});
 					throwIfLifecycleStopped();
 					initializedRuntime.brokerRegistrationActive = true;
-					// Register a listener to update the broker locator when the session moves.
-					const unregisterAfterMoveListener = ctx.sessionManager.registerAfterMoveListener(async move => {
-						try {
-							const newLocator = await resolveSessionLocator(move.newCwd, endpointStateRoot);
-							currentLocator.value = newLocator;
-						} catch (error) {
-							logger.warn("sdk: failed to resolve locator after move_session", {
-								error: error instanceof Error ? error.message : String(error),
-							});
-						}
-					});
-					initializedRuntime.unregisterAfterMoveListener = unregisterAfterMoveListener;
+					// A move that committed while registration was in flight found nothing to
+					// relocate yet; republish under its cwd now.
+					if (movedCwd !== undefined) await relocate(movedCwd);
 					// Host liveness is derived from alive(pid) and the coalesced heartbeats;
 					// activity transitions are appended by the host through this registration.
 				} catch (brokerError) {
@@ -10120,6 +10143,7 @@ export function createNotificationsExtension(
 			throw new Error(`notifications: predecessor runtime ${id} is not safely send-capable.`);
 		predecessor.inboundFenced = true;
 		predecessor.stopSessionNameObserver();
+		predecessor.disposeSessionMoveListener();
 		// Release broker/host authority while leaving the native server alive for
 		// the one accepted terminal response. stopAndWait is deferred to stopSession.
 		const stopped = await predecessor.host.stop();

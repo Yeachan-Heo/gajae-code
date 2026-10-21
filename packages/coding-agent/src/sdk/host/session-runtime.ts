@@ -7905,10 +7905,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const disposeStream = ctx.onSessionEvent?.(event => {
 			if (STREAMED_TURN_EVENT_TYPES.has(event.type)) streamTurnEvent(event, ctx);
 		});
+		// Bound to broker relocation once registration state exists below; the
+		// subscription lives exactly as long as the other session hooks.
+		let sessionCwd = ctx.cwd;
+		let onCommittedSessionMove = async (_cwd: string): Promise<void> => {};
+		const disposeSessionMove = ctx.onSessionMove?.(move => {
+			sessionCwd = move.newCwd;
+			return onCommittedSessionMove(move.newCwd);
+		});
 		const disposeGate = (): void => {
 			disposeWorkflowGate?.();
 			disposeFold?.();
 			disposeStream?.();
+			disposeSessionMove?.();
 		};
 		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
@@ -7951,8 +7960,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		};
 		const startupImageCapture = captureStartupRuntimeImage();
-		const currentLocator = {
-			value: { cwd: ctx.cwd, worktreeRoot: null as string | null, stateRoot },
+		// The publication this host proved it owns, with the index it was appended to.
+		// Heartbeat, release, and committed-move relocation all speak only for it.
+		let brokerRegistrationEvent: SessionIndexEvent | undefined;
+		let brokerRegistrationIndex: SessionIndex | undefined;
+		let brokerPublicationQueue: Promise<void> = Promise.resolve();
+		const serializeBrokerPublication = (task: () => Promise<void>): Promise<void> => {
+			const run = brokerPublicationQueue.then(task);
+			brokerPublicationQueue = run.catch(() => {});
+			return run;
 		};
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRecoveryStopped || brokerRegistered) return;
@@ -7968,11 +7984,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					if (brokerRecoveryStopped) return;
 					const index = await new SessionIndex(options.agentDir).open();
 					if (brokerRecoveryStopped) return;
-					currentLocator.value = await resolveSessionLocator(ctx.cwd, stateRoot);
+					// The committed cwd, not the launch cwd: recovery after a move must
+					// register where the session is now.
+					const locator = await resolveSessionLocator(sessionCwd, stateRoot);
 					const effectiveIncarnation = processIncarnation(process.pid);
 					const direct = await reattestMasterSessionIdentity({
 						index,
-						locator: currentLocator.value,
+						locator,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -7981,7 +7999,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						processIncarnation: effectiveIncarnation,
 					});
 					if (brokerRecoveryStopped) return;
-					let brokerRegistrationEvent: SessionIndexEvent | undefined;
 					await runtime.registerWithBroker({
 						register: async input => {
 							if (publishedEndpointUrl === undefined)
@@ -8012,7 +8029,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							const published = await index.append({
 								type: "host_registered",
 								...input,
-								locator: currentLocator.value,
+								locator,
 								pid: process.pid,
 								endpointMtimeMs,
 								endpointFileId,
@@ -8020,6 +8037,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								...(masterRole ? { masterRole } : {}),
 							});
 							brokerRegistrationEvent = published;
+							brokerRegistrationIndex = index;
 							if (brokerRecoveryStopped) {
 								// Teardown may have run before append returned its ownership proof.
 								await index.unregisterIfCurrent(published);
@@ -8034,13 +8052,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								!expected ||
 								expected.sessionId !== input.sessionId ||
 								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(currentLocator.value.stateRoot) !== path.resolve(input.stateRoot)
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
 							)
 								return;
 							await index.append({
 								type: "host_heartbeat",
 								sessionId: expected.sessionId,
-								locator: currentLocator.value,
+								locator: expected.locator,
 								endpointGeneration: expected.endpointGeneration,
 								pid: expected.pid,
 								...(expected.processIncarnation === undefined
@@ -8054,19 +8072,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								ts: input.activity.at,
 							});
 						},
-						unregister: async input => {
-							const expected = brokerRegistrationEvent;
-							if (
-								!expected ||
-								expected.sessionId !== input.sessionId ||
-								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
-							)
-								return;
-							// Use the successful publication's proof, never a teardown-time file read.
-							await index.unregisterIfCurrent(expected, input.reason);
-							if (brokerRegistrationEvent === expected) brokerRegistrationEvent = undefined;
-						},
+						unregister: input =>
+							serializeBrokerPublication(async () => {
+								const expected = brokerRegistrationEvent;
+								if (
+									!expected ||
+									expected.sessionId !== input.sessionId ||
+									expected.endpointGeneration !== input.endpointGeneration ||
+									path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+								)
+									return;
+								// Use the successful publication's proof, never a teardown-time file read.
+								await index.unregisterIfCurrent(expected, input.reason);
+								if (brokerRegistrationEvent === expected) brokerRegistrationEvent = undefined;
+							}),
 					});
 					if (brokerRecoveryStopped) return;
 					brokerRegistered = true;
@@ -8082,17 +8101,28 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (brokerRegistrationInFlight === registration) brokerRegistrationInFlight = undefined;
 			}
 		};
-		// Register a listener to update the SDK broker locator when the session moves.
-		const unregisterAfterMoveListener = ctx.sessionManager.registerAfterMoveListener(async move => {
-			try {
-				const newLocator = await resolveSessionLocator(move.newCwd, stateRoot);
-				currentLocator.value = newLocator;
-			} catch (error) {
-				logger.warn("sdk: failed to resolve locator after move_session", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		});
+		// A committed move republishes the owned registration under the new locator
+		// (SessionIndex.relocateIfCurrent) before the move returns. Release and
+		// relocation are serialized so a teardown racing a move always releases
+		// whichever publication is current.
+		onCommittedSessionMove = async (cwd: string): Promise<void> => {
+			// A registration racing the move may have resolved the pre-move locator.
+			await brokerRegistrationInFlight?.catch(() => {});
+			await serializeBrokerPublication(async () => {
+				const expected = brokerRegistrationEvent;
+				const index = brokerRegistrationIndex;
+				if (!expected || !index) return;
+				try {
+					const relocated = await index.relocateIfCurrent(
+						expected,
+						await resolveSessionLocator(cwd, expected.locator.stateRoot),
+					);
+					if (relocated && brokerRegistrationEvent === expected) brokerRegistrationEvent = relocated;
+				} catch (error) {
+					logger.warn("sdk broker relocation after session move failed", { code: brokerDiagnosticCode(error) });
+				}
+			});
+		};
 		let brokerRecoveryTimer: NodeJS.Timeout | undefined;
 		let brokerRecoveryInFlight: Promise<void> | undefined;
 		const runBrokerRecovery = async (): Promise<void> => {
@@ -8163,7 +8193,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const stopBrokerRecovery = (): void => {
 			brokerRecoveryStopped = true;
-			unregisterAfterMoveListener();
 			if (brokerRecoveryTimer === undefined) return;
 			(options.clearIntervalImpl ?? clearInterval)(brokerRecoveryTimer);
 			brokerRecoveryTimer = undefined;

@@ -1950,6 +1950,64 @@ export class SessionIndex {
 		});
 	}
 
+	/**
+	 * Re-publish a still-current host registration under a relocated locator after a
+	 * committed session move (`move_session`, `/move`, `session.cwd.move`).
+	 *
+	 * The successor is a `host_registered` event for the SAME composite identity
+	 * (sessionId, generation, stateRoot, incarnation): only `cwd`/`worktreeRoot`
+	 * change, so admission Rule A keeps the same incarnation authority, nothing is
+	 * superseded, and there is no predecessor identity to release. Because the
+	 * projection reads locators from the latest non-heartbeat event of an identity,
+	 * this event is what moves pwd/repo scope membership; heartbeats never can.
+	 *
+	 * Returns the published successor, the still-current registration when the
+	 * locator is unchanged, or `undefined` when `expected` is no longer the identity's latest
+	 * non-heartbeat event (released, closed, superseded, tombstoned, or already
+	 * relocated by another writer), in which case nothing is appended.
+	 */
+	async relocateIfCurrent(
+		expected: SessionIndexEvent,
+		locator: SessionLocatorV2,
+	): Promise<SessionIndexEvent | undefined> {
+		if (expected.type !== "host_registered") throw new Error("Only a host registration can be relocated.");
+		if (!sessionLocatorV2(locator)) throw new Error("Relocated session locator is invalid.");
+		// The state root is part of the identity tuple; changing it would be a new
+		// identity that must go through registration and predecessor release instead.
+		if (locator.stateRoot !== expected.locator.stateRoot)
+			throw new Error("A session relocation must keep its registered state root.");
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			return await withSessionIndexLock("session relocation", this.#agentDir, async () => {
+				await this.#replayUnderLock();
+				if (this.#corruptSuffix) throw new Error("Cannot relocate a session in a corrupt session index");
+				// Persisted-event comparison only: no OS incarnation probe runs under the
+				// machine-global lock (#4544).
+				const identity = identityKey(expected);
+				const latest = admitEvents(this.#events).admitted.findLast(
+					event => event.type !== "host_heartbeat" && identityKey(event) === identity,
+				);
+				if (latest?.indexSeq !== expected.indexSeq || latest.checksum !== expected.checksum) return undefined;
+				if (locator.cwd === latest.locator.cwd && locator.worktreeRoot === latest.locator.worktreeRoot)
+					return latest;
+				const { version: _version, indexSeq: _indexSeq, checksum: _checksum, ts: _ts, ...registration } = latest;
+				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+					...registration,
+					locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
+					version: SESSION_INDEX_EVENT_VERSION,
+					indexSeq: this.indexSeq + 1,
+					ts: Date.now(),
+				};
+				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await this.#refreshUnderLock();
+				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				return event;
+			});
+		});
+	}
+
 	/** Hold the canonical index lock across an authority-sensitive operation. */
 	async withLocked<T>(callback: () => Promise<T>): Promise<T> {
 		const indexPath = path.resolve(logFor(this.#agentDir));

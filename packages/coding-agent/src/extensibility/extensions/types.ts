@@ -455,6 +455,14 @@ export function createCustomToolSettings(settings: Settings | ExtensionSettings)
 // surface (model registry, system prompt, shutdown, full session manager
 // access). Field overlap is incidental; merging into a base would require
 // hooks to widen their public contract.
+/** A committed session cwd move, as reported to {@link ExtensionContext.onSessionMove}. */
+export interface SessionMoveEvent {
+	previousCwd: string;
+	newCwd: string;
+	previousSessionFile: string | undefined;
+}
+export type SessionMoveListener = (move: SessionMoveEvent) => void | Promise<void>;
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -545,6 +553,11 @@ export interface ExtensionContext {
 	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
 	/** Observe session events synchronously in producer order. Returns an unsubscribe function. */
 	onSessionEvent?(listener: AgentSessionEventListener): () => void;
+	/**
+	 * Observe committed session moves (`move_session`, `/move`, `session.cwd.move`) so a host can
+	 * republish location-bound registrations. Awaited by the move. Returns an unsubscribe function.
+	 */
+	onSessionMove?(listener: SessionMoveListener): () => void;
 	/** Typed skill and mode controls exposed to the SDK host. */
 	invokeSkill?(
 		name: string,
@@ -1738,6 +1751,8 @@ export interface ExtensionContextActions {
 	onJobFold?: (listener: (event: JobFoldEvent) => void) => () => void;
 	/** Ordered, synchronous AgentSession subscription, independent of async extension hooks. */
 	onSessionEvent?: (listener: AgentSessionEventListener) => () => void;
+	/** Committed-move subscription backing {@link ExtensionContext.onSessionMove}. */
+	onSessionMove?: (listener: SessionMoveListener) => () => void;
 	setSdkPermissionProvider?: (
 		provider:
 			| ((
