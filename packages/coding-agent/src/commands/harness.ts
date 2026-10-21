@@ -15,6 +15,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { $credentialEnv } from "@gajae-code/utils/env";
+import { logger } from "@gajae-code/utils";
 import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
@@ -785,16 +786,46 @@ export default class Harness extends Command {
 		const info = await owner.start();
 		writeJson({ ok: true, owner: info });
 		await new Promise<void>(resolve => {
-			const stop = (): void => {
+			const stop = (reason?: string): void => {
 				clearInterval(timer);
-				process.removeListener("SIGTERM", stop);
-				process.removeListener("SIGINT", stop);
+				process.removeListener("SIGTERM", stop as NodeJS.SignalsListener);
+				process.removeListener("SIGINT", stop as NodeJS.SignalsListener);
+				// Persist exit reason next to lease if owner stopped due to error
+				if (reason) {
+					void writeSessionState(root, sessionId, state => {
+						state.blockers = state.blockers || [];
+						if (!state.blockers.includes(`owner-exit:${reason}`)) {
+							state.blockers.push(`owner-exit:${reason}`);
+						}
+					}).catch(() => {
+						// Best effort; if write fails, continue shutdown
+					});
+				}
 				resolve();
 			};
+			let consecutiveFailures = 0;
+			const maxConsecutiveFailures = 3;
 			const timer = setInterval(() => {
-				void resolveOwner(root, sessionId).then(resolved => {
-					if (!resolved.live) stop();
-				});
+				void resolveOwner(root, sessionId)
+					.then(resolved => {
+						if (!resolved.live) {
+							stop("live-lease-lost");
+						} else {
+							consecutiveFailures = 0;
+						}
+					})
+					.catch(error => {
+						consecutiveFailures++;
+						logger.warn("Owner watchdog transient error", {
+							error,
+							attempt: consecutiveFailures,
+							maxAttempts: maxConsecutiveFailures,
+						});
+						if (consecutiveFailures >= maxConsecutiveFailures) {
+							logger.error("Owner watchdog exceeded failure bound", { error });
+							stop("lease-read-failed");
+						}
+					});
 			}, 500);
 			timer.unref?.();
 			process.on("SIGTERM", stop);
@@ -1500,6 +1531,9 @@ export default class Harness extends Command {
 		// No live owner: submission is blocked (never echoed-as-accepted). Surface owner exit
 		// evidence + explicit recovery guidance so the caller is not left with a bare gate.
 		const ownerExit = await buildOwnerExitEvidence(root, state);
+		// Check if owner stopped due to lease read failure (persisted exit reason)
+		const leaseFailureBlocker = state.blockers.find(b => b.startsWith("owner-exit:"));
+		const leaseFailureReason = leaseFailureBlocker?.replace("owner-exit:", "");
 		// An owner that started, reported live, then died before accepting the first prompt is a
 		// startup blocker, not a healthy `owner-not-live` gate — persist it and report it as such.
 		const built = await buildObservation(root, state, false);
@@ -1510,7 +1544,11 @@ export default class Harness extends Command {
 			built.completedTerminalEvent,
 			ownerExit.startupBlocker,
 		);
-		const reason = ownerExit.startupBlocker ? ownerExit.reason : "owner-not-live";
+		const reason = leaseFailureReason
+			? `owner-${leaseFailureReason}`
+			: ownerExit.startupBlocker
+				? ownerExit.reason
+				: "owner-not-live";
 		writeJson(
 			buildResponse(
 				state,
