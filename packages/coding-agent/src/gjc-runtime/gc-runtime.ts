@@ -15,6 +15,7 @@
 
 import type { BigIntStats, Dirent, Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { exactRemoveDirectoryTree, exactUnlink, snapshotDirectoryTree } from "@gajae-code/natives";
 import {
@@ -1125,6 +1126,20 @@ async function collectGcSessionReferences(agentDir: string, env: NodeJS.ProcessE
 		for (const name of await fsp.readdir(localRoots)) ids.add(name);
 	} catch (error) {
 		if (!isEnoent(error)) incomplete("local_root_parent_unreadable");
+	}
+
+	// Legacy managed local roots are migrated lazily when their session is opened.
+	// Keep the session referenced while its old temp root exists so disk GC cannot
+	// retire an unopened session before that migration has a chance to run.
+	const temporaryRoot =
+		process.platform === "win32"
+			? env.TEMP || env.TMP || os.tmpdir()
+			: env.TMPDIR || env.TMP || env.TEMP || os.tmpdir();
+	const legacyLocalRoots = path.join(temporaryRoot, "gjc-local");
+	try {
+		for (const name of await fsp.readdir(legacyLocalRoots)) ids.add(name);
+	} catch (error) {
+		if (!isEnoent(error)) incomplete("legacy_local_root_parent_unreadable");
 	}
 
 	return { ids, complete, notes };

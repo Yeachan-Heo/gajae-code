@@ -57,7 +57,7 @@ async function makeTestRoot(): Promise<TestRoot> {
 		env: {
 			GJC_CODING_AGENT_DIR: agentDir,
 			GJC_HARNESS_ROOT_REGISTRY_DIR: path.join(root, "harness-roots"),
-			TMPDIR: path.join(root, "tmp"),
+			[process.platform === "win32" ? "TEMP" : "TMPDIR"]: path.join(root, "tmp"),
 		},
 	};
 }
@@ -310,6 +310,42 @@ describe("gjc gc --disk --prune (sessions)", () => {
 			expect(reasonById(disk, "sessions").get("hosted-session")).toBe("keep:referenced_by_live_surface");
 			expect(await Bun.file(hosted).exists()).toBe(true);
 			expect(disk.surfaces.sessions.reclaimed).toBe(0);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps an unopened legacy local-root session until its temp root disappears", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const sessionId = "unopened-legacy-session";
+			const stale = await writeSession(fixture, "repo-a", sessionId, { ageDays: 90 });
+			await writeSession(fixture, "repo-a", "recent-session", { ageDays: 1 });
+			const artifacts = await writeArtifacts(
+				fixture,
+				"repo-a",
+				sessionId,
+				{ "1.bash.log": "legacy session artifact" },
+				90,
+			);
+			const temporaryRoot = fixture.env.TMPDIR ?? fixture.env.TEMP ?? fixture.env.TMP ?? os.tmpdir();
+			const legacyRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+			await fsp.mkdir(legacyRoot, { recursive: true });
+			await Bun.write(path.join(legacyRoot, "handoff.json"), "unmigrated local data");
+
+			const beforeMigration = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			expect(reasonById(beforeMigration, "sessions").get(sessionId)).toBe("keep:referenced_by_live_surface");
+			expect(reasonById(beforeMigration, "artifacts").get(`${sessionId}/1.bash.log`)).toBe(
+				"keep:referenced_by_live_surface",
+			);
+			expect(await Bun.file(stale).exists()).toBe(true);
+			expect(await Bun.file(path.join(artifacts, "1.bash.log")).exists()).toBe(true);
+
+			await fsp.rm(legacyRoot, { recursive: true, force: true });
+			const afterSourceGone = requireDisk(await runDisk(fixture, ["--disk", "--json"]));
+			expect(reasonById(afterSourceGone, "sessions").get(sessionId)).toBe("would_reclaim:older_than_max_age(30d)");
+			expect(await Bun.file(stale).exists()).toBe(true);
+			expect(await Bun.file(path.join(artifacts, "1.bash.log")).exists()).toBe(true);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
