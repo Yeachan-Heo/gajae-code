@@ -801,18 +801,47 @@ interface LspWritethroughBatchState {
 }
 
 const unscopedWritethroughBatches = new Map<string, LspWritethroughBatchState>();
-const scopedWritethroughBatches = new WeakMap<LocalProtocolOptions, Map<string, LspWritethroughBatchState>>();
+const sessionScopedWritethroughBatches = new Map<string, Map<string, LspWritethroughBatchState>>();
+const anonymousScopedWritethroughBatches = new WeakMap<LocalProtocolOptions, Map<string, LspWritethroughBatchState>>();
 
-function writethroughBatchesFor(
-	localProtocolOptions: LocalProtocolOptions | undefined,
-): Map<string, LspWritethroughBatchState> {
-	if (!localProtocolOptions) return unscopedWritethroughBatches;
-	let batches = scopedWritethroughBatches.get(localProtocolOptions);
+interface WritethroughBatchScope {
+	batches: Map<string, LspWritethroughBatchState>;
+	releaseIfEmpty(): void;
+}
+
+function writethroughBatchScope(localProtocolOptions: LocalProtocolOptions | undefined): WritethroughBatchScope {
+	if (!localProtocolOptions) {
+		return { batches: unscopedWritethroughBatches, releaseIfEmpty: () => undefined };
+	}
+	const sessionId = localProtocolOptions.getSessionId?.();
+	if (sessionId !== null && sessionId !== undefined) {
+		const agentDir = localProtocolOptions.getAgentDir?.();
+		const identity = JSON.stringify([agentDir === undefined ? null : path.resolve(agentDir), sessionId]);
+		let batches = sessionScopedWritethroughBatches.get(identity);
+		if (!batches) {
+			batches = new Map<string, LspWritethroughBatchState>();
+			sessionScopedWritethroughBatches.set(identity, batches);
+		}
+		return {
+			batches,
+			releaseIfEmpty: () => {
+				if (batches.size === 0 && sessionScopedWritethroughBatches.get(identity) === batches) {
+					sessionScopedWritethroughBatches.delete(identity);
+				}
+			},
+		};
+	}
+	let batches = anonymousScopedWritethroughBatches.get(localProtocolOptions);
 	if (!batches) {
 		batches = new Map<string, LspWritethroughBatchState>();
-		scopedWritethroughBatches.set(localProtocolOptions, batches);
+		anonymousScopedWritethroughBatches.set(localProtocolOptions, batches);
 	}
-	return batches;
+	return {
+		batches,
+		releaseIfEmpty: () => {
+			if (batches.size === 0) anonymousScopedWritethroughBatches.delete(localProtocolOptions);
+		},
+	};
 }
 
 function getOrCreateWritethroughBatch(
@@ -840,12 +869,14 @@ export async function flushLspWritethroughBatch(
 	signal?: AbortSignal,
 	localProtocolOptions?: LocalProtocolOptions,
 ): Promise<FileDiagnosticsResult | undefined> {
-	const batches = writethroughBatchesFor(localProtocolOptions);
-	const state = batches.get(id);
+	const scope = writethroughBatchScope(localProtocolOptions);
+	const state = scope.batches.get(id);
 	if (!state) {
+		scope.releaseIfEmpty();
 		return undefined;
 	}
-	batches.delete(id);
+	scope.batches.delete(id);
+	scope.releaseIfEmpty();
 	return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal);
 }
 
@@ -1121,7 +1152,6 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		enableDiagnostics: options?.enableDiagnostics ?? false,
 		localProtocolOptions: options?.localProtocolOptions,
 	};
-	const batches = writethroughBatchesFor(resolvedOptions.localProtocolOptions);
 	if (!resolvedOptions.enableFormat && !resolvedOptions.enableDiagnostics) {
 		return createNoopWritethrough(resolvedOptions.localProtocolOptions);
 	}
@@ -1146,7 +1176,8 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 			return diagnostics;
 		}
 
-		const state = getOrCreateWritethroughBatch(batches, batch.id, resolvedOptions);
+		const scope = writethroughBatchScope(resolvedOptions.localProtocolOptions);
+		const state = getOrCreateWritethroughBatch(scope.batches, batch.id, resolvedOptions);
 		state.entries.set(dst, { dst, content, file });
 
 		if (!batch.flush) {
@@ -1154,7 +1185,8 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 			return undefined;
 		}
 
-		batches.delete(batch.id);
+		scope.batches.delete(batch.id);
+		scope.releaseIfEmpty();
 		return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal, getDeferred);
 	};
 }

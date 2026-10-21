@@ -245,6 +245,83 @@ console.log(root);
 	}
 });
 
+it("recovers validated migration staging after the legacy temporary root disappears", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `staging-recovery-${crypto.randomUUID()}`;
+		const options = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const localRoot = resolveLocalRoot(options);
+		const scratchParent = path.dirname(localRoot);
+		await fs.mkdir(temporaryRoot, { recursive: true });
+		await fs.mkdir(scratchParent, { recursive: true, mode: 0o700 });
+		await fs.chmod(scratchParent, 0o700);
+		await fs.mkdir(localRoot, { mode: 0o700 });
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const staging = path.join(scratchParent, `.gjc-local-migration-${stagingName}`);
+		await fs.mkdir(staging, { mode: 0o700 });
+		await fs.writeFile(path.join(localRoot, "01-installed"), "already published", { mode: 0o600 });
+		await fs.writeFile(path.join(staging, "01-installed"), "already published", { mode: 0o600 });
+		await fs.mkdir(path.join(staging, "nested"), { mode: 0o700 });
+		await fs.writeFile(path.join(staging, "nested", "02-pending"), "still recoverable", { mode: 0o600 });
+
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await initializeLocalRoot(options);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "01-installed"), "utf8")).toBe("already published");
+		expect(await fs.readFile(path.join(localRoot, "nested", "02-pending"), "utf8")).toBe("still recoverable");
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("verified\n");
+		await expect(fs.lstat(staging)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("leaves conflicting source-absent migration staging untouched", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `staging-conflict-${crypto.randomUUID()}`;
+		const options = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const localRoot = resolveLocalRoot(options);
+		const scratchParent = path.dirname(localRoot);
+		await fs.mkdir(temporaryRoot, { recursive: true });
+		await fs.mkdir(scratchParent, { recursive: true, mode: 0o700 });
+		await fs.chmod(scratchParent, 0o700);
+		await fs.mkdir(localRoot, { mode: 0o700 });
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const staging = path.join(scratchParent, `.gjc-local-migration-${stagingName}`);
+		await fs.mkdir(staging, { mode: 0o700 });
+		await fs.writeFile(path.join(localRoot, "handoff.json"), "current destination", { mode: 0o600 });
+		await fs.writeFile(path.join(staging, "handoff.json"), "recoverable staged data", { mode: 0o600 });
+
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await expect(initializeLocalRoot(options)).rejects.toThrow(
+				"Legacy local:// migration destination is ambiguous",
+			);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "handoff.json"), "utf8")).toBe("current destination");
+		expect(await fs.readFile(path.join(staging, "handoff.json"), "utf8")).toBe("recoverable staged data");
+		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+});
+
 it("migrates opaque managed legacy topology, retires exactly once, and verifies the marker", async () => {
 	const sessionId = `managed-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;

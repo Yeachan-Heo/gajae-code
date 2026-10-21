@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { LocalProtocolHandler } from "@gajae-code/coding-agent/internal-urls";
-import { createLspWritethrough, writethroughNoop } from "@gajae-code/coding-agent/lsp";
+import { createLspWritethrough, flushLspWritethroughBatch, writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import * as lspConfig from "@gajae-code/coding-agent/lsp/config";
 import { getLocalRootsDir, TempDir } from "@gajae-code/utils";
 import type { ServerConfig } from "../../src/lsp/types";
@@ -68,6 +68,38 @@ describe("createLspWritethrough batching", () => {
 		expect(getServersSpy).toHaveBeenCalledTimes(1);
 		expect(loadConfigSpy).toHaveBeenCalledTimes(1);
 		expect(await Bun.file(filePath).text()).toBe("const single = true;\n");
+	});
+
+	it("flushes a batch when local options are recreated for the same session", async () => {
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		const client = {
+			format: async () => "const formatted = true;\n",
+			lint: async () => [],
+		};
+		const server: ServerConfig = {
+			command: "custom-formatter",
+			fileTypes: ["ts"],
+			rootMarkers: [],
+			createClient: () => client,
+		};
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["custom", server]]);
+
+		const getLocalProtocolOptions = () => ({
+			getAgentDir: () => path.join(tempDir.path(), "agent"),
+			getSessionId: () => "stable-session-id",
+			isManagedDestination: () => true,
+		});
+		const writethrough = createLspWritethrough(tempDir.path(), {
+			enableFormat: true,
+			localProtocolOptions: getLocalProtocolOptions(),
+		});
+		const filePath = path.join(tempDir.path(), "same-session.ts");
+		const batchId = `stable-session-batch-${Date.now()}`;
+
+		await writethrough(filePath, "const original = true;\n", undefined, undefined, { id: batchId, flush: false });
+		await flushLspWritethroughBatch(batchId, tempDir.path(), undefined, getLocalProtocolOptions());
+
+		expect(await fs.readFile(filePath, "utf8")).toBe("const formatted = true;\n");
 	});
 
 	it("honors the exported BunFile writethrough target", async () => {
@@ -151,8 +183,8 @@ describe("createLspWritethrough batching", () => {
 		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([]);
 		const firstAgentDir = path.join(tempDir.path(), "profile-a");
 		const secondAgentDir = path.join(tempDir.path(), "profile-b");
-		const firstSessionId = "profile-a-session";
-		const secondSessionId = "profile-b-session";
+		const firstSessionId = "shared-session-id";
+		const secondSessionId = "shared-session-id";
 		const firstRoot = path.join(getLocalRootsDir(firstAgentDir), firstSessionId);
 		const secondRoot = path.join(getLocalRootsDir(secondAgentDir), secondSessionId);
 		await fs.mkdir(firstRoot, { recursive: true, mode: 0o700 });

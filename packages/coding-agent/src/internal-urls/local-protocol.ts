@@ -13,7 +13,7 @@ import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
 type NativeLocalBindings = Pick<
 	typeof import("@gajae-code/natives"),
-	"exactRemoveDirectoryTree" | "snapshotDirectoryTree"
+	"exactRemoveDirectoryTree" | "renameNoReplacePathAsync" | "snapshotDirectoryTree"
 >;
 
 let nativeLocalBindings: NativeLocalBindings | undefined;
@@ -465,6 +465,8 @@ interface MigrationContentEntry {
 	readonly sha256?: string;
 }
 
+type MigrationStagingEntry = NativeDirectoryTreeSnapshot["entries"][number];
+
 function sameMigrationContent(
 	expected: readonly MigrationContentEntry[],
 	actual: readonly MigrationContentEntry[],
@@ -505,6 +507,16 @@ function managedContentForTop(
 			relativePath: relativeToMigrationTop(entry.relativePath, top),
 			kind: entry.kind,
 			...(entry.kind === "file" ? { size: BigInt(entry.bytes?.byteLength ?? 0), sha256: entry.sha256 } : {}),
+		}));
+}
+
+function stagingContentForTop(entries: readonly MigrationContentEntry[], top: string): MigrationContentEntry[] {
+	return entries
+		.filter(entry => entry.relativePath === top || entry.relativePath.startsWith(`${top}/`))
+		.map(entry => ({
+			relativePath: relativeToMigrationTop(entry.relativePath, top),
+			kind: entry.kind,
+			...(entry.kind === "file" ? { size: entry.size, sha256: entry.sha256 } : {}),
 		}));
 }
 
@@ -579,6 +591,106 @@ async function removeEmptyMigrationStaging(localRoot: string, scratchParent: str
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
+}
+
+function validatedMigrationStagingManifest(entries: readonly MigrationStagingEntry[]): MigrationContentEntry[] {
+	const root = entries.find(entry => entry.relativePath === "");
+	if (root?.kind !== "directory") throw new Error("Unsafe local:// migration staging");
+
+	let copiedBytes = 0n;
+	const manifest: MigrationContentEntry[] = [];
+	for (const entry of entries) {
+		const relativePath = entry.relativePath;
+		if (relativePath) {
+			const segments = relativePath.split("/");
+			if (
+				segments.some(
+					segment => segment === "" || segment === "." || segment === ".." || segment === LEGACY_MIGRATION_MARKER,
+				)
+			) {
+				throw new Error("Unsafe local:// migration staging");
+			}
+		}
+		if (entry.kind === "directory") {
+			manifest.push({ relativePath, kind: "directory" });
+			continue;
+		}
+		if (entry.kind !== "file" || !entry.sha256 || !/^[a-f0-9]{64}$/.test(entry.sha256)) {
+			throw new Error("Unsafe local:// migration staging");
+		}
+		const size = BigInt(entry.size);
+		copiedBytes += size;
+		if (size < 0n || copiedBytes > BigInt(MAX_LEGACY_LOCAL_BYTES)) {
+			throw new Error("Legacy local:// migration exceeds the safe size limit");
+		}
+		manifest.push({ relativePath, kind: "file", size, sha256: entry.sha256 });
+	}
+	return manifest;
+}
+
+/** Recover only a no-follow validated staging tree when no legacy source remains. */
+async function recoverMigrationStaging(localRoot: string, scratchParent: string): Promise<boolean> {
+	const staging = migrationStagingPath(localRoot, scratchParent);
+	let stagingStat: fsSync.Stats;
+	try {
+		stagingStat = await fs.lstat(staging);
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+	assertAdoptedManagedRoot(stagingStat);
+	if (!stagingStat.isDirectory() || stagingStat.isSymbolicLink()) {
+		throw new Error("Unsafe local:// migration staging");
+	}
+
+	const captured = nativeLocal().snapshotDirectoryTree(staging);
+	if (
+		!captured.ok ||
+		!captured.snapshot ||
+		captured.snapshot.rootDev !== String(stagingStat.dev) ||
+		captured.snapshot.rootIno !== String(stagingStat.ino)
+	) {
+		throw new Error("Unsafe local:// migration staging");
+	}
+	const manifest = validatedMigrationStagingManifest(captured.snapshot.entries);
+	const topLevelNames = topLevelMigrationNames(manifest.map(entry => entry.relativePath));
+	for (const top of topLevelNames) {
+		const expected = stagingContentForTop(manifest, top);
+		const stagedTop = path.join(staging, top);
+		const destination = path.join(localRoot, top);
+		try {
+			await fs.lstat(destination);
+			if (!(await destinationContentMatches(destination, expected))) {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+			await fs.rm(stagedTop, { recursive: true, force: true });
+			continue;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+
+		const published = await nativeLocal().renameNoReplacePathAsync(stagedTop, destination);
+		if (!published.ok) {
+			let destinationMatches = false;
+			try {
+				destinationMatches = await destinationContentMatches(destination, expected);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			if (destinationMatches) {
+				await fs.rm(stagedTop, { recursive: true, force: true });
+				continue;
+			}
+			if (published.code === "destination_exists" || published.reason === "destination_exists") {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+			throw new Error(`Legacy local:// migration staging recovery failed: ${published.code ?? published.reason}`);
+		}
+		if (!(await destinationContentMatches(destination, expected))) {
+			throw new Error("Legacy local:// migration destination verification failed");
+		}
+	}
+	return topLevelNames.length > 0;
 }
 
 async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEntrySnapshot[]): Promise<void> {
@@ -833,6 +945,7 @@ async function migrateLegacyLocal(
 			if (state === "cleanup_pending") cleanupPending = true;
 		}
 	}
+	if (!foundSource) foundSource = await recoverMigrationStaging(localRoot, scratchParent);
 	await removeEmptyMigrationStaging(localRoot, scratchParent);
 	const value = cleanupPending ? "cleanup_pending\n" : foundSource ? "verified\n" : "absent\n";
 	await fs.writeFile(marker, value, { mode: 0o600, flag: "wx" });
