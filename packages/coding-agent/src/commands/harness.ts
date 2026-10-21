@@ -15,6 +15,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { $credentialEnv } from "@gajae-code/utils/env";
+import { logger } from "@gajae-code/utils";
 import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
@@ -794,6 +795,9 @@ export default class Harness extends Command {
 			const timer = setInterval(() => {
 				void resolveOwner(root, sessionId).then(resolved => {
 					if (!resolved.live) stop();
+				}).catch(error => {
+					logger.error("Owner watchdog error while checking lease", { error });
+					stop();
 				});
 			}, 500);
 			timer.unref?.();
