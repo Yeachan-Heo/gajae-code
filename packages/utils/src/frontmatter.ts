@@ -2,8 +2,29 @@ import { YAML } from "bun";
 import { truncate } from "./format";
 import * as logger from "./logger";
 
+const HTML_COMMENT_OPEN = "<!--";
+const HTML_COMMENT_CLOSE = "-->";
+
+// One forward scan. `/<!--[\s\S]*?-->/g` retries every unterminated opener
+// against the rest of the input, which is quadratic in the opener count.
+// An opener with no later close does not match, so that tail stays unchanged.
 function stripHtmlComments(content: string): string {
-	return content.replace(/<!--[\s\S]*?-->/g, "");
+	const parts: string[] = [];
+	let from = 0;
+	let i = 0;
+	const n = content.length;
+	while (i < n) {
+		const start = content.indexOf(HTML_COMMENT_OPEN, i);
+		if (start < 0) break;
+		const end = content.indexOf(HTML_COMMENT_CLOSE, start + HTML_COMMENT_OPEN.length);
+		if (end < 0) break;
+		if (start > from) parts.push(content.slice(from, start));
+		from = end + HTML_COMMENT_CLOSE.length;
+		i = from;
+	}
+	if (from === 0) return content;
+	if (from < n) parts.push(content.slice(from));
+	return parts.join("");
 }
 
 function stripLooseScalarTrailingCommas(metadata: string): string {

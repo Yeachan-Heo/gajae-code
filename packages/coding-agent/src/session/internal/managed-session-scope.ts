@@ -228,14 +228,22 @@ function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandid
 function assertRetainedManagedDirectoryIdentity(scope: ManagedScope): void {
 	const expected = managedDirectoryIdentities.get(scope);
 	if (!expected) return;
-	const current = fs.lstatSync(scope.directoryPath, { bigint: true });
-	if (
-		!current.isDirectory() ||
-		current.isSymbolicLink() ||
-		current.dev !== expected.dev ||
-		current.ino !== expected.ino
-	)
-		throw new Error("Managed session directory changed");
+	assertSameManagedDirectoryIdentity(fs.lstatSync(scope.directoryPath, { bigint: true }), expected);
+}
+
+/**
+ * Fence a managed directory to the identity it was bound with. The decision is
+ * the same for every mismatch; only the reported reason differs. The same
+ * inode on a different `dev` is the shape a remount, drive-letter change or
+ * volume-serial change leaves behind (#6750). It is still refused, because an
+ * inode is only unique within one volume, but it is named so an operator is
+ * not sent looking for a corrupted binding.
+ */
+function assertSameManagedDirectoryIdentity(current: fs.BigIntStats, expected: { dev: bigint; ino: bigint }): void {
+	if (!current.isDirectory() || current.isSymbolicLink()) throw new Error("Managed session directory changed");
+	if (current.dev === expected.dev && current.ino === expected.ino) return;
+	if (current.ino === expected.ino) throw new Error("volume_identity_changed");
+	throw new Error("Managed session directory changed");
 }
 
 export function managedDirectoryAuthorityForScope(scope: ManagedScope): RecoveryFsRoot | undefined {
@@ -319,7 +327,13 @@ export type ManagedScopeResolution =
  * propagating them keeps startup redaction intact while telling the operator
  * which invariant actually failed instead of a blanket `binding_invalid`.
  */
-const managedScopeIdentityFailureCodes = new Set(["identity_mismatch", "reparse_point", "not_directory", "not_file"]);
+const managedScopeIdentityFailureCodes = new Set([
+	"identity_mismatch",
+	"volume_identity_changed",
+	"reparse_point",
+	"not_directory",
+	"not_file",
+]);
 
 /**
  * Fixed, path-free tokens from the replacement-cleanup receipt preflight that
@@ -1893,13 +1907,7 @@ export function prepareManagedSessionScopeForWriteSync(
 		managedDirectoryAuthorities.set(scope, retainedAuthority);
 		stage = "scope_revalidate";
 		const directoryStat = fs.lstatSync(scope.directoryPath, { bigint: true });
-		if (
-			!directoryStat.isDirectory() ||
-			directoryStat.isSymbolicLink() ||
-			directoryStat.dev !== preparedDirectory.dev ||
-			directoryStat.ino !== preparedDirectory.ino
-		)
-			throw new Error("Managed session directory changed");
+		assertSameManagedDirectoryIdentity(directoryStat, preparedDirectory);
 		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
 		if (validated) {
 			if (validated.kind !== "error") throw new Error("Unexpected managed scope binding result");
