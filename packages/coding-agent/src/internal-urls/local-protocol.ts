@@ -6,6 +6,7 @@ import * as path from "node:path";
 
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { getLocalRootsDir, isEnoent } from "@gajae-code/utils";
+import { withFileLock } from "../config/file-lock";
 import { AgentRegistry } from "../registry/agent-registry";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
@@ -724,7 +725,14 @@ async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEnt
 
 function previousManagedLocalRoot(options: LocalProtocolOptions): string | null {
 	if (options.isManagedDestination?.() === false || !options.getSessionId?.()) return null;
-	return path.join(fsSync.realpathSync(os.tmpdir()), "gjc-local", safeSessionId(options));
+	let temporaryRoot: string;
+	try {
+		temporaryRoot = fsSync.realpathSync(os.tmpdir());
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
+	return path.join(temporaryRoot, "gjc-local", safeSessionId(options));
 }
 
 /** The pre-persistence root is kept as an exact-removal authority until its copy is verified. */
@@ -1093,7 +1101,10 @@ async function initializeManagedLocalRoot(options: LocalProtocolOptions, localRo
 	const recorded = initializedLocalRoots.get(localRoot);
 	acceptManagedRootForInit(localRoot, rootStat, recorded, adoptedExisting);
 	if (!adoptedExisting) pendingCreatedRoots.set(localRoot, managedRootIdentity(rootStat));
-	await migrateLegacyLocal(options, localRoot, scratchParent);
+	await withFileLock(migrationStagingPath(localRoot, scratchParent), async () => {
+		// Another process may have completed the migration while this one waited.
+		await migrateLegacyLocal(options, localRoot, scratchParent);
+	});
 
 	const resolvedScratchParent = await fs.realpath(scratchParent);
 	const resolvedLocalRoot = await fs.realpath(localRoot);

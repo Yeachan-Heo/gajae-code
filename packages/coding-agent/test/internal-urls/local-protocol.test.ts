@@ -114,6 +114,49 @@ it("resolves managed roots from the session's configured agent directory", async
 	});
 });
 
+it("initializes a managed root when the configured temporary directory is missing", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "removed-tmp");
+		const sessionId = `missing-temp-${crypto.randomUUID()}`;
+		await fs.mkdir(temporaryRoot);
+		await fs.rm(temporaryRoot, { recursive: true });
+
+		const script = `
+import { initializeLocalRoot } from "./src/internal-urls/local-protocol.ts";
+
+const options = {
+  getAgentDir: () => process.env.GJC_CODING_AGENT_DIR,
+  getSessionId: () => ${JSON.stringify(sessionId)},
+  isManagedDestination: () => true,
+};
+console.log(await initializeLocalRoot(options));
+`;
+		const proc = Bun.spawn(["bun", "-e", script], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			env: {
+				...process.env,
+				GJC_CODING_AGENT_DIR: agentDir,
+				TMPDIR: temporaryRoot,
+				TMP: temporaryRoot,
+				TEMP: temporaryRoot,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`missing-temp local-root initialization exited ${code}\n${stdout}\n${stderr}`);
+
+		const localRoot = path.join(agentDir, "local", sessionId);
+		expect(stdout.trim()).toBe(localRoot);
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("absent\n");
+	});
+});
+
 it("keeps managed local data when temporary storage is cleaned", async () => {
 	const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-persistent-"));
 	const agentDir = path.join(sandbox, "agent");
@@ -243,6 +286,96 @@ console.log(root);
 	} finally {
 		await fs.rm(sandbox, { recursive: true, force: true });
 	}
+});
+
+it("serializes first managed-root migration across independent processes", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `cross-process-${crypto.randomUUID()}`;
+		const legacyRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const legacyPayload = path.join(legacyRoot, "payloads");
+		const payloadCount = 512;
+		const payload = Buffer.alloc(64 * 1024, "x");
+		await fs.mkdir(legacyPayload, { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(legacyRoot), 0o700);
+		await fs.chmod(legacyRoot, 0o700);
+		for (let index = 0; index < payloadCount; index++) {
+			await fs.writeFile(path.join(legacyPayload, `item-${String(index).padStart(4, "0")}.bin`), payload, {
+				mode: 0o600,
+			});
+		}
+
+		const localRoot = path.join(agentDir, "local", sessionId);
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const stagingPayload = path.join(path.dirname(localRoot), `.gjc-local-migration-${stagingName}`, "payloads");
+		const script = `
+import { initializeLocalRoot } from "./src/internal-urls/local-protocol.ts";
+
+const options = {
+  getAgentDir: () => process.env.GJC_CODING_AGENT_DIR,
+  getSessionId: () => ${JSON.stringify(sessionId)},
+  isManagedDestination: () => true,
+};
+console.log(await initializeLocalRoot(options));
+`;
+		const startMigration = () =>
+			Bun.spawn(["bun", "-e", script], {
+				cwd: path.resolve(import.meta.dir, "../.."),
+				env: {
+					...process.env,
+					GJC_CODING_AGENT_DIR: agentDir,
+					TMPDIR: temporaryRoot,
+					TMP: temporaryRoot,
+					TEMP: temporaryRoot,
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+
+		const first = startMigration();
+		const firstStdout = new Response(first.stdout).text();
+		const firstStderr = new Response(first.stderr).text();
+		const firstExit = first.exited;
+		const copyDeadline = Date.now() + 30_000;
+		let copiedEntries = 0;
+		while (Date.now() < copyDeadline && copiedEntries < 2) {
+			try {
+				copiedEntries = (await fs.readdir(stagingPayload)).length;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (copiedEntries < 2) await Bun.sleep(2);
+		}
+		expect(copiedEntries).toBeGreaterThanOrEqual(2);
+
+		const second = startMigration();
+		const secondStdout = new Response(second.stdout).text();
+		const secondStderr = new Response(second.stderr).text();
+		const secondExit = second.exited;
+		const [firstOutput, firstError, firstCode, secondOutput, secondError, secondCode] = await Promise.all([
+			firstStdout,
+			firstStderr,
+			firstExit,
+			secondStdout,
+			secondStderr,
+			secondExit,
+		]);
+		if (firstCode !== 0)
+			throw new Error(`first local-root migration exited ${firstCode}\n${firstOutput}\n${firstError}`);
+		if (secondCode !== 0)
+			throw new Error(`second local-root migration exited ${secondCode}\n${secondOutput}\n${secondError}`);
+
+		expect(firstOutput.trim()).toBe(localRoot);
+		expect(secondOutput.trim()).toBe(localRoot);
+		expect(await fs.readFile(path.join(localRoot, "payloads", "item-0000.bin"))).toEqual(payload);
+		expect(await fs.readFile(path.join(localRoot, "payloads", "item-0511.bin"))).toEqual(payload);
+		expect(await fs.readdir(path.join(localRoot, "payloads"))).toHaveLength(payloadCount);
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(legacyRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
 });
 
 it("recovers validated migration staging after the legacy temporary root disappears", async () => {
