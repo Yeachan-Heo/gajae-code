@@ -8529,6 +8529,12 @@ export class AgentSession {
 				if (this.#activeSkillState?.skill === skill && this.#activeSkillState.sessionId === sessionId) {
 					this.#activeSkillState = undefined;
 				}
+			} else {
+				// A durable workflow can be completed or cleared during a regular user
+				// turn or automatic continuation, when no skill prompt is active. Refresh
+				// its cached identity at every terminal boundary so stale state does not
+				// keep workflow-scoped behavior enabled indefinitely.
+				await this.#attachAskToolIfWorkflowActive();
 			}
 			const fallbackAssistant = [...event.messages]
 				.reverse()

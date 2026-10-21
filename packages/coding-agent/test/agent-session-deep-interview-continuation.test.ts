@@ -266,13 +266,19 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(2);
 
 		await emitSkillPromptStart("deep-interview");
+		await emitAssistantStop(300);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+
 		await syncSkillActiveState({
 			cwd: tempDir.path(),
 			skill: "deep-interview",
 			active: false,
 			sessionId: sessionManager.getSessionId(),
 		});
-		await emitAssistantStop(300);
+		// This cache is intentionally still stale until the next terminal refresh.
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		await emitAssistantStop(400);
 		expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
 		expect(session.getDeepInterviewAskStage()).toBeUndefined();
 	});
