@@ -1,211 +1,459 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import * as path from "node:path";
+import Harness from "../../src/commands/harness";
+import * as ownerModule from "../../src/harness-control-plane/owner";
+import * as sdkTransport from "../../src/harness-control-plane/sdk-transport";
+import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
 import {
-	readSessionState,
-	writeSessionState,
 	generateSessionId,
-	canonicalWorkspacePath,
+	readSessionState,
+	sessionPaths,
+	writeSessionState,
 } from "../../src/harness-control-plane/storage";
-import type { SessionState } from "../../src/harness-control-plane/types";
+import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 
-/**
- * Mode 1: Harness owner watchdog retry logic and exit reason persistence.
- *
- * Test verifies that:
- * 1. Single transient resolveOwner() error does NOT stop the owner (retry logic)
- * 2. N consecutive errors DO stop the owner
- * 3. When owner stops, exit reason is persisted to state.blockers
- * 4. Caller (submit/finalize) receives typed exit code, not generic "owner-not-live"
- */
+type JsonRecord = Record<string, unknown>;
+type SignalName = "SIGTERM" | "SIGINT";
 
-describe("Mode 1: Watchdog retry logic and exit reason persistence", () => {
-	let testRoot: string;
-	let sessionId: string;
+interface RestorableMock {
+	mockRestore(): void;
+}
 
-	beforeEach(async () => {
-		testRoot = path.join(tmpdir(), `gjc-mode1-retry-${Date.now()}`);
-		sessionId = generateSessionId();
-		await fs.mkdir(testRoot, { recursive: true });
-	});
+interface OwnerCommandRun {
+	promise: Promise<void>;
+	settled: boolean;
+	outputStart: number;
+	listenersBefore: Record<SignalName, readonly unknown[]>;
+}
 
-	afterEach(async () => {
-		try {
-			await fs.rm(testRoot, { recursive: true, force: true });
-		} catch {
-			// Best effort cleanup
-		}
-	});
+interface RunningOwner {
+	command: OwnerCommandRun;
+	initialResponse: JsonRecord;
+	pollCount(): number;
+	injectedFailureCount(): number;
+	consumedFaultCount(): number;
+	restoreResolver(): void;
+}
 
-	it("verifies single transient error does NOT stop watchdog (retry bound)", async () => {
-		// Simulate watchdog behavior with retry logic
-		let callCount = 0;
-		let watchdogStopped = false;
-		const maxConsecutiveFailures = 3;
-		let consecutiveFailures = 0;
+class FakeTransport implements HarnessSessionTransport {
+	#cursor = 0;
 
-		// Mock resolveOwner that fails once, then succeeds
-		async function mockResolveOwnerWithTransientError() {
-			callCount++;
-			if (callCount === 1) {
-				throw new Error("Transient I/O error");
+	async getState(): Promise<SessionStateSnapshot> {
+		return { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
+	}
+
+	async sendPrompt(): Promise<{ commandId: string; ack: boolean }> {
+		this.#cursor += 1;
+		return { commandId: "watchdog-test-command", ack: true };
+	}
+
+	eventCursor(): number {
+		return this.#cursor;
+	}
+
+	async waitForAgentStart(afterCursor: number, _timeoutMs: number): Promise<{ cursor: number } | null> {
+		return { cursor: afterCursor + 1 };
+	}
+
+	async close(): Promise<void> {}
+}
+
+let root = "";
+let workspace = "";
+let sessionId = "";
+let originalStateRoot: string | undefined;
+let originalExitCode: typeof process.exitCode;
+let outputChunks: string[] = [];
+let activeOwnerCommand: OwnerCommandRun | null = null;
+let leaseBeforeCorruption: string | undefined;
+const activeMocks: RestorableMock[] = [];
+
+function trackMock<T extends RestorableMock>(mock: T): T {
+	activeMocks.push(mock);
+	return mock;
+}
+
+function restoreMock(mock: RestorableMock): void {
+	const index = activeMocks.indexOf(mock);
+	if (index === -1) return;
+	activeMocks.splice(index, 1);
+	mock.mockRestore();
+}
+
+function restoreAllMocks(): void {
+	for (const mock of activeMocks.splice(0).reverse()) mock.mockRestore();
+}
+
+function asRecord(value: unknown): JsonRecord {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected_json_object");
+	return value as JsonRecord;
+}
+
+function parseJsonChunk(chunk: string): JsonRecord {
+	return asRecord(JSON.parse(chunk));
+}
+
+function recordProperty(value: JsonRecord, key: string): JsonRecord {
+	return asRecord(value[key]);
+}
+
+async function waitUntil(predicate: () => boolean, description: string, timeoutMs = 12_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error(`timed_out_waiting_for_${description}`);
+		await Bun.sleep(20);
+	}
+}
+
+function gitInit(dir: string): void {
+	const run = (args: string[]): void => {
+		const result = Bun.spawnSync(["git", ...args], { cwd: dir, stdout: "ignore", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+	};
+	run(["init", "--quiet"]);
+	run(["config", "user.email", "test@example.com"]);
+	run(["config", "user.name", "Watchdog regression test"]);
+	run(["commit", "--allow-empty", "-m", "fixture", "--quiet"]);
+}
+
+function seedState(stateRoot: string, id: string, repo: string): SessionState {
+	const now = new Date().toISOString();
+	const paths = sessionPaths(stateRoot, id);
+	const handle: SessionHandle = {
+		sessionId: id,
+		harness: "gajae-code",
+		mode: "implement",
+		repo: null,
+		workspace: repo,
+		branch: "main",
+		base: null,
+		issueOrPr: null,
+		processHandle: { kind: "runtime-owner", ownerId: null, pid: null },
+		sdkHandle: { kind: "sdk-session-endpoint", sessionId: id },
+		ownerHandle: { leasePath: paths.lease, endpoint: null, heartbeatAt: null },
+		routerHandle: { kind: "default-in-owner", policy: "default-fallback", eventsPath: paths.events },
+		viewportHandle: { kind: "event-monitor", tmuxSessionName: null, viewOnly: true },
+		startedAt: now,
+		updatedAt: now,
+	};
+	return {
+		schemaVersion: SESSION_SCHEMA_VERSION,
+		sessionId: id,
+		lifecycle: "started",
+		harness: "gajae-code",
+		handle,
+		retries: {},
+		blockers: [],
+		createdAt: now,
+		updatedAt: now,
+	};
+}
+
+function launchOwnerCommand(args: string[]): OwnerCommandRun {
+	const command: OwnerCommandRun = {
+		promise: Promise.resolve(),
+		settled: false,
+		outputStart: outputChunks.length,
+		listenersBefore: {
+			SIGTERM: process.listeners("SIGTERM"),
+			SIGINT: process.listeners("SIGINT"),
+		},
+	};
+	command.promise = new Harness(args, { bin: "gjc", version: "test", commands: new Map() }).run();
+	void command.promise.then(
+		() => {
+			command.settled = true;
+		},
+		() => {
+			command.settled = true;
+		},
+	);
+	activeOwnerCommand = command;
+	return command;
+}
+
+async function startOwner(failureSequence: readonly boolean[]): Promise<RunningOwner> {
+	const originalResolveOwner = ownerModule.resolveOwner;
+	let armed = false;
+	let polls = 0;
+	let injectedFailures = 0;
+	let consumedFaults = 0;
+	let resolverRestored = false;
+	const resolverSpy = trackMock(
+		vi.spyOn(ownerModule, "resolveOwner").mockImplementation(async (requestedRoot, requestedSessionId) => {
+			if (armed && requestedRoot === root && requestedSessionId === sessionId) {
+				polls += 1;
+				if (consumedFaults < failureSequence.length) {
+					const shouldReject = failureSequence[consumedFaults];
+					consumedFaults += 1;
+					if (shouldReject) {
+						injectedFailures += 1;
+						throw new Error(`watchdog lease read failure ${injectedFailures}`);
+					}
+				}
 			}
-			// After first error, return live owner
-			return { live: true, socketPath: "/tmp/socket", lease: null };
+			return originalResolveOwner(requestedRoot, requestedSessionId);
+		}),
+	);
+	const transportSpy = trackMock(
+		vi.spyOn(sdkTransport, "createSdkSessionTransport").mockImplementation(async () => new FakeTransport()),
+	);
+	const command = launchOwnerCommand(["__owner", "--session", sessionId]);
+	await waitUntil(() => outputChunks.length > command.outputStart, "owner start response");
+	const initialResponse = parseJsonChunk(outputChunks[command.outputStart]);
+	expect(initialResponse.ok).toBe(true);
+	restoreMock(transportSpy);
+	armed = true;
+
+	return {
+		command,
+		initialResponse,
+		pollCount: () => polls,
+		injectedFailureCount: () => injectedFailures,
+		consumedFaultCount: () => consumedFaults,
+		restoreResolver() {
+			if (resolverRestored) return;
+			resolverRestored = true;
+			restoreMock(resolverSpy);
+		},
+	};
+}
+
+async function runHarnessCommand(args: string[]): Promise<JsonRecord> {
+	const firstOutput = outputChunks.length;
+	await new Harness(args, { bin: "gjc", version: "test", commands: new Map() }).run();
+	const writes = outputChunks.slice(firstOutput);
+	expect(writes).toHaveLength(1);
+	const output = writes[0];
+	if (output === undefined) throw new Error("harness_command_did_not_write_json");
+	return parseJsonChunk(output);
+}
+
+function ownsSignalListener(command: OwnerCommandRun, signal: SignalName): boolean {
+	return process.listeners(signal).some(listener => !command.listenersBefore[signal].includes(listener));
+}
+
+function emitOwnerSignal(command: OwnerCommandRun, signal: SignalName): void {
+	if (!ownsSignalListener(command, signal)) throw new Error(`owner_has_no_owned_${signal}_listener`);
+	// Dispatch the Node signal argument to this owner's registered listeners only.
+	// Importing the CLI also registers application-wide exit handlers; invoking
+	// those would terminate the test runner rather than exercise the owner.
+	for (const listener of process.listeners(signal)) {
+		if (!command.listenersBefore[signal].includes(listener)) listener(signal);
+	}
+}
+
+async function stopOwner(owner: RunningOwner, signal: SignalName): Promise<void> {
+	emitOwnerSignal(owner.command, signal);
+	await waitUntil(() => owner.command.settled, `owner ${signal} shutdown`);
+	await owner.command.promise;
+}
+
+function installCallerReadFailure(): RestorableMock {
+	const originalResolveOwner = ownerModule.resolveOwner;
+	return trackMock(
+		vi.spyOn(ownerModule, "resolveOwner").mockImplementation(async (requestedRoot, requestedSessionId) => {
+			if (requestedRoot === root && requestedSessionId === sessionId) {
+				throw new Error("caller-side owner lease read failed");
+			}
+			return originalResolveOwner(requestedRoot, requestedSessionId);
+		}),
+	);
+}
+
+function expectNoOwnerExitBlocker(response: JsonRecord): void {
+	const state = recordProperty(response, "state");
+	const blockers = state.blockers;
+	if (!Array.isArray(blockers)) throw new Error("expected_state_blocker_array");
+	const ownerExitBlockers = blockers.filter(
+		(blocker): blocker is string => typeof blocker === "string" && blocker.startsWith("owner-exit:"),
+	);
+	expect(ownerExitBlockers).toEqual([]);
+}
+
+function expectLeaseReadFailure(response: JsonRecord): void {
+	const evidence = recordProperty(response, "evidence");
+	expect(evidence.reason).toBe("owner-lease-read-failed");
+	expect(recordProperty(evidence, "ownerExit").reason).toBe("owner-lease-read-failed");
+	expectNoOwnerExitBlocker(response);
+}
+
+function expectNoStaleLeaseReadFailure(response: JsonRecord): void {
+	const evidence = recordProperty(response, "evidence");
+	expect(evidence.reason).not.toBe("owner-lease-read-failed");
+	expect(recordProperty(evidence, "ownerExit").reason).not.toBe("owner-lease-read-failed");
+	expectNoOwnerExitBlocker(response);
+}
+
+beforeEach(async () => {
+	originalStateRoot = process.env.GJC_HARNESS_STATE_ROOT;
+	originalExitCode = process.exitCode;
+	process.exitCode = 0;
+	root = await mkdtemp(path.join(tmpdir(), "gjc-owner-watchdog-regression-"));
+	workspace = path.join(root, "workspace");
+	await mkdir(workspace, { recursive: true });
+	gitInit(workspace);
+	sessionId = generateSessionId("watchdog");
+	process.env.GJC_HARNESS_STATE_ROOT = root;
+	await writeSessionState(root, seedState(root, sessionId, workspace));
+	outputChunks = [];
+	activeOwnerCommand = null;
+	leaseBeforeCorruption = undefined;
+	const stdoutSpy = trackMock(vi.spyOn(process.stdout, "write"));
+	stdoutSpy.mockImplementation(((chunk: string | Uint8Array) => {
+		outputChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as typeof process.stdout.write);
+});
+
+afterEach(async () => {
+	try {
+		if (leaseBeforeCorruption !== undefined) {
+			await Bun.write(sessionPaths(root, sessionId).lease, leaseBeforeCorruption);
 		}
-
-		// Simulate watchdog loop
-		await new Promise<void>((resolve) => {
-			let timer: Timer | null = null;
-
-			const stop = () => {
-				if (timer) clearInterval(timer);
-				watchdogStopped = true;
-				resolve();
-			};
-
-			// Simulate multiple watchdog iterations
-			const iterations = [1, 2, 3, 4, 5]; // Simulate 5 checks
-			let iterIndex = 0;
-
-			timer = setInterval(async () => {
-				if (iterIndex >= iterations.length) {
-					stop();
-					return;
-				}
-
-				try {
-					const resolved = await mockResolveOwnerWithTransientError();
-					if (!resolved.live) {
-						stop();
-						return;
-					}
-					// Reset counter on success
-					consecutiveFailures = 0;
-				} catch (error) {
-					consecutiveFailures++;
-					// Don't stop on first error
-					if (consecutiveFailures >= maxConsecutiveFailures) {
-						stop();
-						return;
-					}
-				}
-				iterIndex++;
-			}, 10);
-		});
-
-		// Verify: Single error did not stop the watchdog (it continued)
-		expect(consecutiveFailures).toBeLessThan(maxConsecutiveFailures);
-		expect(callCount).toBeGreaterThan(1); // Recovered from error
-		console.log("✓ POST-FIX: Single transient error did NOT stop watchdog");
-		console.log(`  Calls: ${callCount}, Final consecutive failures: ${consecutiveFailures}`);
-	});
-
-	it("verifies 3 consecutive errors DO stop watchdog", async () => {
-		let callCount = 0;
-		let watchdogStopped = false;
-		let stopReason: string | null = null;
-		const maxConsecutiveFailures = 3;
-		let consecutiveFailures = 0;
-
-		// Mock resolveOwner that always fails
-		async function mockResolveOwnerAlwaysFails() {
-			callCount++;
-			throw new Error("Persistent lease read error");
+		const command = activeOwnerCommand;
+		if (command && !command.settled && ownsSignalListener(command, "SIGTERM")) {
+			emitOwnerSignal(command, "SIGTERM");
+			await waitUntil(() => command.settled, "active owner cleanup");
+			await command.promise;
 		}
+	} finally {
+		restoreAllMocks();
+		if (originalStateRoot === undefined) delete process.env.GJC_HARNESS_STATE_ROOT;
+		else process.env.GJC_HARNESS_STATE_ROOT = originalStateRoot;
+		process.exitCode = originalExitCode ?? 0;
+		if (root) await rm(root, { recursive: true, force: true });
+		activeOwnerCommand = null;
+	}
+});
 
-		// Simulate watchdog loop
-		await new Promise<void>((resolve) => {
-			let timer: Timer | null = null;
+describe("Harness owner watchdog retries and generation-scoped exit evidence", () => {
+	it("keeps the owner running after transient lease-read failures and resets the consecutive-failure count", async () => {
+		const owner = await startOwner([true, true, false, true, true]);
+		await waitUntil(() => owner.consumedFaultCount() === 5, "five watchdog polls");
 
-			const stop = (reason?: string) => {
-				if (timer) clearInterval(timer);
-				watchdogStopped = true;
-				stopReason = reason || null;
-				resolve();
-			};
+		expect(owner.pollCount()).toBe(5);
+		expect(owner.injectedFailureCount()).toBe(4);
+		expect(owner.command.settled).toBe(false);
+		const liveOwner = await ownerModule.resolveOwner(root, sessionId);
+		expect(liveOwner.live).toBe(true);
+		expect(liveOwner.socketPath).toBeTruthy();
 
-			let iterIndex = 0;
-			const maxIters = 10;
+		owner.restoreResolver();
+		await stopOwner(owner, "SIGTERM");
+		const stoppedOwner = await ownerModule.resolveOwner(root, sessionId);
+		expect(stoppedOwner.live).toBe(false);
+	}, 20_000);
 
-			timer = setInterval(async () => {
-				if (iterIndex >= maxIters) {
-					stop();
-					return;
-				}
+	it("stops after three consecutive lease-read failures and reports durable typed evidence to submit and finalize", async () => {
+		const owner = await startOwner([true, true, true]);
+		await waitUntil(() => owner.consumedFaultCount() === 3, "three consecutive watchdog failures");
+		await waitUntil(() => owner.command.settled, "watchdog owner shutdown");
+		expect(owner.injectedFailureCount()).toBe(3);
+		await owner.command.promise;
+		owner.restoreResolver();
 
-				try {
-					await mockResolveOwnerAlwaysFails();
-					consecutiveFailures = 0;
-				} catch (error) {
-					consecutiveFailures++;
-					if (consecutiveFailures >= maxConsecutiveFailures) {
-						stop("lease-read-failed");
-						return;
-					}
-				}
-				iterIndex++;
-			}, 10);
-		});
+		const callerReadFailure = installCallerReadFailure();
+		try {
+			const submit = await runHarnessCommand([
+				"submit",
+				"--session",
+				sessionId,
+				"--input",
+				JSON.stringify({ prompt: "exercise durable owner exit evidence" }),
+			]);
+			expect(submit.ok).toBe(false);
+			expectLeaseReadFailure(submit);
 
-		// Verify: Watchdog stopped after 3 consecutive failures
-		expect(watchdogStopped).toBe(true);
-		expect(consecutiveFailures).toBe(maxConsecutiveFailures);
-		expect(stopReason).toBe("lease-read-failed");
-		console.log("✓ POST-FIX: Watchdog stopped after 3 consecutive failures");
-	});
-
-	it("verifies exit reason is persisted to state.blockers", async () => {
-		// Create initial state
-		const state = {
-			handle: { workspace: canonicalWorkspacePath(path.join(testRoot, "ws")), sessionId },
-			lifecycle: "active",
-			blockers: [],
-			events: [],
-			schema: 1,
-		} as unknown as SessionState;
-
-		// Simulate owner stopping with exit reason
-		const exitReason = "lease-read-failed";
-		const blocker = `owner-exit:${exitReason}`;
-
-		// Persist the blocker
-		state.blockers = state.blockers || [];
-		if (!state.blockers.includes(blocker)) {
-			state.blockers.push(blocker);
+			const finalize = await runHarnessCommand(["finalize", "--session", sessionId, "--input", "{}"]);
+			expect(finalize.ok).toBe(false);
+			expectLeaseReadFailure(finalize);
+		} finally {
+			restoreMock(callerReadFailure);
 		}
+	}, 20_000);
 
-		await writeSessionState(testRoot, sessionId, () => state);
+	it("exits with an actually unreadable lease and exposes the watchdog reason through lifecycle gates", async () => {
+		const owner = await startOwner([]);
+		owner.restoreResolver();
+		leaseBeforeCorruption = await Bun.file(sessionPaths(root, sessionId).lease).text();
+		await Bun.write(sessionPaths(root, sessionId).lease, "{malformed lease");
+		await waitUntil(() => owner.command.settled, "terminal unreadable lease shutdown", 5_000);
+		await owner.command.promise;
+		expect(outputChunks.slice(owner.command.outputStart)).toHaveLength(1);
+		// An unreadable lease cannot safely be deleted: it may belong to a successor.
+		expect(await Bun.file(sessionPaths(root, sessionId).lease).text()).toBe("{malformed lease");
 
-		// Read back and verify
-		const readBack = await readSessionState(testRoot, sessionId);
-		const foundBlocker = readBack.blockers.find((b) => b.startsWith("owner-exit:"));
+		const submit = await runHarnessCommand(["submit", "--session", sessionId, "--input", '{"prompt":"retry"}']);
+		expectLeaseReadFailure(submit);
+		expect(recordProperty(recordProperty(submit, "evidence"), "ownerExit").leaseStatus).toBe("unreadable");
+		const finalize = await runHarnessCommand(["finalize", "--session", sessionId]);
+		expectLeaseReadFailure(finalize);
 
-		expect(foundBlocker).toBe(blocker);
-		console.log("✓ POST-FIX: Exit reason persisted to state.blockers");
-		console.log(`  Blocker: ${foundBlocker}`);
-	});
+		const state = await readSessionState(root, sessionId);
+		if (!state) throw new Error("missing_test_state");
+		state.lifecycle = "finalizing";
+		state.blockers = [];
+		await writeSessionState(root, state);
+		const gated = await runHarnessCommand(["submit", "--session", sessionId, "--input", '{"prompt":"retry"}']);
+		expectLeaseReadFailure(gated);
+		expect(recordProperty(gated, "evidence").lifecycleGate).toBe("lifecycle-not-idle:finalizing");
+		expect(recordProperty(gated, "state").lifecycle).toBe("finalizing");
+	}, 15_000);
 
-	it("verifies caller receives typed exit code, not generic 'owner-not-live'", async () => {
-		// Simulate submit verb's exit reason extraction
-		const state = {
-			blockers: ["owner-exit:lease-read-failed"],
-		} as any;
+	it("does not apply a prior generation's watchdog error to a fresh SIGTERM-stopped owner", async () => {
+		const failedGeneration = await startOwner([true, true, true]);
+		await waitUntil(() => failedGeneration.consumedFaultCount() === 3, "first generation watchdog failures");
+		await waitUntil(() => failedGeneration.command.settled, "first generation shutdown");
+		await failedGeneration.command.promise;
+		failedGeneration.restoreResolver();
 
-		// Extract exit reason (as done in #submit method)
-		const leaseFailureBlocker = state.blockers.find((b: string) =>
-			b.startsWith("owner-exit:"),
-		);
-		const leaseFailureReason = leaseFailureBlocker?.replace("owner-exit:", "");
+		const freshGeneration = await startOwner([]);
+		const failedOwnerInfo = recordProperty(failedGeneration.initialResponse, "owner");
+		const freshOwnerInfo = recordProperty(freshGeneration.initialResponse, "owner");
+		expect(freshOwnerInfo.ownerId).not.toBe(failedOwnerInfo.ownerId);
+		await waitUntil(() => freshGeneration.pollCount() >= 1, "fresh generation watchdog poll");
+		await stopOwner(freshGeneration, "SIGTERM");
+		freshGeneration.restoreResolver();
 
-		// Determine final reason code for response
-		const reason = leaseFailureReason ? `owner-${leaseFailureReason}` : "owner-not-live";
+		const afterSignal = await startOwner([]);
+		afterSignal.restoreResolver();
+		const submitted = await runHarnessCommand([
+			"submit",
+			"--session",
+			sessionId,
+			"--input",
+			JSON.stringify({ prompt: "fresh owner after SIGTERM accepts normally" }),
+		]);
+		expect(submitted.ok).toBe(true);
+		expect(recordProperty(submitted, "evidence").accepted).toBe(true);
+		expectNoOwnerExitBlocker(submitted);
+		await stopOwner(afterSignal, "SIGTERM");
 
-		// Verify: caller gets typed code
-		expect(reason).toBe("owner-lease-read-failed");
-		expect(reason).not.toBe("owner-not-live");
-		console.log("✓ POST-FIX: Caller receives typed exit code");
-		console.log(`  Response reason: "${reason}" (not generic "owner-not-live")`);
-	});
+		const submit = await runHarnessCommand([
+			"submit",
+			"--session",
+			sessionId,
+			"--input",
+			JSON.stringify({ prompt: "confirm the previous generation error is not reused" }),
+		]);
+		expect(submit.ok).toBe(false);
+		expectNoStaleLeaseReadFailure(submit);
+
+		const finalize = await runHarnessCommand(["finalize", "--session", sessionId, "--input", "{}"]);
+		expect(finalize.ok).toBe(false);
+		expectNoStaleLeaseReadFailure(finalize);
+	}, 25_000);
+
+	it("treats SIGINT as a normal owner shutdown", async () => {
+		const owner = await startOwner([]);
+		await waitUntil(() => owner.pollCount() >= 1, "SIGINT owner watchdog poll");
+		owner.restoreResolver();
+		await stopOwner(owner, "SIGINT");
+
+		const stoppedOwner = await ownerModule.resolveOwner(root, sessionId);
+		expect(stoppedOwner.live).toBe(false);
+	}, 15_000);
 });
