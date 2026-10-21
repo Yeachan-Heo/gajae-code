@@ -2211,7 +2211,9 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const parentOwnedToolNames = new Set(["todo_write"]);
 			const filteredSubagentTools = subagentToolNames.filter(name => !parentOwnedToolNames.has(name));
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
-				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
+				await awaitAbortable(
+					session.setActiveToolsByName(filteredSubagentTools, { explicit: false, persistMCPSelection: false }),
+				);
 			}
 
 			if (!options.preflightProbe && !options.preflightDurable) {

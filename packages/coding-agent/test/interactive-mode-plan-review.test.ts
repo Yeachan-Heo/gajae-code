@@ -13,6 +13,7 @@ import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { formatKeyHints } from "../src/config/keybindings";
 import { ModelRegistry } from "../src/config/model-registry";
+import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { planSnapshotHash } from "../src/modes/components/plan-preview-overlay";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { InteractiveMode } from "../src/modes/interactive-mode";
@@ -102,6 +103,148 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(await session.setSdkPlanMode(false)).toBeUndefined();
 		expect(mode.planModeController.enabled).toBe(false);
 		expect(session.getActiveToolNames()).toEqual(["test_read", "test_write"]);
+		expect(session.peekStandingResolveHandler()).toBeUndefined();
+	});
+
+	it("retries plan activation after catalog changes without dropping local mcp-prefixed tools", async () => {
+		mode.stop();
+		await session.dispose();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const readTool = createTestTool("test_read");
+		const writeTool = createTestTool("test_write");
+		const resolveTool = createTestTool("resolve");
+		const localMcpNamedTool = createTestTool("mcp__local_custom");
+		const mcpTool: CustomTool = {
+			name: "mcp__docs_search",
+			label: "docs/search",
+			description: "Search docs",
+			parameters: z.object({}),
+			mcpServerName: "docs",
+			mcpToolName: "search",
+			async execute() {
+				return { content: [{ type: "text", text: "found" }] };
+			},
+		};
+		const planPromptStarted = Promise.withResolvers<void>();
+		const releasePlanPrompt = Promise.withResolvers<void>();
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [readTool, writeTool, localMcpNamedTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "plan.enabled": true }),
+			modelRegistry,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[writeTool.name, writeTool],
+				[resolveTool.name, resolveTool],
+				[localMcpNamedTool.name, localMcpNamedTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["docs"],
+			rebuildSystemPrompt: async toolNames => {
+				if (toolNames.includes(resolveTool.name) && !toolNames.includes(mcpTool.name)) {
+					planPromptStarted.resolve();
+					await releasePlanPrompt.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		mode = new InteractiveMode(session, "test");
+
+		const enteringPlan = mode.planModeController.enter();
+		await planPromptStarted.promise;
+		const refreshingMcp = session.refreshMCPTools([mcpTool]);
+		expect(session.getToolByName(mcpTool.name)).toBeDefined();
+		releasePlanPrompt.resolve();
+		await Promise.all([enteringPlan, refreshingMcp]);
+
+		expect(mode.planModeController.enabled).toBe(true);
+		expect(session.getActiveToolNames()).toContain(resolveTool.name);
+		expect(session.getActiveToolNames()).toContain(localMcpNamedTool.name);
+		expect(session.getActiveMCPToolNames()).toEqual([mcpTool.name]);
+		expect(session.peekStandingResolveHandler()).toBeDefined();
+		await mode.planModeController.exit({ silent: true });
+	});
+
+	it("retries plan exit after a concurrent MCP catalog change", async () => {
+		mode.stop();
+		await session.dispose();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const readTool = createTestTool("test_read");
+		const writeTool = createTestTool("test_write");
+		const resolveTool = createTestTool("resolve");
+		const docsTool: CustomTool = {
+			name: "mcp__docs_search",
+			label: "docs/search",
+			description: "Search docs",
+			parameters: z.object({}),
+			mcpServerName: "docs",
+			mcpToolName: "search",
+			async execute() {
+				return { content: [{ type: "text", text: "found" }] };
+			},
+		};
+		const refreshedDocsTool: CustomTool = { ...docsTool, description: "Search docs with refreshed metadata" };
+		const exitRebuildStarted = Promise.withResolvers<void>();
+		const releaseExitRebuild = Promise.withResolvers<void>();
+		let blockExitRebuild = false;
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [readTool, writeTool],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "plan.enabled": true }),
+			modelRegistry,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[writeTool.name, writeTool],
+				[resolveTool.name, resolveTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["docs"],
+			rebuildSystemPrompt: async toolNames => {
+				if (blockExitRebuild && !toolNames.includes(resolveTool.name) && toolNames.includes(docsTool.name)) {
+					blockExitRebuild = false;
+					exitRebuildStarted.resolve();
+					await releaseExitRebuild.promise;
+				}
+				return { systemPrompt: [`tools:${toolNames.join(",")}`] };
+			},
+		});
+		mode = new InteractiveMode(session, "test");
+
+		await session.refreshMCPTools([docsTool], { persistMCPSelection: false });
+		await mode.planModeController.enter();
+		expect(session.getActiveToolNames()).toContain("resolve");
+		blockExitRebuild = true;
+		const exitingPlan = mode.planModeController.exit({ silent: true });
+		try {
+			await exitRebuildStarted.promise;
+			const refreshingMcp = session.refreshMCPTools([refreshedDocsTool], { persistMCPSelection: false });
+			releaseExitRebuild.resolve();
+			await Promise.all([exitingPlan, refreshingMcp]);
+		} finally {
+			releaseExitRebuild.resolve();
+		}
+
+		expect(mode.planModeController.enabled).toBe(false);
+		expect(session.getActiveToolNames()).toEqual([readTool.name, writeTool.name, docsTool.name]);
+		expect(session.getActiveToolNames()).not.toContain(resolveTool.name);
 		expect(session.peekStandingResolveHandler()).toBeUndefined();
 	});
 
@@ -570,6 +713,207 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(clear).toHaveBeenCalledTimes(1);
 		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
 			synthetic: true,
+		});
+	});
+
+	it("persists transferred MCP tools and late defaults into the fresh execution session", async () => {
+		mode.stop();
+		await session.dispose();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const readTool = createTestTool("test_read");
+		const writeTool = createTestTool("test_write");
+		const resolveTool = createTestTool("resolve");
+		const mcpTool = {
+			name: "mcp__docs_search",
+			label: "docs/search",
+			description: "Search docs",
+			parameters: z.object({}),
+			strict: true,
+			mcpServerName: "docs",
+			mcpToolName: "search",
+			async execute() {
+				return { content: [{ type: "text" as const, text: "found" }] };
+			},
+		} as CustomTool;
+		const lateDefaultTool = {
+			name: "mcp__default_lookup",
+			label: "default/lookup",
+			description: "Look up default data",
+			parameters: z.object({}),
+			strict: true,
+			mcpServerName: "default",
+			mcpToolName: "lookup",
+			async execute() {
+				return { content: [{ type: "text" as const, text: "found default" }] };
+			},
+		} as CustomTool;
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [readTool, writeTool],
+					messages: [],
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "plan.enabled": true }),
+			modelRegistry,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[writeTool.name, writeTool],
+				[resolveTool.name, resolveTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["default"],
+			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [`tools:${toolNames.join(",")}`] }),
+		});
+		mode = new InteractiveMode(session, "test");
+		await session.refreshMCPTools([mcpTool]);
+		await session.setActiveToolsByName([readTool.name, mcpTool.name]);
+		const predecessorSessionFile = session.sessionFile;
+
+		const planFilePath = "local://PLAN.md";
+		const finalPlanFilePath = "local://APPROVED.md";
+		const plan = "# Plan\n\nUse the selected MCP tool.";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, plan);
+		const planHash = planSnapshotHash(plan);
+		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
+			action: "Approve and execute",
+			comments: [],
+			notes: "",
+			snapshotHash: planHash,
+		});
+		const clear = vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => {
+			const switched = await session.newSession();
+			if (!switched) return false;
+			await session.refreshMCPTools([mcpTool, lateDefaultTool]);
+			return true;
+		});
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.planModeController.enter();
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath,
+		});
+
+		expect(clear).toHaveBeenCalledTimes(1);
+		expect(session.getActiveMCPToolNames()).toEqual([mcpTool.name, lateDefaultTool.name]);
+		expect(sessionManager.buildSessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: true,
+			selectedMCPToolNames: [mcpTool.name, lateDefaultTool.name],
+		});
+		await session.sessionManager.ensureOnDisk();
+		await session.sessionManager.flush();
+		const executionSessionFile = session.sessionFile;
+		if (!executionSessionFile) throw new Error("Expected the plan-execution session to be on disk");
+		expect(executionSessionFile).not.toBe(predecessorSessionFile);
+		expect(await fs.readFile(executionSessionFile, "utf8")).toContain('"type":"mcp_tool_selection"');
+		const resumedSessionManager = await SessionManager.open(executionSessionFile, tempDir.path());
+		try {
+			expect(resumedSessionManager.buildSessionContext()).toMatchObject({
+				hasPersistedMCPToolSelection: true,
+				selectedMCPToolNames: [mcpTool.name, lateDefaultTool.name],
+			});
+		} finally {
+			await resumedSessionManager.close();
+		}
+	});
+
+	it("honors an explicitly empty MCP selection in the fresh plan successor", async () => {
+		mode.stop();
+		await session.dispose();
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const readTool = createTestTool("test_read");
+		const writeTool = createTestTool("test_write");
+		const resolveTool = createTestTool("resolve");
+		const mcpTool = {
+			name: "mcp__docs_search",
+			label: "docs/search",
+			description: "Search docs",
+			parameters: z.object({}),
+			strict: true,
+			mcpServerName: "docs",
+			mcpToolName: "search",
+			async execute() {
+				return { content: [{ type: "text" as const, text: "found" }] };
+			},
+		} as CustomTool;
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [readTool, writeTool],
+					messages: [],
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true, "plan.enabled": true }),
+			modelRegistry,
+			toolRegistry: new Map([
+				[readTool.name, readTool],
+				[writeTool.name, writeTool],
+				[resolveTool.name, resolveTool],
+			]),
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [`tools:${toolNames.join(",")}`] }),
+		});
+		mode = new InteractiveMode(session, "test");
+		await session.refreshMCPTools([mcpTool]);
+		await session.setActiveToolsByName([readTool.name, mcpTool.name]);
+
+		const planFilePath = "local://PLAN.md";
+		const finalPlanFilePath = "local://APPROVED.md";
+		const plan = "# Plan\n\nRespect the successor MCP selection.";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, plan);
+		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
+			action: "Approve and execute",
+			comments: [],
+			notes: "",
+			snapshotHash: planSnapshotHash(plan),
+		});
+		const clear = vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => {
+			const switched = await session.newSession();
+			if (!switched) return false;
+			await session.setActiveToolsByName([readTool.name], { persistMCPSelection: false });
+			return true;
+		});
+		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.planModeController.enter();
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath,
+		});
+
+		expect(clear).toHaveBeenCalledTimes(1);
+		expect(session.hasMCPToolSelectionAuthority()).toBe(true);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+		expect(session.getActiveMCPToolNames()).toEqual([]);
+		expect(session.getActiveToolNames()).toEqual([readTool.name]);
+		expect(sessionManager.buildSessionContext()).toMatchObject({
+			hasPersistedMCPToolSelection: false,
+			selectedMCPToolNames: [],
 		});
 	});
 

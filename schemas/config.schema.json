@@ -3014,6 +3014,10 @@
 					"items": true,
 					"default": []
 				},
+				"discoveryDeferAutoload": {
+					"type": "boolean",
+					"default": false
+				},
 				"notifications": {
 					"type": "boolean",
 					"default": false

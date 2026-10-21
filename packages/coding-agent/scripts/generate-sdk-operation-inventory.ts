@@ -199,6 +199,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:onJobFold": "internal fold-event plumbing feeding the bash_folded event frame, not a control seam",
 
 	"agent_session:getSelectedMCPToolNames": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getActiveMCPToolNames":
+		"internal MCP bridge subset used by mode controllers to preserve live selections across tool swaps; not a user-facing SDK control seam",
+	"agent_session:hasMCPToolSelectionAuthority":
+		"internal MCP-selection authority predicate used by catalog and mode-transition reconciliation; not a user-facing SDK control seam",
+	"agent_session:hasCommittedMCPToolSelectionAuthority":
+		"internal committed MCP-selection authority predicate used by catalog reconciliation; not a user-facing SDK control seam",
 	"agent_session:isToolDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getDiscoverableToolSearchIndex": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSelectedDiscoveredToolNames": "internal accessor/plumbing, not a user-facing control seam",
