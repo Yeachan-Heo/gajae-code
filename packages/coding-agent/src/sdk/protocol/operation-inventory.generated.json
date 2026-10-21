@@ -2715,6 +2715,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:refreshEffectiveActiveWorkflowSkillState",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal durable workflow identity refresh before session safety checks, not an independent public SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:replaceOwnedMcpManager",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
