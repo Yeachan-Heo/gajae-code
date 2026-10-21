@@ -3,7 +3,7 @@ import * as z from "zod/v4";
 import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
-import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
+import { detectOpenAICompat, resolveOpenAICompat } from "../src/providers/openai-completions-compat";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
 import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
 
@@ -1973,5 +1973,185 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 			.map(b => (b as { text: string }).text)
 			.join("");
 		expect(text).toBe("keep <\uff5cas-is\uff5c> please");
+	});
+});
+
+// #1207
+describe("DeepSeek V4 keeps reasoning with tools", () => {
+	const echoTool: Tool = {
+		name: "echo",
+		description: "Echo input",
+		parameters: z.object({ text: z.string() }),
+	};
+
+	const contextWithTools: Context = {
+		messages: [{ role: "user", content: "call echo", timestamp: Date.now() }],
+		tools: [echoTool],
+	};
+
+	async function capturePayload(model: Model<"openai-completions">): Promise<Record<string, unknown>> {
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		streamOpenAICompletions(model, contextWithTools, {
+			apiKey: "test-key",
+			signal: createAbortedSignal(),
+			reasoning: "minimal",
+			toolChoice: "auto",
+			maxTokens: 123,
+			onPayload: payload => resolve(payload),
+		});
+		return (await promise) as Record<string, unknown>;
+	}
+
+	function customDeepseekFlash(): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			id: "deepseek-v4-flash",
+			name: "DeepSeek V4 Flash",
+			provider: "ds",
+			baseUrl: "https://api.deepseek.com/v1",
+			reasoning: true,
+			compat: {
+				supportsReasoningEffort: true,
+				reasoningEffortMap: { xhigh: "max" },
+			},
+		};
+	}
+
+	it("detects the documented direct DeepSeek V4 compat shape", () => {
+		const model = getBundledModel("deepseek", "deepseek-v4-flash") as Model<"openai-completions">;
+		const compat = detectOpenAICompat(model);
+
+		expect(compat.supportsToolChoice).toBe(false);
+		expect(compat.maxTokensField).toBe("max_tokens");
+		expect(compat.extraBody).toEqual({ thinking: { type: "enabled" } });
+		expect(compat.reasoningEffortMap).toMatchObject({
+			minimal: "high",
+			low: "high",
+			medium: "high",
+			high: "high",
+			xhigh: "max",
+		});
+	});
+
+	it("merges partial user reasoning maps with DeepSeek defaults", () => {
+		const compat = resolveOpenAICompat(customDeepseekFlash());
+
+		expect(compat.supportsToolChoice).toBe(false);
+		expect(compat.reasoningEffortMap).toMatchObject({
+			minimal: "high",
+			low: "high",
+			medium: "high",
+			xhigh: "max",
+		});
+	});
+
+	it("omits tool_choice but preserves documented reasoning when tools are present", async () => {
+		const body = await capturePayload(customDeepseekFlash());
+
+		expect(body.tools).toBeDefined();
+		expect(body.tool_choice).toBeUndefined();
+		expect(body.reasoning_effort).toBe("high");
+		expect(body.thinking).toEqual({ type: "enabled" });
+		expect(body.max_tokens).toBe(123);
+		expect(body.max_completion_tokens).toBeUndefined();
+	});
+
+	it("preserves OpenRouter reasoning when tool_choice auto is present", async () => {
+		const model = getBundledModel("openrouter", "deepseek/deepseek-v4-flash") as Model<"openai-completions">;
+		const compat = detectOpenAICompat(model);
+		const body = await capturePayload(model);
+
+		expect(compat.disableReasoningOnToolChoice).toBe(false);
+		expect(body.tools).toBeDefined();
+		expect(body.tool_choice).toBe("auto");
+		expect(body.reasoning).toEqual({ effort: "high" });
+		expect(body.reasoning_effort).toBeUndefined();
+	});
+});
+
+// #959
+describe("direct DeepSeek chat-template token stripping", () => {
+	const model: Model<"openai-completions"> = {
+		...getBundledModel("deepseek", "deepseek-v4-flash"),
+	};
+
+	it("strips leaked deepseek chat-template markers from visible text for deepseek providers", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "去改前端交互描述：" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "<｜Assistant｜>\n\n" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "让我找到对应位置并修改。" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-1",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(block => block.type === "text")
+			.map(block => (block as { text: string }).text)
+			.join("");
+
+		expect(text).toBe("去改前端交互描述：让我找到对应位置并修改。");
+		expect(text).not.toContain("<｜Assistant｜>");
+	});
+
+	it("holds partial deepseek markers across chunks before stripping them", async () => {
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-deepseek-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "去改前端交互描述：<｜Ass" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "istant｜>\n\n让我找到对应位置并修改。" } }],
+			},
+			{
+				id: "chatcmpl-deepseek-2",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const text = result.content
+			.filter(block => block.type === "text")
+			.map(block => (block as { text: string }).text)
+			.join("");
+
+		expect(text).toBe("去改前端交互描述：让我找到对应位置并修改。");
+		expect(text).not.toContain("<｜Assistant｜>");
 	});
 });

@@ -8620,11 +8620,15 @@ export class AgentSession {
 				if (this.#activeSkillState?.skill === skill && this.#activeSkillState.sessionId === sessionId) {
 					this.#activeSkillState = undefined;
 				}
-			} else {
-				// A durable workflow can be completed or cleared during a regular user
-				// turn or automatic continuation, when no skill prompt is active. Refresh
-				// its cached identity at every terminal boundary so stale state does not
-				// keep workflow-scoped behavior enabled indefinitely.
+			} else if (
+				!this.#isDisposed &&
+				!this.#sessionAdmissionClosing &&
+				this.getEffectiveActiveWorkflowSkillState()
+			) {
+				// A known durable workflow can be completed or cleared during a regular
+				// turn. Refresh only that cached identity: a speculative state-file read
+				// for sessions with no active workflow would delay terminal handling,
+				// including cancellation and the auto-compaction abort boundary.
 				await this.refreshEffectiveActiveWorkflowSkillState();
 			}
 			const fallbackAssistant = [...event.messages]
