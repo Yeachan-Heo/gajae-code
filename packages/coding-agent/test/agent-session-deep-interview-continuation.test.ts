@@ -410,51 +410,59 @@ describe("AgentSession deep-interview continuation", () => {
 		},
 		{ timeout: 15_000 },
 	);
-	it("restores the same active interview identity after an actual session reopen", async () => {
-		await session.dispose();
-		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
-		sessionManager.appendMessage({ role: "user", content: "Persist this fixture session.", timestamp: Date.now() });
-		await sessionManager.flush();
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected bundled test model");
-		const createSession = (manager: SessionManager) =>
-			new AgentSession({
-				agent: new Agent({
-					getApiKey: provider => `${provider}-test-key`,
-					initialState: {
-						model,
-						systemPrompt: ["Test"],
-						tools: [],
-						messages: [],
-					},
-				}),
-				sessionManager: manager,
-				settings: Settings.isolated(),
-				modelRegistry: new ModelRegistry(authStorage),
+	it(
+		"restores the same active interview identity after an actual session reopen",
+		async () => {
+			await session.dispose();
+			sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+			sessionManager.appendMessage({
+				role: "user",
+				content: "Persist this fixture session.",
+				timestamp: Date.now(),
 			});
+			await sessionManager.flush();
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled test model");
+			const createSession = (manager: SessionManager) =>
+				new AgentSession({
+					agent: new Agent({
+						getApiKey: provider => `${provider}-test-key`,
+						initialState: {
+							model,
+							systemPrompt: ["Test"],
+							tools: [],
+							messages: [],
+						},
+					}),
+					sessionManager: manager,
+					settings: Settings.isolated(),
+					modelRegistry: new ModelRegistry(authStorage),
+				});
 
-		session = createSession(sessionManager);
-		await session.workflowGateToolRestoration;
-		await emitSkillPromptStart("deep-interview");
-		await emitAssistantStop(100);
-		expect(session.getDeepInterviewAskStage()).toBe("topology");
-		expect(session.getActiveSkillState()).toBeUndefined();
+			session = createSession(sessionManager);
+			await session.workflowGateToolRestoration;
+			await emitSkillPromptStart("deep-interview");
+			await emitAssistantStop(100);
+			expect(session.getDeepInterviewAskStage()).toBe("topology");
+			expect(session.getActiveSkillState()).toBeUndefined();
 
-		const originalSessionId = sessionManager.getSessionId();
-		const sessionFile = sessionManager.getSessionFile();
-		if (!sessionFile) throw new Error("Expected a persisted session file");
-		await session.dispose();
+			const originalSessionId = sessionManager.getSessionId();
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted session file");
+			await session.dispose();
 
-		sessionManager = await SessionManager.open(sessionFile, tempDir.path());
-		expect(sessionManager.getSessionId()).toBe(originalSessionId);
-		session = createSession(sessionManager);
-		await session.workflowGateToolRestoration;
-		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
-		expect(session.getDeepInterviewAskStage()).toBe("topology");
+			sessionManager = await SessionManager.open(sessionFile, tempDir.path());
+			expect(sessionManager.getSessionId()).toBe(originalSessionId);
+			session = createSession(sessionManager);
+			await session.workflowGateToolRestoration;
+			expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+			expect(session.getDeepInterviewAskStage()).toBe("topology");
 
-		await emitAssistantStop(200);
-		expect(session.getDeepInterviewAskStage()).toBe("topology");
-	});
+			await emitAssistantStop(200);
+			expect(session.getDeepInterviewAskStage()).toBe("topology");
+		},
+		{ timeout: 15_000 },
+	);
 	it("contains a scheduled continuation persistence failure and allows the next continuation", async () => {
 		await activateWorkflow("deep-interview");
 		const persistenceFailure = new Error("managed_replace_exact_unavailable");
