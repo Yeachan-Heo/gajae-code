@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getLocalRootsDir } from "@gajae-code/utils";
+import { getAgentDir, getLocalRootsDir } from "@gajae-code/utils";
 import type { PlanModeState } from "../../src/plan-mode/state";
 import type { ToolSession } from "../../src/tools";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../src/tools/plan-mode-guard";
@@ -20,6 +20,7 @@ function makeSession(overrides: SessionOverrides): ToolSession {
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		settings: {
+			getAgentDir,
 			getPlansDirectory: () => "/plans",
 		},
 		getArtifactsDir: () => overrides.artifactsDir ?? null,
