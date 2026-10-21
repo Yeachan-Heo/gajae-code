@@ -1,3 +1,3 @@
 ### Fixes
 
-- Preserve the active Deep Interview ask contract across assistant continuations and same-session input, while clearing the identity when its durable workflow ends (#7049).
+- Preserve canonical workflow identity across assistant continuations and helper prompts, including the Deep Interview ask contract, while clearing the identity when its durable workflow ends (#7049).

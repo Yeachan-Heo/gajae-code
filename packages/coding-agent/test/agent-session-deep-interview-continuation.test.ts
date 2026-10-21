@@ -5,6 +5,7 @@ import type { AssistantMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { LoadedSubskillActivation } from "@gajae-code/coding-agent/extensibility/gjc-plugins/types";
 import { createDeepInterviewIntentManifest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import * as skillState from "@gajae-code/coding-agent/hooks/skill-state";
@@ -14,7 +15,7 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
+import { readVisibleSkillActiveState, syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
 import { logger, TempDir } from "@gajae-code/utils";
@@ -66,7 +67,7 @@ describe("AgentSession deep-interview continuation", () => {
 		});
 	}
 
-	async function emitSkillPromptStart(skill: string): Promise<void> {
+	async function emitSkillPromptStart(skill: string, subskillActivation?: LoadedSubskillActivation): Promise<void> {
 		session.agent.emitExternalEvent({
 			type: "message_start",
 			message: {
@@ -75,7 +76,7 @@ describe("AgentSession deep-interview continuation", () => {
 				content: `Run the ${skill} workflow.`,
 				display: false,
 				timestamp: Date.now(),
-				details: { name: skill },
+				details: { name: skill, ...(subskillActivation ? { subskillActivation } : {}) },
 				attribution: "agent",
 			},
 		});
@@ -311,6 +312,35 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(session.getActiveSkillState()).toBeUndefined();
 		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
 		expect(session.getDeepInterviewAskStage()).toBe("topology");
+	});
+	it("skips a more-recent helper subskill row when restoring autoresearch identity", async () => {
+		await emitSkillPromptStart("autoresearch");
+		await emitAssistantStop(50);
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
+
+		await Bun.sleep(5);
+		await emitSkillPromptStart("assistant-helpers", {
+			activationArg: "assistant-helpers",
+			plugin: "test-plugin",
+			subskillName: "research-helper",
+			parent: "autoresearch",
+			bindsTo: "autoresearch",
+			phase: "research",
+			scope: "project",
+			extensionId: "test-extension",
+			expectedDigest: "a".repeat(64),
+			filePath: "/test/research-helper.md",
+			toolPaths: [],
+		});
+		const activeState = await readVisibleSkillActiveState(tempDir.path(), sessionManager.getSessionId(), {
+			bypassCache: true,
+		});
+		expect(activeState?.active_skills?.map(entry => entry.skill)).toEqual(["assistant-helpers", "autoresearch"]);
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
+
+		await emitAssistantStop(100);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
 	});
 	it("restores the same active interview identity after an actual session reopen", async () => {
 		await session.dispose();

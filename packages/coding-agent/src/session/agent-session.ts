@@ -13897,7 +13897,10 @@ export class AgentSession {
 			try {
 				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
 				const durableSkill = activeState?.active_skills?.find(
-					entry => entry.active !== false && entry.session_id === sessionId,
+					entry =>
+						entry.active !== false &&
+						entry.session_id === sessionId &&
+						isCanonicalGjcWorkflowSkill(entry.skill),
 				)?.skill;
 				activeSkill = durableSkill && isCanonicalGjcWorkflowSkill(durableSkill) ? durableSkill : undefined;
 			} catch (error) {
