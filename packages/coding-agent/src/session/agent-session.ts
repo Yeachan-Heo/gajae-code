@@ -13570,13 +13570,22 @@ export class AgentSession {
 		if (!canContinuePersistedHistory(this.agent.state.messages)) {
 			throw new Error("Cannot continue from persisted message history");
 		}
-		await this.#awaitStartupTurnBarrier();
+		// Agent.continue creates its controller synchronously at loop entry. Until
+		// then, abort() must cancel this preparation through the session's existing
+		// preflight signal rather than being lost against an idle agent.
+		const generation = this.#promptGeneration;
+		const preflightSignal = this.#promptPreflightAbortController.signal;
+		await this.#awaitPromptPreflight(generation, preflightSignal, this.#awaitStartupTurnBarrier(preflightSignal));
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		let continuationSdkRunToken: string | undefined;
 		try {
-			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
+			const volatileProjectContextMessage = await this.#awaitPromptPreflight(
+				generation,
+				preflightSignal,
+				this.#buildVolatileProjectContextMessage(),
+			);
 			if (!this.#isLatestRetainedEphemeralCopy(volatileProjectContextMessage)) {
 				this.agent.appendMessage(volatileProjectContextMessage);
 			}
@@ -13588,7 +13597,11 @@ export class AgentSession {
 				this.agent.appendMessage(untrustedMcpServerInstructionsMessage);
 			}
 			const hindsightState = this.getHindsightSessionState();
-			await hindsightState?.maybeRecallOnAgentStart();
+			await this.#awaitPromptPreflight(
+				generation,
+				preflightSignal,
+				Promise.resolve(hindsightState?.maybeRecallOnAgentStart(generation)),
+			);
 			hindsightRecall = hindsightState?.getRecallSnippetForInjection();
 			if (hindsightRecall) {
 				const messages = this.agent.state.messages;
@@ -13614,6 +13627,7 @@ export class AgentSession {
 			// volatile-context/hindsight awaits above and this would otherwise start a
 			// turn against the session being handed off.
 			this.#assertExternalSessionIngress();
+			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: (handle: AttemptRunHandle) => {
