@@ -4096,7 +4096,7 @@ export class AgentSession {
 
 	#skillsSettings: SkillsSettings | undefined;
 	#activeSkillState: { skill: string; sessionId?: string } | undefined;
-	#restoredWorkflowSkillState: { skill: string; sessionId: string } | undefined;
+	#durableWorkflowSkillState: { skill: string; sessionId: string } | undefined;
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
@@ -6491,8 +6491,8 @@ export class AgentSession {
 		};
 	}
 	/**
-	 * Live prompt marker or restored durable workflow — the effective state the
-	 * cwd-local mutation guard must honor after resume.
+	 * Live prompt marker or durable workflow identity — the effective state the
+	 * cwd-local mutation guard must honor during and after a workflow prompt.
 	 */
 	getEffectiveActiveWorkflowSkillState(): { skill: string; sessionId: string } | undefined {
 		const currentSessionId = this.sessionManager.getSessionId();
@@ -6505,10 +6505,10 @@ export class AgentSession {
 			return { skill: inMemory.skill, sessionId: inMemory.sessionId ?? currentSessionId };
 		}
 		if (
-			this.#restoredWorkflowSkillState?.sessionId === currentSessionId &&
-			isCanonicalGjcWorkflowSkill(this.#restoredWorkflowSkillState.skill)
+			this.#durableWorkflowSkillState?.sessionId === currentSessionId &&
+			isCanonicalGjcWorkflowSkill(this.#durableWorkflowSkillState.skill)
 		) {
-			return this.#restoredWorkflowSkillState;
+			return this.#durableWorkflowSkillState;
 		}
 		return undefined;
 	}
@@ -13871,8 +13871,8 @@ export class AgentSession {
 	}
 
 	async #attachAskToolIfWorkflowActive(): Promise<void> {
-		if (this.#explicitEmptyToolSelection) return;
 		const sessionId = this.sessionManager.getSessionId();
+		const promptGeneration = this.#promptGeneration;
 		const inMemoryActiveSkill =
 			this.#activeSkillState && (!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === sessionId)
 				? this.#activeSkillState.skill
@@ -13885,21 +13885,27 @@ export class AgentSession {
 					entry => entry.active !== false && entry.session_id === sessionId,
 				)?.skill;
 			} catch (error) {
-				logger.warn("Failed to read durable workflow skill state while restoring ask tool", {
+				logger.warn("Failed to read durable workflow skill state while restoring identity and ask tool", {
 					error: error instanceof Error ? error.message : String(error),
 				});
 				return;
 			}
-			// Identity fence: the durable read is async — the session may have been
-			// disposed or switched to a different identity meanwhile. Never attach
-			// a predecessor session's workflow state to the current identity.
-			if (this.#isDisposed || this.sessionManager.getSessionId() !== sessionId) return;
+			// Fence the async read against session or prompt changes. Never attach a
+			// predecessor session's workflow state or an older turn's identity to the
+			// current prompt.
+			if (
+				this.#isDisposed ||
+				this.sessionManager.getSessionId() !== sessionId ||
+				this.#promptGeneration !== promptGeneration ||
+				this.#activeSkillState
+			)
+				return;
 		}
 		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
-			if (!inMemoryActiveSkill) this.#restoredWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
+			if (!inMemoryActiveSkill) this.#durableWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
 			this.#attachAskTool();
-		} else if (this.#restoredWorkflowSkillState?.sessionId === sessionId) {
-			this.#restoredWorkflowSkillState = undefined;
+		} else if (this.#durableWorkflowSkillState?.sessionId === sessionId) {
+			this.#durableWorkflowSkillState = undefined;
 		}
 	}
 
@@ -14659,10 +14665,15 @@ export class AgentSession {
 			}
 		}
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
-		this.#restoredWorkflowSkillState = undefined;
+		this.#durableWorkflowSkillState = undefined;
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 		if (active) {
 			await this.refreshGjcSubskillTools();
+		} else {
+			// Prompt activity ends with this turn, but the durable workflow remains
+			// effective until its own state transitions. Restore from the session's
+			// active-workflow row so automatic continuations retain the contract.
+			await this.#attachAskToolIfWorkflowActive();
 		}
 	}
 
