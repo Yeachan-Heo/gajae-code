@@ -2973,6 +2973,11 @@ describe("bash scanner quoting model", () => {
 			`perl -e 'CORE::open(F, "<input.txt"); print <F>;'`,
 			`perl -e 'CORE::open F, "<", "input.txt"; print <F>;'`,
 			`perl -e 'print "use Project::Helper"; open(F, "<input.txt");'`,
+			`perl -e 'my $use = 1; open(F, "<", "input.txt"); print 1;'`,
+			`perl -e 'my $no = 1; open(F, "<input.txt"); print 1;'`,
+			`printf '%s' PERL5OPT=-MConfig; perl -e 'open(F, "<input.txt");'`,
+			`env printf '%s' PERL5OPT=-MConfig; perl -e 'open(F, "<input.txt");'`,
+			`cat <<'DATA'\nPERL5OPT=-MConfig\nDATA\nperl -e 'open(F, "<input.txt");'`,
 			String.raw`perl -e 'print "\$literal"; open(F, "<input.txt");'`,
 			String.raw`perl -e 'print "mail\@example"; open(F, "<input.txt");'`,
 			String.raw`perl -e 'print "\\\$literal"; open(F, "<input.txt");'`,
@@ -3035,6 +3040,21 @@ describe("bash scanner quoting model", () => {
 			String.raw`PERL5LIB=lib perl -e 'print "\\@{[do { use Project::Helper qw(open); 1 }]}"; open(F, "<src/product.ts");'`,
 			`PERL5LIB=lib perl -M Project::Helper=open -e 'open(F, "<src/product.ts");'`,
 			`PERL5LIB=lib perl -mProject::Helper -e 'open(F, "<src/product.ts");'`,
+			`PERL5OPT=-MPlanted PERL5LIB=lib perl -e 'open(F, "<src/product.ts");'`,
+			`env PERL5OPT=-MPlanted PERL5LIB=lib perl -e 'open(F, "<src/product.ts");'`,
+			`export PERL5OPT=-MPlanted; perl -e 'open(F, "<src/product.ts");'`,
+			`export 'PERL5OPT=-MPlanted'; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`</dev/null PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`< /dev/null PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`2>&1 PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`2>& 1 PERL5OPT=-MPlanted; export PERL5OPT; perl -e 'my $use = 1; open(F, "<src/product.ts");'`,
+			`export "PERL5DB=Planted"; perl -e 'my $no = 1; open(F, "<src/product.ts");'`,
+			`declare -x 'PERL5OPT=-MPlanted'; perl -e 'open(F, "<src/product.ts");'`,
+			`readonly 'PERL5OPT=-MPlanted'; export PERL5OPT; perl -e 'open(F, "<src/product.ts");'`,
+			`PERL5OPT=-MPlanted bash -c ${quoteBashSingle(`perl -e 'open(F, "<src/product.ts");'`)}`,
+			`PERL5DB=Planted perl -d -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -d:Planted -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -wd:Planted -e 'open(F, "<src/product.ts");'`,
 			`perl -e 'no Project::Helper; open(F, "<src/product.ts");'`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
@@ -3045,6 +3065,45 @@ describe("bash scanner quoting model", () => {
 			});
 			expect(decision.blocked, command).toBe(true);
 			expect(decision.reason, command).toBe("unknown-target");
+		}
+	});
+
+	it("carries tool startup environment into nested Perl reads without blocking unrelated commands", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		const perl = `perl -e 'my $use = 1; open(F, "<input.txt");'`;
+		for (const command of [perl, `bash -c ${quoteBashSingle(perl)}`, `echo "$(${perl})"`, `printf safe`]) {
+			for (const variable of ["PERL5OPT", "PERL5DB"]) {
+				const decision = await getWorkflowMutationDecision({
+					cwd,
+					sessionId: "session-a",
+					tool: tool("bash"),
+					args: { command, env: { [variable]: "-MPlanted" } },
+				});
+				expect(decision.blocked, command).toBe(command !== "printf safe");
+			}
+		}
+	});
+
+	it("denies inherited Perl startup code without changing the test process environment", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const variable of ["PERL5OPT", "PERL5DB"]) {
+			const result = Bun.spawnSync(
+				[
+					process.execPath,
+					"--eval",
+					`import { getWorkflowMutationDecision } from "@gajae-code/coding-agent/skill-state/workflow-mutation-guard";
+const decision = await getWorkflowMutationDecision({
+  cwd: ${JSON.stringify(cwd)}, sessionId: "session-a", tool: { name: "bash" },
+  args: { command: 'perl -e \\'open(F, "<input.txt");\\'' }
+});
+process.stdout.write(JSON.stringify(decision));`,
+				],
+				{ env: { ...process.env, PERL5OPT: "", PERL5DB: "", [variable]: "-MPlanted" } },
+			);
+			expect(result.exitCode, result.stderr.toString()).toBe(0);
+			expect(JSON.parse(result.stdout.toString())).toMatchObject({ blocked: true, reason: "unknown-target" });
 		}
 	});
 
