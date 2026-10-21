@@ -554,6 +554,30 @@ async function destinationContentMatches(
 	return sameMigrationContent(expected, observed);
 }
 
+async function publishMigrationEntryNoReplace(
+	stagedEntry: string,
+	destination: string,
+	expected: readonly MigrationContentEntry[],
+): Promise<void> {
+	const published = await nativeLocal().renameNoReplacePathAsync(stagedEntry, destination);
+	if (!published.ok) {
+		if (published.code !== "destination_exists" && published.reason !== "destination_exists") {
+			throw new Error(`Legacy local:// migration publication failed: ${published.code ?? published.reason}`);
+		}
+		let destinationMatches = false;
+		try {
+			destinationMatches = await destinationContentMatches(destination, expected);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		if (destinationMatches) return;
+		throw new Error("Legacy local:// migration destination is ambiguous");
+	}
+	if (!(await destinationContentMatches(destination, expected))) {
+		throw new Error("Legacy local:// migration destination verification failed");
+	}
+}
+
 function topLevelMigrationNames(relativePaths: readonly string[]): string[] {
 	return [
 		...new Set(
@@ -891,10 +915,11 @@ async function migrateManagedLegacyLocal(
 			} catch (error) {
 				if (!isEnoent(error)) throw error;
 			}
-			await fs.rename(path.join(staging, entry), destination);
-			if (!(await destinationContentMatches(destination, managedContentForTop(captured.entries, entry)))) {
-				throw new Error("Legacy local:// migration destination verification failed");
-			}
+			await publishMigrationEntryNoReplace(
+				path.join(staging, entry),
+				destination,
+				managedContentForTop(captured.entries, entry),
+			);
 		}
 		try {
 			source.retire(captured.snapshot);
@@ -990,10 +1015,11 @@ async function migrateArtifactsLegacyLocal(
 			} catch (error) {
 				if (!isEnoent(error)) throw error;
 			}
-			await fs.rename(path.join(staging, entry), path.join(localRoot, entry));
-			if (!(await destinationContentMatches(path.join(localRoot, entry), legacyContentForTop(manifest, entry)))) {
-				throw new Error("Legacy local:// migration destination verification failed");
-			}
+			await publishMigrationEntryNoReplace(
+				path.join(staging, entry),
+				path.join(localRoot, entry),
+				legacyContentForTop(manifest, entry),
+			);
 		}
 		try {
 			await retireLegacyTree(legacySource.root, manifest);

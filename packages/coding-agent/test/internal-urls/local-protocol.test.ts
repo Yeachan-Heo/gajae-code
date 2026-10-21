@@ -573,6 +573,76 @@ it("keeps a sorted managed partial install recoverable after a destination confl
 	});
 });
 
+it("does not replace a concurrent destination during legacy publication", async () => {
+	for (const sourceKind of ["managed", "artifacts"] as const) {
+		await withTempDir(async sandbox => {
+			const sessionId = `publish-race-${sourceKind}-${crypto.randomUUID()}`;
+			const artifactsDir = path.join(sandbox, "artifacts");
+			const legacyPayload = Buffer.from("legacy content");
+			const destinationContent = "concurrent content";
+			const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
+			let retired = 0;
+			if (sourceKind === "artifacts") {
+				await fs.mkdir(path.join(artifactsDir, "local"), { recursive: true });
+				await fs.writeFile(path.join(artifactsDir, "local", "payload.txt"), legacyPayload);
+			}
+
+			await withLocalRoot(sessionId, async localRoot => {
+				const destination = path.join(localRoot, "payload.txt");
+				const options =
+					sourceKind === "managed"
+						? {
+								getSessionId: () => sessionId,
+								getManagedLegacyLocalMigrationSource: () => ({
+									capture: async () => ({
+										snapshot,
+										entries: [
+											{ relativePath: "", kind: "directory" as const },
+											{
+												relativePath: "payload.txt",
+												kind: "file" as const,
+												bytes: legacyPayload,
+												sha256: createHash("sha256").update(legacyPayload).digest("hex"),
+											},
+										],
+									}),
+									retire: () => retired++,
+								}),
+							}
+						: localOptions(sessionId, artifactsDir);
+				const lstat = fs.lstat.bind(fs);
+				let raced = false;
+				const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation((async (
+					target: nodeFs.PathLike,
+					options?: nodeFs.StatOptions,
+				) => {
+					if (!raced && path.resolve(String(target)) === destination) {
+						raced = true;
+						await fs.writeFile(destination, destinationContent, { flag: "wx" });
+						throw Object.assign(new Error("simulated destination race"), { code: "ENOENT" });
+					}
+					return await lstat(target, options);
+				}) as unknown as typeof fs.lstat);
+				try {
+					await expect(initializeLocalRoot(options)).rejects.toThrow("destination is ambiguous");
+				} finally {
+					lstatSpy.mockRestore();
+				}
+
+				expect(raced).toBe(true);
+				expect(await fs.readFile(destination, "utf8")).toBe(destinationContent);
+				expect(retired).toBe(0);
+				await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+				if (sourceKind === "artifacts") {
+					expect(await fs.readFile(path.join(artifactsDir, "local", "payload.txt"))).toEqual(legacyPayload);
+				}
+			});
+		});
+	}
+});
+
 it("resumes an interrupted managed migration from its retained source", async () => {
 	const sessionId = `managed-interrupted-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
@@ -602,19 +672,22 @@ it("resumes an interrupted managed migration from its retained source", async ()
 				retire: () => retired++,
 			}),
 		};
-		const rename = fs.rename.bind(fs);
+		const lstat = fs.lstat.bind(fs);
 		let interrupted = false;
-		const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
-			if (!interrupted && path.resolve(String(destination)) === path.join(localRoot, "02-second")) {
+		const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation((async (
+			target: nodeFs.PathLike,
+			options?: nodeFs.StatOptions,
+		) => {
+			if (!interrupted && path.resolve(String(target)) === path.join(localRoot, "02-second")) {
 				interrupted = true;
 				throw new Error("simulated migration interruption");
 			}
-			await rename(source, destination);
-		});
+			return await lstat(target, options);
+		}) as unknown as typeof fs.lstat);
 		try {
 			await expect(initializeLocalRoot(options)).rejects.toThrow("simulated migration interruption");
 		} finally {
-			renameSpy.mockRestore();
+			lstatSpy.mockRestore();
 		}
 
 		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
