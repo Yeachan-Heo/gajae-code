@@ -2974,11 +2974,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 									);
 								}
-								if (await session?.refreshEffectiveActiveWorkflowSkillState()) {
-									throw new Error(
-										"A workflow skill is active in this session; finish or exit it before rescoping.",
-									);
-								}
 								if (options.mcpManager && !ownsMcpManager) {
 									throw new Error(
 										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
@@ -2992,7 +2987,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									}
 									if (await session?.refreshEffectiveActiveWorkflowSkillState()) {
 										throw new Error(
-											"A workflow skill became active while waiting for the cwd transition; finish or exit it before rescoping.",
+											"A workflow skill is active in this session; finish or exit it before rescoping.",
 										);
 									}
 									const from = sessionManager.getCwd();
