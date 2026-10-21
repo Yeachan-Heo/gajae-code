@@ -315,6 +315,33 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("ralplan");
 		expect(session.getDeepInterviewAskStage()).toBeUndefined();
 	});
+	it(
+		"restores the current workflow when direct skill prompts overlap",
+		async () => {
+			await emitSkillPromptStart("deep-interview");
+			await emitAssistantStop(50);
+			await Bun.sleep(5);
+			await emitSkillPromptStart("autoresearch");
+
+			const activeState = await readVisibleSkillActiveState(tempDir.path(), sessionManager.getSessionId(), {
+				bypassCache: true,
+			});
+			const activeSkills = activeState?.active_skills ?? [];
+			expect(activeSkills.map(entry => entry.skill)).toEqual(["deep-interview", "autoresearch"]);
+			const deepInterview = activeSkills.find(entry => entry.skill === "deep-interview");
+			const autoresearch = activeSkills.find(entry => entry.skill === "autoresearch");
+			expect(Date.parse(autoresearch?.updated_at ?? "")).toBeGreaterThan(
+				Date.parse(deepInterview?.updated_at ?? ""),
+			);
+
+			await emitAssistantStop(100);
+
+			expect(session.getActiveSkillState()).toBeUndefined();
+			expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("autoresearch");
+			expect(session.getDeepInterviewAskStage()).toBeUndefined();
+		},
+		{ timeout: 15_000 },
+	);
 	it("preserves durable interview identity during a helper skill prompt", async () => {
 		await emitSkillPromptStart("deep-interview");
 		await emitAssistantStop(50);

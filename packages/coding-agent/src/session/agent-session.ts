@@ -448,6 +448,7 @@ import {
 	assertWorkflowMutationAllowed,
 	assertWorkflowMutationRawPathsAllowed,
 	isWorkflowMutationTool,
+	resolveCurrentWorkflowEntry,
 } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
@@ -14163,12 +14164,17 @@ export class AgentSession {
 		if (!activeSkill) {
 			try {
 				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
-				const durableSkill = activeState?.active_skills?.find(
-					entry =>
+				const durableEntries =
+					activeState?.active_skills?.filter(
+						entry =>
 						entry.active !== false &&
 						entry.session_id === sessionId &&
-						isCanonicalGjcWorkflowSkill(entry.skill),
-				)?.skill;
+							isCanonicalGjcWorkflowSkill(entry.skill),
+					) ?? [];
+				const durableSkill =
+					durableEntries.length > 0
+						? resolveCurrentWorkflowEntry(durableEntries, activeState?.skill?.trim() ?? "").skill
+						: undefined;
 				activeSkill = durableSkill && isCanonicalGjcWorkflowSkill(durableSkill) ? durableSkill : undefined;
 			} catch (error) {
 				logger.warn("Failed to read durable workflow skill state while restoring identity and ask tool", {
