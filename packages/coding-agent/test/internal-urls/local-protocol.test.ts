@@ -330,6 +330,81 @@ it("merges disjoint files from overlapping temporary and artifacts legacy roots"
 	});
 });
 
+it("recovers temporary staging before migrating artifacts after temporary-root cleanup", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `legacy-staging-retry-${crypto.randomUUID()}`;
+		const previousRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const localRoot = resolveLocalRoot(options);
+		const stagingIdentity = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const interruptedStaging = path.join(path.dirname(localRoot), `.gjc-local-migration-${stagingIdentity}`);
+		await fs.mkdir(path.dirname(localRoot), { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(localRoot), 0o700);
+		await fs.mkdir(previousRoot, { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(previousRoot), 0o700);
+		await fs.chmod(previousRoot, 0o700);
+		await fs.writeFile(path.join(previousRoot, "temp-only.json"), "temporary payload", { mode: 0o600 });
+		await fs.mkdir(interruptedStaging, { mode: 0o700 });
+		await fs.writeFile(path.join(interruptedStaging, "temp-only.json"), "temporary payload", { mode: 0o600 });
+		await fs.mkdir(artifactsLocalRoot, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, "artifact-only.json"), "artifact payload", { mode: 0o600 });
+
+		// The prior process staged temporary data and then the temporary root was swept.
+		await fs.rm(previousRoot, { recursive: true });
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await initializeLocalRoot(options);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "temp-only.json"), "utf8")).toBe("temporary payload");
+		expect(await fs.readFile(path.join(localRoot, "artifact-only.json"), "utf8")).toBe("artifact payload");
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(interruptedStaging)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(artifactsLocalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("preserves literal backslashes in migrated POSIX filenames", async () => {
+	if (process.platform === "win32") return;
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const sessionId = `legacy-backslash-${crypto.randomUUID()}`;
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		const literalName = "report\\raw.json";
+		await fs.mkdir(artifactsLocalRoot, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, literalName), "literal backslash", { mode: 0o600 });
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+
+		await initializeLocalRoot(options);
+
+		const localRoot = resolveLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, literalName), "utf8")).toBe("literal backslash");
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(artifactsLocalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
 it("preserves conflicting files when overlapping legacy directories cannot merge", async () => {
 	await withTempDir(async sandbox => {
 		const agentDir = path.join(sandbox, "agent");
@@ -393,7 +468,11 @@ it("serializes first managed-root migration across independent processes", async
 
 		const localRoot = path.join(agentDir, "local", sessionId);
 		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
-		const stagingPayload = path.join(path.dirname(localRoot), `.gjc-local-migration-${stagingName}`, "payloads");
+		const stagingPayload = path.join(
+			path.dirname(localRoot),
+			`.gjc-local-migration-${stagingName}-temporary`,
+			"payloads",
+		);
 		const script = `
 import { initializeLocalRoot } from "./src/internal-urls/local-protocol.ts";
 

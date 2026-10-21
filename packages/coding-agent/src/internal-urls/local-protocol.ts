@@ -288,6 +288,8 @@ function isSettledRecreatedManagedRoot(localRoot: string, rootStat: DirectoryIde
 
 const LEGACY_MIGRATION_MARKER = ".gjc-local-legacy-migrated-v1";
 const MAX_LEGACY_LOCAL_BYTES = 64 * 1024 * 1024;
+const LEGACY_MIGRATION_STAGING_SOURCES = ["temporary", "artifacts"] as const;
+type LegacyMigrationStagingSource = (typeof LEGACY_MIGRATION_STAGING_SOURCES)[number];
 
 type LegacyMigrationState = "complete" | "cleanup_pending";
 
@@ -679,16 +681,17 @@ function topLevelMigrationNames(relativePaths: readonly string[]): string[] {
 		...new Set(
 			relativePaths.flatMap(relativePath => {
 				if (!relativePath) return [];
-				const top = relativePath.split(/[\\/]/, 1)[0];
+				const top = path.normalize(relativePath).split(path.sep, 1)[0];
 				return top ? [top] : [];
 			}),
 		),
 	].sort((a, b) => a.localeCompare(b));
 }
 
-function migrationStagingPath(localRoot: string, scratchParent: string): string {
+function migrationStagingPath(localRoot: string, scratchParent: string, source?: LegacyMigrationStagingSource): string {
 	const identity = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
-	return path.join(scratchParent, `.gjc-local-migration-${identity}`);
+	const suffix = source ? `-${source}` : "";
+	return path.join(scratchParent, `.gjc-local-migration-${identity}${suffix}`);
 }
 
 async function clearMigrationStaging(staging: string): Promise<void> {
@@ -703,14 +706,19 @@ async function clearMigrationStaging(staging: string): Promise<void> {
 }
 
 async function removeEmptyMigrationStaging(localRoot: string, scratchParent: string): Promise<void> {
-	const staging = migrationStagingPath(localRoot, scratchParent);
-	try {
-		const stat = await fs.lstat(staging);
-		assertAdoptedManagedRoot(stat);
-		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe local:// migration staging");
-		await fs.rmdir(staging);
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
+	const stagingPaths = [
+		migrationStagingPath(localRoot, scratchParent),
+		...LEGACY_MIGRATION_STAGING_SOURCES.map(source => migrationStagingPath(localRoot, scratchParent, source)),
+	];
+	for (const staging of stagingPaths) {
+		try {
+			const stat = await fs.lstat(staging);
+			assertAdoptedManagedRoot(stat);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe local:// migration staging");
+			await fs.rmdir(staging);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
 	}
 }
 
@@ -749,40 +757,47 @@ function validatedMigrationStagingManifest(entries: readonly MigrationStagingEnt
 	return manifest;
 }
 
-/** Recover only a no-follow validated staging tree when no legacy source remains. */
+/** Recover every isolated source stage, including the legacy destination-keyed stage. */
 async function recoverMigrationStaging(localRoot: string, scratchParent: string): Promise<boolean> {
-	const staging = migrationStagingPath(localRoot, scratchParent);
-	let stagingStat: fsSync.Stats;
-	try {
-		stagingStat = await fs.lstat(staging);
-	} catch (error) {
-		if (isEnoent(error)) return false;
-		throw error;
-	}
-	assertAdoptedManagedRoot(stagingStat);
-	if (!stagingStat.isDirectory() || stagingStat.isSymbolicLink()) {
-		throw new Error("Unsafe local:// migration staging");
-	}
+	const stagingPaths = [
+		migrationStagingPath(localRoot, scratchParent),
+		...LEGACY_MIGRATION_STAGING_SOURCES.map(source => migrationStagingPath(localRoot, scratchParent, source)),
+	];
+	let recovered = false;
+	for (const staging of stagingPaths) {
+		let stagingStat: fsSync.Stats;
+		try {
+			stagingStat = await fs.lstat(staging);
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+		assertAdoptedManagedRoot(stagingStat);
+		if (!stagingStat.isDirectory() || stagingStat.isSymbolicLink()) {
+			throw new Error("Unsafe local:// migration staging");
+		}
 
-	const captured = nativeLocal().snapshotDirectoryTree(staging);
-	if (
-		!captured.ok ||
-		!captured.snapshot ||
-		captured.snapshot.rootDev !== String(stagingStat.dev) ||
-		captured.snapshot.rootIno !== String(stagingStat.ino)
-	) {
-		throw new Error("Unsafe local:// migration staging");
+		const captured = nativeLocal().snapshotDirectoryTree(staging);
+		if (
+			!captured.ok ||
+			!captured.snapshot ||
+			captured.snapshot.rootDev !== String(stagingStat.dev) ||
+			captured.snapshot.rootIno !== String(stagingStat.ino)
+		) {
+			throw new Error("Unsafe local:// migration staging");
+		}
+		const manifest = validatedMigrationStagingManifest(captured.snapshot.entries);
+		const topLevelNames = topLevelMigrationNames(manifest.map(entry => entry.relativePath));
+		for (const top of topLevelNames) {
+			const expected = stagingContentForTop(manifest, top);
+			const stagedTop = path.join(staging, top);
+			const destination = path.join(localRoot, top);
+			await publishMigrationEntryNoReplace(stagedTop, destination, expected);
+			await fs.rm(stagedTop, { recursive: true, force: true });
+			recovered = true;
+		}
 	}
-	const manifest = validatedMigrationStagingManifest(captured.snapshot.entries);
-	const topLevelNames = topLevelMigrationNames(manifest.map(entry => entry.relativePath));
-	for (const top of topLevelNames) {
-		const expected = stagingContentForTop(manifest, top);
-		const stagedTop = path.join(staging, top);
-		const destination = path.join(localRoot, top);
-		await publishMigrationEntryNoReplace(stagedTop, destination, expected);
-		await fs.rm(stagedTop, { recursive: true, force: true });
-	}
-	return topLevelNames.length > 0;
+	return recovered;
 }
 
 async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEntrySnapshot[]): Promise<void> {
@@ -941,6 +956,7 @@ async function migrateManagedLegacyLocal(
 	source: ManagedLegacyLocalMigrationSource,
 	localRoot: string,
 	scratchParent: string,
+	stagingSource: LegacyMigrationStagingSource,
 ): Promise<"verified" | "cleanup_pending" | null> {
 	const captured = await source.capture();
 	if (!captured) return null;
@@ -953,7 +969,7 @@ async function migrateManagedLegacyLocal(
 				throw new Error("Legacy local:// migration exceeds the safe size limit");
 		}
 	}
-	const staging = migrationStagingPath(localRoot, scratchParent);
+	const staging = migrationStagingPath(localRoot, scratchParent, stagingSource);
 	await clearMigrationStaging(staging);
 	try {
 		await fs.mkdir(staging, { mode: 0o700 });
@@ -1018,13 +1034,13 @@ async function migrateLegacyLocal(
 	let cleanupPending = false;
 	const previousSource = previousManagedLocalMigrationSource(options);
 	if (previousSource) {
-		const state = await migrateManagedLegacyLocal(previousSource, localRoot, scratchParent);
+		const state = await migrateManagedLegacyLocal(previousSource, localRoot, scratchParent, "temporary");
 		if (state) foundSource = true;
 		if (state === "cleanup_pending") cleanupPending = true;
 	}
 	const managedSource = options.getManagedLegacyLocalMigrationSource?.();
 	if (managedSource) {
-		const state = await migrateManagedLegacyLocal(managedSource, localRoot, scratchParent);
+		const state = await migrateManagedLegacyLocal(managedSource, localRoot, scratchParent, "artifacts");
 		if (state) foundSource = true;
 		if (state === "cleanup_pending") cleanupPending = true;
 	} else {
@@ -1035,7 +1051,7 @@ async function migrateLegacyLocal(
 			if (state === "cleanup_pending") cleanupPending = true;
 		}
 	}
-	if (!foundSource) foundSource = await recoverMigrationStaging(localRoot, scratchParent);
+	if (await recoverMigrationStaging(localRoot, scratchParent)) foundSource = true;
 	await removeEmptyMigrationStaging(localRoot, scratchParent);
 	const value = cleanupPending ? "cleanup_pending\n" : foundSource ? "verified\n" : "absent\n";
 	await fs.writeFile(marker, value, { mode: 0o600, flag: "wx" });
@@ -1055,7 +1071,7 @@ async function migrateArtifactsLegacyLocal(
 		if (isEnoent(error)) return null;
 		throw error;
 	}
-	const staging = migrationStagingPath(localRoot, scratchParent);
+	const staging = migrationStagingPath(localRoot, scratchParent, "artifacts");
 	await clearMigrationStaging(staging);
 	try {
 		await copyLegacyManifest(legacySource.root, staging, manifest);
