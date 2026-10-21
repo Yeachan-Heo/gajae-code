@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod/v4";
-import { Effort } from "../src/model-thinking";
+import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
@@ -96,6 +96,71 @@ function baseContext(): Context {
 		],
 	};
 }
+
+// #969
+describe("OpenAI completions custom reasoning metadata", () => {
+	const testContext: Context = {
+		messages: [{ role: "user", content: "hello", timestamp: 0 }],
+	};
+
+	function customOpenAICompatModel(): Model<"openai-completions"> {
+		return {
+			id: "gpt-5.1",
+			name: "GPT-5.1 proxy",
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://proxy.example.com/v1",
+			reasoning: true,
+			compat: { supportsReasoningEffort: true },
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.XHigh,
+			},
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 16_384,
+		};
+	}
+
+	it("uses the configured xhigh effort for custom OpenAI-compatible models", async () => {
+		const model = customOpenAICompatModel();
+		let payload: Record<string, unknown> | undefined;
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				payload = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
+				return createSseResponse([
+					{
+						id: "chatcmpl-969",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: model.id,
+						choices: [{ index: 0, delta: { content: "ok" } }],
+					},
+					{
+						id: "chatcmpl-969",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: model.id,
+						choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					},
+					"[DONE]",
+				]);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		expect(getSupportedEfforts(model)).toContain(Effort.XHigh);
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			reasoning: "xhigh",
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(payload?.reasoning_effort).toBe("xhigh");
+	});
+});
 
 describe("openai-completions compatibility", () => {
 	it("never sends reasoning controls to Groq compound systems after late metadata overrides", async () => {

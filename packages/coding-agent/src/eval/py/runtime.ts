@@ -7,8 +7,9 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $env, $which, getPythonEnvDir, WhichCachePolicy } from "@gajae-code/utils";
+import { $env, $which, getPythonEnvDir, relativePathEscapesRoot, WhichCachePolicy } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
+import { isProjectControlledPath } from "../../lsp/path-trust";
 
 export const RLM_MANAGED_PYTHON_PACKAGES: readonly string[] = ["numpy", "pandas", "matplotlib", "polars"];
 
@@ -133,6 +134,47 @@ function resolvePythonCandidateInVenv(venvPath: string): { venvPath: string; pyt
 	return { venvPath, pythonPath, binDir };
 }
 
+/**
+ * A workspace `.venv` or `venv` directory is repository content. Use it only when
+ * it is a real virtualenv (`pyvenv.cfg`) whose interpreter file resolves outside
+ * the project. An in-tree script or binary is not an interpreter.
+ *
+ * True when `candidate` is `root` or a descendant after `path.resolve`.
+ * A name such as `..payload` stays inside. Only `..` and a parent segment escape.
+ */
+export function workspacePathContained(root: string, candidate: string): boolean {
+	const normalize = (value: string): string => {
+		const resolved = path.resolve(value);
+		return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+	};
+	return !relativePathEscapesRoot(path.relative(normalize(root), normalize(candidate)));
+}
+
+function isAutoDetectedWorkspaceVenv(candidate: string, cwd: string): boolean {
+	try {
+		if (!fs.statSync(path.join(candidate, "pyvenv.cfg")).isFile()) return false;
+	} catch {
+		return false;
+	}
+	let canonicalPython: string;
+	try {
+		canonicalPython = fs.realpathSync(resolvePythonCandidateInVenv(candidate).pythonPath);
+	} catch {
+		return false;
+	}
+	// HOME stops project-root discovery, so a workspace that is the home directory
+	// is not project-controlled. Refuse an interpreter that still resolves inside
+	// cwd, including a file whose name is `..payload`.
+	let canonicalCwd = path.resolve(cwd);
+	try {
+		canonicalCwd = fs.realpathSync(cwd);
+	} catch {
+		// Missing cwd keeps the resolved path.
+	}
+	if (workspacePathContained(canonicalCwd, canonicalPython)) return false;
+	return !isProjectControlledPath(canonicalPython, cwd);
+}
+
 function resolveManagedPythonCandidate(): { venvPath: string; pythonPath: string; binDir: string } {
 	return resolvePythonCandidateInVenv(resolveGlobalManagedPythonEnv());
 }
@@ -197,9 +239,7 @@ export function resolveVenvPath(cwd: string): string | undefined {
 	if ($env.CONDA_PREFIX) return $env.CONDA_PREFIX;
 	const candidates = [path.join(cwd, ".venv"), path.join(cwd, "venv")];
 	for (const candidate of candidates) {
-		if (fs.existsSync(candidate)) {
-			return candidate;
-		}
+		if (isAutoDetectedWorkspaceVenv(candidate, cwd)) return candidate;
 	}
 	return undefined;
 }

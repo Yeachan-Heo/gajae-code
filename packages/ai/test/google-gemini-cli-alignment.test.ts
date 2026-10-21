@@ -136,6 +136,21 @@ describe("Google Gemini CLI alignment", () => {
 		expect(payload.userAgent).toBeUndefined();
 		expect(payload.requestId).toBeUndefined();
 	});
+	// #976
+	it("normalizes a string systemPrompt into systemInstruction text parts", () => {
+		const context = {
+			systemPrompt: "Stay concise.",
+			messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+		} as unknown as Context;
+
+		const model = { ...createModel("google-gemini-cli"), name: "gemini" };
+		const request = buildRequest(model, context, "proj-123");
+
+		expect(request.request.systemInstruction).toEqual({
+			parts: [{ text: "Stay concise." }],
+		});
+	});
+
 	it("keeps every system prompt block in systemInstruction instead of conversation contents", () => {
 		const model = createModel("google-gemini-cli");
 		const context: Context = {
