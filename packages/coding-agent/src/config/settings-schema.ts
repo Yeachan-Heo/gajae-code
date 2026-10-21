@@ -3603,6 +3603,11 @@ export const SETTINGS_SCHEMA = {
 		default: [] as string[],
 	},
 
+	"mcp.discoveryDeferAutoload": {
+		type: "boolean",
+		default: false,
+	},
+
 	"mcp.notifications": {
 		type: "boolean",
 		default: false,

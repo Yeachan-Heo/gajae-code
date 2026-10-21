@@ -54,6 +54,17 @@ result and log retain a per-server error if that window is also exhausted.
 
 Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCPs and exact-file `--mcp-config` remain governed by their own surfaces). `--no-mcp` and `--mcp-config` are mutually exclusive.
 
+### Keep autoloaded tools behind tool search
+
+With MCP discovery on, autoloaded servers' tools are selected by default, so every tool schema is sent with each request. Servers with large catalogs can take a large share of the context window. Set `mcp.discoveryDeferAutoload: true` to register those tools without selecting them; the model activates them on demand with `search_tool_bm25`. Servers listed in `mcp.discoveryDefaultServers` remain selected.
+
+```yaml
+# ~/.gjc/agent/config.yml
+mcp:
+  discoveryDeferAutoload: true
+  discoveryDefaultServers: [github]
+```
+
 ## Public slash-command boundary
 
 The ordinary interactive TUI and ACP slash-command surfaces intentionally do not

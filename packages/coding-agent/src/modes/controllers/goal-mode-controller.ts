@@ -54,6 +54,7 @@ export class GoalModeController {
 	#enabled = false;
 	#paused = false;
 	#previousTools: string[] | undefined;
+	#previousMCPToolNames: string[] | undefined;
 	#continuationTimer: NodeJS.Timeout | undefined;
 	#turnHadToolCalls = false;
 	#continuationTurnInFlight = false;
@@ -264,8 +265,13 @@ export class GoalModeController {
 			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
 			if (restored?.goal) {
 				this.#previousTools = this.ctx.session.getActiveToolNames();
+				this.#previousMCPToolNames = this.ctx.session.getActiveMCPToolNames();
 				if (!this.ctx.session.isExplicitEmptyToolSelection()) {
-					await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+					await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])], {
+						explicit: false,
+						persistMCPSelection: false,
+						retryOnMcpCatalogChange: true,
+					});
 				}
 			}
 			this.#updateStatus();
@@ -316,16 +322,63 @@ export class GoalModeController {
 	}): Promise<void> {
 		if (this.#enabled) return;
 		if (!this.ctx.modeGate.enter("goal")) return this.ctx.showWarning("Exit plan mode first.");
+		const previousGoalState = this.ctx.session.getGoalModeState();
 		this.#previousTools = this.ctx.session.getActiveToolNames();
+		this.#previousMCPToolNames = this.ctx.session.getActiveMCPToolNames();
 		this.#paused = false;
-		const state = options.resume
-			? await this.ctx.session.goalRuntime.resumeGoal()
-			: await this.ctx.session.goalRuntime.createGoal({
-					objective: options.objective ?? "",
-					provenance: options.provenance,
-				});
-		if (!this.ctx.session.isExplicitEmptyToolSelection()) {
-			await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+		let state: GoalModeState;
+		try {
+			state = options.resume
+				? await this.ctx.session.goalRuntime.resumeGoal()
+				: await this.ctx.session.goalRuntime.createGoal({
+						objective: options.objective ?? "",
+						provenance: options.provenance,
+					});
+			if (!this.ctx.session.isExplicitEmptyToolSelection()) {
+				await this.ctx.session.setActiveToolsByName(
+					[...new Set([...this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), "goal"])],
+					{
+						explicit: false,
+						persistMCPSelection: false,
+						retryOnMcpCatalogChange: true,
+					},
+				);
+			}
+		} catch (error) {
+			const currentGoalState = this.ctx.session.getGoalModeState();
+			const goalWasActivated =
+				currentGoalState?.enabled === true &&
+				currentGoalState.goal.status === "active" &&
+				(options.resume
+					? previousGoalState?.goal.status === "paused" && currentGoalState.goal.id === previousGoalState.goal.id
+					: currentGoalState.goal.id !== previousGoalState?.goal.id);
+			let rollbackError: unknown;
+			if (goalWasActivated) {
+				try {
+					if (options.resume) await this.ctx.session.goalRuntime.pauseGoal();
+					else await this.ctx.session.goalRuntime.dropGoal();
+				} catch (goalRollbackError) {
+					rollbackError = goalRollbackError;
+				}
+			}
+			const rollbackState = this.ctx.session.getGoalModeState();
+			this.#enabled = rollbackState?.enabled === true;
+			this.#paused = rollbackState?.enabled !== true && rollbackState?.goal.status === "paused";
+			this.#previousTools = undefined;
+			this.#previousMCPToolNames = undefined;
+			this.#continuationTurnInFlight = false;
+			this.#resetContinuationSuppression();
+			this.cancelContinuation();
+			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
+			else this.ctx.modeGate.exit("goal");
+			this.#updateStatus();
+			if (rollbackError !== undefined) {
+				throw new AggregateError(
+					[error, rollbackError],
+					"Goal-mode entry failed and goal state rollback also failed",
+				);
+			}
+			throw error;
 		}
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;
@@ -344,7 +397,12 @@ export class GoalModeController {
 			this.#previousTools &&
 			options?.reason !== "dropped" &&
 			(this.#enabled || options?.reason === "completed" || options?.paused);
-		if (shouldRestoreTools && this.#previousTools) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (shouldRestoreTools && this.#previousTools)
+			await this.ctx.session.setActiveToolsByName(this.#restoreToolsWithCurrentMCPSelection(this.#previousTools), {
+				explicit: false,
+				persistMCPSelection: false,
+				retryOnMcpCatalogChange: true,
+			});
 		const currentState = this.ctx.session.getGoalModeState();
 		if (options?.reason === "completed") {
 			this.ctx.session.setGoalModeState(undefined);
@@ -358,6 +416,7 @@ export class GoalModeController {
 		this.#enabled = false;
 		this.#paused = options?.paused ?? false;
 		this.#previousTools = undefined;
+		this.#previousMCPToolNames = undefined;
 		this.#continuationTurnInFlight = false;
 		this.#resetContinuationSuppression();
 		this.cancelContinuation();
@@ -373,6 +432,16 @@ export class GoalModeController {
 							? "Goal mode paused."
 							: "Goal mode disabled.",
 			);
+	}
+
+	#restoreToolsWithCurrentMCPSelection(previousTools: readonly string[]): string[] {
+		const previousMCPToolNames = new Set(this.#previousMCPToolNames ?? []);
+		return [
+			...new Set([
+				...previousTools.filter(name => !previousMCPToolNames.has(name)),
+				...this.ctx.session.getActiveMCPToolNames(),
+			]),
+		];
 	}
 
 	#getPausedState(): GoalModeState | undefined {
