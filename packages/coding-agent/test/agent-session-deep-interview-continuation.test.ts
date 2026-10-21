@@ -293,6 +293,25 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("ralplan");
 		expect(session.getDeepInterviewAskStage()).toBeUndefined();
 	});
+	it("preserves durable interview identity during a helper skill prompt", async () => {
+		await emitSkillPromptStart("deep-interview");
+		await emitAssistantStop(50);
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+
+		await emitSkillPromptStart("assistant-helpers");
+		expect(session.getActiveSkillState()?.skill).toBe("assistant-helpers");
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+		await session.refreshEffectiveActiveWorkflowSkillState();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+		await emitAssistantStop(100);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+	});
 	it("restores the same active interview identity after an actual session reopen", async () => {
 		await session.dispose();
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());

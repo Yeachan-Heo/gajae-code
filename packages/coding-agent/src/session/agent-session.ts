@@ -13885,17 +13885,21 @@ export class AgentSession {
 	async #attachAskToolIfWorkflowActive(): Promise<void> {
 		const sessionId = this.sessionManager.getSessionId();
 		const promptGeneration = this.#promptGeneration;
+		const activeSkillState = this.#activeSkillState;
 		const inMemoryActiveSkill =
-			this.#activeSkillState && (!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === sessionId)
-				? this.#activeSkillState.skill
+			activeSkillState &&
+			(!activeSkillState.sessionId || activeSkillState.sessionId === sessionId) &&
+			isCanonicalGjcWorkflowSkill(activeSkillState.skill)
+				? activeSkillState.skill
 				: undefined;
 		let activeSkill = inMemoryActiveSkill;
 		if (!activeSkill) {
 			try {
 				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
-				activeSkill = activeState?.active_skills?.find(
+				const durableSkill = activeState?.active_skills?.find(
 					entry => entry.active !== false && entry.session_id === sessionId,
 				)?.skill;
+				activeSkill = durableSkill && isCanonicalGjcWorkflowSkill(durableSkill) ? durableSkill : undefined;
 			} catch (error) {
 				logger.warn("Failed to read durable workflow skill state while restoring identity and ask tool", {
 					error: error instanceof Error ? error.message : String(error),
@@ -13909,7 +13913,9 @@ export class AgentSession {
 				this.#isDisposed ||
 				this.sessionManager.getSessionId() !== sessionId ||
 				this.#promptGeneration !== promptGeneration ||
-				this.#activeSkillState
+				(this.#activeSkillState &&
+					(!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === sessionId) &&
+					isCanonicalGjcWorkflowSkill(this.#activeSkillState.skill))
 			)
 				return;
 		}
@@ -14632,11 +14638,12 @@ export class AgentSession {
 		const name = (details as { name?: unknown }).name;
 		if (typeof name !== "string" || !name.trim()) return;
 		const skill = name.trim();
+		const canonicalWorkflowSkill = isCanonicalGjcWorkflowSkill(skill);
 		// Functional tool availability must not depend on the best-effort
 		// observational state-sync below (whose failures are swallowed by
 		// #syncSkillPromptActiveStateSafely): attach ask first so canonical
 		// workflow skills can always call it.
-		if (active && isCanonicalGjcWorkflowSkill(skill)) this.#attachAskTool();
+		if (active && canonicalWorkflowSkill) this.#attachAskTool();
 		const sessionId = this.sessionManager.getSessionId();
 		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, autoresearch)
 		// own their `.gjc/state/skill-active-state.json` row through the
@@ -14677,9 +14684,12 @@ export class AgentSession {
 			}
 		}
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
-		this.#durableWorkflowSkillState = undefined;
+		const preserveDurableIdentity =
+			active && !canonicalWorkflowSkill && this.#durableWorkflowSkillState?.sessionId === sessionId;
+		if (!preserveDurableIdentity) this.#durableWorkflowSkillState = undefined;
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 		if (active) {
+			if (!canonicalWorkflowSkill) await this.#attachAskToolIfWorkflowActive();
 			await this.refreshGjcSubskillTools();
 		} else {
 			// Prompt activity ends with this turn, but the durable workflow remains

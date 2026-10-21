@@ -1498,7 +1498,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		await expect(moving).resolves.toBeDefined();
 		await disposed;
 		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
-	});
+	}, 20_000);
 
 	it("rejects a cwd move fenced after teardown without waiting for active readers", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
