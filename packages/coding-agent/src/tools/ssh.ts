@@ -5,18 +5,35 @@ import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { SSHHost } from "../capability/ssh";
 import { sshCapability } from "../capability/ssh";
+import { getDefault, type Settings } from "../config/settings";
 import { loadCapability } from "../discovery";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import sshDescriptionBase from "../prompts/tools/ssh.md" with { type: "text" };
-import { DEFAULT_MAX_BYTES, streamTailUpdates, TailBuffer } from "../session/streaming-output";
+import type { SessionArtifactPublication } from "../session/session-manager";
+import {
+	DEFAULT_MAX_BYTES,
+	streamTailUpdates,
+	TailBuffer,
+	type TerminalArtifactPublisher,
+	type TruncationResult,
+	truncateMiddle,
+	truncateMiddleWindows,
+	truncateTail,
+} from "../session/streaming-output";
 import type { SSHHostInfo } from "../ssh/connection-manager";
 import { ensureHostInfo, getHostInfoForHost } from "../ssh/connection-manager";
-import { executeSSH } from "../ssh/ssh-executor";
+import { executeSSH, type SSHResult } from "../ssh/ssh-executor";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import type { ToolSession } from ".";
-import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
+import { wrapUntrustedContent } from "./fetch";
+import {
+	formatArtifactReference,
+	formatStyledTruncationWarning,
+	type OutputMeta,
+	stripOutputNotice,
+} from "./output-meta";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -87,6 +104,181 @@ function quotePowerShellPath(value: string): string {
 function quoteCmdPath(value: string): string {
 	const escaped = value.replace(/"/g, '""');
 	return `"${escaped}"`;
+}
+
+const FENCE_OPEN = "<untrusted-content>\n";
+const FENCE_CLOSE = "\n</untrusted-content>";
+const UNTRUSTED_FENCE_OVERHEAD = Buffer.byteLength(`${FENCE_OPEN}${FENCE_CLOSE}`, "utf-8");
+const INLINE_MARKER_RESERVE = 256;
+/** `</untrusted-content>` grows when `wrapUntrustedContent` escapes it. */
+const CLOSER_RAW_BYTES = "</untrusted-content>".length;
+const CLOSER_ESCAPED_BYTES = "&lt;/untrusted-content&gt;".length;
+
+type OutputBudgetPath = "tools.maxInlineResultBytes" | "tools.artifactHeadBytes" | "tools.artifactTailLines";
+
+function settingNumber(settings: Settings | undefined, path: OutputBudgetPath): number {
+	return settings?.get(path) ?? getDefault(path);
+}
+
+type RemoteFrame = {
+	text: string;
+	truncation?: TruncationResult;
+	direction?: "head" | "tail" | "middle";
+	/** True only after the full remote text is already stored. */
+	shrunk: boolean;
+	visibleLines: number;
+	visibleBytes: number;
+};
+
+function inlineCapBytes(settings: Settings | undefined): number {
+	return settingNumber(settings, "tools.maxInlineResultBytes") * 1024;
+}
+
+function exceedsInlineCap(output: string, settings: Settings | undefined): boolean {
+	const cap = inlineCapBytes(settings);
+	if (cap <= 0) return false;
+	// Measure the escaped frame. A raw-size check misses closer expansion.
+	return Buffer.byteLength(wrapUntrustedContent(output), "utf-8") > cap;
+}
+
+function frameFullRemoteOutput(output: string): RemoteFrame {
+	return { text: wrapUntrustedContent(output), shrunk: false, visibleLines: 0, visibleBytes: 0 };
+}
+
+/**
+ * Cut to the inline window, then frame that excerpt. Call only when the full
+ * remote text is already stored, so a tail cut cannot drop the opening fence
+ * or the only copy of the output.
+ */
+function frameShrunkRemoteOutput(output: string, settings: Settings | undefined): RemoteFrame {
+	const cap = inlineCapBytes(settings);
+	const escapedRoom = Math.max(1, cap - UNTRUSTED_FENCE_OVERHEAD - INLINE_MARKER_RESERVE);
+	// Budget in remote-output bytes so framing and closer escaping cannot distort
+	// the source coordinates reported by truncation metadata.
+	let budget = Math.max(1, Math.floor((escapedRoom * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES));
+	const headBytes = settingNumber(settings, "tools.artifactHeadBytes") * 1024;
+	const tailLines = settingNumber(settings, "tools.artifactTailLines");
+	const headBudget = Math.max(
+		1,
+		Math.floor((Math.min(headBytes, escapedRoom / 2) * CLOSER_RAW_BYTES) / CLOSER_ESCAPED_BYTES),
+	);
+	const cutRemoteOutput = (maxBytes: number) => {
+		if (headBytes > 0) {
+			const options = {
+				maxBytes,
+				maxLines: tailLines * 2,
+				maxHeadBytes: Math.min(headBudget, Math.floor(maxBytes / 2)),
+				maxHeadLines: tailLines,
+			};
+			return {
+				truncation: truncateMiddle(output, options),
+				windows: truncateMiddleWindows(output, options),
+			};
+		}
+		const options = { maxBytes, maxLines: tailLines };
+		return {
+			truncation: truncateTail(output, options),
+			windows: truncateMiddleWindows(output, { ...options, maxHeadBytes: 0, maxHeadLines: 0 }),
+		};
+	};
+	let { truncation, windows } = cutRemoteOutput(budget);
+	let excerpt = truncation.truncated ? truncation.content : output;
+	let text = wrapUntrustedContent(excerpt);
+	let textBytes = Buffer.byteLength(text, "utf-8");
+	while (textBytes > cap && budget > 1) {
+		const scaledBudget = Math.floor((budget * cap) / textBytes);
+		budget = Math.max(1, Math.min(budget - 1, scaledBudget));
+		({ truncation, windows } = cutRemoteOutput(budget));
+		excerpt = truncation.truncated ? truncation.content : output;
+		text = wrapUntrustedContent(excerpt);
+		textBytes = Buffer.byteLength(text, "utf-8");
+	}
+	if (text === wrapUntrustedContent(output)) return frameFullRemoteOutput(output);
+	if (windows.kind === "full") return frameFullRemoteOutput(output);
+	const direction = windows.kind === "middle" ? "middle" : windows.kind === "head-only" ? "head" : "tail";
+	return {
+		text,
+		truncation,
+		direction,
+		shrunk: true,
+		visibleLines: (windows.head?.lines ?? 0) + (windows.tail?.lines ?? 0),
+		visibleBytes: (windows.head?.bytes ?? 0) + (windows.tail?.bytes ?? 0),
+	};
+}
+
+/** Store the full remote text. Never write an already-shortened excerpt.
+ * The command has already finished, so a rejected reservation must not discard it.
+ */
+async function storeFullRemoteOutput(
+	session: ToolSession,
+	output: string,
+	artifactPublication: SessionArtifactPublication | undefined,
+): Promise<string | undefined> {
+	let allocated: { id?: string; path?: string } | undefined;
+	try {
+		allocated = await session.allocateOutputArtifact?.("ssh");
+	} catch {
+		allocated = undefined;
+	}
+	if (allocated?.path && allocated.id) {
+		try {
+			await Bun.write(allocated.path, output);
+			return allocated.id;
+		} catch {
+			// Fall through to the session-owned publisher when a writable path failed.
+		}
+	}
+	if (!artifactPublication) return undefined;
+	try {
+		return await artifactPublication(output, "ssh");
+	} catch {
+		return undefined;
+	}
+}
+
+function createSshArtifactPublisher(
+	artifactPublication: SessionArtifactPublication | undefined,
+): TerminalArtifactPublisher | undefined {
+	if (!artifactPublication) return undefined;
+	return async (content, info) => {
+		try {
+			const artifactId = await artifactPublication(content, "ssh");
+			if (!artifactId) return { status: "unavailable" };
+			return info.omittedBytes > 0
+				? { status: "published", artifactId, omittedBytes: info.omittedBytes }
+				: { status: "published", artifactId };
+		} catch (error) {
+			return { status: "failed", diagnostic: error instanceof Error ? error.message : String(error) };
+		}
+	};
+}
+
+function hasCompleteRemoteOutput(result: SSHResult, output: string): boolean {
+	return (
+		!result.truncated &&
+		result.outputBytes === result.totalBytes &&
+		Buffer.byteLength(output, "utf-8") === result.outputBytes
+	);
+}
+
+function incompleteOutputNotice(result: SSHResult, artifactId: string | undefined): string | undefined {
+	const retainedWindowIncomplete = result.truncated || result.outputBytes < result.totalBytes;
+	if (!retainedWindowIncomplete) return undefined;
+
+	const artifactIncomplete =
+		(result.artifactTruncatedBytes ?? 0) > 0 || result.artifactFailureDiagnostic !== undefined;
+	const completeArtifactAvailable = artifactId !== undefined && !artifactIncomplete;
+	if (completeArtifactAvailable) return undefined;
+
+	const notes = [`SSH output is incomplete: retained ${result.outputBytes} of ${result.totalBytes} bytes`];
+	notes.push("no complete output artifact is available");
+	if ((result.artifactTruncatedBytes ?? 0) > 0) {
+		notes.push(`artifact storage omitted at least ${result.artifactTruncatedBytes} bytes`);
+	}
+	if (result.artifactFailureDiagnostic) {
+		notes.push(`Artifact storage failed: ${result.artifactFailureDiagnostic}`);
+	}
+	return notes.join("; ");
 }
 
 function buildRemoteCommand(command: string, cwd: string | undefined, info: SSHHostInfo): string {
@@ -161,6 +353,8 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		// Clamp to reasonable range: 1s - 3600s (1 hour)
 		const timeoutSec = clampTimeout("ssh", rawTimeout);
 		const timeoutMs = timeoutSec * 1000;
+		const outputSettings = _ctx?.settings ?? this.session.settings;
+		const artifactPublication = this.session.captureArtifactPublication?.();
 
 		const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("ssh")) ?? {};
@@ -172,22 +366,94 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 			compatEnabled: hostInfo.compatEnabled,
 			artifactPath,
 			artifactId,
+			artifactPublisher: createSshArtifactPublisher(artifactPublication),
 			onChunk: streamTailUpdates(tailBuffer, onUpdate),
 		});
 
+		const remote = result.output ?? "";
+		let storedArtifactId = result.artifactId;
+		let framed: RemoteFrame | undefined;
+		if (!remote) {
+			framed = undefined;
+		} else if (!exceedsInlineCap(remote, outputSettings)) {
+			framed = frameFullRemoteOutput(remote);
+		} else {
+			if (!storedArtifactId && hasCompleteRemoteOutput(result, remote)) {
+				storedArtifactId = await storeFullRemoteOutput(this.session, remote, artifactPublication);
+			}
+			framed = storedArtifactId ? frameShrunkRemoteOutput(remote, outputSettings) : frameFullRemoteOutput(remote);
+		}
+		// The artifact id stays in truncation metadata. A line after the closing
+		// fence makes the inline backstop drop the opening fence.
+		const modelText = framed?.text;
+		const storedNote =
+			(framed?.shrunk || result.truncated) && storedArtifactId
+				? `\n\n${formatArtifactReference(storedArtifactId, result.artifactTruncatedBytes)}`
+				: "";
+		const incompleteNote = incompleteOutputNotice(result, storedArtifactId);
+		const artifactFailureNote =
+			result.artifactFailureDiagnostic && !incompleteNote
+				? `SSH streaming artifact storage failed: ${result.artifactFailureDiagnostic}`
+				: undefined;
 		if (result.cancelled) {
-			throw new ToolError(result.output || "Command aborted");
+			const message = [
+				modelText || "Command aborted",
+				storedNote.trim() || undefined,
+				incompleteNote,
+				artifactFailureNote,
+			]
+				.filter((part): part is string => part !== undefined)
+				.join("\n\n");
+			throw new ToolError(message);
 		}
 
-		const outputText = result.output || "(no output)";
+		const outputText = modelText ?? "(no output)";
 		const details: SSHToolDetails = {};
-		const resultBuilder = toolResult(details).text(outputText).truncationFromSummary(result, { direction: "tail" });
+		const resultBuilder = toolResult(details).text(outputText);
+		if (framed?.shrunk && framed.truncation && storedArtifactId) {
+			resultBuilder.truncation(framed.truncation, {
+				direction: framed.direction ?? "tail",
+				artifactId: storedArtifactId,
+			});
+		} else {
+			resultBuilder.truncationFromSummary(result, { direction: "tail" });
+		}
 
 		if (result.exitCode !== 0 && result.exitCode !== undefined) {
-			throw new ToolError(`${outputText}\n\nCommand exited with code ${result.exitCode}`);
+			const message = [
+				outputText,
+				storedNote.trim() || undefined,
+				incompleteNote,
+				artifactFailureNote,
+				`Command exited with code ${result.exitCode}`,
+			]
+				.filter((part): part is string => part !== undefined)
+				.join("\n\n");
+			throw new ToolError(message);
 		}
 
-		return resultBuilder.done();
+		const built = resultBuilder.done();
+		const truncation = built.details?.meta?.truncation;
+		if (framed?.shrunk && truncation) {
+			// The cut is a window of an earlier excerpt. Keep the stream totals
+			// and do not present that window's coordinates as the original range.
+			truncation.totalLines = result.totalLines;
+			truncation.totalBytes = result.totalBytes;
+			truncation.outputLines = framed.visibleLines;
+			truncation.outputBytes = framed.visibleBytes;
+			truncation.artifactId = storedArtifactId;
+			truncation.artifactTruncatedBytes = result.artifactTruncatedBytes;
+			truncation.artifactFailureDiagnostic = result.artifactFailureDiagnostic;
+			delete truncation.shownRange;
+			delete truncation.headRange;
+			delete truncation.tailRange;
+			delete truncation.nextOffset;
+			if (framed.direction === "middle") {
+				truncation.elidedLines = Math.max(0, result.totalLines - framed.visibleLines);
+				truncation.elidedBytes = Math.max(0, result.totalBytes - framed.visibleBytes);
+			}
+		}
+		return built;
 	}
 }
 

@@ -3,6 +3,7 @@
  * Uses Biome's CLI with JSON output instead of LSP (which has stale diagnostics issues).
  */
 import path from "node:path";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 // =============================================================================
@@ -84,6 +85,7 @@ async function runBiome(
 	try {
 		const proc = Bun.spawn([command, ...args], {
 			cwd,
+			env: projectSafeSpawnEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,

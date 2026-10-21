@@ -3522,8 +3522,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			throw new ToolError(e instanceof Error ? e.message : String(e));
 		}
 		const scheme = urlMeta.protocol.replace(/:$/, "").toLowerCase();
-		// issue:// and pr:// are remote third-party text, the same boundary as an HTTP fetch.
-		const wrapUntrusted = scheme === "issue" || scheme === "pr";
 		let hasExtraction = false;
 		if (scheme === "agent") {
 			const hasPathExtraction = urlMeta.pathname && urlMeta.pathname !== "/" && urlMeta.pathname !== "";
@@ -3547,6 +3545,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			mcpManager: this.session.getMcpManager?.(),
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
+		// issue:// and pr:// are remote third-party text. SSH artifacts are marked
+		// by their protocol handler and wrapped after selection/truncation below.
+		const wrapUntrusted = scheme === "issue" || scheme === "pr" || resource.untrusted === true;
 
 		// If extraction was used, return directly (no pagination)
 		if (hasExtraction) {
