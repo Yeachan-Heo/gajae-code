@@ -141,6 +141,10 @@ describe("SDK operation inventory", () => {
 				"internal model-profile activation provenance used to gate role-only materialization, not a user-facing SDK control seam",
 			],
 			[
+				"agent_session:refreshEffectiveActiveWorkflowSkillState",
+				"internal durable workflow identity refresh before session safety checks, not an independent public SDK operation",
+			],
+			[
 				"agent_session:awaitPendingContextTransformations",
 				"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 			],

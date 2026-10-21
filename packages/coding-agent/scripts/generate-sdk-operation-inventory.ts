@@ -127,6 +127,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal tool-selection predicate used to preserve the --no-tools boundary, not a user-facing SDK control seam",
 	"agent_session:getEffectiveActiveWorkflowSkillState":
 		"internal restored-or-live workflow guard for session rescope, not a user-facing SDK control seam",
+	"agent_session:refreshEffectiveActiveWorkflowSkillState":
+		"internal durable workflow identity refresh before session safety checks, not an independent public SDK operation",
 	"agent_session:replaceOwnedMcpManager":
 		"internal cwd-rebinding helper for owned MCP authority after move_session, not a user-facing SDK control seam",
 	"agent_session:replaceNamedCustomTools":

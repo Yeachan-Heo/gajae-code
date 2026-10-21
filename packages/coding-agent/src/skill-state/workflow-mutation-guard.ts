@@ -369,7 +369,7 @@ interface ActivePlanningSkill {
  * reliably wins. Ties fall back to the resolved top-level `skill`, then to the
  * first entry, matching how the HUD/chain guard pick `activeSkills[0]`.
  */
-function resolveCurrentWorkflowEntry(entries: SkillActiveEntry[], topLevelSkill: string): SkillActiveEntry {
+export function resolveCurrentWorkflowEntry(entries: SkillActiveEntry[], topLevelSkill: string): SkillActiveEntry {
 	const ts = (entry: SkillActiveEntry): number => {
 		const value = Date.parse(safeString(entry.updated_at) || safeString(entry.activated_at));
 		return Number.isNaN(value) ? -1 : value;
