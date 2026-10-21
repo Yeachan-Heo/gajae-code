@@ -341,6 +341,7 @@ export class PlanModeController {
 	}
 	#localProtocolOptions() {
 		return {
+			getAgentDir: () => this.ctx.session.getSessionAgentDir(),
 			getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
 			isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
 			getSessionId: () => this.ctx.sessionManager.getSessionId(),
@@ -465,11 +466,7 @@ export class PlanModeController {
 				sessionSwitchCompleted = await this.ctx.handleClearCommand();
 				if (sessionSwitchCompleted)
 					await Bun.write(
-						resolveLocalUrlToPath(options.finalPlanFilePath, {
-							getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
-							isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
-							getSessionId: () => this.ctx.sessionManager.getSessionId(),
-						}),
+						resolveLocalUrlToPath(options.finalPlanFilePath, this.#localProtocolOptions()),
 						planContent,
 					);
 			} else if (options.compactBeforeExecute) {

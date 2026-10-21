@@ -109,6 +109,10 @@ describe("createAgentSession session storage isolation", () => {
 
 			expect(sessionFile.startsWith(path.join(agentDir, "sessions"))).toBe(true);
 			expect(sessionFile.startsWith(getSessionsDir())).toBe(false);
+			const sessionId = session.sessionManager.getSessionId();
+			const localRoot = path.join(getLocalRootsDir(agentDir), sessionId);
+			expect(fs.existsSync(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).toBe(true);
+			expect(fs.existsSync(path.join(getLocalRootsDir(), sessionId))).toBe(false);
 		} finally {
 			await session.dispose();
 		}
@@ -150,6 +154,7 @@ describe("createAgentSession session storage isolation", () => {
 
 		try {
 			const localOptions = {
+				getAgentDir: () => session.getSessionAgentDir(),
 				getArtifactsDir: () => resumedManager.getArtifactsDir(),
 				isManagedDestination: () => resumedManager.isManagedDestination(),
 				getManagedLegacyLocalMigrationSource: () => resumedManager.getManagedLegacyLocalMigrationSource(),
@@ -215,6 +220,7 @@ describe("createAgentSession session storage isolation", () => {
 			expect(await session.switchSession(sessionBFile)).toBe(true);
 
 			const localOptions = {
+				getAgentDir: () => session.getSessionAgentDir(),
 				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
 				isManagedDestination: () => session.sessionManager.isManagedDestination(),
 				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
@@ -265,6 +271,7 @@ describe("createAgentSession session storage isolation", () => {
 			// ran for the *new* session identity — /new must await it like
 			// cold start (#2797) and /resume (#2925).
 			const localOptions = {
+				getAgentDir: () => session.getSessionAgentDir(),
 				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
 				isManagedDestination: () => session.sessionManager.isManagedDestination(),
 				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
@@ -334,6 +341,7 @@ describe("createAgentSession session storage isolation", () => {
 							markerExists: fs.existsSync(
 								path.join(
 									resolveLocalRoot({
+										getAgentDir: () => session.getSessionAgentDir(),
 										getArtifactsDir: () => manager.getArtifactsDir(),
 										isManagedDestination: () => manager.isManagedDestination(),
 										getSessionId: () => value,

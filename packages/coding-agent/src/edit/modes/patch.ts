@@ -68,6 +68,8 @@ export interface ApplyPatchResult {
 
 export interface ApplyPatchOptions {
 	cwd: string;
+	/** Agent-state directory used to resolve this session's managed local root. */
+	agentDir?: string;
 	dryRun?: boolean;
 	fuzzyThreshold?: number;
 	allowFuzzy?: boolean;
@@ -145,13 +147,13 @@ function pathIsWithin(target: string, root: string): boolean {
  * artifacts root. Managed roots under the persistent agent-state local
  * directory are recognized from the path. Else `cwd`.
  */
-function boundaryForPatchDelete(cwd: string, absolutePath: string, localRoot?: string): string {
+function boundaryForPatchDelete(cwd: string, absolutePath: string, localRoot?: string, agentDir?: string): string {
 	const resolved = path.resolve(absolutePath);
 	if (localRoot) {
 		const explicit = path.resolve(localRoot);
 		if (pathIsWithin(resolved, explicit)) return explicit;
 	}
-	const managedParent = getLocalRootsDir();
+	const managedParent = getLocalRootsDir(agentDir);
 	if (pathIsWithin(resolved, managedParent)) {
 		const rest = resolved.slice(managedParent.length + path.sep.length);
 		const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
@@ -202,12 +204,13 @@ async function resolvePatchMkdirPath(
 	cwd: string,
 	absolutePath: string,
 	localRoot: string | undefined,
+	agentDir: string | undefined,
 	parentDir: string,
 	displayPath: string,
 	signal?: AbortSignal,
 ): Promise<string> {
 	signal?.throwIfAborted();
-	const boundary = path.resolve(boundaryForPatchDelete(cwd, absolutePath, localRoot));
+	const boundary = path.resolve(boundaryForPatchDelete(cwd, absolutePath, localRoot, agentDir));
 	const lexicalParent = path.resolve(parentDir);
 	if (!pathIsWithin(lexicalParent, boundary)) return parentDir;
 	// A root that does not exist yet is not an escape. Keep the missing suffix
@@ -300,14 +303,35 @@ export async function preflightPatchMkdir(input: PatchInput, options: ApplyPatch
 	const absolutePath = resolvePath(input.path);
 	const op = input.op ?? "update";
 	if (op === "create") {
-		await rejectPatchMkdirEscape(options.cwd, absolutePath, options.localRoot, input.path, options.signal);
+		await rejectPatchMkdirEscape(
+			options.cwd,
+			absolutePath,
+			options.localRoot,
+			options.agentDir,
+			input.path,
+			options.signal,
+		);
 	}
 	if (input.rename) {
 		const destPath = resolvePath(input.rename);
 		if (destPath !== absolutePath) {
 			// The source is locked too. Check it before that lock can mkdir through a symlink.
-			await rejectPatchMkdirEscape(options.cwd, absolutePath, options.localRoot, input.path, options.signal);
-			await rejectPatchMkdirEscape(options.cwd, destPath, options.localRoot, input.rename, options.signal);
+			await rejectPatchMkdirEscape(
+				options.cwd,
+				absolutePath,
+				options.localRoot,
+				options.agentDir,
+				input.path,
+				options.signal,
+			);
+			await rejectPatchMkdirEscape(
+				options.cwd,
+				destPath,
+				options.localRoot,
+				options.agentDir,
+				input.rename,
+				options.signal,
+			);
 		}
 	}
 }
@@ -316,12 +340,13 @@ async function rejectPatchMkdirEscape(
 	cwd: string,
 	absolutePath: string,
 	localRoot: string | undefined,
+	agentDir: string | undefined,
 	displayPath: string,
 	signal?: AbortSignal,
 ): Promise<void> {
 	const parentDir = path.dirname(absolutePath);
 	if (!parentDir || parentDir === ".") return;
-	await resolvePatchMkdirPath(cwd, absolutePath, localRoot, parentDir, displayPath, signal);
+	await resolvePatchMkdirPath(cwd, absolutePath, localRoot, agentDir, parentDir, displayPath, signal);
 }
 
 /**
@@ -337,6 +362,7 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		fuzzyThreshold = DEFAULT_FUZZY_THRESHOLD,
 		allowFuzzy = true,
 		localRoot,
+		agentDir,
 		signal,
 	} = options;
 
@@ -363,7 +389,7 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		const parentDir = path.dirname(absolutePath);
 		const mkdirPath =
 			parentDir && parentDir !== "."
-				? await resolvePatchMkdirPath(cwd, absolutePath, localRoot, parentDir, input.path, signal)
+				? await resolvePatchMkdirPath(cwd, absolutePath, localRoot, agentDir, parentDir, input.path, signal)
 				: undefined;
 		if (!dryRun) {
 			if (mkdirPath) {
@@ -386,7 +412,7 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 	// Handle DELETE operation
 	if (op === "delete") {
 		signal?.throwIfAborted();
-		const boundary = boundaryForPatchDelete(cwd, absolutePath, localRoot);
+		const boundary = boundaryForPatchDelete(cwd, absolutePath, localRoot, agentDir);
 		const deletePath = await resolvePatchDeletePath(boundary, absolutePath, input.path, signal);
 		signal?.throwIfAborted();
 		const oldContent = await readExistingPatchFile(fs, deletePath, input.path);
@@ -438,6 +464,7 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 				cwd,
 				destPath,
 				localRoot,
+				agentDir,
 				parentDir,
 				input.rename ?? input.path,
 				signal,
@@ -696,6 +723,7 @@ export async function executePatchSingle(
 	const localRoot = explicitLocalRootForSession(session);
 	const result = await applyPatch(input, {
 		cwd: session.cwd,
+		agentDir: session.getSessionAgentDir?.(),
 		fs: patchFileSystem,
 		fuzzyThreshold,
 		allowFuzzy,

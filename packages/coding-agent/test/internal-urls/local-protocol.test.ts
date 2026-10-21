@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -97,6 +98,22 @@ it("keeps explicit local roots under artifacts while managed roots stay external
 	});
 });
 
+it("resolves managed roots from the session's configured agent directory", async () => {
+	await withTempDir(async agentDir => {
+		const sessionId = `profile-${path.basename(agentDir)}`;
+		const options = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const expectedRoot = path.join(getLocalRootsDir(agentDir), sessionId);
+
+		expect(resolveLocalRoot(options)).toBe(expectedRoot);
+		await initializeLocalRoot(options);
+		expect(await fs.readFile(path.join(expectedRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("absent\n");
+	});
+});
+
 it("keeps managed local data when temporary storage is cleaned", async () => {
 	const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-persistent-"));
 	const agentDir = path.join(sandbox, "agent");
@@ -131,6 +148,98 @@ console.log(root);
 		expect(root).toBe(path.join(agentDir, "local", sessionId));
 		expect(await fs.readFile(path.join(root, "helper.py"), "utf8")).toBe("retained helper");
 		await expect(fs.stat(tmpDir)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await fs.rm(sandbox, { recursive: true, force: true });
+	}
+});
+
+it("migrates an existing managed root out of temporary storage", async () => {
+	const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-old-root-"));
+	const agentDir = path.join(sandbox, "agent");
+	const tmpDir = path.join(sandbox, "tmp");
+	const sessionId = `old-root-${crypto.randomUUID()}`;
+	await fs.mkdir(tmpDir, { recursive: true });
+	try {
+		const script = `
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { initializeLocalRoot, resolveLocalRoot, resolveLocalUrlToPath } from "./src/internal-urls/local-protocol.ts";
+
+const sessionId = ${JSON.stringify(sessionId)};
+const oldRoot = path.join(os.tmpdir(), "gjc-local", sessionId);
+await fs.mkdir(oldRoot, { recursive: true, mode: 0o700 });
+await fs.chmod(path.dirname(oldRoot), 0o700);
+await fs.chmod(oldRoot, 0o700);
+await fs.writeFile(path.join(oldRoot, "handoff.json"), "preserved handoff", { mode: 0o600 });
+await fs.writeFile(path.join(oldRoot, ".gjc-local-legacy-migrated-v1"), "verified\\n", { mode: 0o600 });
+const managedSnapshot = { rootDev: "1", rootIno: "2", entries: [] };
+let managedSourceRetired = false;
+const options = {
+  getAgentDir: () => process.env.GJC_CODING_AGENT_DIR,
+  getSessionId: () => sessionId,
+  isManagedDestination: () => true,
+  getManagedLegacyLocalMigrationSource: () => ({
+    capture: async () => ({
+      snapshot: managedSnapshot,
+      entries: [
+        { relativePath: "", kind: "directory" },
+        {
+          relativePath: "artifact-handoff.json",
+          kind: "file",
+          bytes: Buffer.from("artifact handoff"),
+          sha256: "a8b625653a58b17e51ed54aa79c0d189a1bed026b73185073dd4b18ec18e2f45",
+        },
+      ],
+    }),
+    retire: () => { managedSourceRetired = true; },
+  }),
+};
+try {
+  resolveLocalUrlToPath("local://handoff.json", {
+    ...options,
+    getManagedLegacyLocalMigrationSource: () => null,
+  });
+  throw new Error("synchronous resolution bypassed legacy migration");
+} catch (error) {
+  if (!String(error).includes("legacy migration must complete")) throw error;
+}
+await initializeLocalRoot(options);
+const root = resolveLocalRoot(options);
+if ((await fs.readFile(path.join(root, "handoff.json"), "utf8")) !== "preserved handoff") {
+  throw new Error("legacy managed root content was not preserved");
+}
+if ((await fs.readFile(path.join(root, "artifact-handoff.json"), "utf8")) !== "artifact handoff") {
+  throw new Error("artifact legacy-local content was not preserved");
+}
+if (!managedSourceRetired) throw new Error("artifact legacy-local source was not retired");
+try {
+  await fs.lstat(oldRoot);
+  throw new Error("legacy managed root was not retired");
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+}
+console.log(root);
+`;
+		const proc = Bun.spawn(["bun", "-e", script], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir, TMPDIR: tmpDir, TMP: tmpDir, TEMP: tmpDir },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`old local-root migration exited ${code}\n${stdout}\n${stderr}`);
+		const root = stdout.trim();
+		expect(root).toBe(path.join(agentDir, "local", sessionId));
+		expect(await fs.readFile(path.join(root, "handoff.json"), "utf8")).toBe("preserved handoff");
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(root, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(path.join(tmpDir, "gjc-local", sessionId))).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
 		await fs.rm(sandbox, { recursive: true, force: true });
 	}
@@ -207,7 +316,7 @@ it("coalesces concurrent managed migration for the same local root", async () =>
 	});
 });
 
-it("rolls back a sorted managed partial install and retries the same identity", async () => {
+it("keeps a sorted managed partial install recoverable after a destination conflict", async () => {
 	const sessionId = `managed-collision-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
 	let retired = 0;
@@ -238,7 +347,7 @@ it("rolls back a sorted managed partial install and retries the same identity", 
 			}),
 		};
 		await expect(initializeLocalRoot(options)).rejects.toThrow("destination is ambiguous");
-		await expect(fs.lstat(path.join(localRoot, "01-first"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
 		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("existing");
 		expect(retired).toBe(0);
 		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
@@ -251,6 +360,67 @@ it("rolls back a sorted managed partial install and retries the same identity", 
 		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("second");
 		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("verified\n");
 		expect(retired).toBe(1);
+	});
+});
+
+it("resumes an interrupted managed migration from its retained source", async () => {
+	const sessionId = `managed-interrupted-${crypto.randomUUID()}`;
+	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
+	let retired = 0;
+	await withLocalRoot(sessionId, async localRoot => {
+		const options = {
+			getSessionId: () => sessionId,
+			getManagedLegacyLocalMigrationSource: () => ({
+				capture: async () => ({
+					snapshot,
+					entries: [
+						{ relativePath: "", kind: "directory" as const },
+						{
+							relativePath: "01-first",
+							kind: "file" as const,
+							bytes: Buffer.from("first"),
+							sha256: "a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e",
+						},
+						{
+							relativePath: "02-second",
+							kind: "file" as const,
+							bytes: Buffer.from("second"),
+							sha256: "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4",
+						},
+					],
+				}),
+				retire: () => retired++,
+			}),
+		};
+		const rename = fs.rename.bind(fs);
+		let interrupted = false;
+		const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+			if (!interrupted && path.resolve(String(destination)) === path.join(localRoot, "02-second")) {
+				interrupted = true;
+				throw new Error("simulated migration interruption");
+			}
+			await rename(source, destination);
+		});
+		try {
+			await expect(initializeLocalRoot(options)).rejects.toThrow("simulated migration interruption");
+		} finally {
+			renameSpy.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
+		await expect(fs.lstat(path.join(localRoot, "02-second"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(retired).toBe(0);
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const interruptedStaging = path.join(path.dirname(localRoot), `.gjc-local-migration-${stagingName}`);
+		await fs.mkdir(interruptedStaging, { mode: 0o700 });
+		await fs.writeFile(path.join(interruptedStaging, "02-second"), "second", { mode: 0o600 });
+
+		await initializeLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
+		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("second");
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("verified\n");
+		expect(retired).toBe(1);
+		await expect(fs.lstat(interruptedStaging)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
 
@@ -309,6 +479,7 @@ describe("LocalProtocolHandler", () => {
 			kind: "main",
 			status: "running",
 			session: {
+				getSessionAgentDir: () => "/registry-agent",
 				sessionManager: {
 					getArtifactsDir: () => "/registry-artifacts",
 					getSessionId: () => "registry-session",
@@ -322,12 +493,14 @@ describe("LocalProtocolHandler", () => {
 
 		dispose();
 		const fallback = LocalProtocolHandler.resolveOptions();
+		expect(fallback?.getAgentDir?.()).toBe("/registry-agent");
 		expect(fallback?.getArtifactsDir?.()).toBe("/registry-artifacts");
 		expect(fallback?.getSessionId?.()).toBe("registry-session");
 	});
 
 	it("uses only live main registry sessions as the fallback", () => {
 		const session = {
+			getSessionAgentDir: () => "/registry-agent",
 			sessionManager: {
 				getArtifactsDir: () => "/registry-artifacts",
 				getSessionId: () => "registry-session",
@@ -346,6 +519,7 @@ describe("LocalProtocolHandler", () => {
 		};
 
 		const idle = resolveForStatus("idle");
+		expect(idle?.getAgentDir?.()).toBe("/registry-agent");
 		expect(idle?.getArtifactsDir?.()).toBe("/registry-artifacts");
 		expect(idle?.getSessionId?.()).toBe("registry-session");
 		expect(resolveForStatus("completed")).toBeUndefined();

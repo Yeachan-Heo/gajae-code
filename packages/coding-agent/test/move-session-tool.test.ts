@@ -64,6 +64,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 	async function makeSession(cwd: string, sessionManager: SessionManager, overrides: Record<string, unknown> = {}) {
 		tempDirs.push(
 			resolveLocalRoot({
+				getAgentDir: () => path.dirname(cwd),
 				getArtifactsDir: () => sessionManager.getArtifactsDir(),
 				isManagedDestination: () => sessionManager.isManagedDestination(),
 				getSessionId: () => sessionManager.getSessionId(),
@@ -135,6 +136,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		);
 		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
 		const localOptions = {
+			getAgentDir: () => session.getSessionAgentDir(),
 			getArtifactsDir: () => sessionManager.getArtifactsDir(),
 			isManagedDestination: () => sessionManager.isManagedDestination(),
 			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
@@ -154,7 +156,9 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			else await sessionManager.moveTo(cwdB);
 			expect(sessionManager.isManagedDestination()).toBe(true);
 			const resolved = resolveLocalUrlToPath("local://note.txt", localOptions);
-			expect(resolved).toBe(path.join(getLocalRootsDir(), session.sessionId, "note.txt"));
+			expect(resolved).toBe(
+				path.join(getLocalRootsDir(session.getSessionAgentDir()), session.sessionId, "note.txt"),
+			);
 			expect(observerPath).toBe(resolved);
 			if (populated) expect(await Bun.file(resolved).text()).toBe("preserved across move\n");
 			else expect(await Bun.file(resolved).exists()).toBe(false);

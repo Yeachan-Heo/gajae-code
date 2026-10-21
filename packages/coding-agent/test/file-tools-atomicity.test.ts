@@ -26,8 +26,8 @@ function createSession(cwd: string, extras: Partial<ToolSession> = {}): ToolSess
 	};
 }
 
-async function createManagedLocalRoot(sessionId: string): Promise<string> {
-	const localRoot = path.join(getLocalRootsDir(), sessionId);
+async function createManagedLocalRoot(sessionId: string, agentDir?: string): Promise<string> {
+	const localRoot = path.join(getLocalRootsDir(agentDir), sessionId);
 	const parent = path.dirname(localRoot);
 	await fs.mkdir(parent, { recursive: true, mode: 0o700 });
 	await fs.chmod(parent, 0o700);
@@ -640,6 +640,29 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
 			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
 		} finally {
+			await fs.rm(sessionRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("applies the custom agent directory to the managed local trust boundary", async () => {
+		if (process.platform === "win32") return;
+		const agentDir = path.join(tmpDir, "custom-agent");
+		const sessionId = "atomic-custom-agent-trust-test";
+		const sessionRoot = await createManagedLocalRoot(sessionId, agentDir);
+		const outside = path.join(tmpDir, "custom-agent-outside.ts");
+		const link = path.join(sessionRoot, "alias.ts");
+		await fs.writeFile(outside, "outside\n");
+		await fs.symlink(outside, link);
+		LocalProtocolHandler.setOverride({
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		});
+		try {
+			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
+			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+		} finally {
+			LocalProtocolHandler.setOverride(undefined);
 			await fs.rm(sessionRoot, { recursive: true, force: true });
 		}
 	});

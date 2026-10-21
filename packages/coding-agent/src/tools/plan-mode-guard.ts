@@ -10,6 +10,7 @@ function resolveRawPath(session: ToolSession, targetPath: string): string {
 	const normalized = normalizeLocalScheme(targetPath);
 	if (normalized.startsWith(LOCAL_SCHEME_PREFIX)) {
 		return resolveLocalUrlToPath(normalized, {
+			getAgentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
 			getArtifactsDir: session.getArtifactsDir,
 			isManagedDestination: session.isManagedSessionDestination,
 			getSessionId: session.getSessionId,

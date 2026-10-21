@@ -27,8 +27,8 @@ function track(directory: string): string {
 	return directory;
 }
 
-async function createManagedLocalRoot(sessionId: string): Promise<string> {
-	const localRoot = track(path.join(getLocalRootsDir(), sessionId));
+async function createManagedLocalRoot(sessionId: string, agentDir?: string): Promise<string> {
+	const localRoot = track(path.join(getLocalRootsDir(agentDir), sessionId));
 	const parent = path.dirname(localRoot);
 	await fs.mkdir(parent, { recursive: true, mode: 0o700 });
 	await fs.chmod(parent, 0o700);
@@ -38,8 +38,9 @@ async function createManagedLocalRoot(sessionId: string): Promise<string> {
 
 function makeSession(
 	cwd: string,
-	options: { artifactsDir?: string | null; sessionId?: string | null; managed?: boolean } = {},
+	options: { agentDir?: string; artifactsDir?: string | null; sessionId?: string | null; managed?: boolean } = {},
 ): ToolSession {
+	const agentDir = options.agentDir;
 	return {
 		cwd,
 		hasUI: false,
@@ -49,6 +50,7 @@ function makeSession(
 		settings: Settings.isolated({ "edit.mode": "patch" }),
 		getArtifactsDir: () => options.artifactsDir ?? null,
 		getSessionId: () => options.sessionId ?? null,
+		...(agentDir === undefined ? {} : { getSessionAgentDir: () => agentDir }),
 		isManagedSessionDestination: () => options.managed ?? false,
 		getPlanModeState: () => undefined,
 	} as unknown as ToolSession;
@@ -216,6 +218,26 @@ describe("patch mkdir symlink", () => {
 
 			await expect(
 				createThrough(makeSession(cwd, { sessionId, managed: true }), "local://planted/newsub/note.txt"),
+			).rejects.toThrow(ApplyPatchError);
+			await expect(fs.stat(path.join(outside, "newsub"))).rejects.toThrow();
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"uses the session agent directory for managed local-root boundaries",
+		async () => {
+			const root = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-custom-agent-")));
+			const cwd = path.join(root, "workspace");
+			const agentDir = path.join(root, "custom-agent");
+			const sessionId = `patch-mkdir-custom-${process.pid}-${Date.now()}`;
+			const localRoot = await createManagedLocalRoot(sessionId, agentDir);
+			const outside = path.join(root, "outside");
+			await fs.mkdir(cwd);
+			await fs.mkdir(outside);
+			await fs.symlink(outside, path.join(localRoot, "planted"), "dir");
+
+			await expect(
+				createThrough(makeSession(cwd, { agentDir, sessionId, managed: true }), "local://planted/newsub/note.txt"),
 			).rejects.toThrow(ApplyPatchError);
 			await expect(fs.stat(path.join(outside, "newsub"))).rejects.toThrow();
 		},

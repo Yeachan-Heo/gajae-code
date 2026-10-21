@@ -1472,6 +1472,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			skills: this.session.skills ?? [],
 			internalRouter: InternalUrlRouter.instance(),
 			localOptions: {
+				getAgentDir: () => this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
 				getArtifactsDir: this.session.getArtifactsDir,
 				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId,

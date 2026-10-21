@@ -44,7 +44,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getLocalRootsDir, hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
-import { LocalProtocolHandler } from "../internal-urls/local-protocol";
+import { LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls/local-protocol";
 
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
@@ -195,9 +195,9 @@ async function realpathOrSelf(p: string): Promise<string> {
  * directory, and a symlink placed inside one must not be able to redirect a
  * write out of it.
  */
-function sessionLocalRootFor(lexicalDest: string): string | undefined {
+function sessionLocalRootFor(lexicalDest: string, agentDir?: string): string | undefined {
 	const resolvedDest = path.resolve(lexicalDest);
-	const localParent = getLocalRootsDir();
+	const localParent = getLocalRootsDir(agentDir);
 	if (!pathIsWithin(resolvedDest, localParent)) return undefined;
 	const rest = resolvedDest.slice(localParent.length + path.sep.length);
 	const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
@@ -210,8 +210,7 @@ function sessionLocalRootFor(lexicalDest: string): string | undefined {
  * inside it. That root is not under the session-local roots directory, so the
  * managed-root helper above would leave the write unbounded.
  */
-function explicitLocalRootFor(lexicalDest: string): string | undefined {
-	const options = LocalProtocolHandler.resolveOptions();
+function explicitLocalRootFor(lexicalDest: string, options: LocalProtocolOptions | undefined): string | undefined {
 	if (!options || options.isManagedDestination?.()) return undefined;
 	const artifactsDir = options.getArtifactsDir?.();
 	if (!artifactsDir) return undefined;
@@ -221,7 +220,8 @@ function explicitLocalRootFor(lexicalDest: string): string | undefined {
 }
 
 function trustBoundaryForDestination(lexicalDest: string): string | undefined {
-	return explicitLocalRootFor(lexicalDest) ?? sessionLocalRootFor(lexicalDest);
+	const options = LocalProtocolHandler.resolveOptions();
+	return explicitLocalRootFor(lexicalDest, options) ?? sessionLocalRootFor(lexicalDest, options?.getAgentDir?.());
 }
 
 /**

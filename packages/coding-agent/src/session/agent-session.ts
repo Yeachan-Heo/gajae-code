@@ -10250,6 +10250,7 @@ export class AgentSession {
 
 	#localProtocolOptions(prepared?: PreparedNewSession): LocalProtocolOptions {
 		return {
+			getAgentDir: () => this.getSessionAgentDir(),
 			getArtifactsDir: () => prepared?.artifactsDir ?? this.sessionManager.getArtifactsDir(),
 			isManagedDestination: () => this.sessionManager.isManagedDestination(),
 			getManagedLegacyLocalMigrationSource: () =>
@@ -18806,6 +18807,7 @@ export class AgentSession {
 				let adopted = false;
 				try {
 					await initializeLocalRoot({
+						getAgentDir: () => this.getSessionAgentDir(),
 						getArtifactsDir: () => forkedManager.getArtifactsDir(),
 						isManagedDestination: () => forkedManager.isManagedDestination(),
 						getManagedLegacyLocalMigrationSource: () => forkedManager.getManagedLegacyLocalMigrationSource(),
