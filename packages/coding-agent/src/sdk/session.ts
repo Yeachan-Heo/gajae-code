@@ -2974,7 +2974,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 									);
 								}
-								if (session?.getEffectiveActiveWorkflowSkillState()) {
+								if (await session?.refreshEffectiveActiveWorkflowSkillState()) {
 									throw new Error(
 										"A workflow skill is active in this session; finish or exit it before rescoping.",
 									);
@@ -2990,7 +2990,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 										);
 									}
-									if (session?.getEffectiveActiveWorkflowSkillState()) {
+									if (await session?.refreshEffectiveActiveWorkflowSkillState()) {
 										throw new Error(
 											"A workflow skill became active while waiting for the cwd transition; finish or exit it before rescoping.",
 										);

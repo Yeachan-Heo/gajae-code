@@ -6513,6 +6513,12 @@ export class AgentSession {
 		return undefined;
 	}
 
+	/** Refresh durable workflow identity before a terminal or safety-sensitive operation. */
+	async refreshEffectiveActiveWorkflowSkillState(): Promise<{ skill: string; sessionId: string } | undefined> {
+		await this.#attachAskToolIfWorkflowActive();
+		return this.getEffectiveActiveWorkflowSkillState();
+	}
+
 	/** Replace the session-owned MCP manager after a cwd rescope. */
 	async replaceOwnedMcpManager(next: MCPManager | undefined): Promise<void> {
 		const previous = this.#ownedMcpManager;
@@ -8534,7 +8540,7 @@ export class AgentSession {
 				// turn or automatic continuation, when no skill prompt is active. Refresh
 				// its cached identity at every terminal boundary so stale state does not
 				// keep workflow-scoped behavior enabled indefinitely.
-				await this.#attachAskToolIfWorkflowActive();
+				await this.refreshEffectiveActiveWorkflowSkillState();
 			}
 			const fallbackAssistant = [...event.messages]
 				.reverse()

@@ -1149,6 +1149,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		});
 		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
 		try {
+			await session.workflowGateToolRestoration;
 			expect(session.getActiveSkillState()).toBeUndefined();
 			expect(session.getEffectiveActiveWorkflowSkillState()).toMatchObject({ skill: "deep-interview" });
 			const moveTool = session.getToolByName("move_session")!;
@@ -1161,10 +1162,23 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			expect(error).toBeDefined();
 			expect(String((error as Error)?.message ?? error)).toContain("workflow skill is active");
 			expect(sessionManager.getCwd()).toBe(cwdA);
+
+			await syncSkillActiveState({
+				cwd: cwdA,
+				sessionId: sessionManager.getSessionId(),
+				skill: "deep-interview",
+				active: false,
+			});
+			expect(session.getEffectiveActiveWorkflowSkillState()).toMatchObject({ skill: "deep-interview" });
+			// Clearing the durable row must unblock the live SDK session without
+			// waiting for another agent_end to refresh its cached identity.
+			await moveTool.execute("move-after-workflow-clear", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+			expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 
 	it("queues an unrelated cwd transition instead of skipping the lock", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
