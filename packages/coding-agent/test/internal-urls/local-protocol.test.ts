@@ -288,6 +288,91 @@ console.log(root);
 	}
 });
 
+it("merges disjoint files from overlapping temporary and artifacts legacy roots", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `legacy-merge-${crypto.randomUUID()}`;
+		const previousRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(path.join(previousRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(previousRoot), 0o700);
+		await fs.chmod(previousRoot, 0o700);
+		await fs.writeFile(path.join(previousRoot, "handoffs", "from-temp.json"), "temporary handoff", {
+			mode: 0o600,
+		});
+		await fs.mkdir(path.join(artifactsLocalRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, "handoffs", "from-artifacts.json"), "artifact handoff", {
+			mode: 0o600,
+		});
+
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await initializeLocalRoot(options);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		const localRoot = resolveLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, "handoffs", "from-temp.json"), "utf8")).toBe("temporary handoff");
+		expect(await fs.readFile(path.join(localRoot, "handoffs", "from-artifacts.json"), "utf8")).toBe(
+			"artifact handoff",
+		);
+		await expect(fs.lstat(previousRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(artifactsLocalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("preserves conflicting files when overlapping legacy directories cannot merge", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `legacy-conflict-${crypto.randomUUID()}`;
+		const previousRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(path.join(previousRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(previousRoot), 0o700);
+		await fs.chmod(previousRoot, 0o700);
+		await fs.writeFile(path.join(previousRoot, "handoffs", "shared.json"), "temporary version", {
+			mode: 0o600,
+		});
+		await fs.mkdir(path.join(artifactsLocalRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, "handoffs", "shared.json"), "artifact version", {
+			mode: 0o600,
+		});
+
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await expect(initializeLocalRoot(options)).rejects.toThrow("destination is ambiguous");
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		const localRoot = resolveLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, "handoffs", "shared.json"), "utf8")).toBe("temporary version");
+		expect(await fs.readFile(path.join(artifactsLocalRoot, "handoffs", "shared.json"), "utf8")).toBe(
+			"artifact version",
+		);
+		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+});
+
 it("serializes first managed-root migration across independent processes", async () => {
 	await withTempDir(async sandbox => {
 		const agentDir = path.join(sandbox, "agent");

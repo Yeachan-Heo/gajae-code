@@ -521,6 +521,92 @@ function stagingContentForTop(entries: readonly MigrationContentEntry[], top: st
 		}));
 }
 
+function migrationContentContains(
+	expected: readonly MigrationContentEntry[],
+	actual: readonly MigrationContentEntry[],
+): boolean {
+	const actualByPath = new Map(actual.map(entry => [entry.relativePath, entry]));
+	return expected.every(entry => {
+		const observed = actualByPath.get(entry.relativePath);
+		if (!observed || entry.kind !== observed.kind) return false;
+		return entry.kind === "directory" || (entry.size === observed.size && entry.sha256 === observed.sha256);
+	});
+}
+
+function destinationDirectoryContent(destination: string): MigrationContentEntry[] {
+	const captured = nativeLocal().snapshotDirectoryTree(destination);
+	if (!captured.ok || !captured.snapshot) throw new Error("Unsafe local:// migration destination");
+	return captured.snapshot.entries.map(entry => {
+		if (entry.kind !== "directory" && entry.kind !== "file") {
+			throw new Error("Unsafe local:// migration destination");
+		}
+		return {
+			relativePath: entry.relativePath,
+			kind: entry.kind,
+			...(entry.kind === "file" ? { size: BigInt(entry.size), sha256: entry.sha256 } : {}),
+		};
+	});
+}
+
+async function mergeStagedMigrationDirectory(
+	stagedEntry: string,
+	destination: string,
+	expected: readonly MigrationContentEntry[],
+): Promise<void> {
+	if (expected[0]?.kind !== "directory") {
+		throw new Error("Legacy local:// migration destination is ambiguous");
+	}
+	if (migrationContentContains(expected, destinationDirectoryContent(destination))) return;
+
+	const entries = expected
+		.filter(entry => entry.relativePath !== "")
+		.toSorted((left, right) => {
+			const depthDifference = left.relativePath.split("/").length - right.relativePath.split("/").length;
+			return depthDifference || left.relativePath.localeCompare(right.relativePath);
+		});
+	for (const entry of entries) {
+		const target = path.join(destination, entry.relativePath);
+		if (entry.kind === "directory") {
+			try {
+				await fs.mkdir(target, { mode: 0o700 });
+			} catch (error) {
+				if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+			}
+			const stat = await fs.lstat(target);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+			continue;
+		}
+
+		if (entry.size === undefined || !entry.sha256) {
+			throw new Error("Legacy local:// migration snapshot is incomplete");
+		}
+		try {
+			const stat = await fs.lstat(target, { bigint: true });
+			if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== entry.size) {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+			const observed = await snapshotRegularFile(target, "", {
+				maxBytes: entry.size,
+				sizeLimitError: "Legacy local:// migration destination changed during verification",
+			});
+			if (observed.digest !== entry.sha256) {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			await publishMigrationEntryNoReplace(path.join(stagedEntry, entry.relativePath), target, [
+				{ relativePath: "", kind: "file", size: entry.size, sha256: entry.sha256 },
+			]);
+		}
+	}
+
+	if (!migrationContentContains(expected, destinationDirectoryContent(destination))) {
+		throw new Error("Legacy local:// migration destination verification failed");
+	}
+}
+
 async function destinationContentMatches(
 	destination: string,
 	expected: readonly MigrationContentEntry[],
@@ -539,19 +625,7 @@ async function destinationContentMatches(
 			{ relativePath: "", kind: "file", size: observed.size, sha256: observed.digest },
 		]);
 	}
-	const captured = nativeLocal().snapshotDirectoryTree(destination);
-	if (!captured.ok || !captured.snapshot) throw new Error("Unsafe local:// migration destination");
-	const observed: MigrationContentEntry[] = captured.snapshot.entries.map(entry => {
-		if (entry.kind !== "directory" && entry.kind !== "file") {
-			throw new Error("Unsafe local:// migration destination");
-		}
-		return {
-			relativePath: entry.relativePath,
-			kind: entry.kind,
-			...(entry.kind === "file" ? { size: BigInt(entry.size), sha256: entry.sha256 } : {}),
-		};
-	});
-	return sameMigrationContent(expected, observed);
+	return sameMigrationContent(expected, destinationDirectoryContent(destination));
 }
 
 async function publishMigrationEntryNoReplace(
@@ -559,10 +633,32 @@ async function publishMigrationEntryNoReplace(
 	destination: string,
 	expected: readonly MigrationContentEntry[],
 ): Promise<void> {
+	const root = expected[0];
+	if (!root) throw new Error("Legacy local:// migration snapshot is incomplete");
+	let destinationExists = true;
+	try {
+		await fs.lstat(destination);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		destinationExists = false;
+	}
+	if (destinationExists) {
+		if (root.kind === "directory") {
+			await mergeStagedMigrationDirectory(stagedEntry, destination, expected);
+			return;
+		}
+		if (await destinationContentMatches(destination, expected)) return;
+		throw new Error("Legacy local:// migration destination is ambiguous");
+	}
+
 	const published = await nativeLocal().renameNoReplacePathAsync(stagedEntry, destination);
 	if (!published.ok) {
 		if (published.code !== "destination_exists" && published.reason !== "destination_exists") {
 			throw new Error(`Legacy local:// migration publication failed: ${published.code ?? published.reason}`);
+		}
+		if (root.kind === "directory") {
+			await mergeStagedMigrationDirectory(stagedEntry, destination, expected);
+			return;
 		}
 		let destinationMatches = false;
 		try {
@@ -683,37 +779,8 @@ async function recoverMigrationStaging(localRoot: string, scratchParent: string)
 		const expected = stagingContentForTop(manifest, top);
 		const stagedTop = path.join(staging, top);
 		const destination = path.join(localRoot, top);
-		try {
-			await fs.lstat(destination);
-			if (!(await destinationContentMatches(destination, expected))) {
-				throw new Error("Legacy local:// migration destination is ambiguous");
-			}
-			await fs.rm(stagedTop, { recursive: true, force: true });
-			continue;
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-		}
-
-		const published = await nativeLocal().renameNoReplacePathAsync(stagedTop, destination);
-		if (!published.ok) {
-			let destinationMatches = false;
-			try {
-				destinationMatches = await destinationContentMatches(destination, expected);
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
-			}
-			if (destinationMatches) {
-				await fs.rm(stagedTop, { recursive: true, force: true });
-				continue;
-			}
-			if (published.code === "destination_exists" || published.reason === "destination_exists") {
-				throw new Error("Legacy local:// migration destination is ambiguous");
-			}
-			throw new Error(`Legacy local:// migration staging recovery failed: ${published.code ?? published.reason}`);
-		}
-		if (!(await destinationContentMatches(destination, expected))) {
-			throw new Error("Legacy local:// migration destination verification failed");
-		}
+		await publishMigrationEntryNoReplace(stagedTop, destination, expected);
+		await fs.rm(stagedTop, { recursive: true, force: true });
 	}
 	return topLevelNames.length > 0;
 }
@@ -869,7 +936,7 @@ function previousManagedLocalMigrationSource(options: LocalProtocolOptions): Man
 	};
 }
 
-/** A completed top-level rename is recoverable only when its full content still matches the retained source. */
+/** Publishes a retained legacy tree, merging only nonconflicting entries into an existing directory. */
 async function migrateManagedLegacyLocal(
 	source: ManagedLegacyLocalMigrationSource,
 	localRoot: string,
@@ -905,19 +972,9 @@ async function migrateManagedLegacyLocal(
 			}
 		}
 		for (const entry of topLevelMigrationNames(captured.entries.map(value => value.relativePath))) {
-			const destination = path.join(localRoot, entry);
-			try {
-				await fs.lstat(destination);
-				if (!(await destinationContentMatches(destination, managedContentForTop(captured.entries, entry)))) {
-					throw new Error("Legacy local:// migration destination is ambiguous");
-				}
-				continue;
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
-			}
 			await publishMigrationEntryNoReplace(
 				path.join(staging, entry),
-				destination,
+				path.join(localRoot, entry),
 				managedContentForTop(captured.entries, entry),
 			);
 		}
@@ -1006,15 +1063,6 @@ async function migrateArtifactsLegacyLocal(
 		if (!manifestsMatch(verifiedManifest, manifest))
 			throw new Error("Legacy local:// migration source changed during capture");
 		for (const entry of topLevelMigrationNames(manifest.map(value => value.relativePath))) {
-			try {
-				await fs.lstat(path.join(localRoot, entry));
-				if (!(await destinationContentMatches(path.join(localRoot, entry), legacyContentForTop(manifest, entry)))) {
-					throw new Error("Legacy local:// migration destination is ambiguous");
-				}
-				continue;
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
-			}
 			await publishMigrationEntryNoReplace(
 				path.join(staging, entry),
 				path.join(localRoot, entry),
