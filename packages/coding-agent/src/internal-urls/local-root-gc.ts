@@ -1,17 +1,15 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
-import { isEnoent } from "@gajae-code/utils";
+import { getLocalRootsDir, isEnoent } from "@gajae-code/utils";
 import type { GcCollectResult, GcContext, GcError, GcRecord, GcStoreAdapter } from "../gjc-runtime/gc-runtime";
 
 /**
  * GC for `local://` session roots.
  *
- * `resolveLocalRoot` gives every session its own `<tmp>/gjc-local/<session-id>`
- * directory, and the first `local://` resolution seeds it with a migration
- * marker. Nothing ever removes those directories, so a machine accumulates one
- * per session indefinitely — and the overwhelming majority only ever hold the
- * marker, because most sessions never write a `local://` file.
+ * `resolveLocalRoot` gives every session its own persistent agent-state
+ * `local/<session-id>` directory, and the first `local://` resolution seeds it
+ * with a migration marker. Marker-only roots are collectible after the grace
+ * period; roots with user data are preserved for session reuse.
  *
  * Only marker-only directories are eligible, and only after a grace period.
  * That keeps the rule provably safe without needing a session-liveness oracle:
@@ -19,7 +17,6 @@ import type { GcCollectResult, GcContext, GcError, GcRecord, GcStoreAdapter } fr
  * started is still inside its grace window.
  */
 
-const LOCAL_ROOT_PARENT = "gjc-local";
 const LEGACY_MIGRATION_MARKER = ".gjc-local-legacy-migrated-v1";
 
 /** Directories younger than this are left alone so a live session is never raced. */
@@ -27,10 +24,6 @@ const GRACE_MS = 24 * 60 * 60 * 1000;
 
 /** Bound the scan so a pathological directory cannot stall `gjc gc`. */
 const MAX_ENTRIES = 20_000;
-
-function localRootParent(env: NodeJS.ProcessEnv): string {
-	return path.join(env.TMPDIR?.trim() || os.tmpdir(), LOCAL_ROOT_PARENT);
-}
 
 /** A root is prunable only when the marker is the single thing inside it. */
 async function classify(dir: string, now: number): Promise<{ status: string; stale: boolean; reason: string } | null> {
@@ -60,7 +53,7 @@ export const localRootsGcAdapter: GcStoreAdapter = {
 	async collect(ctx: GcContext): Promise<GcCollectResult> {
 		const records: GcRecord[] = [];
 		const errors: GcError[] = [];
-		const parent = localRootParent(ctx.env);
+		const parent = getLocalRootsDir(ctx.agentDir);
 		const now = Date.now();
 
 		let dirents: string[];

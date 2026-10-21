@@ -27,7 +27,7 @@
  * The referent is re-resolved immediately before publication so a retargeted
  * link cannot silently repoint the write. When the lexical destination sits
  * inside the active explicit artifacts local root (`<artifacts>/local`) or a
- * session-scoped `gjc-local` root, the resolved referent and its parent must
+ * session-scoped persistent local root, the resolved referent and its parent must
  * remain inside that root (a link there must not redirect the write out of
  * the trust boundary).
  *
@@ -42,9 +42,8 @@
  */
 
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
-import { hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
+import { getLocalRootsDir, hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
 import { LocalProtocolHandler } from "../internal-urls/local-protocol";
 
 const TEMP_CREATE_ATTEMPTS = 8;
@@ -115,8 +114,8 @@ export interface WriteFileAtomicallyOptions {
 	 * Trusted root that a resolved symlink referent and its parent must not
 	 * leave. When omitted, a destination inside the active explicit artifacts
 	 * local root (`<artifacts>/local`) uses that root. Otherwise the helper
-	 * still enforces the session-scoped `gjc-local` boundary implied by a
-	 * lexical destination under `<tmpdir>/gjc-local/<session-id>`.
+	 * still enforces the session-scoped persistent local-root boundary implied by
+	 * a lexical destination under the agent-state local directory.
 	 */
 	trustBoundary?: string;
 	/** Platform override used by deterministic retry tests. */
@@ -192,12 +191,13 @@ async function realpathOrSelf(p: string): Promise<string> {
 
 /**
  * Derive the session-scoped `local://` trust boundary from a lexical write
- * destination. Session roots live at `<tmpdir>/gjc-local/<session-id>`, and a
- * symlink placed inside one must not be able to redirect a write out of it.
+ * destination. Session roots live under the persistent agent-state local
+ * directory, and a symlink placed inside one must not be able to redirect a
+ * write out of it.
  */
 function sessionLocalRootFor(lexicalDest: string): string | undefined {
 	const resolvedDest = path.resolve(lexicalDest);
-	const localParent = path.join(os.tmpdir(), "gjc-local");
+	const localParent = getLocalRootsDir();
 	if (!pathIsWithin(resolvedDest, localParent)) return undefined;
 	const rest = resolvedDest.slice(localParent.length + path.sep.length);
 	const sessionSegment = rest.split(path.sep, 1)[0] ?? "";
@@ -207,8 +207,8 @@ function sessionLocalRootFor(lexicalDest: string): string | undefined {
 
 /**
  * Active explicit artifacts root (`<artifacts>/local`) when `lexicalDest` is
- * inside it. That root is not under `<tmpdir>/gjc-local`, so the tmp helper
- * above would leave the write unbounded. Managed sessions keep the tmp root.
+ * inside it. That root is not under the session-local roots directory, so the
+ * managed-root helper above would leave the write unbounded.
  */
 function explicitLocalRootFor(lexicalDest: string): string | undefined {
 	const options = LocalProtocolHandler.resolveOptions();
@@ -227,7 +227,7 @@ function trustBoundaryForDestination(lexicalDest: string): string | undefined {
 /**
  * Reject publication when the resolved referent's real parent (and therefore
  * the referent itself) leaves the trust boundary. The boundary root is
- * realpathed so a symlinked `gjc-local` root cannot smuggle a write out.
+ * realpathed so a symlinked session-local root cannot smuggle a write out.
  *
  * This must run before any directory is created. A dangling symlink inside a
  * trusted root resolves to a path outside it, so creating parents first would

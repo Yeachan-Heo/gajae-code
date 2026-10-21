@@ -6,10 +6,9 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
-import { isEnoent } from "@gajae-code/utils";
+import { getLocalRootsDir, isEnoent } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { Settings } from "../../config/settings";
 import {
@@ -143,7 +142,8 @@ function pathIsWithin(target: string, root: string): boolean {
 
 /**
  * Trust root for a delete. `localRoot` is the caller session's explicit
- * artifacts root. `gjc-local/<id>` is recognized from the path. Else `cwd`.
+ * artifacts root. Managed roots under the persistent agent-state local
+ * directory are recognized from the path. Else `cwd`.
  */
 function boundaryForPatchDelete(cwd: string, absolutePath: string, localRoot?: string): string {
 	const resolved = path.resolve(absolutePath);
@@ -151,7 +151,7 @@ function boundaryForPatchDelete(cwd: string, absolutePath: string, localRoot?: s
 		const explicit = path.resolve(localRoot);
 		if (pathIsWithin(resolved, explicit)) return explicit;
 	}
-	const managedParent = path.join(os.tmpdir(), "gjc-local");
+	const managedParent = getLocalRootsDir();
 	if (pathIsWithin(resolved, managedParent)) {
 		const rest = resolved.slice(managedParent.length + path.sep.length);
 		const sessionSegment = rest.split(path.sep, 1)[0] ?? "";

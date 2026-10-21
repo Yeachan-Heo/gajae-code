@@ -9,6 +9,7 @@ import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridg
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import { FileReadCache } from "../src/edit/file-read-cache";
 import { writeFileAtomically } from "../src/tools/atomic-file-write";
 
@@ -23,6 +24,15 @@ function createSession(cwd: string, extras: Partial<ToolSession> = {}): ToolSess
 		settings: Settings.isolated(),
 		...extras,
 	};
+}
+
+async function createManagedLocalRoot(sessionId: string): Promise<string> {
+	const localRoot = path.join(getLocalRootsDir(), sessionId);
+	const parent = path.dirname(localRoot);
+	await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+	await fs.chmod(parent, 0o700);
+	await fs.mkdir(localRoot, { mode: 0o700 });
+	return localRoot;
 }
 
 function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -619,12 +629,11 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		},
 	);
 
-	it("rejects a symlink escape from the session-scoped gjc-local root", async () => {
+	it("rejects a symlink escape from the session-scoped persistent local root", async () => {
 		if (process.platform === "win32") return;
-		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-trust-test");
+		const sessionRoot = await createManagedLocalRoot("atomic-trust-test");
 		const outside = path.join(tmpDir, "outside-secret.ts");
 		const link = path.join(sessionRoot, "alias.ts");
-		await fs.mkdir(sessionRoot, { recursive: true });
 		await fs.writeFile(outside, "outside\n");
 		await fs.symlink(outside, link);
 		try {
@@ -637,13 +646,12 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 
 	it("creates no directories outside the trust boundary for a dangling symlink escape", async () => {
 		if (process.platform === "win32") return;
-		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-dangling-test");
+		const sessionRoot = await createManagedLocalRoot("atomic-dangling-test");
 		const outsideRoot = path.join(tmpDir, "outside-root");
 		// The link target does not exist, and neither do its parents. Resolving it
 		// escapes the session root, so nothing under outsideRoot may be created.
 		const danglingTarget = path.join(outsideRoot, "attacker", "nested", "payload.ts");
 		const link = path.join(sessionRoot, "dangling.ts");
-		await fs.mkdir(sessionRoot, { recursive: true });
 		await fs.symlink(danglingTarget, link);
 		try {
 			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
@@ -658,11 +666,10 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 
 	it("does not mkdir an archive path before rejecting a boundary escape", async () => {
 		if (process.platform === "win32") return;
-		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "archive-boundary-test");
+		const sessionRoot = await createManagedLocalRoot("archive-boundary-test");
 		const outsideRoot = path.join(tmpDir, "archive-outside-root");
 		const danglingArchive = path.join(outsideRoot, "attacker", "nested", "payload.zip");
 		const link = path.join(sessionRoot, "archive-link.zip");
-		await fs.mkdir(sessionRoot, { recursive: true });
 		await fs.symlink(danglingArchive, link);
 		try {
 			await expect(

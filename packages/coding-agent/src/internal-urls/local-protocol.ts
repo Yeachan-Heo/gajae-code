@@ -1,11 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
-import { isEnoent } from "@gajae-code/utils";
+import { getLocalRootsDir, isEnoent } from "@gajae-code/utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
@@ -124,7 +123,8 @@ async function buildListing(url: InternalUrl, localRoot: string): Promise<Intern
 			: files.map(file => `- [${localListingLabel(file)}](local://${localListingHref(file)})`).join("\n");
 	const content =
 		`# Local\n\n` +
-		`Session-scoped scratch space for large intermediate data, subagent handoffs, and reusable planning artifacts.\n\n` +
+		`Persistent session-scoped storage for large intermediate data, subagent handoffs, and reusable planning artifacts. ` +
+		`Keep files you reuse across turns here or in the project tree, not in /tmp; /tmp may be cleared on reboot.\n\n` +
 		`Root: ${localRoot}\n\n` +
 		`${files.length} file${files.length === 1 ? "" : "s"} available:\n\n` +
 		`${listing}\n`;
@@ -791,7 +791,7 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 }
 
 export function resolveLocalRoot(options: LocalProtocolOptions): string {
-	return explicitLocalRoot(options) ?? path.join(os.tmpdir(), "gjc-local", safeSessionId(options));
+	return explicitLocalRoot(options) ?? path.join(getLocalRootsDir(), safeSessionId(options));
 }
 
 export function resolveLocalUrlToPath(input: string | InternalUrl, options: LocalProtocolOptions): string {

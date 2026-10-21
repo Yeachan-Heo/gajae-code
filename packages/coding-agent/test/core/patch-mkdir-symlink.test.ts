@@ -12,6 +12,7 @@ import {
 } from "@gajae-code/coding-agent/edit";
 import { writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { getLocalRootsDir } from "@gajae-code/utils";
 
 const temporaryDirectories: string[] = [];
 
@@ -24,6 +25,15 @@ afterEach(async () => {
 function track(directory: string): string {
 	temporaryDirectories.push(directory);
 	return directory;
+}
+
+async function createManagedLocalRoot(sessionId: string): Promise<string> {
+	const localRoot = track(path.join(getLocalRootsDir(), sessionId));
+	const parent = path.dirname(localRoot);
+	await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+	await fs.chmod(parent, 0o700);
+	await fs.mkdir(localRoot, { mode: 0o700 });
+	return localRoot;
 }
 
 function makeSession(
@@ -187,8 +197,7 @@ describe("patch mkdir symlink", () => {
 	test.skipIf(process.platform === "win32")("still allows creating a file inside the session local root", async () => {
 		const cwd = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-managed-ok-")));
 		const sessionId = `patch-mkdir-${process.pid}-${Date.now()}`;
-		const localRoot = track(path.join(os.tmpdir(), "gjc-local", sessionId));
-		await fs.mkdir(localRoot, { recursive: true });
+		const localRoot = await createManagedLocalRoot(sessionId);
 
 		await createThrough(makeSession(cwd, { sessionId, managed: true }), "local://nested/note.txt");
 
@@ -200,9 +209,8 @@ describe("patch mkdir symlink", () => {
 		async () => {
 			const cwd = track(await fs.mkdtemp(path.join(os.tmpdir(), "patch-mkdir-managed-esc-")));
 			const sessionId = `patch-mkdir-${process.pid}-${Date.now()}-esc`;
-			const localRoot = track(path.join(os.tmpdir(), "gjc-local", sessionId));
+			const localRoot = await createManagedLocalRoot(sessionId);
 			const outside = path.join(cwd, "outside");
-			await fs.mkdir(localRoot, { recursive: true });
 			await fs.mkdir(outside);
 			await fs.symlink(outside, path.join(localRoot, "planted"), "dir");
 

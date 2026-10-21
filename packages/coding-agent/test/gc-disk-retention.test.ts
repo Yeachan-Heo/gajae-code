@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import { getDefault } from "../src/config/settings-schema";
 import { collectEmptyDeleteReceipts, runEmptyDeleteGc } from "../src/gjc-runtime/empty-delete-gc";
 import {
@@ -27,8 +28,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Every test runs against a private state root. `GJC_CODING_AGENT_DIR` pins the
- * agent dir, `GJC_HARNESS_ROOT_REGISTRY_DIR` pins the harness registry and
- * `TMPDIR` pins the `local://` root parent, so nothing here can reach ~/.gjc.
+ * agent dir, `GJC_HARNESS_ROOT_REGISTRY_DIR` pins the harness registry, and the
+ * local-root scan uses that isolated agent dir, so nothing here can reach ~/.gjc.
  */
 interface TestRoot {
 	root: string;
@@ -1775,7 +1776,7 @@ describe("gjc gc --disk (session tool artifacts)", () => {
 
 	test("reclaims nothing and names the reason when the live-surface scan is incomplete", async () => {
 		const fixture = await makeTestRoot();
-		const localRoots = path.join(fixture.env.TMPDIR!, "gjc-local");
+		const localRoots = getLocalRootsDir(fixture.agentDir);
 		try {
 			await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
 			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });

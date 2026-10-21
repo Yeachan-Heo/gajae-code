@@ -15,12 +15,12 @@
 
 import type { BigIntStats, Dirent, Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { exactRemoveDirectoryTree, exactUnlink, snapshotDirectoryTree } from "@gajae-code/natives";
 import {
 	getAgentDir,
 	getBlobsDir,
+	getLocalRootsDir,
 	getSessionsDir,
 	isEnoent,
 	loadedProjectEnvSnapshot,
@@ -142,6 +142,7 @@ export interface GcContext {
 	force: boolean;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
+	agentDir?: string;
 }
 
 /**
@@ -676,13 +677,13 @@ export async function runGjcGcCommand(
 		}
 	}
 	const resolvedAdapters = adapters ?? (await defaultGcAdapters());
-	const ctx: GcContext = { probe: gcPidProbe, force: parsed.prune, env, cwd };
+	const agentDir = resolveGcAgentDir(env, loadedProjectEnv);
+	const ctx: GcContext = { probe: gcPidProbe, force: parsed.prune, env, cwd, agentDir };
 	// A failed explicit empty-delete discovery or cleanup is a safety gate: report
 	// ordinary candidates, but never perform their destructive prune in that run.
 	const ordinaryPrune = parsed.prune && (emptyDeleteReceipts?.errors.length ?? 0) === 0;
 	const report = await collectGcReport(resolvedAdapters, ctx, ordinaryPrune);
 	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
-	const agentDir = resolveGcAgentDir(env, loadedProjectEnv);
 	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, agentDir);
 	if (parsed.disk) {
 		report.disk = await collectGcDiskReport({
@@ -1119,7 +1120,7 @@ async function collectGcSessionReferences(agentDir: string, env: NodeJS.ProcessE
 	}
 
 	// 3. `local://` session roots: one directory per session id.
-	const localRoots = path.join(env.TMPDIR?.trim() || os.tmpdir(), "gjc-local");
+	const localRoots = getLocalRootsDir(agentDir);
 	try {
 		for (const name of await fsp.readdir(localRoots)) ids.add(name);
 	} catch (error) {

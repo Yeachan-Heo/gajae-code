@@ -7,6 +7,7 @@ import {
 	getAgentDir,
 	getConfigDirName,
 	getGpuCachePath,
+	getLocalRootsDir,
 	getLogsDir,
 	getPluginsDir,
 	getPuppeteerDir,
@@ -76,6 +77,7 @@ describe("python gateway directory", () => {
 		setAgentDir(defaultAgentDir);
 
 		expect(getPythonGatewayDir()).toBe(path.join(process.env.XDG_STATE_HOME, "gjc", "python-gateway"));
+		expect(getLocalRootsDir()).toBe(path.join(process.env.XDG_STATE_HOME, "gjc", "local"));
 	});
 
 	it("keeps custom agent profiles isolated from XDG shared state", async () => {
@@ -88,6 +90,7 @@ describe("python gateway directory", () => {
 		setAgentDir(customAgentDir);
 
 		expect(getPythonGatewayDir()).toBe(path.join(customAgentDir, "python-gateway"));
+		expect(getLocalRootsDir()).toBe(path.join(customAgentDir, "local"));
 	});
 
 	it("keeps custom agent profile GPU cache out of the global config root", async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import * as os from "node:os";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import type { PlanModeState } from "../../src/plan-mode/state";
 import type { ToolSession } from "../../src/tools";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../src/tools/plan-mode-guard";
@@ -35,11 +36,15 @@ describe("resolvePlanPath local:// support", () => {
 		);
 	});
 
-	it("falls back to os tmp root when artifacts dir is unavailable", () => {
-		const session = makeSession({ artifactsDir: null, sessionId: "session-42" });
-		expect(resolvePlanPath(session, "local://memo.txt")).toBe(
-			path.join(os.tmpdir(), "gjc-local", "session-42", "memo.txt"),
-		);
+	it("uses the persistent managed local root when artifacts dir is unavailable", async () => {
+		const sessionId = `session-${crypto.randomUUID()}`;
+		const session = makeSession({ artifactsDir: null, sessionId });
+		const root = path.join(getLocalRootsDir(), sessionId);
+		try {
+			expect(resolvePlanPath(session, "local://memo.txt")).toBe(path.join(root, "memo.txt"));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
 

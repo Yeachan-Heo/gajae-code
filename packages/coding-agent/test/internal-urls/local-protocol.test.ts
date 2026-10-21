@@ -12,6 +12,7 @@ import {
 } from "@gajae-code/coding-agent/internal-urls";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { getLocalRootsDir } from "@gajae-code/utils";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-"));
@@ -25,7 +26,9 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 async function withLocalRoot<T>(sessionId: string, fn: (root: string) => Promise<T>): Promise<T> {
 	const root = resolveLocalRoot({ getSessionId: () => sessionId });
 	await fs.rm(root, { recursive: true, force: true });
-	await fs.mkdir(root, { recursive: true });
+	await fs.mkdir(path.dirname(root), { recursive: true, mode: 0o700 });
+	await fs.chmod(path.dirname(root), 0o700);
+	await fs.mkdir(root, { mode: 0o700 });
 
 	try {
 		return await fn(root);
@@ -90,9 +93,49 @@ it("keeps explicit local roots under artifacts while managed roots stay external
 				isManagedDestination: () => true,
 				getSessionId: () => sessionId,
 			}),
-		).toBe(path.join(os.tmpdir(), "gjc-local", sessionId));
+		).toBe(path.join(getLocalRootsDir(), sessionId));
 	});
 });
+
+it("keeps managed local data when temporary storage is cleaned", async () => {
+	const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-persistent-"));
+	const agentDir = path.join(sandbox, "agent");
+	const tmpDir = path.join(sandbox, "tmp");
+	const sessionId = `persistent-${crypto.randomUUID()}`;
+	await fs.mkdir(tmpDir, { recursive: true });
+	try {
+		const script = `
+import * as fs from "node:fs/promises";
+import { initializeLocalRoot, resolveLocalRoot, resolveLocalUrlToPath } from "./src/internal-urls/local-protocol.ts";
+
+const options = { getSessionId: () => ${JSON.stringify(sessionId)}, isManagedDestination: () => true };
+const root = resolveLocalRoot(options);
+await initializeLocalRoot(options);
+await fs.writeFile(resolveLocalUrlToPath("local://helper.py", options), "retained helper");
+await fs.rm(process.env.TMPDIR, { recursive: true, force: true });
+console.log(root);
+`;
+		const proc = Bun.spawn(["bun", "-e", script], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir, TMPDIR: tmpDir },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`persistent local-root probe exited ${code}\n${stdout}\n${stderr}`);
+		const root = stdout.trim();
+		expect(root).toBe(path.join(agentDir, "local", sessionId));
+		expect(await fs.readFile(path.join(root, "helper.py"), "utf8")).toBe("retained helper");
+		await expect(fs.stat(tmpDir)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await fs.rm(sandbox, { recursive: true, force: true });
+	}
+});
+
 it("migrates opaque managed legacy topology, retires exactly once, and verifies the marker", async () => {
 	const sessionId = `managed-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
@@ -352,7 +395,7 @@ describe("LocalProtocolHandler", () => {
 				LocalProtocolHandler.setOverride(localOptions(sessionId, artifactsDir));
 				const resource = await InternalUrlRouter.instance().resolve("local://");
 
-				expect(localRoot).toBe(path.join(os.tmpdir(), "gjc-local", sessionId));
+				expect(localRoot).toBe(path.join(getLocalRootsDir(), sessionId));
 				expect(resource.sourcePath).toBe(await fs.realpath(localRoot));
 				expect(resource.content).toContain("handoff.json");
 				expect(resource.content).toContain("legacy.json");
@@ -506,6 +549,9 @@ describe("LocalProtocolHandler", () => {
 				LocalProtocolHandler.setOverride(localOptions(sessionId, path.join(tempDir, "artifacts")));
 				const router = InternalUrlRouter.instance();
 				const listing = await router.resolve("local://");
+				expect(listing.content).toContain(
+					"Keep files you reuse across turns here or in the project tree, not in /tmp",
+				);
 				expect(listing.content).toContain("[report%3Araw.txt](local://report%253Araw.txt)");
 				expect(listing.content).toContain("[report:raw.txt](local://report%3Araw.txt)");
 				expect(listing.content).toContain("[report).txt](local://report%29.txt)");
@@ -598,15 +644,21 @@ describe("LocalProtocolHandler", () => {
 	});
 
 	it("resolves a stable external path before initialization", async () => {
+		const sessionId = `session/fallback-${crypto.randomUUID()}`;
 		const options = {
-			getSessionId: () => "session/fallback",
+			getSessionId: () => sessionId,
 			getArtifactsDir: () => null,
 		};
 		const root = resolveLocalRoot(options);
-		expect(root).toBe(path.join(os.tmpdir(), "gjc-local", "session_fallback"));
-		expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
-		await initializeLocalRoot(options);
-		expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+		const safeSessionId = sessionId.replaceAll("/", "_");
+		try {
+			expect(root).toBe(path.join(getLocalRootsDir(), safeSessionId));
+			expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+			await initializeLocalRoot(options);
+			expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("resolves against a cleanup_pending root the async gate already settled", async () => {
@@ -861,7 +913,13 @@ describe("LocalProtocolHandler", () => {
 		try {
 			const proc = Bun.spawn(["bun", "-e", PARENT_WRITABLE_SCRIPT], {
 				cwd: packageRoot,
-				env: { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp },
+				env: {
+					...process.env,
+					GJC_CODING_AGENT_DIR: path.join(tmp, "agent"),
+					TMPDIR: tmp,
+					TMP: tmp,
+					TEMP: tmp,
+				},
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -938,12 +996,12 @@ describe("LocalProtocolHandler", () => {
 
 const PARENT_WRITABLE_SCRIPT = `
 import { LocalProtocolHandler, resolveLocalUrlToPath } from "./src/internal-urls/local-protocol.ts";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const sessionId = "parent-open";
-const root = path.join(os.tmpdir(), "gjc-local", sessionId);
+const root = path.join(getLocalRootsDir(), sessionId);
 const parent = path.dirname(root);
 await fs.mkdir(parent, { recursive: true });
 await fs.chmod(parent, 0o777);

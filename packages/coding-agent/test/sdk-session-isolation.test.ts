@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,7 +12,7 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { createSecretObfuscator } from "@gajae-code/coding-agent/secrets";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getSessionsDir, Snowflake } from "@gajae-code/utils";
+import { getAgentDir, getLocalRootsDir, getSessionsDir, Snowflake, setAgentDir } from "@gajae-code/utils";
 import { discoverAuthStorage } from "../src/sdk/session";
 import { AgentStorage } from "../src/session/agent-storage";
 
@@ -60,10 +60,18 @@ function getAssistantText(message: AssistantMessage | undefined): string {
 
 describe("createAgentSession session storage isolation", () => {
 	const tempDirs: string[] = [];
+	const agentDirAtStart = getAgentDir();
+
+	beforeEach(() => {
+		const isolatedAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-local-roots-${Snowflake.next()}-`));
+		tempDirs.push(isolatedAgentDir);
+		setAgentDir(isolatedAgentDir);
+	});
 
 	afterEach(async () => {
 		LocalProtocolHandler.resetOverrideForTests();
 		AgentRegistry.resetGlobalForTests();
+		setAgentDir(agentDirAtStart);
 		if (process.platform === "win32") {
 			Bun.gc(true);
 			await Bun.sleep(50);
@@ -491,14 +499,14 @@ describe("createAgentSession session storage isolation", () => {
 			secondSession = undefined;
 			expect(LocalProtocolHandler.resolveOptions()).toBeUndefined();
 
-			// Managed-destination sessions retain their owner-only external gjc-local root.
+			// Managed-destination sessions retain their owner-only persistent local root.
 			expect(
 				resolveLocalRoot({
 					getArtifactsDir: () => firstArtifactsDir,
 					isManagedDestination: () => true,
 					getSessionId: () => "managed-owner-session",
 				}),
-			).toBe(path.join(os.tmpdir(), "gjc-local", "managed-owner-session"));
+			).toBe(path.join(getLocalRootsDir(), "managed-owner-session"));
 		} finally {
 			await secondSession?.dispose();
 			await firstSession?.dispose();

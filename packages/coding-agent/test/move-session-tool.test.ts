@@ -10,7 +10,15 @@ import { resolveLocalRoot, resolveLocalUrlToPath } from "@gajae-code/coding-agen
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, getProjectDir, postmortem, Snowflake, setAgentDir, setProjectDir } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getLocalRootsDir,
+	getProjectDir,
+	postmortem,
+	Snowflake,
+	setAgentDir,
+	setProjectDir,
+} from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
@@ -54,6 +62,13 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 	});
 
 	async function makeSession(cwd: string, sessionManager: SessionManager, overrides: Record<string, unknown> = {}) {
+		tempDirs.push(
+			resolveLocalRoot({
+				getArtifactsDir: () => sessionManager.getArtifactsDir(),
+				isManagedDestination: () => sessionManager.isManagedDestination(),
+				getSessionId: () => sessionManager.getSessionId(),
+			}),
+		);
 		return createAgentSession({
 			cwd,
 			agentDir: path.dirname(cwd),
@@ -139,7 +154,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			else await sessionManager.moveTo(cwdB);
 			expect(sessionManager.isManagedDestination()).toBe(true);
 			const resolved = resolveLocalUrlToPath("local://note.txt", localOptions);
-			expect(resolved).toBe(path.join(os.tmpdir(), "gjc-local", session.sessionId, "note.txt"));
+			expect(resolved).toBe(path.join(getLocalRootsDir(), session.sessionId, "note.txt"));
 			expect(observerPath).toBe(resolved);
 			if (populated) expect(await Bun.file(resolved).text()).toBe("preserved across move\n");
 			else expect(await Bun.file(resolved).exists()).toBe(false);
