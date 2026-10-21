@@ -459,6 +459,76 @@ it("fails closed for real managed payloads above the 64 MiB safe size without wr
 	});
 });
 
+it("rejects oversized pre-persistence local files before buffering them", async () => {
+	const sessionId = `managed-legacy-oversize-${crypto.randomUUID()}`;
+	await withTempDir(async sandbox => {
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const legacyParent = path.join(temporaryRoot, "gjc-local");
+		const legacyRoot = path.join(legacyParent, sessionId);
+		const payload = path.join(legacyRoot, "oversized.bin");
+		await fs.mkdir(legacyRoot, { recursive: true, mode: 0o700 });
+		await fs.chmod(legacyParent, 0o700);
+		await fs.writeFile(payload, "", { mode: 0o600 });
+		await fs.truncate(payload, 64 * 1024 * 1024 + 1);
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await withLocalRoot(sessionId, async localRoot => {
+				const options = { getSessionId: () => sessionId, isManagedDestination: () => true };
+				const realOpen = fs.open.bind(fs);
+				const openedPayloads: string[] = [];
+				const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+					if (path.resolve(String(target)) === path.resolve(payload)) openedPayloads.push(String(target));
+					return realOpen(target, flags, mode);
+				});
+				try {
+					await expect(initializeLocalRoot(options)).rejects.toThrow("exceeds the safe size limit");
+					expect(openedPayloads).toEqual([]);
+					await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+						code: "ENOENT",
+					});
+				} finally {
+					open.mockRestore();
+				}
+			});
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+	});
+});
+
+it("rejects oversized artifact-local files before buffering them", async () => {
+	const sessionId = `artifacts-legacy-oversize-${crypto.randomUUID()}`;
+	await withTempDir(async artifactsDir => {
+		const legacyRoot = path.join(artifactsDir, "local");
+		const payload = path.join(legacyRoot, "oversized.bin");
+		await fs.mkdir(legacyRoot, { recursive: true });
+		await fs.writeFile(payload, "");
+		await fs.truncate(payload, 64 * 1024 * 1024 + 1);
+		await withLocalRoot(sessionId, async localRoot => {
+			const options = {
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => sessionId,
+				isManagedDestination: () => true,
+			};
+			const realOpen = fs.open.bind(fs);
+			const openedPayloads: string[] = [];
+			const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+				if (path.resolve(String(target)) === path.resolve(payload)) openedPayloads.push(String(target));
+				return realOpen(target, flags, mode);
+			});
+			try {
+				await expect(initializeLocalRoot(options)).rejects.toThrow("exceeds the safe size limit");
+				expect(openedPayloads).toEqual([]);
+				await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+			} finally {
+				open.mockRestore();
+			}
+		});
+	});
+});
+
 describe("LocalProtocolHandler", () => {
 	beforeEach(() => {
 		LocalProtocolHandler.resetOverrideForTests();

@@ -345,9 +345,16 @@ async function canonicalLegacyRoot(artifactsDir: string): Promise<CanonicalLegac
 	return { root: canonicalRoot, identity: lexicalIdentity };
 }
 
-async function snapshotRegularFile(filePath: string, relativePath: string): Promise<LegacyEntrySnapshot> {
+async function snapshotRegularFile(
+	filePath: string,
+	relativePath: string,
+	options: { maxBytes: bigint; sizeLimitError?: string },
+): Promise<LegacyEntrySnapshot> {
 	const before = await fs.lstat(filePath, { bigint: true });
 	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Unsafe legacy local:// migration source");
+	if (before.size > options.maxBytes) {
+		throw new Error(options.sizeLimitError ?? "Legacy local:// migration exceeds the safe size limit");
+	}
 	const flags = fsSync.constants.O_RDONLY | (process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0));
 	const handle = await fs.open(filePath, flags);
 	try {
@@ -355,7 +362,13 @@ async function snapshotRegularFile(filePath: string, relativePath: string): Prom
 		const identity = { relativePath, dev: before.dev, ino: before.ino, size: before.size };
 		if (!opened.isFile() || !matchesSnapshot(opened, identity))
 			throw new Error("Legacy local:// migration source changed during capture");
-		const bytes = await handle.readFile();
+		const bytes = Buffer.alloc(Number(before.size));
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const { bytesRead } = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
+			if (bytesRead === 0) throw new Error("Legacy local:// migration source changed during capture");
+			offset += bytesRead;
+		}
 		const after = await fs.lstat(filePath, { bigint: true });
 		if (!matchesSnapshot(after, identity)) throw new Error("Legacy local:// migration source changed during capture");
 		return { ...identity, digest: createHash("sha256").update(bytes).digest("hex"), bytes };
@@ -398,7 +411,9 @@ async function captureLegacyManifest(
 			if (entry.name === LEGACY_MIGRATION_MARKER) throw new Error("Unsafe legacy local:// migration source");
 			if (entry.isDirectory()) await captureDirectory(entryPath, entryRelativePath);
 			else {
-				const file = await snapshotRegularFile(entryPath, entryRelativePath);
+				const file = await snapshotRegularFile(entryPath, entryRelativePath, {
+					maxBytes: BigInt(MAX_LEGACY_LOCAL_BYTES) - copiedBytes,
+				});
 				copiedBytes += file.size;
 				if (copiedBytes > BigInt(MAX_LEGACY_LOCAL_BYTES))
 					throw new Error("Legacy local:// migration exceeds the safe size limit");
@@ -429,7 +444,10 @@ async function copyLegacyManifest(
 			await fs.mkdir(to, { mode: 0o700 });
 			continue;
 		}
-		const captured = await snapshotRegularFile(from, entry.relativePath);
+		const captured = await snapshotRegularFile(from, entry.relativePath, {
+			maxBytes: entry.size,
+			sizeLimitError: "Legacy local:// migration source changed during capture",
+		});
 		if (captured.digest !== entry.digest || !matchesSnapshot(captured, entry))
 			throw new Error("Legacy local:// migration source changed during capture");
 		if (entry.bytes === undefined) throw new Error("Legacy local:// migration snapshot is incomplete");
@@ -497,7 +515,13 @@ async function destinationContentMatches(
 	const root = expected[0];
 	if (!root) return false;
 	if (root.kind === "file") {
-		const observed = await snapshotRegularFile(destination, "");
+		if (root.size === undefined) return false;
+		const stat = await fs.lstat(destination, { bigint: true });
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== root.size) return false;
+		const observed = await snapshotRegularFile(destination, "", {
+			maxBytes: root.size,
+			sizeLimitError: "Legacy local:// migration destination changed during verification",
+		});
 		return sameMigrationContent(expected, [
 			{ relativePath: "", kind: "file", size: observed.size, sha256: observed.digest },
 		]);
@@ -620,6 +644,21 @@ function previousManagedLocalMigrationSource(options: LocalProtocolOptions): Man
 				throw new Error("Legacy local:// migration source changed during capture");
 			}
 
+			let sourceBytes = 0n;
+			for (const entry of captured.snapshot.entries) {
+				if (entry.kind !== "file") continue;
+				const size = BigInt(entry.size);
+				if (entry.relativePath === LEGACY_MIGRATION_MARKER) {
+					if (size > 32n) throw new Error("Unsafe legacy local:// migration source");
+					continue;
+				}
+				sourceBytes += size;
+				if (sourceBytes > BigInt(MAX_LEGACY_LOCAL_BYTES)) {
+					throw new Error("Legacy local:// migration exceeds the safe size limit");
+				}
+			}
+
+			let retainedBytes = 0n;
 			const entries: ManagedLegacyLocalMigrationEntry[] = [];
 			for (const entry of captured.snapshot.entries) {
 				if (entry.relativePath === "") {
@@ -631,7 +670,13 @@ function previousManagedLocalMigrationSource(options: LocalProtocolOptions): Man
 					continue;
 				}
 				if (entry.kind !== "file") throw new Error("Unsafe legacy local:// migration source");
-				const file = await snapshotRegularFile(path.join(legacyRoot, entry.relativePath), entry.relativePath);
+				const isMarker = entry.relativePath === LEGACY_MIGRATION_MARKER;
+				const file = await snapshotRegularFile(path.join(legacyRoot, entry.relativePath), entry.relativePath, {
+					maxBytes: isMarker ? 32n : BigInt(MAX_LEGACY_LOCAL_BYTES) - retainedBytes,
+					sizeLimitError: isMarker
+						? "Unsafe legacy local:// migration source"
+						: "Legacy local:// migration exceeds the safe size limit",
+				});
 				if (
 					file.dev.toString() !== entry.dev ||
 					file.ino.toString() !== entry.ino ||
@@ -641,12 +686,13 @@ function previousManagedLocalMigrationSource(options: LocalProtocolOptions): Man
 				) {
 					throw new Error("Legacy local:// migration source changed during capture");
 				}
-				if (entry.relativePath === LEGACY_MIGRATION_MARKER) {
+				if (isMarker) {
 					if (file.bytes.byteLength > 32 || !isSettledMigrationMarkerValue(file.bytes.toString("utf8"))) {
 						throw new Error("Unsafe legacy local:// migration source");
 					}
 					continue;
 				}
+				retainedBytes += file.size;
 				entries.push({ relativePath: entry.relativePath, kind: "file", bytes: file.bytes, sha256: file.digest });
 			}
 
@@ -744,7 +790,10 @@ async function migrateManagedLegacyLocal(
 
 async function readMigrationMarker(marker: string): Promise<LegacyMigrationState | null> {
 	try {
-		const snapshot = await snapshotRegularFile(marker, LEGACY_MIGRATION_MARKER);
+		const snapshot = await snapshotRegularFile(marker, LEGACY_MIGRATION_MARKER, {
+			maxBytes: 32n,
+			sizeLimitError: "Unsafe local:// migration marker",
+		});
 		if (snapshot.size > 32n || snapshot.bytes === undefined) throw new Error("Unsafe local:// migration marker");
 		const value = snapshot.bytes.toString("utf8");
 		if (value === "cleanup_pending\n") return "cleanup_pending";
