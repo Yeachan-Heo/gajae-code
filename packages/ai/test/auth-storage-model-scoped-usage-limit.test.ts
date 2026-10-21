@@ -84,6 +84,61 @@ describe("AuthStorage model-scoped usage limits", () => {
 		expect(otherModel?.accessToken).not.toBe(first?.accessToken);
 	}, 20_000);
 
+	it("conservatively blocks callers without modelId when model-scoped limits exist", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const sessionId = "conservative-model-scope-session";
+		const first = await authStorage.getOAuthAccess("anthropic", sessionId);
+		const failedRowId = authStorage.getSessionCredentialRowId("anthropic", sessionId);
+		expect(first).toBeDefined();
+		expect(failedRowId).toBeTypeOf("number");
+
+		// Mark the credential as exhausted for a specific model
+		const marked = await authStorage.markUsageLimitReached("anthropic", sessionId, {
+			retryAfterMs: 60_000,
+			modelId: "claude-sonnet-4-5",
+		});
+		expect(marked.state).toBe("marked");
+
+		// When calling getOAuthAccess WITHOUT a modelId, it should conservatively
+		// block access (not return the same credential that's exhausted for Sonnet)
+		const withoutModel = await authStorage.getOAuthAccess("anthropic", sessionId);
+		expect(withoutModel?.accessToken).toBeDefined();
+		expect(withoutModel?.accessToken).not.toBe(first?.accessToken);
+	}, 20_000);
+
+	it("threads model ID through markUsageLimitReached in credential rotation (P1 review)", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const sessionId = "p1-thread-modelid-session";
+
+		// Get initial credential for Sonnet
+		const sonnetAccess = await authStorage.getOAuthAccess("anthropic", sessionId, {
+			modelId: "claude-sonnet-4-5",
+		});
+		expect(sonnetAccess).toBeDefined();
+		const initialRowId = authStorage.getSessionCredentialRowId("anthropic", sessionId);
+
+		// Mark the credential as exhausted, passing modelId (simulating agent-session behavior)
+		const marked = await authStorage.markUsageLimitReached("anthropic", sessionId, {
+			retryAfterMs: 60_000,
+			modelId: "claude-sonnet-4-5", // This would come from the failed candidate model
+		});
+		expect(marked.state).toBe("marked");
+		expect(marked.failedRowId).toBe(initialRowId);
+
+		// Verify Sonnet rotates away from exhausted credential
+		const sonnetAfter = await authStorage.getOAuthAccess("anthropic", sessionId, {
+			modelId: "claude-sonnet-4-5",
+		});
+		expect(sonnetAfter?.accessToken).toBeDefined();
+		expect(sonnetAfter?.accessToken).not.toBe(sonnetAccess?.accessToken);
+
+		// Verify Opus still uses the original credential (different model, unaffected by Sonnet-scoped limit)
+		const opusAccess = await authStorage.getOAuthAccess("anthropic", sessionId, {
+			modelId: "claude-opus-4-1",
+		});
+		expect(opusAccess?.accessToken).toBe(sonnetAccess?.accessToken);
+	}, 20_000);
+
 	it("treats a usage-report limit scoped to one model as that model's limit only", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 		const now = Date.now();
