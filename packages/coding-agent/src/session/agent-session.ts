@@ -428,7 +428,10 @@ import type { LazyService } from "../runtime/lazy-service";
 import type { NetworkPrewarmRuntime } from "../runtime/network-prewarm-service";
 import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
 import { type ExactMcpServerControlResult, MCPManager } from "../runtime-mcp/manager";
-import { omitPluginMcpNameShadows, retainPluginMcpMandatoryNames } from "../runtime-mcp/plugin-mcp-name-filter";
+import {
+	omitPluginMcpNameShadows,
+	retainPluginMcpMandatoryNames,
+} from "../runtime-mcp/plugin-mcp-name-filter";
 import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } from "../runtime-mcp/redaction";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
@@ -550,11 +553,11 @@ import type {
 	PreparedNewSession,
 	RecoveryHydrationContext,
 	RecoveryHydrationPromotionFence,
-	SessionArtifactPublication,
 	SessionContext,
 	SessionEntry,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
+	SessionArtifactPublication,
 } from "./session-manager";
 import {
 	createReadonlySessionManager,
@@ -2198,8 +2201,7 @@ async function assertDebugExecutionMutationAllowed(input: {
 			: undefined;
 	const action = record && typeof record.action === "string" ? record.action : undefined;
 	if (action !== "launch" && action !== "attach") return;
-	const program =
-		record && typeof record.program === "string" && record.program.length > 0 ? record.program : undefined;
+	const program = record && typeof record.program === "string" && record.program.length > 0 ? record.program : undefined;
 	await assertWorkflowMutationRawPathsAllowed({
 		cwd: input.cwd,
 		sessionId: input.sessionId,
@@ -3556,8 +3558,7 @@ export class AgentSession {
 				callbackError ??= error;
 			}
 		}
-		if (callbackError !== undefined)
-			logger.warn("Queued run start failure callback failed", { error: callbackError });
+		if (callbackError !== undefined) logger.warn("Queued run start failure callback failed", { error: callbackError });
 	}
 	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
 		let callbackError: unknown;
@@ -8584,8 +8585,7 @@ export class AgentSession {
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			// Skip retry for todo reminder continuations - they should fail silently without retrying
-			const isReminderContinuationError =
-				this.#todoReminderContinuationGeneration === agentEndGeneration && agentEndGeneration !== undefined;
+			const isReminderContinuationError = this.#todoReminderContinuationGeneration === agentEndGeneration && agentEndGeneration !== undefined;
 			if (!isReminderContinuationError && this.#isRetryableError(msg)) {
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
@@ -9022,9 +9022,7 @@ export class AgentSession {
 										: this.agent.continue.bind(this.agent);
 									try {
 										await continueQueued({
-											...(options?.disableManagedFallback
-												? { fallbackManaged: false }
-												: this.#managedFallbackPromptOptions()),
+											...(options?.disableManagedFallback ? { fallbackManaged: false } : this.#managedFallbackPromptOptions()),
 											maintenanceContinuation: options?.maintenanceContinuation,
 											// Reset only after continue() has claimed the queued turn. Skipped or stale
 											// continuations retain predecessor accounting, and resetAttemptBudget keeps
@@ -9815,13 +9813,7 @@ export class AgentSession {
 						attribution: "agent",
 						timestamp: Date.now(),
 					});
-					this.sessionManager.appendCustomMessageEntry(
-						"ttsr-injection",
-						injection.content,
-						false,
-						details,
-						"agent",
-					);
+					this.sessionManager.appendCustomMessageEntry("ttsr-injection", injection.content, false, details, "agent");
 					this.#markTtsrInjected(details.rules);
 				}
 				await this.#scheduleAgentContinue({
@@ -14032,8 +14024,7 @@ export class AgentSession {
 	}
 
 	resolveRoleModel(role: string): Model | undefined {
-		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(this.credentialSessionId), this.model)
-			.model;
+		return this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(this.credentialSessionId), this.model).model;
 	}
 
 	/**
@@ -14427,7 +14418,9 @@ export class AgentSession {
 						options?.preflightSignal ||
 						internalOptions?.sdkRunToken
 						? {
-								...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
+								...(options?.onPreflightAccepted
+									? { onPreflightAccepted: options.onPreflightAccepted }
+									: {}),
 								...(options?.onPreflightAcceptCommit
 									? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 									: {}),
@@ -19160,7 +19153,10 @@ export class AgentSession {
 				}
 				if (!settingsCandidate.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
 				try {
-					modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(candidate.models, settingsCandidate);
+					modelsCandidate = await this.#modelRegistry.stageModelsConfigReload(
+						candidate.models,
+						settingsCandidate,
+					);
 				} catch (error) {
 					throw new ConfigurationReloadError("MODELS_INVALID", error);
 				}
@@ -19169,11 +19165,7 @@ export class AgentSession {
 				}
 				const prepared = await this.#preflightActiveProfile(settingsCandidate, modelsCandidate);
 				const chain = this.getConfiguredModelChainState("default");
-				if (
-					!prepared ||
-					chain?.origin !== "profile-activation" ||
-					chain.identity !== this.getActiveModelProfile()
-				) {
+				if (!prepared || chain?.origin !== "profile-activation" || chain.identity !== this.getActiveModelProfile()) {
 					this.#updatedCurrentModel(modelsCandidate.registry);
 				}
 			} catch (error) {
@@ -19192,7 +19184,10 @@ export class AgentSession {
 			}
 
 			// Staging can overlap a transition before its generation commits, or outlive the transition entirely.
-			if (this.#sessionTransitionKind !== undefined || transitionGeneration !== this.#sessionTransitionGeneration) {
+			if (
+				this.#sessionTransitionKind !== undefined ||
+				transitionGeneration !== this.#sessionTransitionGeneration
+			) {
 				await this.#waitForSessionTransitionEnd(this.#disposeAbortController.signal);
 				this.#assertConfigurationReloadAvailable(candidate);
 				continue;
@@ -19204,8 +19199,16 @@ export class AgentSession {
 		}
 	}
 
-	reloadConfiguration(candidate: ConfigHotReloadCandidate, signal: AbortSignal): Promise<ConfigurationReloadResult> {
-		return this.#reloadConfiguration(candidate, signal, this.getUserModelSelectionRevision(), this.model);
+	reloadConfiguration(
+		candidate: ConfigHotReloadCandidate,
+		signal: AbortSignal,
+	): Promise<ConfigurationReloadResult> {
+		return this.#reloadConfiguration(
+			candidate,
+			signal,
+			this.getUserModelSelectionRevision(),
+			this.model,
+		);
 	}
 
 	async #reloadConfiguration(
@@ -19273,7 +19276,10 @@ export class AgentSession {
 					}
 					if (!stagedSettings.diagnostics.valid) throw new ConfigurationReloadError("SETTINGS_INVALID");
 					try {
-						stagedModels = await this.#modelRegistry.stageModelsConfigReload(candidate.models, stagedSettings);
+						stagedModels = await this.#modelRegistry.stageModelsConfigReload(
+							candidate.models,
+							stagedSettings,
+						);
 					} catch (error) {
 						throw new ConfigurationReloadError("MODELS_INVALID", error);
 					}
@@ -19294,9 +19300,7 @@ export class AgentSession {
 					let preparedLiveModelSelection: PreparedProfileModelSelection | undefined;
 					let preparedLiveModelSelectionRevision = userModelSelectionRevision;
 					let preserveDefaultModelSelection = true;
-					const prepareCandidateSelections = async (
-						modelsCandidate: ModelsConfigReloadCandidate,
-					): Promise<void> => {
+					const prepareCandidateSelections = async (modelsCandidate: ModelsConfigReloadCandidate): Promise<void> => {
 						prepared = undefined;
 						preparedLiveModelSelection = undefined;
 						preparedLiveModelSelectionRevision = userModelSelectionRevision;
@@ -19347,9 +19351,7 @@ export class AgentSession {
 					publicationFenceRelease = await this.#modelRegistry.acquirePublicationFence(reloadSignal);
 					reloadSignal.throwIfAborted();
 					let preserveLiveModelSelection = false;
-					const prepareLiveModelSelection = async (
-						modelsCandidate: ModelsConfigReloadCandidate,
-					): Promise<void> => {
+					const prepareLiveModelSelection = async (modelsCandidate: ModelsConfigReloadCandidate): Promise<void> => {
 						preserveLiveModelSelection =
 							this.getUserModelSelectionRevision() !== userModelSelectionRevision ||
 							this.model !== userModelSelectionModel;
@@ -19457,9 +19459,12 @@ export class AgentSession {
 							if (preparedLiveModelSelection) {
 								this.#assertPreparedProfileModelSelectionCurrent(preparedLiveModelSelection);
 								liveModelSelectionCommitted = true;
-								this.commitPreparedProfileModelSelection(preparedLiveModelSelection, mutationRevision => {
-									committedThinkingLevelLiveMutationRevision = mutationRevision;
-								});
+								this.commitPreparedProfileModelSelection(
+									preparedLiveModelSelection,
+									mutationRevision => {
+										committedThinkingLevelLiveMutationRevision = mutationRevision;
+									},
+								);
 								liveModelSelectionCommitFinished = true;
 							}
 						});
@@ -19612,7 +19617,12 @@ export class AgentSession {
 		}
 		if (retryAfterSessionTransition) {
 			await this.#waitForSessionTransitionEnd(AbortSignal.any([signal, this.#disposeAbortController.signal]));
-			return await this.#reloadConfiguration(candidate, signal, userModelSelectionRevision, userModelSelectionModel);
+			return await this.#reloadConfiguration(
+				candidate,
+				signal,
+				userModelSelectionRevision,
+				userModelSelectionModel,
+			);
 		}
 		throw new Error("Configuration reload exited without a result or a session-transition retry.");
 	}
@@ -19944,10 +19954,7 @@ export class AgentSession {
 	materializeActiveDefaultModelProfileAssignment(model: Model): boolean {
 		// A merged read could let a project-scoped value authorize durable global writes.
 		const persistedProfile = this.settings.getGlobal("modelProfile.default");
-		if (
-			persistedProfile === undefined ||
-			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
-		)
+		if (persistedProfile === undefined || !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile()))
 			return false;
 		return materializeActiveModelProfileAssignment({
 			session: this,
@@ -20028,10 +20035,7 @@ export class AgentSession {
 		// marker is superseded: the concrete selection is now the durable
 		// default, so the next launch must not reapply the stale profile.
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (
-			persistedProfile !== undefined &&
-			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
-		) {
+		if (persistedProfile !== undefined && !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -20047,10 +20051,7 @@ export class AgentSession {
 	 */
 	clearSessionOnlyModelProfileState(): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (
-			persistedProfile !== undefined &&
-			!this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())
-		) {
+		if (persistedProfile !== undefined && !this.#modelProfileNamesMatch(persistedProfile, this.getActiveModelProfile())) {
 			this.settings.unset("modelProfile.default");
 			this.settings.clearOverride("modelProfile.default");
 		}
@@ -21986,7 +21987,7 @@ export class AgentSession {
 								promptOverride: compactionPrep.hookPrompt,
 								extraContext: compactionPrep.hookContext,
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
-								convertToLlm: messages => this.#summaryConvertToLlm(messages),
+								convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 							},
 						);
 						summary = result.summary;
@@ -22239,7 +22240,7 @@ export class AgentSession {
 					tools: this.agent.state.tools,
 					customInstructions,
 					promptExtension: this.settings.get("compaction.handoffPromptExtension") || undefined,
-					convertToLlm: messages => this.#summaryConvertToLlm(messages),
+					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 					initiatorOverride: "agent",
 					metadata: this.agent.metadataForProvider(model.provider),
 					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
@@ -22534,7 +22535,8 @@ export class AgentSession {
 		const successfulEmptyStop =
 			assistantMessage.stopReason === "stop" &&
 			assistantMessage.content.length === 0 &&
-			(emptyStopPromptTokens + assistantMessage.usage.output > 0 || assistantMessage.usage.totalTokens > 0) &&
+			(emptyStopPromptTokens + assistantMessage.usage.output > 0 ||
+				assistantMessage.usage.totalTokens > 0) &&
 			emptyStopPromptTokens <= contextWindow &&
 			!hasOverflowEvidenceBeyondEmptyStopHeuristic;
 		if (
@@ -23418,11 +23420,7 @@ export class AgentSession {
 		// Publishing it here would settle the caller's prompt mid-reminder.
 		// Disable managed fallback to prevent indefinite retries for this server-initiated turn.
 		this.#todoReminderContinuationGeneration = this.#promptGeneration;
-		this.#scheduleAgentContinue({
-			skipCompactionCheck: true,
-			suppressPredecessorAgentEnd: true,
-			disableManagedFallback: true,
-		});
+		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true, disableManagedFallback: true });
 	}
 
 	/**
@@ -24074,8 +24072,7 @@ export class AgentSession {
 						resolved = await resolveCurrentSelection();
 						break;
 					}
-					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id))
-						continue;
+					if (credential.disabled || !authStorage.isCredentialAvailable(candidate.provider, credential.id)) continue;
 					let alternative: { apiKey: string | undefined; credentialRowId: number | undefined };
 					try {
 						alternative = await this.#modelRegistry.getApiKeyWithCredentialRowId(
@@ -24208,7 +24205,9 @@ export class AgentSession {
 		signal: AbortSignal,
 		options?: SummaryOptions,
 	): Promise<CompactionResult> {
-		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable(this.credentialSessionId));
+		const candidates = this.#getCompactionModelCandidates(
+			this.#modelRegistry.getAvailable(this.credentialSessionId),
+		);
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 		let previousCandidate: Model | undefined;
 		let previousFailure: unknown;
@@ -24230,7 +24229,7 @@ export class AgentSession {
 					...options,
 					...this.#maintenanceProviderTransport(),
 					metadata: this.agent.metadataForProvider(candidate.provider),
-					convertToLlm: messages => this.#summaryConvertToLlm(messages),
+					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 					telemetry,
 					authCredentialType: this.#modelRegistry.getSessionCredentialType(
 						candidate.provider,
@@ -24757,7 +24756,7 @@ export class AgentSession {
 								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
 								metadata: this.agent.metadataForProvider(candidate.provider),
 								initiatorOverride: "agent",
-								convertToLlm: messages => this.#summaryConvertToLlm(messages),
+								convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 								telemetry,
 								authCredentialType: this.#modelRegistry.getSessionCredentialType(
 									candidate.provider,
@@ -25857,7 +25856,10 @@ export class AgentSession {
 		// this discarded attempt is clean, even after earlier committed work in
 		// the same prompt. Preserve the committed failure path when this attempt
 		// itself is not replay-safe.
-		if (isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) && !this.#isRetryScopeClean(outcome.scope)) {
+		if (
+			isStatuslessTypedOverloadFacts(outcome.failure.transportFailure) &&
+			!this.#isRetryScopeClean(outcome.scope)
+		) {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return this.#managedFallbackExhaustionDecision(
 				outcome.failure.message,
@@ -26541,7 +26543,9 @@ export class AgentSession {
 				transportFailure.openaiErrorCode === SERVER_OVERLOADED_PROVIDER_CODE) &&
 			(managedOutcome ? !scopeWasClean : !this.#hasCleanRetryReplaySafety)
 		) {
-			return managedOutcome ? { type: "terminal", terminal: { stopReason: "error", messages: [message] } } : false;
+			return managedOutcome
+				? { type: "terminal", terminal: { stopReason: "error", messages: [message] } }
+				: false;
 		}
 		// A local machinery failure must never stay charged against the provider
 		// fallback budget, no matter which local exit follows (disabled retry,
@@ -26646,8 +26650,9 @@ export class AgentSession {
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined =
-			canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure ? { class: "server" } : fallbackTrigger;
+			| undefined = canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure
+				? { class: "server" }
+				: fallbackTrigger;
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
@@ -29354,7 +29359,7 @@ export class AgentSession {
 					customInstructions: options.customInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
 					metadata: this.agent.metadataForProvider(model.provider),
-					convertToLlm: messages => this.#summaryConvertToLlm(messages),
+					convertToLlm: (messages) => this.#summaryConvertToLlm(messages),
 					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
 				});
 				this.#branchSummaryAbortController = undefined;
