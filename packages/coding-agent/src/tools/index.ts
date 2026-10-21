@@ -7,6 +7,7 @@ import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
@@ -332,6 +333,8 @@ export interface ToolSession {
 	 * global Settings singleton (which can be reused across sessions).
 	 */
 	getSessionAgentDir?: () => string;
+	/** Local-root options owned by this session, including its selected profile. */
+	getLocalProtocolOptions?: () => LocalProtocolOptions;
 	/** Live service-tier intent of the parent session, inherited by `inherit` subagents. */
 	serviceTier?: ServiceTier;
 	/** Whether the effective subagent tier grants fast mode for a resolved provider. */

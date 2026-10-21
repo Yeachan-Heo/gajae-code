@@ -796,7 +796,12 @@ export async function executePatchSingle(
 
 	let diagnostics = patchFileSystem.getDiagnostics();
 	if (op === "delete" && batchRequest?.flush) {
-		const flushedDiagnostics = await flushLspWritethroughBatch(batchRequest.id, session.cwd, signal);
+		const flushedDiagnostics = await flushLspWritethroughBatch(
+			batchRequest.id,
+			session.cwd,
+			signal,
+			session.getLocalProtocolOptions?.(),
+		);
 		diagnostics ??= flushedDiagnostics;
 	}
 	const mergedDiagnostics = mergeDiagnosticsWithWarnings(diagnostics, result.warnings ?? []);

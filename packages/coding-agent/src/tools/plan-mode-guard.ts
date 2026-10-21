@@ -9,12 +9,13 @@ const LOCAL_SCHEME_PREFIX = "local:";
 function resolveRawPath(session: ToolSession, targetPath: string): string {
 	const normalized = normalizeLocalScheme(targetPath);
 	if (normalized.startsWith(LOCAL_SCHEME_PREFIX)) {
-		return resolveLocalUrlToPath(normalized, {
+		const localProtocolOptions = session.getLocalProtocolOptions?.() ?? {
 			getAgentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
 			getArtifactsDir: session.getArtifactsDir,
 			isManagedDestination: session.isManagedSessionDestination,
 			getSessionId: session.getSessionId,
-		});
+		};
+		return resolveLocalUrlToPath(normalized, localProtocolOptions);
 	}
 
 	return resolveToCwd(normalized, session.cwd);

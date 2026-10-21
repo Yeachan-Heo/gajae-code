@@ -26,10 +26,10 @@
  * Destination symlinks are followed: the referent is replaced, the link stays.
  * The referent is re-resolved immediately before publication so a retargeted
  * link cannot silently repoint the write. When the lexical destination sits
- * inside the active explicit artifacts local root (`<artifacts>/local`) or a
- * session-scoped persistent local root, the resolved referent and its parent must
- * remain inside that root (a link there must not redirect the write out of
- * the trust boundary).
+ * inside the originating session's explicit artifacts local root
+ * (`<artifacts>/local`) or persistent local root, the resolved referent and its
+ * parent must remain inside that root (a link there must not redirect the write
+ * out of the trust boundary).
  *
  * Staging uses exclusive create (`wx`) so a colliding leftover temp is never
  * truncated or unlinked; only the temp this call created is cleaned on failure.
@@ -44,7 +44,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getLocalRootsDir, hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
-import { LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls/local-protocol";
+import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
@@ -112,12 +112,13 @@ export function formatFileWriteError(error: unknown, dest: string, options: { de
 export interface WriteFileAtomicallyOptions {
 	/**
 	 * Trusted root that a resolved symlink referent and its parent must not
-	 * leave. When omitted, a destination inside the active explicit artifacts
-	 * local root (`<artifacts>/local`) uses that root. Otherwise the helper
-	 * still enforces the session-scoped persistent local-root boundary implied by
-	 * a lexical destination under the agent-state local directory.
+	 * leave. When omitted, the boundary is derived from `localProtocolOptions`,
+	 * which must belong to the session originating this write. That preserves
+	 * profile isolation when several SDK sessions share a process.
 	 */
 	trustBoundary?: string;
+	/** Originating session's local-root context for automatic boundary derivation. */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Platform override used by deterministic retry tests. */
 	platform?: NodeJS.Platform;
 	/** Sleep seam used by deterministic retry tests. */
@@ -219,8 +220,10 @@ function explicitLocalRootFor(lexicalDest: string, options: LocalProtocolOptions
 	return root;
 }
 
-function trustBoundaryForDestination(lexicalDest: string): string | undefined {
-	const options = LocalProtocolHandler.resolveOptions();
+function trustBoundaryForDestination(
+	lexicalDest: string,
+	options: LocalProtocolOptions | undefined,
+): string | undefined {
 	return explicitLocalRootFor(lexicalDest, options) ?? sessionLocalRootFor(lexicalDest, options?.getAgentDir?.());
 }
 
@@ -533,7 +536,7 @@ export async function writeFileAtomically(
 	try {
 		const platform = options.platform ?? process.platform;
 		const sleep = options.sleep ?? (async (delayMs: number): Promise<void> => await Bun.sleep(delayMs));
-		const trustBoundary = options.trustBoundary ?? trustBoundaryForDestination(dest);
+		const trustBoundary = options.trustBoundary ?? trustBoundaryForDestination(dest, options.localProtocolOptions);
 		const resolved = await resolvePublishPath(dest);
 		publishPath = resolved.publishPath;
 		// Boundary first, then create parents. A dangling symlink inside a trusted

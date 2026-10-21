@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { LocalProtocolHandler } from "@gajae-code/coding-agent/internal-urls";
 import { createLspWritethrough, writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import * as lspConfig from "@gajae-code/coding-agent/lsp/config";
-import { TempDir } from "@gajae-code/utils";
+import { getLocalRootsDir, TempDir } from "@gajae-code/utils";
 import type { ServerConfig } from "../../src/lsp/types";
 import * as atomicFileWrite from "../../src/tools/atomic-file-write";
 import { FileWriteNotPublishedError } from "../../src/tools/atomic-file-write";
@@ -142,5 +144,58 @@ describe("createLspWritethrough batching", () => {
 			destUnchanged: true,
 			publicationState: "not_published",
 		});
+	});
+
+	it("keeps pending batches isolated by originating profile", async () => {
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([]);
+		const firstAgentDir = path.join(tempDir.path(), "profile-a");
+		const secondAgentDir = path.join(tempDir.path(), "profile-b");
+		const firstSessionId = "profile-a-session";
+		const secondSessionId = "profile-b-session";
+		const firstRoot = path.join(getLocalRootsDir(firstAgentDir), firstSessionId);
+		const secondRoot = path.join(getLocalRootsDir(secondAgentDir), secondSessionId);
+		await fs.mkdir(firstRoot, { recursive: true, mode: 0o700 });
+		await fs.mkdir(secondRoot, { recursive: true, mode: 0o700 });
+		const firstOptions = {
+			getAgentDir: () => firstAgentDir,
+			getSessionId: () => firstSessionId,
+			isManagedDestination: () => true,
+		};
+		const secondOptions = {
+			getAgentDir: () => secondAgentDir,
+			getSessionId: () => secondSessionId,
+			isManagedDestination: () => true,
+		};
+		const disposeSecondOverride = LocalProtocolHandler.installOverride(secondOptions);
+		const firstWrite = createLspWritethrough(tempDir.path(), {
+			enableFormat: true,
+			localProtocolOptions: firstOptions,
+		});
+		const secondWrite = createLspWritethrough(tempDir.path(), {
+			enableFormat: true,
+			localProtocolOptions: secondOptions,
+		});
+		const firstPath = path.join(firstRoot, "pending.ts");
+		const secondPath = path.join(secondRoot, "pending.ts");
+		const outside = path.join(tempDir.path(), "outside.ts");
+		await fs.writeFile(outside, "outside\n");
+		const batchId = `profile-batch-${Date.now()}`;
+		try {
+			await firstWrite(firstPath, "first pending\n", undefined, undefined, { id: batchId, flush: false });
+			await secondWrite(secondPath, "second pending\n", undefined, undefined, { id: batchId, flush: false });
+			await fs.unlink(secondPath);
+			await fs.symlink(outside, secondPath);
+
+			await firstWrite(firstPath, "first flushed\n", undefined, undefined, { id: batchId, flush: true });
+			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+			expect(await fs.readFile(firstPath, "utf8")).toBe("first flushed\n");
+			await expect(
+				secondWrite(secondPath, "second flushed\n", undefined, undefined, { id: batchId, flush: true }),
+			).rejects.toThrow(/outside trust boundary/);
+			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+		} finally {
+			disposeSecondOverride();
+		}
 	});
 });
