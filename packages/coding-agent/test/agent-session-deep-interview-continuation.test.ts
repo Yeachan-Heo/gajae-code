@@ -8,6 +8,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { LoadedSubskillActivation } from "@gajae-code/coding-agent/extensibility/gjc-plugins/types";
 import { createDeepInterviewIntentManifest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import * as skillState from "@gajae-code/coding-agent/hooks/skill-state";
 import { ensureWorkflowSkillActivationState } from "@gajae-code/coding-agent/hooks/skill-state";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -302,6 +303,36 @@ describe("AgentSession deep-interview continuation", () => {
 		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
 		await emitAssistantStop(400);
 		expect(session.getEffectiveActiveWorkflowSkillState()).toBeUndefined();
+		expect(session.getDeepInterviewAskStage()).toBeUndefined();
+	});
+	it("does not expose Deep Interview ask metadata after durable deactivation", async () => {
+		await emitSkillPromptStart("deep-interview");
+		await emitAssistantStop(100);
+		expect(session.getActiveSkillState()).toBeUndefined();
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
+		expect(session.getDeepInterviewAskStage()).toBe("topology");
+
+		const result = await runNativeStateCommand(
+			[
+				"write",
+				"--mode",
+				"deep-interview",
+				"--session-id",
+				sessionManager.getSessionId(),
+				"--input",
+				JSON.stringify({ active: false }),
+			],
+			tempDir.path(),
+		);
+		expect(result.status).toBe(0);
+
+		const persisted = JSON.parse(
+			await Bun.file(modeStatePath(tempDir.path(), sessionManager.getSessionId(), "deep-interview")).text(),
+		) as { active?: unknown; current_phase?: unknown };
+		expect(persisted).toMatchObject({ active: false, current_phase: "interviewing" });
+		// The session cache is stale until its next refresh, but inactive persisted state
+		// must not continue selecting stage-specific Ask metadata.
+		expect(session.getEffectiveActiveWorkflowSkillState()?.skill).toBe("deep-interview");
 		expect(session.getDeepInterviewAskStage()).toBeUndefined();
 	});
 	it("does not force Deep Interview metadata for another active workflow", async () => {
