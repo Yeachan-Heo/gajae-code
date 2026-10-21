@@ -2216,11 +2216,12 @@ function interpreterCodeContainsWriteApi(
 		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
-		if (language === "perl" && /^open\b/.test(script.slice(index))) {
+		const perlOpen = language === "perl" ? /^(?:CORE::)?open\b/.exec(script.slice(index)) : null;
+		if (perlOpen) {
 			// Both `open(...)` and the list form `open H, MODE, EXPR` matter; only an
 			// explicit read mode is safe, and an unparsed open fails closed.
 			if (!isReadOnlyPerlOpen(script, index)) return true;
-			index += "open".length;
+			index += perlOpen[0].length;
 			continue;
 		}
 		if (apiAtStart.test(script.slice(index))) {
@@ -2247,10 +2248,14 @@ function interpreterCodeContainsWriteApi(
  * (write/pipe modes, a variable mode, or an unparsed statement) fails closed.
  */
 function isReadOnlyPerlOpen(script: string, index: number): boolean {
+	const prefix = script.slice(0, index);
+	// Custom functions and methods can ignore a read-looking mode operand.
+	if (/[\p{ID_Continue}:'$@%&]$/u.test(prefix) || /(?:->|::|&)\s*$/.test(prefix)) return false;
 	const rest = script.slice(index);
-	if (!/^open\b/.test(rest)) return false;
-	const parenthesized = /^open\s*\(/.exec(rest);
-	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice("open".length);
+	const open = /^(?:CORE::)?open\b/.exec(rest);
+	if (!open) return false;
+	const parenthesized = /^(?:CORE::)?open\s*\(/.exec(rest);
+	const body = parenthesized ? rest.slice(parenthesized[0].length) : rest.slice(open[0].length);
 	const delimiters: string[] = [];
 	let stringChar = "";
 	let modeStart = -1;
@@ -2302,7 +2307,7 @@ function isReadOnlyPerlOpen(script: string, index: number): boolean {
 		return false;
 	if (modeEnd >= 0 && !body.slice(modeEnd + 1, end).trim()) return false;
 	const modeArg = body.slice(modeStart, modeEnd < 0 ? end : modeEnd).trim();
-	const quotedMode = /^(?:'([^'\\]*)'|"([^"\\$@]*)")$/.exec(modeArg);
+	const quotedMode = /^(?:'((?:[^'\\]|\\\\)*)'|"((?:[^"\\$@]|\\\\)*)")$/.exec(modeArg);
 	if (!quotedMode) return false;
 	const mode = (quotedMode[1] ?? quotedMode[2]).trim();
 	return mode.startsWith("<") && !mode.startsWith("<+") && !mode.includes("|");

@@ -2970,6 +2970,10 @@ describe("bash scanner quoting model", () => {
 			`perl -e 'open(my $fh, "<input.txt"); print <$fh>;'`,
 			`perl -e 'open(main::F, "<", "input.txt");'`,
 			`perl -e 'open(*F, "<", "input.txt");'`,
+			`perl -e 'CORE::open(F, "<input.txt"); print <F>;'`,
+			`perl -e 'CORE::open F, "<", "input.txt"; print <F>;'`,
+			String.raw`perl -e 'open F, "<input\\file"; print <F>;'`,
+			String.raw`perl -e 'open(F, "<input\\file"); print <F>;'`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -2978,6 +2982,33 @@ describe("bash scanner quoting model", () => {
 				args: { command },
 			});
 			expect(decision.blocked, command).toBe(false);
+		}
+	});
+
+	it("denies imported Perl routines with read-looking open suffixes", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const source of [
+			`Project::Helper::reopen(F, "<src/product.ts")`,
+			`use utf8; Project::Helper::réopen(F, "<src/product.ts")`,
+			`reopen(F, "<src/product.ts")`,
+			`Project::Helper::open(F, "<src/product.ts")`,
+			`Project::Helper->open(F, "<src/product.ts")`,
+			`Project::Helper -> open(F, "<src/product.ts")`,
+			`Project::Helper::CORE::open(F, "<src/product.ts")`,
+			`Project::Helper -> CORE::open(F, "<src/product.ts")`,
+			`CORE::GLOBAL::open(F, "<src/product.ts")`,
+			`&open(F, "<src/product.ts")`,
+		]) {
+			const command = `PERL5LIB=lib perl -MProject::Helper -e ${quoteBashSingle(source)}`;
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(true);
+			expect(decision.reason, command).toBe("unknown-target");
 		}
 	});
 
@@ -3017,6 +3048,9 @@ describe("bash scanner quoting model", () => {
 			`open(F, $mode, "input.txt");`,
 			`open(F, "<$file");`,
 			`open(F, "<@files");`,
+			String.raw`open(F, "<input\nfile");`,
+			String.raw`open(F, "<input\\$file");`,
+			String.raw`open(F, "<input\\file|");`,
 			`open(F, "<input.txt|");`,
 			`open(F, "<input.txt";`,
 			`open(F, "<input.txt);`,
