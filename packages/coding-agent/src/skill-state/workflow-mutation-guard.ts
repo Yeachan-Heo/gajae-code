@@ -2072,9 +2072,24 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 		const words = shellWords(tail);
 		const parts = words.map(cleanShellWord);
 		const binary = (match[1] ?? "").toLowerCase();
+		if (binary === "perl") {
+			// shellWords does not decode unquoted escapes in interpreter options.
+			for (const escapeMatch of tail.matchAll(/\\/g)) {
+				if (!shellSyntaxPosition(tail, escapeMatch.index)) continue;
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
+		}
 		const options = interpreterCodeOptions(binary);
 		for (let index = 0; index < parts.length; index++) {
 			const part = parts[index] ?? "";
+			// Module-loading switches, including bundled -wM, run unscanned code.
+			if (binary === "perl" && /^-[^eEImM]*[mM]/.test(part)) {
+				targets.explicitMutation = true;
+				targets.unknown = true;
+				return;
+			}
 			let rawScript: string | undefined;
 			const option = options.find(
 				candidate =>
@@ -2207,6 +2222,7 @@ function interpreterCodeContainsWriteApi(
 			const next = skipOtherInterpreterNoise(script, index);
 			if (next !== index) {
 				const skipped = script.slice(index, next);
+				if (language === "perl" && script[index] === '"' && /(?:^|[^\\])(?:\\\\)*[$@]/.test(skipped)) return true;
 				if (language === "ruby" && script[index] !== "'" && skipped.includes("#{") && api.test(skipped))
 					return true;
 				index = next;
@@ -2216,6 +2232,8 @@ function interpreterCodeContainsWriteApi(
 		if (INTERPRETER_OUTPUT_METHOD_ASSIGNMENT_RE.test(script.slice(index))) return true;
 		if (language === "py" && PYTHON_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
 		if (language === "js" && JAVASCRIPT_DYNAMIC_EXECUTION_IDENTIFIER_RE.test(script.slice(index))) return true;
+		// Perl imports can shadow even a bare open with an unscanned routine.
+		if (language === "perl" && /^(?:use|no)\b/.test(script.slice(index))) return true;
 		const perlOpen = language === "perl" ? /^(?:CORE::)?open\b/.exec(script.slice(index)) : null;
 		if (perlOpen) {
 			// Both `open(...)` and the list form `open H, MODE, EXPR` matter; only an
@@ -2250,7 +2268,7 @@ function interpreterCodeContainsWriteApi(
 function isReadOnlyPerlOpen(script: string, index: number): boolean {
 	const prefix = script.slice(0, index);
 	// Custom functions and methods can ignore a read-looking mode operand.
-	if (/[\p{ID_Continue}:'$@%&]$/u.test(prefix) || /(?:->|::|&)\s*$/.test(prefix)) return false;
+	if (/[\p{ID_Continue}:'$@%&]$/u.test(prefix) || /(?:->|::|&)\s*(?:#[^\n]*\n\s*)*$/.test(prefix)) return false;
 	const rest = script.slice(index);
 	const open = /^(?:CORE::)?open\b/.exec(rest);
 	if (!open) return false;

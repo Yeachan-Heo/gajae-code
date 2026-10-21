@@ -2972,6 +2972,10 @@ describe("bash scanner quoting model", () => {
 			`perl -e 'open(*F, "<", "input.txt");'`,
 			`perl -e 'CORE::open(F, "<input.txt"); print <F>;'`,
 			`perl -e 'CORE::open F, "<", "input.txt"; print <F>;'`,
+			`perl -e 'print "use Project::Helper"; open(F, "<input.txt");'`,
+			String.raw`perl -e 'print "\$literal"; open(F, "<input.txt");'`,
+			String.raw`perl -e 'print "mail\@example"; open(F, "<input.txt");'`,
+			String.raw`perl -e 'print "\\\$literal"; open(F, "<input.txt");'`,
 			String.raw`perl -e 'open F, "<input\\file"; print <F>;'`,
 			String.raw`perl -e 'open(F, "<input\\file"); print <F>;'`,
 		]) {
@@ -2985,22 +2989,54 @@ describe("bash scanner quoting model", () => {
 		}
 	});
 
-	it("denies imported Perl routines with read-looking open suffixes", async () => {
+	it("denies nonbuiltin Perl calls with read-looking open suffixes", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 		for (const source of [
 			`Project::Helper::reopen(F, "<src/product.ts")`,
-			`use utf8; Project::Helper::réopen(F, "<src/product.ts")`,
+			`Project::Helper::réopen(F, "<src/product.ts")`,
 			`reopen(F, "<src/product.ts")`,
 			`Project::Helper::open(F, "<src/product.ts")`,
 			`Project::Helper->open(F, "<src/product.ts")`,
 			`Project::Helper -> open(F, "<src/product.ts")`,
+			`Project::Helper -> # note\nopen(F, "<src/product.ts")`,
+			`Project::Helper -> # first\n# second\nopen(F, "<src/product.ts")`,
+			`Project::Helper:: # note\nopen(F, "<src/product.ts")`,
+			`& # note\nopen(F, "<src/product.ts")`,
 			`Project::Helper::CORE::open(F, "<src/product.ts")`,
 			`Project::Helper -> CORE::open(F, "<src/product.ts")`,
 			`CORE::GLOBAL::open(F, "<src/product.ts")`,
 			`&open(F, "<src/product.ts")`,
 		]) {
-			const command = `PERL5LIB=lib perl -MProject::Helper -e ${quoteBashSingle(source)}`;
+			const command = `perl -e ${quoteBashSingle(source)}`;
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked, command).toBe(true);
+			expect(decision.reason, command).toBe("unknown-target");
+		}
+	});
+
+	it("denies Perl imports that can override a bare read-looking open", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "ralplan", "planner");
+		for (const command of [
+			`PERL5LIB=lib perl -e 'use Project::Helper "open"; open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -MProject::Helper -e 'Project::Helper::reopen(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -MProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -wMProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -\MProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -w\MProject::Helper=open -e 'open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -e 'open(F, "<src/product.ts");' -\MProject::Helper=open`,
+			`PERL5LIB=lib perl -e 'print "@{[do { use Project::Helper qw(open); 1 }]}"; open(F, "<src/product.ts");'`,
+			String.raw`PERL5LIB=lib perl -e 'print "\\@{[do { use Project::Helper qw(open); 1 }]}"; open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -M Project::Helper=open -e 'open(F, "<src/product.ts");'`,
+			`PERL5LIB=lib perl -mProject::Helper -e 'open(F, "<src/product.ts");'`,
+			`perl -e 'no Project::Helper; open(F, "<src/product.ts");'`,
+		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
 				sessionId: "session-a",
