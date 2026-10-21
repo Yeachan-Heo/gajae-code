@@ -1262,6 +1262,8 @@ interface SessionRuntime {
 	idleSeq: number;
 	/** Stops delayed session-name observation when this runtime loses authority. */
 	stopSessionNameObserver: () => void;
+	/** Deregisters the after-move listener from the session manager. */
+	unregisterAfterMoveListener?: () => void;
 	/** Interactive asks awaiting a remote answer, by action id. */
 	pendingInteractive: Map<string, PendingInteractiveAsk>;
 	/** Deregisters this session's ask answer source. */
@@ -9474,7 +9476,9 @@ export function createNotificationsExtension(
 					throwIfLifecycleStopped();
 					const index = await new SessionIndex(agentDir).open();
 					throwIfLifecycleStopped();
-					const locator = await resolveSessionLocator(ctx.cwd, endpointStateRoot);
+					const currentLocator = {
+						value: await resolveSessionLocator(ctx.cwd, endpointStateRoot),
+					};
 					const endpointPath = path.join(endpointStateRoot, "sdk", `${id}.json`);
 					const endpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
 					const endpointIdentity = fs.statSync(endpointPath, { bigint: true });
@@ -9482,7 +9486,7 @@ export function createNotificationsExtension(
 					const hostProcessIncarnation = processIncarnation(process.pid);
 					const direct = await reattestMasterSessionIdentity({
 						index,
-						locator,
+						locator: currentLocator.value,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -9508,7 +9512,7 @@ export function createNotificationsExtension(
 							registration = await index.append({
 								type: "host_registered",
 								...input,
-								locator,
+								locator: currentLocator.value,
 								pid: process.pid,
 								// A pid alone cannot survive its own reuse, and the marker that
 								// binds it lives in the workspace state root this host can outlive.
@@ -9527,13 +9531,13 @@ export function createNotificationsExtension(
 								!expected ||
 								expected.sessionId !== input.sessionId ||
 								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+								path.resolve(currentLocator.value.stateRoot) !== path.resolve(input.stateRoot)
 							)
 								return;
 							await index.append({
 								type: "host_heartbeat",
 								sessionId: expected.sessionId,
-								locator: expected.locator,
+								locator: currentLocator.value,
 								endpointGeneration: expected.endpointGeneration,
 								pid: expected.pid,
 								...(expected.processIncarnation === undefined
@@ -9562,6 +9566,18 @@ export function createNotificationsExtension(
 					});
 					throwIfLifecycleStopped();
 					initializedRuntime.brokerRegistrationActive = true;
+					// Register a listener to update the broker locator when the session moves.
+					const unregisterAfterMoveListener = ctx.sessionManager.registerAfterMoveListener(async move => {
+						try {
+							const newLocator = await resolveSessionLocator(move.newCwd, endpointStateRoot);
+							currentLocator.value = newLocator;
+						} catch (error) {
+							logger.warn("sdk: failed to resolve locator after move_session", {
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					});
+					initializedRuntime.unregisterAfterMoveListener = unregisterAfterMoveListener;
 					// Host liveness is derived from alive(pid) and the coalesced heartbeats;
 					// activity transitions are appended by the host through this registration.
 				} catch (brokerError) {

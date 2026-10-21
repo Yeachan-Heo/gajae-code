@@ -2682,6 +2682,13 @@ export interface ReadonlySessionManager {
 	getEntries(): SessionEntry[];
 	getTree(): SessionTreeNode[];
 	getUsageStatistics(): UsageStatistics;
+	registerAfterMoveListener(
+		listener: (move: {
+			previousCwd: string;
+			newCwd: string;
+			previousSessionFile: string | undefined;
+		}) => void | Promise<void>,
+	): () => void;
 }
 
 function cloneAndFreezeSnapshot<T>(value: T): T {
@@ -2724,6 +2731,8 @@ export function createReadonlySessionManager(manager: SessionManager): ReadonlyS
 		getEntries: () => cloneAndFreezeSnapshot(manager.getEntries()),
 		getTree: () => cloneAndFreezeSnapshot(manager.getTree()),
 		getUsageStatistics: () => cloneAndFreezeSnapshot(manager.getUsageStatistics()),
+		registerAfterMoveListener: (listener: Parameters<SessionManager['registerAfterMoveListener']>[0]) =>
+			manager.registerAfterMoveListener(listener),
 	});
 	readonlySessionArtifactCapabilities.set(facade, sessionArtifactCapability(manager)!);
 	return facade;

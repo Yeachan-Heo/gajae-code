@@ -7951,6 +7951,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		};
 		const startupImageCapture = captureStartupRuntimeImage();
+		const currentLocator = {
+			value: { cwd: ctx.cwd, worktreeRoot: null as string | null, stateRoot },
+		};
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRecoveryStopped || brokerRegistered) return;
 			if (brokerRegistrationInFlight !== undefined) {
@@ -7965,11 +7968,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					if (brokerRecoveryStopped) return;
 					const index = await new SessionIndex(options.agentDir).open();
 					if (brokerRecoveryStopped) return;
-					const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
+					currentLocator.value = await resolveSessionLocator(ctx.cwd, stateRoot);
 					const effectiveIncarnation = processIncarnation(process.pid);
 					const direct = await reattestMasterSessionIdentity({
 						index,
-						locator,
+						locator: currentLocator.value,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
 						ownerSessionId: options.masterOwnerSessionId,
@@ -8009,7 +8012,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							const published = await index.append({
 								type: "host_registered",
 								...input,
-								locator,
+								locator: currentLocator.value,
 								pid: process.pid,
 								endpointMtimeMs,
 								endpointFileId,
@@ -8031,13 +8034,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								!expected ||
 								expected.sessionId !== input.sessionId ||
 								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+								path.resolve(currentLocator.value.stateRoot) !== path.resolve(input.stateRoot)
 							)
 								return;
 							await index.append({
 								type: "host_heartbeat",
 								sessionId: expected.sessionId,
-								locator: expected.locator,
+								locator: currentLocator.value,
 								endpointGeneration: expected.endpointGeneration,
 								pid: expected.pid,
 								...(expected.processIncarnation === undefined
@@ -8079,6 +8082,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (brokerRegistrationInFlight === registration) brokerRegistrationInFlight = undefined;
 			}
 		};
+		// Register a listener to update the SDK broker locator when the session moves.
+		const unregisterAfterMoveListener = ctx.sessionManager.registerAfterMoveListener(async move => {
+			try {
+				const newLocator = await resolveSessionLocator(move.newCwd, stateRoot);
+				currentLocator.value = newLocator;
+			} catch (error) {
+				logger.warn("sdk: failed to resolve locator after move_session", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		});
 		let brokerRecoveryTimer: NodeJS.Timeout | undefined;
 		let brokerRecoveryInFlight: Promise<void> | undefined;
 		const runBrokerRecovery = async (): Promise<void> => {
@@ -8149,6 +8163,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const stopBrokerRecovery = (): void => {
 			brokerRecoveryStopped = true;
+			unregisterAfterMoveListener();
 			if (brokerRecoveryTimer === undefined) return;
 			(options.clearIntervalImpl ?? clearInterval)(brokerRecoveryTimer);
 			brokerRecoveryTimer = undefined;
