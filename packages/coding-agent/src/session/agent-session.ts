@@ -28542,6 +28542,8 @@ export class AgentSession {
 			// the existing message objects is sufficient and avoids structured-clone failures for
 			// extension/custom metadata that is valid to persist but not cloneable.
 			const previousAgentMessages = [...this.agent.state.messages];
+			const previousCheckpointState = this.#checkpointState;
+			const previousPendingRewindReport = this.#pendingRewindReport;
 			const previousSteeringMessages = [...this.#steeringMessages];
 			const previousFollowUpMessages = [...this.#followUpMessages];
 			const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
@@ -28861,6 +28863,11 @@ export class AgentSession {
 					await exactRetirement?.commit();
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
+					// A checkpoint count and entry id belong to the predecessor file.
+					// Leaving them armed lets a later rewind slice the successor and
+					// branch it from a missing entry, which falls back to the root.
+					this.#checkpointState = undefined;
+					this.#pendingRewindReport = undefined;
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -28952,6 +28959,8 @@ export class AgentSession {
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
+				this.#checkpointState = previousCheckpointState;
+				this.#pendingRewindReport = previousPendingRewindReport;
 				let exactRetirementAbortError: unknown;
 				try {
 					await exactRetirement?.abort();
