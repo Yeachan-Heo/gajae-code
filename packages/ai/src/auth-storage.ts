@@ -6734,7 +6734,11 @@ export class AuthStorage {
 						this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
 					}
 				} else {
-					this.#markCredentialBlocked(providerKey, selection.index, resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs);
+					this.#markCredentialBlocked(
+						providerKey,
+						selection.index,
+						resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
+					);
 				}
 				return undefined;
 			}
@@ -6819,7 +6823,11 @@ export class AuthStorage {
 							this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
 						}
 					} else {
-						this.#markCredentialBlocked(providerKey, selection.index, resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs);
+						this.#markCredentialBlocked(
+							providerKey,
+							selection.index,
+							resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
+						);
 					}
 					return undefined;
 				}
