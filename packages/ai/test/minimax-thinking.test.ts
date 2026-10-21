@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import {
 	applyGeneratedModelPolicies,
 	clampThinkingLevelForModel,
@@ -17,6 +17,54 @@ import type { Context, Model, SimpleStreamOptions } from "../src/types";
 
 const providers = ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const;
 const context: Context = { messages: [{ role: "user", content: "hello", timestamp: 0 }] };
+
+// #955
+describe("MiniMax coding-plan payload normalization", () => {
+	const originalFetch = global.fetch;
+
+	afterEach(() => {
+		global.fetch = originalFetch;
+	});
+
+	const context: Context = {
+		systemPrompt: ["stable instructions", "cacheable policy"],
+		messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+	};
+
+	function abortedSignal(): AbortSignal {
+		const controller = new AbortController();
+		controller.abort();
+		return controller.signal;
+	}
+
+	async function capturePayload(model: Model<"openai-completions">): Promise<Record<string, unknown>> {
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			signal: abortedSignal(),
+			reasoning: "high",
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+		return await promise;
+	}
+
+	it.each([
+		["minimax-code", "MiniMax-M2.5"],
+		["minimax-code-cn", "MiniMax-M2.5"],
+	] as const)("omits unsupported thinking fields for %s/%s", async (provider, modelId) => {
+		const model = getBundledModel(provider, modelId) as Model<"openai-completions">;
+		const body = await capturePayload(model);
+
+		expect(body.model).toBe(modelId);
+		expect(body.messages).toEqual([
+			{ role: "system", content: "stable instructions\n\ncacheable policy" },
+			{ role: "user", content: "hello" },
+		]);
+		expect(body.thinking).toBeUndefined();
+		expect(body.reasoning).toBeUndefined();
+		expect(body.reasoning_effort).toBeUndefined();
+	});
+});
 
 async function capturePayload(model: Model, options: SimpleStreamOptions): Promise<Record<string, unknown>> {
 	let payload: Record<string, unknown> | undefined;
