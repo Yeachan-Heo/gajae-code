@@ -7278,6 +7278,7 @@ test("SDK session switches rotate endpoint authority before publishing the repla
 		...context(cwd, sessionA),
 		sessionManager: {
 			getSessionId: () => activeSessionId,
+			getCwd: () => cwd,
 			getSessionName: () => "SDK switch",
 			getUsageStatistics: () => ({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
 		},
@@ -7347,6 +7348,7 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			...context(cwd, sessionA),
 			sessionManager: {
 				getSessionId: () => activeSessionId,
+				getCwd: () => cwd,
 				getSessionName: () => "SDK rotate",
 				getUsageStatistics: () => ({
 					input: 1,

@@ -1784,6 +1784,7 @@ describe("notifications config", () => {
 				({
 					cwd,
 					sessionManager: {
+						getCwd: () => cwd,
 						getSessionId: () => sessionId,
 						getSessionName: () => sessionId,
 					},
@@ -1892,6 +1893,7 @@ describe("notifications config", () => {
 			const context = {
 				cwd,
 				sessionManager: {
+					getCwd: () => cwd,
 					getSessionId: () => sessionId,
 					getSessionName: () => "safe chat sibling",
 				},
@@ -2003,6 +2005,7 @@ describe("notifications config", () => {
 			const context = {
 				cwd,
 				sessionManager: {
+					getCwd: () => cwd,
 					getSessionId: () => "provider-readiness-retry",
 					getSessionName: () => "provider readiness retry",
 				},
@@ -2292,6 +2295,7 @@ describe("notifications config", () => {
 		const context = {
 			cwd,
 			sessionManager: {
+				getCwd: () => cwd,
 				getSessionId: () => sessionId,
 				getSessionName: () => "command harness",
 			},
