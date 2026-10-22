@@ -1292,6 +1292,8 @@ interface SessionRuntime {
 	disposeGateEmitterListener: () => void;
 	/** Deregisters this session's job-fold listener (`bash_folded`). */
 	disposeFoldListener: () => void;
+	/** Deregisters the committed-move broker relocation listener. */
+	disposeSessionMoveListener: () => void;
 	/** Aborts and fences side turns while notification delivery is disabled. */
 	disableEphemeralTurns: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
@@ -4873,6 +4875,9 @@ export function createNotificationsExtension(
 		} catch {}
 		try {
 			rt.disposeFoldListener();
+		} catch {}
+		try {
+			rt.disposeSessionMoveListener();
 		} catch {}
 		rt.gatePresentations?.dispose();
 		try {
@@ -8642,6 +8647,7 @@ export function createNotificationsExtension(
 			},
 			disposeGateEmitterListener: () => {},
 			disposeFoldListener: () => {},
+			disposeSessionMoveListener: () => {},
 			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
 				await Promise.allSettled(inFlightGateResolutions);
@@ -9378,6 +9384,45 @@ export function createNotificationsExtension(
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
 			};
 			emitSessionEvent(initializedRuntime, identityHeader);
+			// Broker publication state. The committed-move listener is installed before the
+			// transport exposes `session.cwd.move` and before any asynchronous broker setup,
+			// so no committed move can go unobserved; registration reads the session
+			// manager's current cwd (`ctx.cwd` is the launch cwd) for moves committed
+			// earlier. A move target stays pending until a relocation lands: a failed
+			// attempt is retried by the next heartbeat, move, or release, and
+			// `relocateIfCurrent` adopts a relocation that became durable before failing.
+			// Relocation, heartbeat, and release are serialized so each presents the
+			// proof the index currently holds.
+			let brokerIndex: SessionIndex | undefined;
+			let registration: SessionIndexEvent | undefined;
+			let pendingRelocationCwd: string | undefined;
+			let publicationQueue: Promise<void> = Promise.resolve();
+			const serializePublication = (task: () => Promise<void>): Promise<void> => {
+				const run = publicationQueue.then(task);
+				publicationQueue = run.catch(() => {});
+				return run;
+			};
+			const reconcileLocator = async (): Promise<void> => {
+				const target = pendingRelocationCwd;
+				const expected = registration;
+				const index = brokerIndex;
+				if (target === undefined || !expected || !index) return;
+				try {
+					const relocated = await index.relocateIfCurrent(
+						expected,
+						await resolveSessionLocator(target, expected.locator.stateRoot),
+					);
+					if (relocated && registration === expected) registration = relocated;
+					if (pendingRelocationCwd === target) pendingRelocationCwd = undefined;
+				} catch (error) {
+					logger.warn(`sdk broker relocation after session move failed; retrying later: ${String(error)}`);
+				}
+			};
+			initializedRuntime.disposeSessionMoveListener =
+				ctx.onSessionMove?.(move => {
+					pendingRelocationCwd = move.newCwd;
+					return serializePublication(reconcileLocator);
+				}) ?? (() => {});
 			const endpoint = await sdkRuntime.startTransport();
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
@@ -9474,7 +9519,7 @@ export function createNotificationsExtension(
 					throwIfLifecycleStopped();
 					const index = await new SessionIndex(agentDir).open();
 					throwIfLifecycleStopped();
-					const locator = await resolveSessionLocator(ctx.cwd, endpointStateRoot);
+					const locator = await resolveSessionLocator(ctx.sessionManager.getCwd(), endpointStateRoot);
 					const endpointPath = path.join(endpointStateRoot, "sdk", `${id}.json`);
 					const endpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
 					const endpointIdentity = fs.statSync(endpointPath, { bigint: true });
@@ -9491,7 +9536,6 @@ export function createNotificationsExtension(
 						processIncarnation: hostProcessIncarnation,
 					});
 					throwIfLifecycleStopped();
-					let registration: SessionIndexEvent | undefined;
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
@@ -9505,6 +9549,7 @@ export function createNotificationsExtension(
 								processIncarnation: hostProcessIncarnation,
 								direct,
 							});
+							brokerIndex = index;
 							registration = await index.append({
 								type: "host_registered",
 								...input,
@@ -9521,47 +9566,54 @@ export function createNotificationsExtension(
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
-						heartbeat: async input => {
-							const expected = registration;
-							if (
-								!expected ||
-								expected.sessionId !== input.sessionId ||
-								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
-							)
-								return;
-							await index.append({
-								type: "host_heartbeat",
-								sessionId: expected.sessionId,
-								locator: expected.locator,
-								endpointGeneration: expected.endpointGeneration,
-								pid: expected.pid,
-								...(expected.processIncarnation === undefined
-									? {}
-									: { processIncarnation: expected.processIncarnation }),
-								...(expected.hostIncarnation === undefined
-									? {}
-									: { hostIncarnation: expected.hostIncarnation }),
-								...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
-								activity: input.activity,
-								ts: input.activity.at,
-							});
-						},
-						unregister: async input => {
-							const expected = registration;
-							if (
-								!expected ||
-								expected.sessionId !== input.sessionId ||
-								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
-							)
-								return;
-							await index.unregisterIfCurrent(expected);
-							if (registration === expected) registration = undefined;
-						},
+						heartbeat: input =>
+							serializePublication(async () => {
+								await reconcileLocator();
+								const expected = registration;
+								if (
+									!expected ||
+									expected.sessionId !== input.sessionId ||
+									expected.endpointGeneration !== input.endpointGeneration ||
+									path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+								)
+									return;
+								await index.append({
+									type: "host_heartbeat",
+									sessionId: expected.sessionId,
+									locator: expected.locator,
+									endpointGeneration: expected.endpointGeneration,
+									pid: expected.pid,
+									...(expected.processIncarnation === undefined
+										? {}
+										: { processIncarnation: expected.processIncarnation }),
+									...(expected.hostIncarnation === undefined
+										? {}
+										: { hostIncarnation: expected.hostIncarnation }),
+									...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
+									activity: input.activity,
+									ts: input.activity.at,
+								});
+							}),
+						unregister: input =>
+							serializePublication(async () => {
+								await reconcileLocator();
+								const expected = registration;
+								if (
+									!expected ||
+									expected.sessionId !== input.sessionId ||
+									expected.endpointGeneration !== input.endpointGeneration ||
+									path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+								)
+									return;
+								await index.unregisterIfCurrent(expected);
+								if (registration === expected) registration = undefined;
+							}),
 					});
 					throwIfLifecycleStopped();
 					initializedRuntime.brokerRegistrationActive = true;
+					// A move that committed while registration was in flight found nothing to
+					// relocate yet; republish under its cwd now.
+					if (pendingRelocationCwd !== undefined) await serializePublication(reconcileLocator);
 					// Host liveness is derived from alive(pid) and the coalesced heartbeats;
 					// activity transitions are appended by the host through this registration.
 				} catch (brokerError) {
@@ -10104,6 +10156,7 @@ export function createNotificationsExtension(
 			throw new Error(`notifications: predecessor runtime ${id} is not safely send-capable.`);
 		predecessor.inboundFenced = true;
 		predecessor.stopSessionNameObserver();
+		predecessor.disposeSessionMoveListener();
 		// Release broker/host authority while leaving the native server alive for
 		// the one accepted terminal response. stopAndWait is deferred to stopSession.
 		const stopped = await predecessor.host.stop();

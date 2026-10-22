@@ -330,6 +330,7 @@ export class ExtensionRunner {
 	#getProjectProgressFn: ExtensionContextActions["getProjectProgress"] = undefined;
 	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
 	#onSessionEventFn: ExtensionContextActions["onSessionEvent"] = undefined;
+	#onSessionMoveFn: ExtensionContextActions["onSessionMove"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
 	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
 	#setSdkClientBridgeFn: ExtensionContextActions["setSdkClientBridge"] = undefined;
@@ -488,6 +489,7 @@ export class ExtensionRunner {
 		this.#getProjectProgressFn = contextActions.getProjectProgress;
 		this.#onJobFoldFn = contextActions.onJobFold;
 		this.#onSessionEventFn = contextActions.onSessionEvent;
+		this.#onSessionMoveFn = contextActions.onSessionMove;
 		this.#sdkControlFn = contextActions.sdkControl;
 		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
 		this.#setSdkClientBridgeFn = contextActions.setSdkClientBridge;
@@ -855,6 +857,7 @@ export class ExtensionRunner {
 			...(this.#getProjectProgressFn ? { getProjectProgress: this.#getProjectProgressFn } : {}),
 			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			onSessionEvent: listener => this.#onSessionEventFn?.(listener) ?? (() => {}),
+			onSessionMove: listener => this.#onSessionMoveFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
 			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),

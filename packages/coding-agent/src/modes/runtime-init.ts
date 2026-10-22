@@ -207,6 +207,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				toProjectProgressSnapshot(await buildSessionProjectProgress(session, session.sessionManager)),
 			onJobFold: listener => session.onJobFold(listener),
 			onSessionEvent: listener => session.subscribe(listener),
+			onSessionMove: listener => session.sessionManager.registerAfterMoveListener(listener),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {

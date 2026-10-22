@@ -250,6 +250,7 @@ function extensionContext(
 		workflowGate: undefined,
 		sdkBindings: () => [],
 		sessionManager: {
+			getCwd: () => cwd,
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(cwd, `${sessionId}.json`),
 			getSessionName: () => undefined,
@@ -4855,6 +4856,7 @@ async function invocationHarness(
 		abort: hooks.abort ?? (() => {}),
 		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
 		sessionManager: {
+			getCwd: () => cwd,
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
 			getSessionName: () => undefined,

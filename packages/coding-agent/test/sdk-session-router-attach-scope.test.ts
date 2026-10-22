@@ -23,6 +23,7 @@ async function scopedRouterFixture(
 	sessionIds?: readonly string[],
 	attachFilter?: (sessionId: string) => boolean,
 	stateRootCaseVariant = false,
+	locatorCwd?: (repo: string) => string,
 ): Promise<{
 	attached: string[];
 	closed: string[];
@@ -57,7 +58,7 @@ async function scopedRouterFixture(
 			indexSeq: 1,
 			sessions: SESSION_IDS.map(sessionId => ({
 				sessionId,
-				locator: { cwd: repo, worktreeRoot: null, stateRoot: indexedStateRoot },
+				locator: { cwd: locatorCwd?.(repo) ?? repo, worktreeRoot: null, stateRoot: indexedStateRoot },
 				endpointGeneration: 1,
 				pid: 42,
 				endpointMtimeMs: endpointMtimeMs.get(sessionId),
@@ -99,6 +100,17 @@ async function scopedRouterFixture(
 
 test("an unscoped Router attaches to every live indexed session", async () => {
 	const { attached, stop } = await scopedRouterFixture();
+	try {
+		expect([...attached].sort()).toEqual([...SESSION_IDS].sort());
+	} finally {
+		await stop();
+	}
+});
+
+test("a Router attaches a session whose committed move relocated its cwd away from the endpoint workspace", async () => {
+	// A move relocates the locator cwd; the endpoint stays under the launch
+	// workspace's state root, which is the only place the Router may read it.
+	const { attached, stop } = await scopedRouterFixture(undefined, undefined, false, repo => path.join(repo, "moved"));
 	try {
 		expect([...attached].sort()).toEqual([...SESSION_IDS].sort());
 	} finally {
