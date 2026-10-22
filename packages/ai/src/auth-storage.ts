@@ -5212,28 +5212,57 @@ export class AuthStorage {
 	/**
 	 * Backoff targets implied by an exhausted usage report: a credential-wide
 	 * until for limits that are not model-scoped, plus one entry per exhausted
-	 * model-scoped limit. A model-scoped limit must not take the whole credential
+	 * model-scoped limit must not take the whole credential
 	 * out of rotation for other models.
+	 *
+	 * An exhausted limit without a usable (future) reset still produces a target,
+	 * expiring at `fallbackUntilMs`, so a reset-less wide limit keeps blocking the
+	 * credential and a reset-less scoped limit stays confined to its model.
 	 */
 	#exhaustedLimitBlockTargets(
 		report: UsageReport,
 		nowMs: number,
+		fallbackUntilMs: number,
 	): { wideUntil?: number; scoped: Array<{ modelId: string; untilMs: number }> } {
 		let wideUntil: number | undefined;
+		let wideWithoutReset = false;
 		const scoped: Array<{ modelId: string; untilMs: number }> = [];
 		for (const limit of report.limits) {
 			if (!this.#isUsageLimitExhausted(limit)) continue;
 			const resetsAt = limit.window?.resetsAt;
-			if (!resetsAt || resetsAt <= nowMs) continue;
+			const usableReset = resetsAt !== undefined && resetsAt > nowMs ? resetsAt : undefined;
 			const scopeModel = limit.scope?.modelId?.trim();
 			const tier = limit.scope?.tier?.trim().toLowerCase();
 			if (!scopeModel && !(tier && MODEL_FAMILY_TIERS.has(tier))) {
-				wideUntil = wideUntil === undefined ? resetsAt : Math.min(wideUntil, resetsAt);
+				if (usableReset === undefined) wideWithoutReset = true;
+				else wideUntil = wideUntil === undefined ? usableReset : Math.min(wideUntil, usableReset);
 				continue;
 			}
-			scoped.push({ modelId: scopeModel ?? tier!, untilMs: resetsAt });
+			scoped.push({ modelId: scopeModel ?? tier!, untilMs: usableReset ?? fallbackUntilMs });
 		}
+		if (wideUntil === undefined && wideWithoutReset) wideUntil = fallbackUntilMs;
 		return wideUntil === undefined ? { scoped } : { wideUntil, scoped };
+	}
+
+	/**
+	 * Records the backoff implied by an exhausted usage report on one credential:
+	 * a credential-wide block only when a non-model-scoped limit is exhausted (or
+	 * nothing more specific is known), plus one block per exhausted scoped limit.
+	 */
+	#markExhaustedUsageBlocks(
+		providerKey: string,
+		credentialIndex: number,
+		report: UsageReport,
+		nowMs: number,
+		fallbackUntilMs: number,
+	): void {
+		const targets = this.#exhaustedLimitBlockTargets(report, nowMs, fallbackUntilMs);
+		if (targets.wideUntil !== undefined || targets.scoped.length === 0) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, targets.wideUntil ?? fallbackUntilMs);
+		}
+		for (const scoped of targets.scoped) {
+			this.#markCredentialBlocked(providerKey, credentialIndex, scoped.untilMs, scoped.modelId);
+		}
 	}
 
 	async #getUsageReport(
@@ -5800,7 +5829,7 @@ export class AuthStorage {
 		if (initial.credential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
 			const report = await this.#getUsageReport(provider, initial.credential, options);
 			if (report) {
-				const targets = this.#exhaustedLimitBlockTargets(report, Date.now());
+				const targets = this.#exhaustedLimitBlockTargets(report, Date.now(), blockedUntil);
 				if (targets.wideUntil !== undefined) {
 					reportHasWideLimit = true;
 					if (targets.wideUntil > blockedUntil) blockedUntil = targets.wideUntil;
@@ -5840,10 +5869,13 @@ export class AuthStorage {
 			};
 		}
 		const providerKey = this.#getProviderTypeKey(provider, credentialKind);
-		// A report whose only exhausted limits are model-scoped must not take the
-		// whole credential out of rotation; the caller's retry-after backoff applies
-		// to those models instead.
-		if (!(scopedBlocks.length > 0 && !reportHasWideLimit)) {
+		// An exhausted wide limit in the report takes the whole credential out of
+		// rotation regardless of which model hit it. A report whose only exhausted
+		// limits are model-scoped must not; those scopes carry the backoff instead.
+		// Without report evidence the caller's retry-after applies to its model.
+		if (reportHasWideLimit) {
+			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
+		} else if (scopedBlocks.length === 0) {
 			this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil, options?.modelId);
 		}
 		for (const scoped of scopedBlocks) {
@@ -6057,15 +6089,9 @@ export class AuthStorage {
 			let blocked = blockedUntil !== undefined;
 			if (!blocked && usage && this.#isUsageLimitReached(usage, args.options?.modelId)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, nowMs, args.options?.modelId);
-				blockedUntil = resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs;
-				const targets = this.#exhaustedLimitBlockTargets(usage, nowMs);
-				if (targets.wideUntil === undefined && targets.scoped.length > 0) {
-					for (const scoped of targets.scoped) {
-						this.#markCredentialBlocked(args.providerKey, selection.index, scoped.untilMs, scoped.modelId);
-					}
-				} else {
-					this.#markCredentialBlocked(args.providerKey, selection.index, blockedUntil);
-				}
+				const fallbackUntilMs = Date.now() + AuthStorage.#defaultBackoffMs;
+				blockedUntil = resetAtMs ?? fallbackUntilMs;
+				this.#markExhaustedUsageBlocks(args.providerKey, selection.index, usage, nowMs, fallbackUntilMs);
 				blocked = true;
 			}
 			// Rank on the windows that apply to the requested model so a limit scoped
@@ -6731,19 +6757,14 @@ export class AuthStorage {
 				usageChecked = true;
 			}
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
-				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
-				const targets = this.#exhaustedLimitBlockTargets(usage, Date.now());
-				if (targets.wideUntil === undefined && targets.scoped.length > 0) {
-					for (const scoped of targets.scoped) {
-						this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
-					}
-				} else {
-					this.#markCredentialBlocked(
-						providerKey,
-						selection.index,
-						resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
-					);
-				}
+				const nowMs = Date.now();
+				this.#markExhaustedUsageBlocks(
+					providerKey,
+					selection.index,
+					usage,
+					nowMs,
+					nowMs + AuthStorage.#defaultBackoffMs,
+				);
 				return undefined;
 			}
 		}
@@ -6820,19 +6841,14 @@ export class AuthStorage {
 					usageChecked = true;
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage, options?.modelId)) {
-					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now(), options?.modelId);
-					const targets = this.#exhaustedLimitBlockTargets(usage, Date.now());
-					if (targets.wideUntil === undefined && targets.scoped.length > 0) {
-						for (const scoped of targets.scoped) {
-							this.#markCredentialBlocked(providerKey, selection.index, scoped.untilMs, scoped.modelId);
-						}
-					} else {
-						this.#markCredentialBlocked(
-							providerKey,
-							selection.index,
-							resetAtMs ?? Date.now() + AuthStorage.#defaultBackoffMs,
-						);
-					}
+					const nowMs = Date.now();
+					this.#markExhaustedUsageBlocks(
+						providerKey,
+						selection.index,
+						usage,
+						nowMs,
+						nowMs + AuthStorage.#defaultBackoffMs,
+					);
 					return undefined;
 				}
 			}

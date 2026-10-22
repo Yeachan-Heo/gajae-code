@@ -254,4 +254,120 @@ describe("AuthStorage model-scoped usage limits", () => {
 		// Callers without model context stay conservative.
 		expect(authStorage.isCredentialAvailable("anthropic", rowId)).toBe(false);
 	}, 20_000);
+
+	describe("usage reports with exhausted limits lacking a usable reset", () => {
+		const exhausted = (id: string, scope: UsageLimit["scope"], resetsAt?: number): UsageLimit => ({
+			id: `anthropic:${id}`,
+			label: id,
+			scope,
+			window: { id, label: id, durationMs: 7 * 24 * HOUR_MS, ...(resetsAt === undefined ? {} : { resetsAt }) },
+			amount: { unit: "percent", used: 100, limit: 100, remaining: 0, usedFraction: 1, remainingFraction: 0 },
+			status: "exhausted",
+		});
+		const healthy = (accountId: string): UsageLimit => ({
+			id: "anthropic:5h",
+			label: "5 Hour",
+			scope: { provider: "anthropic", accountId },
+			window: { id: "5h", label: "5 Hour", durationMs: 5 * HOUR_MS, resetsAt: Date.now() + HOUR_MS },
+			amount: { unit: "percent", used: 10, limit: 100, remaining: 90, usedFraction: 0.1, remainingFraction: 0.9 },
+			status: "ok",
+		});
+
+		/** Rebuilds the storage with a usage provider whose acct-first report holds `firstLimits`. */
+		async function useReports(firstLimits: UsageLimit[]): Promise<{ storage: AuthStorage; firstRowId: number }> {
+			const reports: Record<string, UsageReport> = {
+				"acct-first": { provider: "anthropic", fetchedAt: Date.now(), limits: firstLimits },
+				"acct-second": { provider: "anthropic", fetchedAt: Date.now(), limits: [healthy("acct-second")] },
+			};
+			const usageProvider: UsageProvider = {
+				id: "anthropic",
+				async fetchUsage(params) {
+					const accountId = params.credential.accountId;
+					return accountId ? (reports[accountId] ?? null) : null;
+				},
+			};
+			store?.close();
+			store = await SqliteAuthCredentialStore.open(path.join(tempDir, "reset-less.db"));
+			const storage = new AuthStorage(store, {
+				usageProviderResolver: provider => (provider === "anthropic" ? usageProvider : undefined),
+				credentialRankingMode: "balanced",
+			});
+			authStorage = storage;
+			await storage.reload();
+			await storage.set("anthropic", [
+				{ type: "oauth", ...createCredential("acct-first") },
+				{ type: "oauth", ...createCredential("acct-second") },
+			]);
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+				const credential = credentials.anthropic as OAuthCredentials | undefined;
+				if (!credential?.accountId) return null;
+				return { apiKey: `api-${credential.accountId}`, newCredentials: credential };
+			});
+			const firstRowId = storage
+				.listCredentialInventory("anthropic")
+				.find(row => row.email === "acct-first@example.com")?.id;
+			if (firstRowId === undefined) throw new Error("acct-first row missing");
+			return { storage, firstRowId };
+		}
+
+		const sonnetOnlyResetLess = () => [
+			exhausted("sonnet-7d", { provider: "anthropic", accountId: "acct-first", tier: "sonnet" }),
+			healthy("acct-first"),
+		];
+		const wideResetLessPlusScoped = () => [
+			exhausted("7d", { provider: "anthropic", accountId: "acct-first" }),
+			exhausted(
+				"sonnet-7d",
+				{ provider: "anthropic", accountId: "acct-first", tier: "sonnet" },
+				Date.now() + HOUR_MS,
+			),
+		];
+
+		it("keeps a reset-less scoped limit on its model when a pinned credential is checked", async () => {
+			const { storage, firstRowId } = await useReports(sonnetOnlyResetLess());
+			await storage.getApiKey("anthropic", "pinned-scoped-session", {
+				modelId: "claude-sonnet-4-5",
+				credentialSelector: { kind: "id", value: String(firstRowId) },
+			});
+			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-sonnet-4-5")).toBe(false);
+			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1")).toBe(true);
+		}, 20_000);
+
+		it("keeps a reset-less scoped limit on its model when ranking credentials", async () => {
+			const { storage, firstRowId } = await useReports(sonnetOnlyResetLess());
+			const sonnet = await storage.getApiKey("anthropic", "ranked-scoped-session", {
+				modelId: "claude-sonnet-4-5",
+			});
+			expect(sonnet).toBe("api-acct-second");
+			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-sonnet-4-5")).toBe(false);
+			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1")).toBe(true);
+		}, 20_000);
+
+		it("keeps a reset-less wide limit credential-wide when a pinned credential is checked", async () => {
+			const { storage, firstRowId } = await useReports(wideResetLessPlusScoped());
+			await storage.getApiKey("anthropic", "pinned-wide-session", {
+				modelId: "claude-sonnet-4-5",
+				credentialSelector: { kind: "id", value: String(firstRowId) },
+			});
+			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1")).toBe(false);
+		}, 20_000);
+
+		it("keeps a reset-less wide limit credential-wide when ranking credentials", async () => {
+			const { storage, firstRowId } = await useReports(wideResetLessPlusScoped());
+			console.error("PRE", storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1"));
+			await storage.getApiKey("anthropic", "ranked-wide-session", { modelId: "claude-sonnet-4-5" });
+			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1")).toBe(false);
+		}, 20_000);
+
+		it("keeps a reset-less wide limit credential-wide when a usage limit is reported", async () => {
+			const { storage, firstRowId } = await useReports(wideResetLessPlusScoped());
+			const marked = await storage.markUsageLimitReached("anthropic", undefined, {
+				retryAfterMs: 60_000,
+				rowId: firstRowId,
+				modelId: "claude-sonnet-4-5",
+			});
+			expect(marked.state).toBe("marked");
+			expect(storage.isCredentialAvailable("anthropic", firstRowId, "claude-opus-4-1")).toBe(false);
+		}, 20_000);
+	});
 });
