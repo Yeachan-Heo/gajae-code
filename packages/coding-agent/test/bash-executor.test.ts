@@ -389,10 +389,14 @@ describe("executeBash", () => {
 		if (process.platform === "win32") return;
 		await disposeAllShellSessions();
 		const ready = Promise.withResolvers<void>();
+		const readyEntered = Promise.withResolvers<void>();
 		const closeSpy = vi.fn(async () => undefined);
 		const runSpy = vi.fn(async () => ({ exitCode: 0, cancelled: false, timedOut: false }));
 		setShellFactoryForTests(() => ({
-			ready: async () => await ready.promise,
+			ready: async () => {
+				readyEntered.resolve();
+				await ready.promise;
+			},
 			run: runSpy,
 			abort: async () => undefined,
 			close: closeSpy,
@@ -403,7 +407,7 @@ describe("executeBash", () => {
 			timeout: 1_000,
 			sessionKey: "dispose-during-startup",
 		});
-		for (let attempt = 0; attempt < 40 && getShellSessionCount() === 0; attempt++) await Bun.sleep(5);
+		await Promise.race([readyEntered.promise, execution]);
 		expect(getShellSessionCount()).toBe(1);
 
 		await disposeAllShellSessions();
