@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
+import { MAX_PROMPT_IMAGE_CHUNK_BYTES } from "../../utils/image-limits";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import {
 	DEFAULT_SDK_REQUEST_TIMEOUT_MS,
@@ -458,6 +459,9 @@ export class AcpSdkAdapter {
 		const invalid = validateRequiredPromptText("turn.prompt", {
 			text,
 			...(typeof params === "object" && Array.isArray(params.images) ? { images: params.images } : {}),
+			...(typeof params === "object" && params.stagedImages !== undefined
+				? { stagedImages: params.stagedImages }
+				: {}),
 		});
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
 		return await this.#requestSession({
@@ -466,6 +470,61 @@ export class AcpSdkAdapter {
 			input: { ...(typeof params === "object" ? params : {}), text },
 		});
 	}
+	/**
+	 * Upload one prompt image through the host-owned `turn.image.*` staging controls in
+	 * chunks below the SDK frame cap and return its one-shot staged ID. These controls are
+	 * GJC-private and stay prohibited on the generic `_gjc/sdk/control` passthrough; only
+	 * this adapter-owned prompt path may use them. A failed upload is discarded before the
+	 * error propagates, so no lease outlives this call except a finished, returned one.
+	 */
+	async stagePromptImage(image: { data: string; mimeType: string }, batchId: string): Promise<string> {
+		const bytes = Buffer.from(image.data, "base64");
+		const begun = object(
+			await this.#requestSession({
+				type: "control_request",
+				operation: "turn.image.begin",
+				input: {
+					mimeType: image.mimeType,
+					byteLength: bytes.length,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+					batchId,
+				},
+			}),
+		);
+		const id = begun?.id;
+		if (typeof id !== "string" || !id)
+			throw new AcpSdkAdapterError("invalid_response", "SDK turn.image.begin returned no upload ID.");
+		try {
+			for (let offset = 0, sequence = 0; offset < bytes.length; offset += MAX_PROMPT_IMAGE_CHUNK_BYTES, sequence++)
+				await this.#requestSession({
+					type: "control_request",
+					operation: "turn.image.append",
+					input: {
+						id,
+						sequence,
+						data: bytes.subarray(offset, offset + MAX_PROMPT_IMAGE_CHUNK_BYTES).toString("base64"),
+					},
+				});
+			await this.#requestSession({ type: "control_request", operation: "turn.image.finish", input: { id } });
+		} catch (error) {
+			await this.discardPromptImage(id);
+			throw error;
+		}
+		return id;
+	}
+
+	/** Best-effort release of a staged or unfinished upload; an already-consumed ID is a no-op. */
+	async discardPromptImage(id: string): Promise<void> {
+		try {
+			await this.#requestSession({ type: "control_request", operation: "turn.image.discard", input: { id } });
+		} catch (error) {
+			logger.debug("ACP staged prompt image discard did not apply", {
+				id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	/**
 	 * Ends the active turn with a C04 terminal abort. The default `scope:"turn"`
 	 * only stops the current turn, matching the SDK `turn.abort` default and
