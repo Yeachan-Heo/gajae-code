@@ -2520,8 +2520,12 @@ export class AuthStorage {
 		return this.#storedApiKeyUsability(storageProvider, entry.credential.key);
 	}
 
-	/** Whether an enabled stored row is currently available outside quota backoff. */
-	isCredentialAvailable(provider: string, rowId: number): boolean {
+	/**
+	 * Whether an enabled stored row is currently available outside quota backoff.
+	 * Pass `modelId` when the caller knows the requested model so a backoff scoped
+	 * to another model does not hide the row; without it every backoff applies.
+	 */
+	isCredentialAvailable(provider: string, rowId: number, modelId?: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const entries = this.#getStoredCredentials(storageProvider);
 		const index = entries.findIndex(entry => entry.id === rowId);
@@ -2536,7 +2540,7 @@ export class AuthStorage {
 		const entry = entries[index];
 		return (
 			entry !== undefined &&
-			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index)
+			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index, modelId)
 		);
 	}
 
@@ -3062,8 +3066,8 @@ export class AuthStorage {
 	/**
 	 * Returns the block expiry for a credential, cleaning up expired entries.
 	 * A block recorded for one model only applies to that model; a block without a
-	 * model applies to the whole credential. `modelId` is the requested model, so
-	 * omitting it asks only about credential-wide blocks.
+	 * model applies to the whole credential. `modelId` is the requested model;
+	 * omitting it conservatively treats every live block, scoped or not, as applicable.
 	 */
 	#getCredentialBlockedUntil(providerKey: string, credentialIndex: number, modelId?: string): number | undefined {
 		const backoffMap = this.#credentialBackoff.get(providerKey);

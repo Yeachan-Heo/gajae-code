@@ -35,6 +35,7 @@ describe("AuthStorage model-scoped usage limits", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		store?.close();
 		store = null;
 		authStorage = null;
@@ -236,4 +237,21 @@ describe("AuthStorage model-scoped usage limits", () => {
 		expect(opus).toBe("api-acct-first");
 		expect(sonnet).toBe("api-acct-second");
 	}, 30_000);
+
+	it("answers availability for the requested model when a backoff is scoped to another model", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const sessionId = "availability-model-scope-session";
+		await authStorage.getOAuthAccess("anthropic", sessionId);
+		const rowId = authStorage.getSessionCredentialRowId("anthropic", sessionId)!;
+		const marked = await authStorage.markUsageLimitReached("anthropic", sessionId, {
+			retryAfterMs: 60_000,
+			modelId: "claude-sonnet-4-5",
+		});
+		expect(marked.state).toBe("marked");
+
+		expect(authStorage.isCredentialAvailable("anthropic", rowId, "claude-opus-4-1")).toBe(true);
+		expect(authStorage.isCredentialAvailable("anthropic", rowId, "claude-sonnet-4-5")).toBe(false);
+		// Callers without model context stay conservative.
+		expect(authStorage.isCredentialAvailable("anthropic", rowId)).toBe(false);
+	}, 20_000);
 });
