@@ -368,6 +368,25 @@ const tupleKey = (event: SessionIndexEvent) =>
 const effectiveIncarnation = (event: SessionIndexEvent) => event.hostIncarnation ?? event.processIncarnation;
 const identityKey = (event: SessionIndexEvent) => `${tupleKey(event)}\u0000${effectiveIncarnation(event) ?? ""}`;
 
+/** Registration content apart from its sequencing envelope and relocatable cwd/worktree. */
+function publicationContent(event: SessionIndexEvent): Record<string, unknown> {
+	const { version: _version, indexSeq: _indexSeq, checksum: _checksum, ts: _ts, locator, ...content } = event;
+	return { ...content, stateRoot: locator.stateRoot };
+}
+
+/**
+ * Whether `latest` is the publication `expected` proves: that exact event, or a later
+ * `host_registered` relocation of it whose only difference is the locator cwd/worktree.
+ */
+function samePublication(latest: SessionIndexEvent, expected: SessionIndexEvent): boolean {
+	if (latest.indexSeq === expected.indexSeq) return latest.checksum === expected.checksum;
+	return (
+		latest.type === "host_registered" &&
+		latest.indexSeq > expected.indexSeq &&
+		Bun.deepEquals(publicationContent(latest), publicationContent(expected))
+	);
+}
+
 function hasSessionLocatorV2(event: SessionIndexEvent): boolean {
 	return sessionLocatorV2(event.locator);
 }
@@ -1961,10 +1980,17 @@ export class SessionIndex {
 	 * projection reads locators from the latest non-heartbeat event of an identity,
 	 * this event is what moves pwd/repo scope membership; heartbeats never can.
 	 *
-	 * Returns the published successor, the still-current registration when the
-	 * locator is unchanged, or `undefined` when `expected` is no longer the identity's latest
-	 * non-heartbeat event (released, closed, superseded, tombstoned, or already
-	 * relocated by another writer), in which case nothing is appended.
+	 * `expected` may be a proof the caller already relocated without receiving the
+	 * result (the append was durable but a later step threw). A latest
+	 * `host_registered` event that is that same publication under another locator is
+	 * therefore adopted as current; only the owning host relocates its identity, so
+	 * this is the caller's own earlier write. A corrupt suffix is repaired under the
+	 * lock exactly as {@link append} does, so the proof check and the append stay atomic.
+	 *
+	 * Returns the published successor, the current registration when its locator
+	 * already matches, or `undefined` when the identity's latest non-heartbeat event is
+	 * not this publication (released, closed, superseded, or tombstoned), in which case
+	 * nothing is appended.
 	 */
 	async relocateIfCurrent(
 		expected: SessionIndexEvent,
@@ -1981,14 +2007,23 @@ export class SessionIndex {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
 			return await withSessionIndexLock("session relocation", this.#agentDir, async () => {
 				await this.#replayUnderLock();
-				if (this.#corruptSuffix) throw new Error("Cannot relocate a session in a corrupt session index");
+				if (this.#corruptSuffix) {
+					const repair = await this.#repairUnderLock();
+					if (this.#corruptSuffix)
+						throw new Error(
+							"Cannot relocate a session in a corrupt session index; automatic repair did not converge",
+						);
+					logger.warn(
+						`sdk broker: session index self-repaired before relocation (${repair.reason ?? "corrupt suffix"}); evidence quarantined at ${repair.quarantinePath ?? "unknown"}`,
+					);
+				}
 				// Persisted-event comparison only: no OS incarnation probe runs under the
 				// machine-global lock (#4544).
 				const identity = identityKey(expected);
 				const latest = admitEvents(this.#events).admitted.findLast(
 					event => event.type !== "host_heartbeat" && identityKey(event) === identity,
 				);
-				if (latest?.indexSeq !== expected.indexSeq || latest.checksum !== expected.checksum) return undefined;
+				if (!latest || !samePublication(latest, expected)) return undefined;
 				if (locator.cwd === latest.locator.cwd && locator.worktreeRoot === latest.locator.worktreeRoot)
 					return latest;
 				const { version: _version, indexSeq: _indexSeq, checksum: _checksum, ts: _ts, ...registration } = latest;

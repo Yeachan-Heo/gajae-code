@@ -563,7 +563,7 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 	const context = {
 		cwd,
 		sdkBindings: () => [],
-		sessionManager: { getSessionId: () => sessionId, getSessionName: () => undefined },
+		sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId, getSessionName: () => undefined },
 		workflowGate,
 	} as unknown as ExtensionContext;
 	try {
@@ -701,7 +701,7 @@ test("SDK-only runtime rejects an endpoint substituted before broker registratio
 	const context = {
 		cwd,
 		sdkBindings: () => [],
-		sessionManager: { getSessionId: () => sessionId, getSessionName: () => undefined },
+		sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId, getSessionName: () => undefined },
 	} as unknown as ExtensionContext;
 	try {
 		const start = handlers.get("session_start");

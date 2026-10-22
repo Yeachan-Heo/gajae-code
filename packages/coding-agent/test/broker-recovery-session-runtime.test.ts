@@ -17,6 +17,7 @@ function sdkContext(sessionId: string, cwd: string): ExtensionContext {
 		workflowGate: undefined,
 		sdkBindings: () => [],
 		sessionManager: {
+			getCwd: () => cwd,
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(cwd, `${sessionId}.json`),
 			getSessionName: () => undefined,

@@ -7906,12 +7906,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (STREAMED_TURN_EVENT_TYPES.has(event.type)) streamTurnEvent(event, ctx);
 		});
 		// Bound to broker relocation once registration state exists below; the
-		// subscription lives exactly as long as the other session hooks.
-		let sessionCwd = ctx.cwd;
-		let onCommittedSessionMove = async (_cwd: string): Promise<void> => {};
+		// subscription lives exactly as long as the other session hooks. A move
+		// committed before this point is covered by registration reading the session
+		// manager's current cwd (`ctx.cwd` is the launch cwd and never follows a move).
+		// The target stays pending until a relocation lands, so a failed attempt is
+		// retried by the next heartbeat, recovery tick, move, or release.
+		let pendingRelocationCwd: string | undefined;
+		let onCommittedSessionMove = async (): Promise<void> => {};
 		const disposeSessionMove = ctx.onSessionMove?.(move => {
-			sessionCwd = move.newCwd;
-			return onCommittedSessionMove(move.newCwd);
+			pendingRelocationCwd = move.newCwd;
+			return onCommittedSessionMove();
 		});
 		const disposeGate = (): void => {
 			disposeWorkflowGate?.();
@@ -7970,6 +7974,31 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			brokerPublicationQueue = run.catch(() => {});
 			return run;
 		};
+		/**
+		 * Publish the pending committed-move cwd for the owned registration. Runs inside
+		 * `serializeBrokerPublication`. The target is cleared only once the index holds a
+		 * registration at it (or no longer holds this publication at all); a failure keeps
+		 * it pending, and `relocateIfCurrent` adopts a relocation that became durable
+		 * before the failure, so retries converge on one proof.
+		 */
+		const reconcileBrokerLocator = async (): Promise<void> => {
+			const target = pendingRelocationCwd;
+			const expected = brokerRegistrationEvent;
+			const index = brokerRegistrationIndex;
+			if (target === undefined || !expected || !index) return;
+			try {
+				const relocated = await index.relocateIfCurrent(
+					expected,
+					await resolveSessionLocator(target, expected.locator.stateRoot),
+				);
+				if (relocated && brokerRegistrationEvent === expected) brokerRegistrationEvent = relocated;
+				if (pendingRelocationCwd === target) pendingRelocationCwd = undefined;
+			} catch (error) {
+				logger.warn("sdk broker relocation after session move failed; retrying later", {
+					code: brokerDiagnosticCode(error),
+				});
+			}
+		};
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRecoveryStopped || brokerRegistered) return;
 			if (brokerRegistrationInFlight !== undefined) {
@@ -7984,9 +8013,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					if (brokerRecoveryStopped) return;
 					const index = await new SessionIndex(options.agentDir).open();
 					if (brokerRecoveryStopped) return;
-					// The committed cwd, not the launch cwd: recovery after a move must
-					// register where the session is now.
-					const locator = await resolveSessionLocator(sessionCwd, stateRoot);
+					// The committed cwd, not the launch cwd: registration after a move must
+					// publish where the session is now.
+					const locator = await resolveSessionLocator(ctx.sessionManager.getCwd(), stateRoot);
 					const effectiveIncarnation = processIncarnation(process.pid);
 					const direct = await reattestMasterSessionIdentity({
 						index,
@@ -8044,36 +8073,41 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								if (brokerRegistrationEvent === published) brokerRegistrationEvent = undefined;
 							}
 						},
-						heartbeat: async input => {
-							// Heartbeat only ever speaks for the publication this host proved it
-							// owns. A stale or foreign generation must not renew liveness.
-							const expected = brokerRegistrationEvent;
-							if (
-								!expected ||
-								expected.sessionId !== input.sessionId ||
-								expected.endpointGeneration !== input.endpointGeneration ||
-								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
-							)
-								return;
-							await index.append({
-								type: "host_heartbeat",
-								sessionId: expected.sessionId,
-								locator: expected.locator,
-								endpointGeneration: expected.endpointGeneration,
-								pid: expected.pid,
-								...(expected.processIncarnation === undefined
-									? {}
-									: { processIncarnation: expected.processIncarnation }),
-								...(expected.hostIncarnation === undefined
-									? {}
-									: { hostIncarnation: expected.hostIncarnation }),
-								...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
-								activity: input.activity,
-								ts: input.activity.at,
-							});
-						},
+						heartbeat: input =>
+							serializeBrokerPublication(async () => {
+								await reconcileBrokerLocator();
+								// Heartbeat only ever speaks for the publication this host proved it
+								// owns. A stale or foreign generation must not renew liveness.
+								const expected = brokerRegistrationEvent;
+								if (
+									!expected ||
+									expected.sessionId !== input.sessionId ||
+									expected.endpointGeneration !== input.endpointGeneration ||
+									path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+								)
+									return;
+								await index.append({
+									type: "host_heartbeat",
+									sessionId: expected.sessionId,
+									locator: expected.locator,
+									endpointGeneration: expected.endpointGeneration,
+									pid: expected.pid,
+									...(expected.processIncarnation === undefined
+										? {}
+										: { processIncarnation: expected.processIncarnation }),
+									...(expected.hostIncarnation === undefined
+										? {}
+										: { hostIncarnation: expected.hostIncarnation }),
+									...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
+									activity: input.activity,
+									ts: input.activity.at,
+								});
+							}),
 						unregister: input =>
 							serializeBrokerPublication(async () => {
+								// Adopt or finish a pending relocation first so release presents the
+								// proof the index currently holds for this publication.
+								await reconcileBrokerLocator();
 								const expected = brokerRegistrationEvent;
 								if (
 									!expected ||
@@ -8105,23 +8139,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// (SessionIndex.relocateIfCurrent) before the move returns. Release and
 		// relocation are serialized so a teardown racing a move always releases
 		// whichever publication is current.
-		onCommittedSessionMove = async (cwd: string): Promise<void> => {
+		onCommittedSessionMove = async (): Promise<void> => {
 			// A registration racing the move may have resolved the pre-move locator.
 			await brokerRegistrationInFlight?.catch(() => {});
-			await serializeBrokerPublication(async () => {
-				const expected = brokerRegistrationEvent;
-				const index = brokerRegistrationIndex;
-				if (!expected || !index) return;
-				try {
-					const relocated = await index.relocateIfCurrent(
-						expected,
-						await resolveSessionLocator(cwd, expected.locator.stateRoot),
-					);
-					if (relocated && brokerRegistrationEvent === expected) brokerRegistrationEvent = relocated;
-				} catch (error) {
-					logger.warn("sdk broker relocation after session move failed", { code: brokerDiagnosticCode(error) });
-				}
-			});
+			await serializeBrokerPublication(reconcileBrokerLocator);
 		};
 		let brokerRecoveryTimer: NodeJS.Timeout | undefined;
 		let brokerRecoveryInFlight: Promise<void> | undefined;
@@ -8147,8 +8168,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					return;
 				}
 				if (brokerRecoveryStopped) return;
-				if (brokerRegistered) await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
-				else {
+				if (brokerRegistered) {
+					await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
+					// An idle session emits no heartbeat; the recovery cadence retries a
+					// failed committed-move relocation so scope lookups converge.
+					if (pendingRelocationCwd !== undefined) await serializeBrokerPublication(reconcileBrokerLocator);
+				} else {
 					// Optional registration logs and resolves on failure; recovery must still count it
 					// as a failed attempt so the backoff holds instead of resetting every tick.
 					await registerBroker();
