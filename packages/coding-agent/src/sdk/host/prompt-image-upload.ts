@@ -7,12 +7,13 @@ import {
 	MAX_PASTED_IMAGE_DIMENSION,
 	MAX_PASTED_IMAGE_PIXELS,
 	MAX_PASTED_IMAGE_SOURCE_BYTES,
+	MAX_PROMPT_IMAGE_CHUNK_BYTES,
 	MAX_STAGED_PROMPT_IMAGES,
 } from "../../utils/image-limits";
 import { isAnimatedImage } from "../../utils/pasted-image-loading";
 import { TypedControlError } from "./control/dispatch";
 
-const MAX_CHUNK_BYTES = 96 * 1024;
+const MAX_CHUNK_BYTES = MAX_PROMPT_IMAGE_CHUNK_BYTES;
 const MIN_RETAINED_BUFFER_BYTES = 4 * 1024;
 const MAX_ACCEPTED_BYTES = 64 * 1024 * 1024;
 const MAX_PROCESS_BYTES = 256 * 1024 * 1024;

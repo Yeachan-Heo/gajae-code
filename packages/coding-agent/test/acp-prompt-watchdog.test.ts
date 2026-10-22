@@ -1,4 +1,5 @@
 import { expect, setDefaultTimeout, test, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
@@ -95,6 +96,10 @@ type Fixture = {
 	sendSessionTerminated(): void;
 	acknowledgeCancel(): void;
 	acknowledgePrompt(): void;
+	/** Every control request the fixture host received, in arrival order, with its raw frame size. */
+	controlFrames: Array<{ operation: string; input: Record<string, unknown>; bytes: number }>;
+	/** Answer a `turn.image.finish` held by `deferImageFinish`. */
+	releaseImageFinish(): void;
 	dispose(): void;
 };
 
@@ -162,6 +167,10 @@ type FixtureOptions = {
 	cancelSettlementGraceMs?: number;
 	preflightCancelAcknowledgement?: boolean;
 	deferCancelAcknowledgement?: boolean;
+	/** Reject every `turn.image.finish` like a host that fails digest/decode verification. */
+	rejectImageFinish?: boolean;
+	/** Hold every `turn.image.finish` response until `releaseImageFinish()`. */
+	deferImageFinish?: boolean;
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -182,6 +191,9 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		| { socket: TestSocket; id: unknown; result: { commandId: string; turnId: string; accepted: true } }
 		| undefined;
 	let deferredCancelAcknowledgement: { socket: TestSocket; id: unknown; result: Record<string, unknown> } | undefined;
+	const controlFrames: Fixture["controlFrames"] = [];
+	const deferredImageFinishes: Array<{ socket: TestSocket; id: unknown; result: Record<string, unknown> }> = [];
+	let imageUploads = 0;
 
 	const send = (frame: Record<string, unknown>): void => {
 		if (!promptSocket) throw new Error("Expected a prompt socket");
@@ -355,6 +367,31 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					return;
 				}
 				if (frame.type !== "control_request") return;
+				const input = (frame.input ?? {}) as Record<string, unknown>;
+				controlFrames.push({ operation: String(frame.operation), input, bytes: Buffer.byteLength(String(raw)) });
+				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.")) {
+					const reply = (ok: boolean, result: Record<string, unknown>) =>
+						socket.send(
+							JSON.stringify(
+								ok
+									? { type: "control_response", id: frame.id, ok, result }
+									: { type: "control_response", id: frame.id, ok, error: result },
+							),
+						);
+					if (frame.operation === "turn.image.begin") {
+						imageUploads += 1;
+						reply(true, { id: `staged-${imageUploads}`, nextSequence: 0 });
+					} else if (frame.operation === "turn.image.append")
+						reply(true, { id: input.id, nextSequence: Number(input.sequence) + 1 });
+					else if (frame.operation === "turn.image.finish") {
+						if (options.rejectImageFinish)
+							reply(false, { code: "invalid_input", message: "Image SHA-256 digest mismatch." });
+						else if (options.deferImageFinish)
+							deferredImageFinishes.push({ socket, id: frame.id, result: { id: input.id } });
+						else reply(true, { id: input.id });
+					} else reply(true, { discarded: true });
+					return;
+				}
 				if (frame.operation === "turn.prompt") {
 					promptSocket = socket;
 					turnCount += 1;
@@ -467,6 +504,13 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		sendSessionTerminated,
 		acknowledgeCancel,
 		acknowledgePrompt,
+		controlFrames,
+		releaseImageFinish: () => {
+			for (const deferred of deferredImageFinishes.splice(0))
+				deferred.socket.send(
+					JSON.stringify({ type: "control_response", id: deferred.id, ok: true, result: deferred.result }),
+				);
+		},
 		dispose: () => {
 			abort.abort();
 			server.stop(true);
@@ -531,17 +575,33 @@ async function startTurnAfterFence(fixture: Fixture): Promise<{ pending: Promise
 	}
 }
 
-test("oversize ACP images are rejected before dispatch without losing the session", async () => {
+function imagePrompt(fixture: Fixture, images: Buffer[]): Promise<{ stopReason: StoppedReason }> {
+	return fixture.agent.prompt({
+		sessionId: fixture.sessionId,
+		prompt: [
+			{ type: "text", text: "inspect" },
+			...images.map(image => ({ type: "image" as const, mimeType: "image/png", data: image.toString("base64") })),
+		],
+	}) as Promise<{ stopReason: StoppedReason }>;
+}
+
+function imageOperations(fixture: Fixture): string[] {
+	return fixture.controlFrames
+		.map(frame => frame.operation)
+		.filter(operation => operation === "turn.prompt" || operation.startsWith("turn.image."));
+}
+
+test("oversize ACP prompt text is rejected before dispatch without losing the session", async () => {
 	const fixture = await createFixture();
 	const control = vi.spyOn(AcpSdkAdapter.prototype, "control");
 	try {
-		for (const dataLength of [REQUEST_FRAME_BYTES - 100, REQUEST_FRAME_BYTES + 1_000]) {
+		for (const textLength of [REQUEST_FRAME_BYTES - 100, REQUEST_FRAME_BYTES + 1_000]) {
 			const request: PromptRequest = {
 				sessionId: fixture.sessionId,
-				prompt: [{ type: "image", mimeType: "image/png", data: "A".repeat(dataLength) }],
+				prompt: [{ type: "text", text: "A".repeat(textLength) }],
 			};
 			// The first payload fits; its real SDK envelope must still be refused.
-			if (dataLength < REQUEST_FRAME_BYTES)
+			if (textLength < REQUEST_FRAME_BYTES)
 				expect(Buffer.byteLength(JSON.stringify(acpPromptPayload(request.prompt)))).toBeLessThan(
 					REQUEST_FRAME_BYTES,
 				);
@@ -552,6 +612,7 @@ test("oversize ACP images are rejected before dispatch without losing the sessio
 		}
 		expect(fixture.promptDeliveryCount()).toBe(0);
 		expect(control).not.toHaveBeenCalled();
+		expect(imageOperations(fixture)).toEqual([]);
 		expect(fixture.clock.pending).toBe(0);
 		const { pending } = await startTurn(fixture);
 		fixture.sendStopped("end_turn");
@@ -559,6 +620,100 @@ test("oversize ACP images are rejected before dispatch without losing the sessio
 		expect(fixture.promptDeliveryCount()).toBe(1);
 	} finally {
 		control.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("ACP images over the frame cap are staged in sub-cap chunks and referenced by ID", async () => {
+	const fixture = await createFixture();
+	try {
+		const first = crypto.randomBytes(300_000);
+		const second = crypto.randomBytes(5_000);
+		const pending = imagePrompt(fixture, [first, second]);
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "staged prompt delivery");
+		fixture.sendStopped("end_turn");
+		await expect(pending).resolves.toEqual({ stopReason: "end_turn" });
+
+		const frames = fixture.controlFrames;
+		const prompt = frames.at(-1)!;
+		expect(prompt.operation).toBe("turn.prompt");
+		expect(prompt.input.images).toBeUndefined();
+		expect(prompt.input.stagedImages).toEqual([{ id: "staged-1" }, { id: "staged-2" }]);
+		for (const frame of frames) expect(frame.bytes).toBeLessThan(REQUEST_FRAME_BYTES);
+		expect(imageOperations(fixture)).not.toContain("turn.image.discard");
+		for (const [index, source] of [first, second].entries()) {
+			const id = `staged-${index + 1}`;
+			const begin = frames.filter(frame => frame.operation === "turn.image.begin")[index]!;
+			expect(begin.input).toEqual({
+				mimeType: "image/png",
+				byteLength: source.length,
+				sha256: crypto.createHash("sha256").update(source).digest("hex"),
+				batchId: prompt.input.clientRef,
+			});
+			const appends = frames.filter(frame => frame.operation === "turn.image.append" && frame.input.id === id);
+			expect(appends.map(frame => frame.input.sequence)).toEqual(appends.map((_, sequence) => sequence));
+			expect(Buffer.concat(appends.map(frame => Buffer.from(String(frame.input.data), "base64")))).toEqual(source);
+			expect(frames.some(frame => frame.operation === "turn.image.finish" && frame.input.id === id)).toBe(true);
+		}
+		expect(frames.filter(frame => frame.operation === "turn.image.append").length).toBeGreaterThan(3);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP images that fit the frame cap stay inline", async () => {
+	const fixture = await createFixture();
+	try {
+		const image = crypto.randomBytes(10_000);
+		const pending = imagePrompt(fixture, [image]);
+		await waitFor(() => fixture.promptDeliveryCount() === 1, "inline prompt delivery");
+		fixture.sendStopped("end_turn");
+		await expect(pending).resolves.toEqual({ stopReason: "end_turn" });
+		expect(imageOperations(fixture)).toEqual(["turn.prompt"]);
+		expect(fixture.controlFrames.find(frame => frame.operation === "turn.prompt")!.input.images).toEqual([
+			{ data: image.toString("base64"), mimeType: "image/png" },
+		]);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a rejected image upload is discarded and fails the prompt without losing the session", async () => {
+	const fixture = await createFixture({ rejectImageFinish: true });
+	try {
+		await expect(imagePrompt(fixture, [crypto.randomBytes(300_000)])).rejects.toMatchObject({
+			message: expect.stringContaining("Image SHA-256 digest mismatch."),
+		});
+		const operations = imageOperations(fixture);
+		expect(operations).not.toContain("turn.prompt");
+		expect(operations.at(-1)).toBe("turn.image.discard");
+		expect(fixture.controlFrames.at(-1)!.input).toEqual({ id: "staged-1" });
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		const { pending } = await startTurn(fixture);
+		fixture.sendStopped("end_turn");
+		await expect(pending).resolves.toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("cancelling while an image is staging discards it and never submits the prompt", async () => {
+	const fixture = await createFixture({ deferImageFinish: true });
+	try {
+		const pending = imagePrompt(fixture, [crypto.randomBytes(300_000), crypto.randomBytes(300_000)]);
+		await waitFor(() => imageOperations(fixture).includes("turn.image.finish"), "first image finish");
+		await fixture.agent.cancel({ sessionId: fixture.sessionId });
+		fixture.releaseImageFinish();
+		await expect(bounded(pending, "cancelled staged prompt")).resolves.toEqual({ stopReason: "cancelled" });
+		await waitFor(() => imageOperations(fixture).includes("turn.image.discard"), "staged image discard");
+		const operations = imageOperations(fixture);
+		expect(operations).not.toContain("turn.prompt");
+		expect(operations.filter(operation => operation === "turn.image.begin")).toHaveLength(1);
+		expect(fixture.controlFrames.find(frame => frame.operation === "turn.image.discard")!.input).toEqual({
+			id: "staged-1",
+		});
+		expect(fixture.promptDeliveryCount()).toBe(0);
+	} finally {
 		fixture.dispose();
 	}
 });
