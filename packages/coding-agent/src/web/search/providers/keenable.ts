@@ -20,6 +20,8 @@ const KEENABLE_APP_TITLE = "Gajae-Code";
 const DEFAULT_NUM_RESULTS = 10;
 const MAX_NUM_RESULTS = 50;
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** Cap on provider-supplied error text surfaced in fallback warnings and tool errors. */
+const MAX_ERROR_MESSAGE_CHARS = 200;
 
 /** Map our recency filter to a lookback window for Keenable's `published_after`. */
 const RECENCY_DAYS: Record<"day" | "week" | "month" | "year", number> = {
@@ -68,6 +70,13 @@ function getErrorMessage(value: unknown): string | null {
 	}
 
 	return null;
+}
+
+/** Collapse whitespace and control characters in remote error text and cap its length. */
+function boundErrorMessage(text: string): string {
+	const collapsed = text.replace(/[\s\p{Cc}\p{Cf}]+/gu, " ").trim();
+	if (collapsed.length <= MAX_ERROR_MESSAGE_CHARS) return collapsed;
+	return `${collapsed.slice(0, MAX_ERROR_MESSAGE_CHARS - 1)}…`;
 }
 
 /** Find an optional Keenable API key through AuthStorage's unified refresh pipeline. */
@@ -125,7 +134,11 @@ async function callKeenableSearch(
 				// Keep raw text fallback.
 			}
 		}
-		throw new SearchProviderError("keenable", `Keenable API error (${response.status}): ${message}`, response.status);
+		throw new SearchProviderError(
+			"keenable",
+			`Keenable API error (${response.status}): ${boundErrorMessage(message)}`,
+			response.status,
+		);
 	}
 
 	return (await response.json()) as KeenableSearchResponse;

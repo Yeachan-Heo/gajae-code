@@ -168,6 +168,20 @@ describe("Keenable web search provider", () => {
 		);
 	});
 
+	it("bounds unclassified provider error text", async () => {
+		const body = `<html>\n<body>\u001b[31m${"upstream exploded ".repeat(200)}</body>\n</html>`;
+		using _hook = hookFetch(() => new Response(body, { status: 503, headers: { "Content-Type": "text/html" } }));
+
+		const error = (await searchKeenable(makeParams("server error")).catch(err => err)) as SearchProviderError;
+		const prefix = "Keenable API error (503): ";
+		expect(error.provider).toBe("keenable");
+		expect(error.status).toBe(503);
+		expect(error.message.startsWith(`${prefix}<html> <body> [31mupstream exploded`)).toBe(true);
+		expect(error.message.endsWith("…")).toBe(true);
+		expect(error.message.length).toBe(prefix.length + 200);
+		expect(error.message).not.toMatch(/[\n\u001b]/);
+	});
+
 	it("classifies rejected keys", async () => {
 		process.env.KEENABLE_API_KEY = "bad-key";
 		using _hook = hookFetch(
