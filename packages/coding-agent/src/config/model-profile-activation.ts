@@ -89,6 +89,7 @@ type ModelProfileActivationSession = Pick<
 	getDefaultFallbackRuntimeState?: () => DefaultFallbackRuntimeState;
 	restoreDefaultFallbackRuntimeState?: (state: DefaultFallbackRuntimeState) => void;
 	restoreModelSelectionForRollback?: AgentSession["restoreModelSelectionForRollback"];
+	recordModelSelectionUsage?: AgentSession["recordModelSelectionUsage"];
 	prepareModelSelectionForProfileActivation?: AgentSession["prepareModelSelectionForProfileActivation"];
 	commitPreparedProfileModelSelection?: AgentSession["commitPreparedProfileModelSelection"];
 	finishPreparedProfileModelSelection?: AgentSession["finishPreparedProfileModelSelection"];
@@ -2094,6 +2095,8 @@ export function publishPreparedModelProfileActivation(
 
 export async function finishPreparedModelProfileActivation(prepared: PreparedModelProfileActivation): Promise<void> {
 	if (prepared.defaultModelPublished && prepared.preparedDefaultModelSelection) {
+		// The enclosing publication committed: the profile DEFAULT is now a usage choice.
+		prepared.session.recordModelSelectionUsage?.(prepared.preparedDefaultModelSelection.model);
 		try {
 			await prepared.session.finishPreparedProfileModelSelection?.(prepared.preparedDefaultModelSelection);
 		} catch (error) {
@@ -2436,6 +2439,10 @@ export async function applyPreparedModelProfileActivation(
 		if (activationWasCancelled) return;
 		throw error;
 	}
+	// Record the profile DEFAULT only after the activation fully succeeded: a failed
+	// or superseded switch rolls back (or yields) without touching the usage order.
+	if (modelMutationStarted && prepared.defaultModel)
+		prepared.session.recordModelSelectionUsage?.(prepared.defaultModel);
 	if (!options.deferRuntimePublication) await finishPreparedModelProfileActivation(prepared);
 }
 

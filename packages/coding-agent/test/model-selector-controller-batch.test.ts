@@ -37,6 +37,7 @@ function createControllerContext() {
 			selector?: string;
 			thinkingLevel?: ThinkingLevel;
 			onMutationStarted?: () => void;
+			recordUsage?: boolean;
 		};
 	}> = [];
 	const setModelTemporary = vi.fn(
@@ -88,6 +89,7 @@ function createControllerContext() {
 				selector?: string;
 				thinkingLevel?: ThinkingLevel;
 				onMutationStarted?: () => void;
+				recordUsage?: boolean;
 			},
 		) {
 			setModelCalls.push({ model: nextModel, role, options });
@@ -266,6 +268,7 @@ describe("SelectorController model batch assignments", () => {
 				options: {
 					cause: "user-selection",
 					onMutationStarted: expect.any(Function),
+					recordUsage: false,
 					selector: "provider-a/selected",
 					thinkingLevel: ThinkingLevel.Inherit,
 				},
@@ -579,6 +582,7 @@ describe("SelectorController model batch assignments", () => {
 				options: {
 					cause: "user-selection",
 					onMutationStarted: expect.any(Function),
+					recordUsage: false,
 					selector: "provider-a/selected",
 					thinkingLevel: ThinkingLevel.High,
 				},

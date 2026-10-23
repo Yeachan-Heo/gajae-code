@@ -1284,8 +1284,64 @@ describe("AgentSession configuration reload", () => {
 			expect(session!.model).toMatchObject({ id: "default-model", baseUrl: "https://before.example/v1" });
 			expect(session!.thinkingLevel).toBe(ThinkingLevel.High);
 			expect(modelRegistry!.find(provider, "default-model")?.baseUrl).toBe("https://before.example/v1");
+			// Neither the failed rebind nor its compensation is a model-usage choice.
+			expect(session!.settings.getStorage()?.getModelUsageOrder()).toEqual([]);
 		} finally {
 			appendModelChangeSpy.mockRestore();
+		}
+	});
+
+	it.each([
+		["records a reloaded profile DEFAULT in the model usage order after publication", false],
+		["keeps a reloaded profile DEFAULT out of the model usage order when publication fails", true],
+	])("%s", async (_label, fail) => {
+		const { configPath, modelsPath } = await createSession({
+			modelId: "default-model",
+			additionalModelId: "manual-model",
+			withProfile: true,
+			profileRoleMapping: true,
+		});
+		await session!.activateModelProfileForControl("active-profile");
+		const storage = session!.settings.getStorage();
+		const before = [...(storage?.getModelUsageOrder() ?? [])];
+		expect(before).toEqual([`${provider}/default-model`]);
+		const originalStageModelsReload = modelRegistry!.stageModelsConfigReload.bind(modelRegistry!);
+		const stageSpy = vi.spyOn(modelRegistry!, "stageModelsConfigReload").mockImplementation(async (...args) => {
+			const stagedModels = await originalStageModelsReload(...args);
+			if (fail) {
+				vi.spyOn(stagedModels, "finalize").mockImplementation(() => {
+					throw new Error("Injected failure after publication");
+				});
+			}
+			return stagedModels;
+		});
+		try {
+			const staged = candidate(
+				26,
+				configPath,
+				modelsPath,
+				settingsText({ todoEnabled: false, compactionEnabled: false }),
+				modelsText({
+					modelId: "manual-model",
+					additionalModelId: "default-model",
+					name: "After",
+					baseUrl: "https://after.example/v1",
+					withProfile: true,
+					profileRoleMapping: true,
+				}),
+			);
+			const reload = session!.reloadConfiguration(staged, new AbortController().signal);
+			if (fail) {
+				await expect(reload).rejects.toMatchObject({ code: "PUBLICATION_FAILED" });
+				expect(session!.model?.id).toBe("default-model");
+				expect(storage?.getModelUsageOrder()).toEqual(before);
+			} else {
+				await reload;
+				expect(session!.model?.id).toBe("manual-model");
+				expect(storage?.getModelUsageOrder()).toContain(`${provider}/manual-model`);
+			}
+		} finally {
+			stageSpy.mockRestore();
 		}
 	});
 

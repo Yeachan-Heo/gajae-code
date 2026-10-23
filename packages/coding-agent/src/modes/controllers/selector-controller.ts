@@ -2887,6 +2887,8 @@ export class SelectorController {
 										selector: defaultSelector,
 										thinkingLevel,
 										cause: "user-selection",
+										// Recorded below once every assignment succeeded; a rollback leaves no usage.
+										recordUsage: false,
 										onMutationStarted: () => {
 											defaultMutationStarted = true;
 										},
@@ -2959,6 +2961,8 @@ export class SelectorController {
 									selector: selectedSelector,
 									thinkingLevel,
 									cause: "user-selection",
+									// Recorded below once the assignment succeeded; a rollback leaves no usage.
+									recordUsage: false,
 									onMutationStarted: () => {
 										defaultMutationStarted = true;
 									},
@@ -2985,6 +2989,7 @@ export class SelectorController {
 								);
 							}
 							refreshRoleAssignments();
+							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
