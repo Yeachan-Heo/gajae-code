@@ -1,4 +1,10 @@
-import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
+import {
+	$credentialEnv,
+	assertEndpointConfiguration,
+	extractHttpStatusFromError,
+	logger,
+	readEndpointConfiguration,
+} from "@gajae-code/utils";
 import { APIConnectionTimeoutError, AzureOpenAI } from "openai";
 import type {
 	Tool as OpenAITool,
@@ -76,7 +82,9 @@ function resolveDeploymentName(model: Model<"azure-openai-responses">, options?:
 	if (options?.azureDeploymentName) {
 		return options.azureDeploymentName;
 	}
-	const mappedDeployment = parseDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(model.id);
+	const mappedDeployment = parseDeploymentNameMap(
+		readEndpointConfiguration(options?.endpointConfiguration, "AZURE_OPENAI_DEPLOYMENT_NAME_MAP"),
+	).get(model.id);
 	return mappedDeployment ?? model.id;
 }
 
@@ -108,6 +116,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 	context: Context,
 	options?: AzureOpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const stream = new AssistantMessageEventStream();
 
 	// Start async processing
@@ -128,7 +137,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 
 		try {
 			// Create Azure OpenAI client
-			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
+			const apiKey = options?.apiKey || getEnvApiKey(model.provider, options?.endpointConfiguration) || "";
 			const client = createClient(model, apiKey, options);
 			const { baseUrl } = resolveAzureConfig(model, options);
 			let params = buildParams(model, context, options, deploymentName, baseUrl);
@@ -257,15 +266,23 @@ function resolveAzureConfig(
 	model: Model<"azure-openai-responses">,
 	options?: AzureOpenAIResponsesOptions,
 ): { baseUrl: string; apiVersion: string } {
-	const apiVersion = options?.azureApiVersion || $env.AZURE_OPENAI_API_VERSION || DEFAULT_AZURE_API_VERSION;
+	const apiVersion =
+		options?.azureApiVersion ||
+		readEndpointConfiguration(options?.endpointConfiguration, "AZURE_OPENAI_API_VERSION") ||
+		DEFAULT_AZURE_API_VERSION;
 
 	// Trusted sources only: both of these decide the request endpoint that carries
 	// the Azure credential, and `$env` merges the caller's `cwd/.env`. The resource
 	// name is the alternate constructor for the same host
 	// (`https://<resource>.openai.azure.com/openai/v1`), so it needs the same
 	// boundary as the explicit base URL.
-	const baseUrl = options?.azureBaseUrl?.trim() || $credentialEnv("AZURE_OPENAI_BASE_URL") || undefined;
-	const resourceName = options?.azureResourceName || $credentialEnv("AZURE_OPENAI_RESOURCE_NAME");
+	const baseUrl =
+		options?.azureBaseUrl?.trim() ||
+		readEndpointConfiguration(options?.endpointConfiguration, "AZURE_OPENAI_BASE_URL") ||
+		undefined;
+	const resourceName =
+		options?.azureResourceName ||
+		readEndpointConfiguration(options?.endpointConfiguration, "AZURE_OPENAI_RESOURCE_NAME");
 
 	let resolvedBaseUrl = baseUrl;
 
