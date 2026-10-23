@@ -2189,15 +2189,17 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				}
 			}
 
-			expect(executed).toHaveLength(0);
-			expect(toolResults).toHaveLength(3);
-			expect(toolResults.map(result => result.isError)).toEqual([true, true, true]);
-			expect(toolResults[0].text).toContain("\\uXXXX");
-			expect(toolResults[1].text).toContain("\\uXXXX");
-			expect(toolResults[2].text).toBe(
+			expect(executed, label).toHaveLength(0);
+			expect(toolResults, label).toHaveLength(3);
+			expect(
+				toolResults.map(result => result.isError),
+				label,
+			).toEqual([true, true, true]);
+			expect(toolResults[0].text, label).toContain("\\uXXXX");
+			expect(toolResults[1].text, label).toContain("\\uXXXX");
+			expect(toolResults[2].text, label).toBe(
 				"Tool execution failed due to an error: Tool calls are disabled during repeated malformed tool-call recovery.",
 			);
-			expect(label).toBeTruthy();
 		}
 	});
 
