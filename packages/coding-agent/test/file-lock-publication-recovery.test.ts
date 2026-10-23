@@ -1265,6 +1265,8 @@ test("reaps an empty staging directory after info identity retries exhaust", asy
 		if (!pendingName) throw new Error("expected the staging root to remain after transient cleanup denial");
 		const pendingPath = path.join(root, pendingName);
 		expect(await fs.readdir(pendingPath)).toEqual([]);
+		const expiredAt = new Date(Date.now() - 61_000);
+		await fs.utimes(pendingPath, expiredAt, expiredAt);
 
 		FileLockTestHooks.cleanupPendingStaging = undefined;
 		FileLockTestHooks.processIncarnation = () => "staging-owner-after-exit";
