@@ -8,7 +8,7 @@
 import type { AuthStorage } from "@gajae-code/ai/core";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
-import { clampNumResults } from "../utils";
+import { clampNumResults, dateToAgeSeconds } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -40,6 +40,8 @@ interface KeenableSearchResult {
 	title?: string | null;
 	url?: string | null;
 	snippet?: string | null;
+	/** ISO 8601 publication timestamp in UTC, when known. */
+	published_at?: string | null;
 }
 
 interface KeenableSearchResponse {
@@ -145,10 +147,13 @@ export async function searchKeenable(params: SearchParams): Promise<SearchRespon
 	for (const result of response.results ?? []) {
 		if (!result?.url) continue;
 		const snippet = result.snippet?.replace(/\s+/g, " ").trim();
+		const publishedDate = typeof result.published_at === "string" ? result.published_at : undefined;
 		sources.push({
 			title: result.title?.trim() || result.url,
 			url: result.url,
 			snippet: snippet || undefined,
+			publishedDate,
+			ageSeconds: dateToAgeSeconds(publishedDate),
 		});
 	}
 

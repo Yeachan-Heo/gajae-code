@@ -211,7 +211,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
     - Querying: POST `https://api.keenable.ai/v1/search/public` with `{ query, max_results }` and an `X-Keenable-Title` app header. When a `keenable` API key resolves through `AuthStorage` (env `KEENABLE_API_KEY` or `agent.db`), POSTs to `https://api.keenable.ai/v1/search` with `X-API-Key` instead.
     - `recency` maps to `published_after` as a full ISO timestamp (now minus 1/7/30/365 days). Ignores `max_tokens` and `temperature`.
     - `limit` and `num_search_results` are collapsed together before dispatch, clamped to `1..50`, default `10`.
-    - Output: `sources` only (snippet whitespace collapsed); `authMode: "api_key"` when a key was used.
+    - Output: `sources` only (snippet whitespace collapsed, `publishedDate`/`ageSeconds` from `published_at` when present); `authMode: "api_key"` when a key was used.
 
 ## Side Effects
 - Network

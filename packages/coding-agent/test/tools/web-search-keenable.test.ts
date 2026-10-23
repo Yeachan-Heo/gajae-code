@@ -52,9 +52,10 @@ describe("Keenable web search provider", () => {
 							url: "https://example.com/one",
 							description: "",
 							snippet: "First line\n\n  second   line",
+							published_at: "2026-09-30T08:15:00Z",
 							acquired_at: "2026-10-01T00:00:00Z",
 						},
-						{ url: "https://example.com/two", description: "", snippet: "" },
+						{ url: "https://example.com/two", description: "", snippet: "", published_at: null },
 						{ title: "No URL", snippet: "dropped" },
 					],
 				}),
@@ -70,11 +71,19 @@ describe("Keenable web search provider", () => {
 		expect(response).toEqual({
 			provider: "keenable",
 			sources: [
-				{ title: "Result One", url: "https://example.com/one", snippet: "First line second line" },
+				{
+					title: "Result One",
+					url: "https://example.com/one",
+					snippet: "First line second line",
+					publishedDate: "2026-09-30T08:15:00Z",
+					ageSeconds: expect.any(Number),
+				},
 				{ title: "https://example.com/two", url: "https://example.com/two", snippet: undefined },
 			],
 			authMode: undefined,
 		});
+		expect(response.sources[1]?.publishedDate).toBeUndefined();
+		expect(response.sources[1]?.ageSeconds).toBeUndefined();
 	});
 
 	it("uses the keyed endpoint with X-API-Key when a key is configured", async () => {
