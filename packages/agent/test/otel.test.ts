@@ -1067,7 +1067,6 @@ describe("agent-loop OTEL instrumentation", () => {
 		};
 		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
 		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
-		await Bun.sleep(1);
 
 		expect(warnings).toContain("on_chat_usage_failed");
 	});
