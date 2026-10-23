@@ -190,6 +190,33 @@ assert.equal(requests.at(-1).url, "https://generic.example/generic");
 `);
 	});
 
+	it("keeps OAuth canonical through native fallback, disabled remote, split summary, handoff and branch maintenance", async () => {
+		await routingScenario(`
+Bun.env.OPENAI_BASE_URL = "https://captured-custom.example/v1";
+const endpointConfiguration = captureEndpointConfiguration();
+delete Bun.env.OPENAI_BASE_URL;
+const options = { endpointConfiguration, authCredentialType: "oauth", maintenanceCall: true };
+failNative = true;
+for (const remoteEnabled of [true, false]) {
+ const split = preparation();
+ split.settings.remoteEnabled = remoteEnabled;
+ split.messagesToSummarize = messages;
+ split.turnPrefixMessages = messages;
+ split.isSplitTurn = true;
+ const result = await compact(split, model, "fixture-oauth", undefined, undefined, options);
+ assert.match(result.summary, /maintenance summary/);
+}
+assert.equal(await generateSummary(messages, model, 1024, "fixture-oauth", undefined, undefined, undefined, options), "maintenance summary");
+assert.equal(await generateHandoff(messages, model, "fixture-oauth", { ...options, systemPrompt: ["fixture"] }), "maintenance summary");
+const branch = await generateBranchSummary([{ type: "message", id: "entry", parentId: null, timestamp: "2026-01-01T00:00:00Z", message: messages[0] }],
+ { ...options, model, apiKey: "fixture-oauth", signal: new AbortController().signal });
+assert.match(branch.summary, /maintenance summary/);
+assert.equal(requests.length, 8);
+assert.ok(requests.every(request => request.url.startsWith("https://api.openai.com/v1/")), JSON.stringify(requests.map(request => request.url)));
+assert.ok(requests.every(request => request.authorization === "Bearer fixture-oauth"));
+`);
+	});
+
 	it("rejects forged handles before fetch, conversion, generic routes and empty early returns", async () => {
 		await routingScenario(`
 const endpointConfiguration = Object.freeze({});

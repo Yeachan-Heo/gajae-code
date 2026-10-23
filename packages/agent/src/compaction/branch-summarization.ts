@@ -73,6 +73,8 @@ export interface GenerateBranchSummaryOptions {
 	model: Model;
 	/** API key for the model */
 	apiKey: string;
+	/** Preserve the provider's credential-specific endpoint policy. */
+	authCredentialType?: "api_key" | "oauth";
 	/** Abort signal for cancellation */
 	signal: AbortSignal;
 	/** Optional custom instructions for summarization */
@@ -349,6 +351,7 @@ export async function generateBranchSummary(
 			maintenanceCall: options.maintenanceCall,
 			preferWebsockets,
 			endpointConfiguration: options.endpointConfiguration,
+			authCredentialType: options.authCredentialType,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "branch_summary" },
 	);

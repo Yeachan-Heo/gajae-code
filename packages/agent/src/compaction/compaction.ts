@@ -1103,6 +1103,7 @@ export async function generateSummary(
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
 			endpointConfiguration: options?.endpointConfiguration,
+			authCredentialType: options?.authCredentialType,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_summary" },
 	);
@@ -1212,6 +1213,7 @@ export async function generateHandoff(
 			providerSessionState: options.providerSessionState,
 			preferWebsockets: options.preferWebsockets,
 			endpointConfiguration: options.endpointConfiguration,
+			authCredentialType: options.authCredentialType,
 		},
 		{ telemetry: options.telemetry, oneshotKind: "handoff" },
 	);
@@ -1503,6 +1505,7 @@ export async function compact(
 
 	const summaryOptions: SummaryOptions = {
 		endpointConfiguration: options?.endpointConfiguration,
+		authCredentialType: options?.authCredentialType,
 		promptOverride: options?.promptOverride,
 		extraContext: options?.extraContext,
 		remoteEndpoint: settings.remoteEnabled === false ? undefined : settings.remoteEndpoint,
@@ -1697,6 +1700,7 @@ async function generateTurnPrefixSummary(
 			providerSessionState: options?.providerSessionState,
 			preferWebsockets: options?.preferWebsockets,
 			endpointConfiguration: options?.endpointConfiguration,
+			authCredentialType: options?.authCredentialType,
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_turn_prefix" },
 	);
