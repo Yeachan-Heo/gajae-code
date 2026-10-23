@@ -2962,11 +2962,12 @@ async function tryAcquireLock(
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	const stagingIdentity = currentFileLockStagingIdentity();
+	const stagingHostIdentity = ownerHostId === undefined ? "" : `h${fileLockStagingIdentityHash(ownerHostId)}.`;
 	const pendingPath = derivedFileLockPath(
 		lockPath,
 		stagingIdentity
-			? `.pending.${process.pid}.${stagingIdentity}.${crypto.randomBytes(12).toString("base64url")}`
-			: `.pending.${process.pid}.${crypto.randomUUID()}`,
+			? `.pending.${process.pid}.${stagingHostIdentity}${stagingIdentity}.${crypto.randomBytes(12).toString("base64url")}`
+			: `.pending.${process.pid}.${stagingHostIdentity}${crypto.randomUUID()}`,
 	);
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
@@ -3892,7 +3893,7 @@ export async function withFileLock<T>(
 }
 
 type FileLockStagingIdentity = { kind: "process_incarnation" | "start_time"; value: string };
-type FileLockStagingOwner = { pid: number; identity?: FileLockStagingIdentity };
+type FileLockStagingOwner = { pid: number; identity?: FileLockStagingIdentity; ownerHostIdHash?: string };
 
 const FILE_LOCK_STAGING_UNVERIFIED_GRACE_MS = 60_000;
 const FILE_LOCK_STAGING_REAPER_BATCH_SIZE = 64;
@@ -3901,9 +3902,9 @@ const fileLockStagingReaperCursors = new Map<string, string>();
 
 const FILE_LOCK_STAGING_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const FILE_LOCK_STAGING_NAME_WITH_IDENTITY =
-	/^(?:.+\.lock|\.gjc-lock-[0-9a-f]{64})\.pending\.([1-9]\d*)\.([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{16})$/;
+	/^(?:.+\.lock|\.gjc-lock-[0-9a-f]{64})\.pending\.([1-9]\d*)\.(?:h([A-Za-z0-9_-]{16})\.)?([is][A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]{16})$/;
 const LEGACY_FILE_LOCK_STAGING_NAME = new RegExp(
-	`^(?:.+\\.lock|\\.gjc-lock-[0-9a-f]{64})\\.pending\\.([1-9]\\d*)\\.${FILE_LOCK_STAGING_UUID}$`,
+	`^(?:.+\\.lock|\\.gjc-lock-[0-9a-f]{64})\\.pending\\.([1-9]\\d*)\\.(?:h([A-Za-z0-9_-]{16})\\.)?${FILE_LOCK_STAGING_UUID}$`,
 );
 const FILE_LOCK_STAGING_REMOVING_SUFFIX = ".removing";
 function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
@@ -3916,10 +3917,12 @@ function fileLockStagingOwner(name: string): FileLockStagingOwner | null {
 	if (!match) return null;
 	const pid = Number(match[1]);
 	if (!Number.isSafeInteger(pid)) return null;
-	if (!current) return { pid };
-	const encodedIdentity = current[2] ?? "";
+	const ownerHostIdHash = match[2];
+	if (!current) return { pid, ...(ownerHostIdHash === undefined ? {} : { ownerHostIdHash }) };
+	const encodedIdentity = current[3] ?? "";
 	return {
 		pid,
+		...(ownerHostIdHash === undefined ? {} : { ownerHostIdHash }),
 		identity: {
 			kind: encodedIdentity.startsWith("i") ? "process_incarnation" : "start_time",
 			value: encodedIdentity.slice(1),
@@ -3931,6 +3934,18 @@ function fileLockStagingIdentityHash(identity: string): string {
 	// Ninety-six bits are sufficient to disambiguate process generations while
 	// keeping the sibling name within the old component-length envelope.
 	return crypto.createHash("sha256").update(identity, "utf8").digest("base64url").slice(0, 16);
+}
+
+function fileLockStagingHostIdentityIsLocal(
+	ownerHostIdHash: string | undefined,
+	ownerHostId: string | undefined,
+	previousOwnerHostIds: readonly string[],
+): boolean {
+	if (ownerHostId === undefined || ownerHostIdHash === undefined) return false;
+	if (fileLockStagingIdentityHash(ownerHostId) === ownerHostIdHash) return true;
+	return previousOwnerHostIds.some(
+		previousOwnerHostId => fileLockStagingIdentityHash(previousOwnerHostId) === ownerHostIdHash,
+	);
 }
 
 /**
@@ -4012,6 +4027,13 @@ export async function inspectFileLockStagingDir(
 	const nameOwner = fileLockStagingOwner(path.basename(stagingPath));
 	if (!nameOwner) return kept;
 	const namePid = nameOwner.pid;
+	const nameHostIdentityIsLocal = fileLockStagingHostIdentityIsLocal(
+		nameOwner.ownerHostIdHash,
+		ownerHostId,
+		previousOwnerHostIds,
+	);
+	if (nameOwner.ownerHostIdHash !== undefined && !nameHostIdentityIsLocal)
+		return { ...kept, pid: namePid, reason: "host_qualified_staging_owner" };
 	const canonical = await canonicalLockPathPreservingFinal(stagingPath);
 	// A winning acquirer publishes (renames) its staging directory concurrently, so the
 	// candidate can disappear between the caller's readdir and this observation.
@@ -4071,6 +4093,12 @@ export async function inspectFileLockStagingDir(
 		)
 			return kept;
 		pid = observation.info.pid;
+		if (
+			nameOwner.ownerHostIdHash !== undefined &&
+			(observation.info.owner_host_id === undefined ||
+				nameOwner.ownerHostIdHash !== fileLockStagingIdentityHash(observation.info.owner_host_id))
+		)
+			return { ...kept, pid, reason: "host_qualified_staging_owner" };
 		if (lockRecordIsForeignHost(observation.info, ownerHostId, previousOwnerHostIds))
 			return { ...kept, pid, reason: "host_qualified_staging_owner" };
 		status = fileLockStagingOwnerStatus(observation.info, pid === namePid ? namePidStatus : probe(pid));
@@ -4078,8 +4106,10 @@ export async function inspectFileLockStagingDir(
 		// An empty or missing info file has no owner identity. Reclaim it only after
 		// the directory and its empty info file, if any, have been unchanged long
 		// enough for an interrupted publisher to be safely distinguished from a
-		// slow or paused live owner. Non-empty malformed info remains fail-closed.
-		if (!fileLockStagingIsOldUnverifiedDirectory(captured.snapshot))
+		// slow or paused live owner. The staging name must also prove its host,
+		// because the PID in a foreign host's name has no local liveness meaning.
+		// Non-empty malformed info remains fail-closed.
+		if (!nameHostIdentityIsLocal || !fileLockStagingIsOldUnverifiedDirectory(captured.snapshot))
 			return { ...kept, pid: namePid, reason: "unverified_staging_directory" };
 		pid = namePid;
 		status = namePidStatus;
