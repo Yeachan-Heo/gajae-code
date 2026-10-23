@@ -84,8 +84,10 @@ export function buildRequestBody(params: KeenableSearchParams, now: Date = new D
 		max_results: clampNumResults(params.num_results, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS),
 	};
 	if (params.recency) {
+		// Send the full timestamp: a bare date resolves to midnight UTC on Keenable's
+		// side and would widen the window by up to a day.
 		const since = new Date(now.getTime() - RECENCY_DAYS[params.recency] * DAY_MS);
-		body.published_after = since.toISOString().slice(0, 10);
+		body.published_after = since.toISOString();
 	}
 	return body;
 }

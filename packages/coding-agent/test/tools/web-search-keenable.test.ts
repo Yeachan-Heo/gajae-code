@@ -98,14 +98,47 @@ describe("Keenable web search provider", () => {
 		expect(response).toMatchObject({ provider: "keenable", sources: [], authMode: "api_key" });
 	});
 
-	it("clamps result counts and maps recency to a published_after date", () => {
-		const now = new Date("2026-10-23T12:00:00Z");
+	it("clamps result counts and maps recency to an exact published_after timestamp", () => {
+		// Non-midnight on purpose: a date-only cutoff would widen the window to 00:00 UTC.
+		const now = new Date("2026-10-23T12:34:56.789Z");
 		expect(buildRequestBody({ query: "q" }, now)).toEqual({ query: "q", max_results: 10 });
 		expect(buildRequestBody({ query: "q", num_results: 500 }, now)).toEqual({ query: "q", max_results: 50 });
-		expect(buildRequestBody({ query: "q", recency: "day" }, now)).toMatchObject({ published_after: "2026-10-22" });
-		expect(buildRequestBody({ query: "q", recency: "week" }, now)).toMatchObject({ published_after: "2026-10-16" });
-		expect(buildRequestBody({ query: "q", recency: "month" }, now)).toMatchObject({ published_after: "2026-09-23" });
-		expect(buildRequestBody({ query: "q", recency: "year" }, now)).toMatchObject({ published_after: "2025-10-23" });
+		expect(buildRequestBody({ query: "q", recency: "day" }, now)).toEqual({
+			query: "q",
+			max_results: 10,
+			published_after: "2026-10-22T12:34:56.789Z",
+		});
+		expect(buildRequestBody({ query: "q", recency: "week" }, now)).toMatchObject({
+			published_after: "2026-10-16T12:34:56.789Z",
+		});
+		expect(buildRequestBody({ query: "q", recency: "month" }, now)).toMatchObject({
+			published_after: "2026-09-23T12:34:56.789Z",
+		});
+		expect(buildRequestBody({ query: "q", recency: "year" }, now)).toMatchObject({
+			published_after: "2025-10-23T12:34:56.789Z",
+		});
+	});
+
+	it("sends the exact recency cutoff in the request body", async () => {
+		let requestBody: Record<string, unknown> = {};
+		using _hook = hookFetch(async (_input, init) => {
+			requestBody = JSON.parse(String(init?.body ?? "{}"));
+			return new Response(JSON.stringify({ results: [] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const before = Date.now();
+		await searchKeenable({ ...makeParams("recent news"), recency: "day" });
+		const after = Date.now();
+
+		const cutoff = requestBody.published_after;
+		expect(typeof cutoff).toBe("string");
+		expect(cutoff).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+		const cutoffMs = Date.parse(cutoff as string);
+		expect(cutoffMs).toBeGreaterThanOrEqual(before - 24 * 60 * 60 * 1000);
+		expect(cutoffMs).toBeLessThanOrEqual(after - 24 * 60 * 60 * 1000);
 	});
 
 	it("surfaces rate-limit errors with the API message", async () => {
