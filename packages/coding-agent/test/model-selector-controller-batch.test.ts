@@ -100,6 +100,8 @@ function createControllerContext() {
 		},
 		markUserModelSelection,
 		setModelTemporary,
+		recordModelSelectionUsage: vi.fn(),
+		beginModelSelectionUsage: () => 1,
 		setDefaultFallbackRuntimeModel,
 		async restoreModelSelectionForRollback(nextModel: Model | undefined, thinkingLevel: ThinkingLevel | undefined) {
 			this.model = nextModel;

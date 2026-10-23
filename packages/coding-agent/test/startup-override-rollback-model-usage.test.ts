@@ -2,8 +2,11 @@ import { afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test"
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
+import { scheduler } from "node:timers/promises";
+import { Agent, type AgentOptions, ThinkingLevel } from "@gajae-code/agent-core";
+import type { AssistantMessage, Model } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { activateModelProfile } from "@gajae-code/coding-agent/config/model-profile-activation";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -71,7 +74,7 @@ function liveModel(env: Env): string | undefined {
 	return model ? `${model.provider}/${model.id}` : undefined;
 }
 
-async function createEnv(startModel: string): Promise<Env> {
+async function createEnv(startModel: string, streamFn?: AgentOptions["streamFn"]): Promise<Env> {
 	// Canonicalize: macOS os.tmpdir() sits behind the /var -> /private/var symlink.
 	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-rollback-mru-")));
 	const agentDir = path.join(root, "agent");
@@ -90,6 +93,7 @@ async function createEnv(startModel: string): Promise<Env> {
 	spyOn(modelRegistry, "refreshInBackground").mockImplementation(() => {});
 	const agent = new Agent({
 		initialState: { model: find(modelRegistry, startModel), systemPrompt: ["Test"], tools: [], messages: [] },
+		...(streamFn ? { streamFn, getApiKey: () => "test-key" } : {}),
 	});
 	const session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 	const output: string[] = [];
@@ -107,6 +111,36 @@ async function createEnv(startModel: string): Promise<Env> {
 	const env = { root, agentDir, cwd, settings, modelRegistry, session, output, runtime };
 	envs.push(env);
 	return env;
+}
+
+/** A typed provider quota failure that the real retry path answers with a fallback switch. */
+function rateLimitedStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Provider returned error: rate_limit_error: organization quota reached",
+			errorStatus: 429,
+			transportFailure: { kind: "transport", status: 429, headers: { "retry-after-ms": "60000" } },
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
 }
 
 /** `gjc --model CLI_MODEL --thinking xhigh` through the real startup policy. */
@@ -310,6 +344,132 @@ describe("failed model changes after a startup override leave the model MRU unto
 		expect(superseded).toBe(true);
 		expect(liveModel(env)).toBe(SONNET);
 		expect(await freshUsageOrder(env)).toEqual([SONNET]);
+	});
+
+	it("a profile switch without a supersede check does not record its DEFAULT over a newer user selection", async () => {
+		const env = await startWithCliModel();
+		const storage = env.settings.getStorage();
+		if (!storage) throw new Error("Expected file-backed agent storage");
+		const record = spyOn(storage, "recordModelUsage");
+		const setModelTemporary = env.session.setModelTemporary.bind(env.session);
+		let overtaken = false;
+		spyOn(env.session, "setModelTemporary").mockImplementation(async (model, thinkingLevel, options) => {
+			const result = await setModelTemporary(model, thinkingLevel, options);
+			if (options?.cause === "profile-activation" && !overtaken) {
+				overtaken = true;
+				expect(liveModel(env)).toBe(OPUS);
+				// The TUI profile selector passes no isCurrent fence, so the activation
+				// completes after the user picks Sonnet in the meantime.
+				await env.session.setModel(find(env.modelRegistry, SONNET), "default", { cause: "user-selection" });
+			}
+			return result;
+		});
+
+		await activateModelProfile(
+			{ session: env.session, modelRegistry: env.modelRegistry, settings: env.settings, profileName: PROFILE },
+			{ persistDefault: false },
+		);
+
+		expect(overtaken).toBe(true);
+		expect(liveModel(env)).toBe(SONNET);
+		expect(record.mock.calls).toEqual([[SONNET]]);
+		expect(await freshUsageOrder(env)).toEqual([SONNET]);
+	});
+
+	it("a TUI DEFAULT selection overtaken by a newer selection while it awaits does not record over it", async () => {
+		const env = await startWithCliModel();
+		const storage = env.settings.getStorage();
+		if (!storage) throw new Error("Expected file-backed agent storage");
+		const record = spyOn(storage, "recordModelUsage");
+		const setModel = env.session.setModel.bind(env.session);
+		let overtaken = false;
+		spyOn(env.session, "setModel").mockImplementation(async (model, role, options) => {
+			await setModel(model, role, options);
+			if (`${model.provider}/${model.id}` === SONNET && !overtaken) {
+				overtaken = true;
+				// A second selector completes Opus before the first selection's transaction ends.
+				await selectDefault(env, OPUS);
+			}
+		});
+
+		await selectDefault(env, SONNET);
+
+		expect(overtaken).toBe(true);
+		expect(liveModel(env)).toBe(OPUS);
+		expect(record.mock.calls).toEqual([[OPUS]]);
+		expect(await freshUsageOrder(env)).toEqual([OPUS]);
+	});
+
+	it("a TUI DEFAULT selection keeps its usage when a fallback switch moves the live model mid-transaction", async () => {
+		const requested: string[] = [];
+		const recovering = createMockModel({ responses: [{ content: ["Recovered"] }] });
+		const env = await createEnv(CLI_MODEL, (model, context, options) => {
+			const selector = `${model.provider}/${model.id}`;
+			requested.push(selector);
+			return selector === OPUS ? rateLimitedStream(model) : recovering.stream(model, context, options);
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		env.settings.set("retry.baseDelayMs", 1);
+		env.settings.set("compaction.enabled", false);
+		env.session.setConfiguredModelChain("default", [OPUS, SONNET], "test");
+		const storage = env.settings.getStorage();
+		if (!storage) throw new Error("Expected file-backed agent storage");
+		const record = spyOn(storage, "recordModelUsage");
+		const setModel = env.session.setModel.bind(env.session);
+		spyOn(env.session, "setModel").mockImplementation(async (model, role, options) => {
+			await setModel(model, role, options);
+			// A turn running on the selected head fails and the real retry path
+			// advances the default fallback chain before the selection transaction ends.
+			await env.session.prompt("turn during the selection");
+			await env.session.waitForIdle();
+		});
+
+		await selectDefault(env, OPUS);
+
+		expect(requested[0]).toBe(OPUS);
+		expect(requested.at(-1)).toBe(SONNET);
+		expect(liveModel(env)).toBe(SONNET);
+		// The fallback switch is not a usage choice; the user's completed OPUS pick is.
+		expect(record.mock.calls).toEqual([[OPUS]]);
+		expect(await freshUsageOrder(env)).toEqual([OPUS]);
+	});
+
+	it("a TUI DEFAULT selection still records when a newer overlapping selection fails and rolls back to it", async () => {
+		const env = await startWithCliModel();
+		await selectDefault(env, CLI_MODEL, ThinkingLevel.XHigh);
+		expect(await freshUsageOrder(env)).toEqual([CLI_MODEL]);
+		// Cross SQLite's one-second last_used_at granularity so a stale head would show.
+		await Bun.sleep(1100);
+		const setModelRole = env.settings.setModelRole.bind(env.settings);
+		let opusRoleWrites = 0;
+		spyOn(env.settings, "setModelRole").mockImplementation((role, value) => {
+			// Write 1 for OPUS is inside AgentSession.setModel; write 2 is the selector's durable write.
+			if (String(value).startsWith(OPUS) && ++opusRoleWrites === 2)
+				throw new Error("injected default role write failure");
+			setModelRole(role, value);
+		});
+		const setModel = env.session.setModel.bind(env.session);
+		const releaseOverlap = Promise.withResolvers<void>();
+		let overlapping: Promise<void> | undefined;
+		spyOn(env.session, "setModel").mockImplementation(async (model, role, options) => {
+			await setModel(model, role, options);
+			const selector = `${model.provider}/${model.id}`;
+			if (selector === SONNET && !overlapping) {
+				// A newer OPUS selection starts and installs OPUS before SONNET's transaction ends.
+				overlapping = selectDefault(env, OPUS);
+				await Bun.sleep(0);
+				expect(liveModel(env)).toBe(OPUS);
+			} else if (selector === OPUS) {
+				await releaseOverlap.promise;
+			}
+		});
+
+		await selectDefault(env, SONNET);
+		releaseOverlap.resolve();
+		await expect(overlapping).rejects.toThrow("injected default role write failure");
+
+		expect(liveModel(env)).toBe(SONNET);
+		expect(await freshUsageOrder(env)).toEqual([SONNET, CLI_MODEL]);
 	});
 
 	it("a rolled-back TUI DEFAULT selection keeps a concurrent session's usage write", async () => {

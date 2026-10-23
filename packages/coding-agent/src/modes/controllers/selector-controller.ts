@@ -2879,6 +2879,7 @@ export class SelectorController {
 
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
+							let defaultUsageSequence: number | undefined;
 							let assignmentMutationStarted = false;
 							let materializedProfile = false;
 							try {
@@ -2891,6 +2892,7 @@ export class SelectorController {
 										recordUsage: false,
 										onMutationStarted: () => {
 											defaultMutationStarted = true;
+											defaultUsageSequence = this.ctx.session.beginModelSelectionUsage();
 										},
 									});
 									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
@@ -2928,7 +2930,11 @@ export class SelectorController {
 								activeModelProfile:
 									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
 							});
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+							// A DEFAULT pick awaited setModel: a newer recorded choice keeps the MRU head.
+							if (defaultUsageSequence !== undefined)
+								this.ctx.session.recordModelSelectionUsage(model, defaultUsageSequence);
+							else if (!includesDefault)
+								this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							await this.ctx.notifyConfigChanged?.();
@@ -2951,6 +2957,7 @@ export class SelectorController {
 							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
+							let defaultUsageSequence: number | undefined;
 							let assignmentMutationStarted = false;
 							const value = formatModelSelectorValue(
 								selectedSelector ?? `${model.provider}/${model.id}`,
@@ -2965,6 +2972,7 @@ export class SelectorController {
 									recordUsage: false,
 									onMutationStarted: () => {
 										defaultMutationStarted = true;
+										defaultUsageSequence = this.ctx.session.beginModelSelectionUsage();
 									},
 								});
 								assignmentMutationStarted = true;
@@ -2989,7 +2997,9 @@ export class SelectorController {
 								);
 							}
 							refreshRoleAssignments();
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+							// setModel awaited: a newer recorded choice keeps the MRU head.
+							if (defaultUsageSequence !== undefined)
+								this.ctx.session.recordModelSelectionUsage(model, defaultUsageSequence);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);

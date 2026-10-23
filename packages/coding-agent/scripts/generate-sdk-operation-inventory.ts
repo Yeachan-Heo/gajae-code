@@ -113,6 +113,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal rollback compensation, not a user-facing SDK control seam",
 	"agent_session:restoreModelSelectionForRollback":
 		"internal rollback compensation, not a user-facing SDK control seam",
+	"agent_session:beginModelSelectionUsage":
+		"internal model-usage ordering slot for a selection transaction, not a user-facing SDK control seam",
 	"agent_session:recordModelSelectionUsage":
 		"internal model-usage bookkeeping after a completed selection transaction, not a user-facing SDK control seam",
 	"agent_session:materializeActiveDefaultModelProfileAssignment":
