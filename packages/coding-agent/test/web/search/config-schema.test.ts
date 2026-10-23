@@ -43,6 +43,9 @@ describe("web search config schema", () => {
 		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "insane", label: "Insane" }));
 		expect(webSearch.values).toContain("tavily");
 		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "tavily", label: "Tavily" }));
+		expect(webSearch.values).toContain("keenable");
+		expect(webSearch.ui?.options).toContainEqual(expect.objectContaining({ value: "keenable", label: "Keenable" }));
+		expect(webSearch.default).toBe("auto");
 	});
 
 	it("accepts web_search.provider as a compatibility alias", () => {
