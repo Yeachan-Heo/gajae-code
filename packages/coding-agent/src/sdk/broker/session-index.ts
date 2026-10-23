@@ -2448,8 +2448,15 @@ export class SessionIndex {
 			for (let attempt = 0; ; attempt++) {
 				if (signal.aborted || performance.now() >= deadline) return 0;
 				const result = await this.#checkpointLiveHeartbeatsOnce(now, signal, deadline);
-				if (result !== STALE_OBSERVATION || attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS)
-					return result === STALE_OBSERVATION ? 0 : result;
+				if (result !== STALE_OBSERVATION) return result;
+				if (attempt + 1 >= SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS) {
+					// Failing closed on every attempt writes nothing, so running hosts age
+					// out and read as not-live. Without this the only symptom is `live: false`.
+					logger.warn(
+						`sdk broker: heartbeat checkpoint wrote nothing: all ${SESSION_HEARTBEAT_CHECKPOINT_ATTEMPTS} attempts saw a stale observation (index lock or replay exceeded its freshness bound)`,
+					);
+					return 0;
+				}
 				now = Date.now();
 			}
 		};

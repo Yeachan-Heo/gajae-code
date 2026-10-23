@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import * as lockModule from "../src/config/file-lock";
 import * as incarnationModule from "../src/sdk/broker/process-incarnation";
 import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
@@ -421,10 +422,17 @@ describe("SDK session index lock contention (#4544)", () => {
 				}
 				return await realWithFileLock(filePath, fn, options);
 			});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			expect(await index.checkpointLiveHeartbeats()).toBe(0);
 			expect(stalls).toBeGreaterThanOrEqual(2);
 			expect(stalls).toBe(4);
+			// #7151: starving every attempt must be visible, not a silent 0.
+			const starved = warn.mock.calls.filter(([message]) =>
+				String(message).includes("heartbeat checkpoint wrote nothing"),
+			);
+			expect(starved).toHaveLength(1);
+			expect(String(starved[0]?.[0])).toContain("all 4 attempts");
 			expect(incarnationCalls).toBeGreaterThanOrEqual(stalls);
 			const rows = index.listSessions().sessions;
 			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
@@ -466,9 +474,13 @@ describe("SDK session index lock contention (#4544)", () => {
 				}
 				return await realWithFileLock(filePath, fn, options);
 			});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			expect(await index.checkpointLiveHeartbeats()).toBe(1);
 			expect(stalled).toBe(true);
+			expect(
+				warn.mock.calls.some(([message]) => String(message).includes("heartbeat checkpoint wrote nothing")),
+			).toBe(false);
 			expect(incarnationCalls).toBeGreaterThanOrEqual(2);
 			expect(index.listSessions().sessions[0]?.lastHeartbeatAt).toBeDefined();
 		} finally {
