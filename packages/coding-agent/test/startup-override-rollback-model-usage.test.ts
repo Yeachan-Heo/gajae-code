@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
@@ -71,7 +72,8 @@ function liveModel(env: Env): string | undefined {
 }
 
 async function createEnv(startModel: string): Promise<Env> {
-	const root = await fs.realpath(await fs.mkdtemp("/private/tmp/gjc-rollback-mru-"));
+	// Canonicalize: macOS os.tmpdir() sits behind the /var -> /private/var symlink.
+	const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-rollback-mru-")));
 	const agentDir = path.join(root, "agent");
 	const cwd = path.join(root, "work");
 	await fs.mkdir(cwd, { recursive: true });
