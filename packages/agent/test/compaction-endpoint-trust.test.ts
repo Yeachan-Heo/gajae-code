@@ -91,7 +91,7 @@ let failNative = false;
 using hook = hookFetch(async (input, init) => {
  const request = input instanceof Request ? input : new Request(String(input), init);
  requests.push({ url: request.url, authorization: request.headers.get("authorization") });
- if (request.url.endsWith("/responses/compact")) {
+ if (request.url.includes("/responses/compact")) {
   return failNative ? new Response("unavailable", { status: 503 }) : Response.json({ output: [{ type: "compaction_summary", summary: "remote preserve summary" }] });
  }
  if (request.url.endsWith("/generic")) return Response.json({ summary: "generic summary" });
@@ -214,6 +214,22 @@ assert.match(branch.summary, /maintenance summary/);
 assert.equal(requests.length, 8);
 assert.ok(requests.every(request => request.url.startsWith("https://api.openai.com/v1/")), JSON.stringify(requests.map(request => request.url)));
 assert.ok(requests.every(request => request.authorization === "Bearer fixture-oauth"));
+`);
+	});
+
+	it("preserves query routing when appending native compaction paths", async () => {
+		await routingScenario(`
+Bun.env.OPENAI_BASE_URL = "https://retained.example/v1?route=tenant%2Fone";
+const endpointConfiguration = captureEndpointConfiguration();
+delete Bun.env.OPENAI_BASE_URL;
+await native(endpointConfiguration);
+await native(endpointConfiguration, "key", { baseUrl: "https://explicit.example/v1/?route=two" });
+await native(endpointConfiguration, "key", { provider: "openai-codex", baseUrl: "https://codex.example/backend-api/codex?route=three" });
+assert.deepEqual(requests.map(request => request.url), [
+ "https://retained.example/v1/responses/compact?route=tenant%2Fone",
+ "https://explicit.example/v1/responses/compact?route=two",
+ "https://codex.example/backend-api/codex/responses/compact?route=three",
+]);
 `);
 	});
 

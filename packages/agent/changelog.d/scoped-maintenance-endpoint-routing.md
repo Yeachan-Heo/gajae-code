@@ -3,3 +3,4 @@
 
 ### Fixed
 - Preserve the credential type through all local maintenance completions so captured alternate endpoints cannot bypass canonical OpenAI OAuth routing during native fallback or disabled remote compaction.
+- Preserve endpoint query routing when constructing OpenAI and Codex native compaction paths.

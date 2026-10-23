@@ -105,9 +105,10 @@ function resolveOpenAiCompactEndpoint(
 			: isDefaultBaseUrl
 				? OPENAI_DEFAULT_BASE_URL
 				: configuredBaseUrl || OPENAI_DEFAULT_BASE_URL;
-	const normalizedBase = rawBase.replace(/\/+$/, "");
-	if (normalizedBase.endsWith("/v1")) return `${normalizedBase}/responses/compact`;
-	return `${normalizedBase}/v1/responses/compact`;
+	const endpoint = new URL(rawBase);
+	const pathname = endpoint.pathname.replace(/\/+$/, "");
+	endpoint.pathname = `${pathname.endsWith("/v1") ? pathname : `${pathname}/v1`}/responses/compact`;
+	return endpoint.toString();
 }
 
 /** Test seam: the compaction endpoint as resolved from trusted env. */
@@ -121,9 +122,10 @@ export function resolveOpenAiCompactEndpointForTest(
 
 function resolveOpenAiCodexCompactEndpoint(baseUrl: string | undefined): string {
 	const rawBase = baseUrl && baseUrl.length > 0 ? baseUrl : CODEX_BASE_URL;
-	const normalizedBase = rawBase.endsWith("/") ? rawBase.slice(0, -1) : rawBase;
-	if (/\/codex(?:\/v\d+)?$/.test(normalizedBase)) return `${normalizedBase}/responses/compact`;
-	return `${normalizedBase}/codex/responses/compact`;
+	const endpoint = new URL(rawBase);
+	const pathname = endpoint.pathname.replace(/\/+$/, "");
+	endpoint.pathname = `${/\/codex(?:\/v\d+)?$/.test(pathname) ? pathname : `${pathname}/codex`}/responses/compact`;
+	return endpoint.toString();
 }
 
 function normalizeOpenAiCompactionToolCallId(id: string): string {
