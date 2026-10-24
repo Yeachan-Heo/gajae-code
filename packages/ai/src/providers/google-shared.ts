@@ -181,6 +181,13 @@ function getGeminiMajorVersion(modelId: string): number | undefined {
 	return Number.parseInt(match[1], 10);
 }
 
+function supportsNativeArgumentStreaming(model: Model<GoogleApiType>): boolean {
+	return (
+		(model.api === "google-generative-ai" || model.api === "google-vertex") &&
+		(getGeminiMajorVersion(model.id) ?? 0) >= 3
+	);
+}
+
 function supportsMultimodalFunctionResponse(modelId: string): boolean {
 	const geminiMajorVersion = getGeminiMajorVersion(modelId);
 	if (geminiMajorVersion !== undefined) {
@@ -198,6 +205,10 @@ function isGemini3Model(modelId: string): boolean {
  */
 export function convertMessages<T extends GoogleApiType>(model: Model<T>, context: Context): Content[] {
 	const contents: Content[] = [];
+	// Native streamed calls require matching opaque IDs on both sides of the tool turn.
+	// Keep legacy Claude emission separate from its ID sanitization below.
+	const includeId =
+		supportsNativeArgumentStreaming(model) || (requiresToolCallId(model.id) && model.provider !== "google-vertex");
 	const normalizeToolCallId = (id: string): string => {
 		if (!requiresToolCallId(model.id)) return id;
 		return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
@@ -295,12 +306,9 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 						functionCall: {
 							name: block.name,
 							args: sanitizeJsonStrings(block.arguments ?? {}) as Record<string, unknown>,
-							...(requiresToolCallId(model.id) ? { id: block.id } : {}),
+							...(includeId ? { id: block.id } : {}),
 						},
 					};
-					if (model.provider === "google-vertex" && part?.functionCall?.id) {
-						delete part.functionCall.id; // Vertex AI does not support 'id' in functionCall
-					}
 					if (effectiveSignature) {
 						part.thoughtSignature = effectiveSignature;
 					}
@@ -345,7 +353,6 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 				},
 			}));
 
-			const includeId = requiresToolCallId(model.id);
 			const functionResponsePart: Part = {
 				functionResponse: {
 					name: msg.toolName,
@@ -354,10 +361,6 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					...(includeId ? { id: msg.toolCallId } : {}),
 				},
 			};
-
-			if (model.provider === "google-vertex" && functionResponsePart.functionResponse?.id) {
-				delete functionResponsePart.functionResponse.id; // Vertex AI does not support 'id' in functionResponse
-			}
 
 			// Cloud Code Assist API requires all function responses to be in a single user turn.
 			// Check if the last content is already a user turn with function responses and merge.
@@ -852,7 +855,7 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 
 	if (context.tools && context.tools.length > 0) {
 		const resolved = resolveToolChoice(model, options.toolChoice);
-		const streamArguments = (getGeminiMajorVersion(model.id) ?? 0) >= 3;
+		const streamArguments = supportsNativeArgumentStreaming(model);
 		if (resolved.resolvedChoice || streamArguments) {
 			config.toolConfig = {
 				functionCallingConfig: {

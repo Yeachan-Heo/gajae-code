@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { streamGoogle } from "../src/providers/google";
-import type { GoogleSharedStreamOptions } from "../src/providers/google-shared";
+import { convertMessages, type GoogleSharedStreamOptions } from "../src/providers/google-shared";
 import type { GenerateContentResponse, Part } from "../src/providers/google-types";
 import { streamGoogleVertex } from "../src/providers/google-vertex";
-import type { AssistantMessageEvent, Context } from "../src/types";
+import type { AssistantMessageEvent, Context, ToolResultMessage } from "../src/types";
 import { clearToolChoiceIncapabilityRegistryForTests } from "../src/utils/tool-choice-capability";
 import {
 	collectEvents,
@@ -41,6 +41,7 @@ function openStream(
 	options: GoogleSharedStreamOptions = {},
 	id = "gemini-4-argon",
 	version = "v1",
+	requestContext: Context = context,
 ) {
 	const queue = Array.isArray(responses) ? [...responses] : [responses];
 	const requests: { url: string; body: Record<string, unknown> }[] = [];
@@ -56,14 +57,15 @@ function openStream(
 	};
 	const stream =
 		api === "google-vertex"
-			? streamGoogleVertex({ ...createBaseModel("google-vertex"), id }, context, streamOptions)
+			? streamGoogleVertex({ ...createBaseModel("google-vertex"), provider: api, id }, requestContext, streamOptions)
 			: streamGoogle(
 					{
 						...createBaseModel("google-generative-ai"),
+						provider: api,
 						id,
 						baseUrl: `https://google.example.test/${version}`,
 					},
-					context,
+					requestContext,
 					streamOptions,
 				);
 	return { stream, requests };
@@ -83,6 +85,154 @@ beforeEach(() => clearToolChoiceIncapabilityRegistryForTests());
 
 for (const api of ["google-generative-ai", "google-vertex"] as const) {
 	describe(`${api} streamed function arguments`, () => {
+		it.each([
+			{ modelId: "gemini-3.1-pro", serverId: true },
+			{ modelId: "gemini-3.1-pro", serverId: false },
+			{ modelId: "gemini-4-argon", serverId: true },
+			{ modelId: "gemini-4-argon", serverId: false },
+		])("round-trips sequential calls on $modelId with server ID=$serverId", async ({ modelId, serverId }) => {
+			const opaqueId = `call:/+|?=&${"opaque.segment-".repeat(20)}:end`;
+			const secondId = `${opaqueId}/second`;
+			const first = openStream(
+				api,
+				createSseResponse([
+					chunk({
+						functionCall: { name: "write", ...(serverId && { id: opaqueId }), willContinue: true },
+						thoughtSignature: "Zmlyc3Q=",
+					}),
+					chunk({
+						functionCall: {
+							partialArgs: [{ jsonPath: "$.content", stringValue: "first ", willContinue: true }],
+							willContinue: true,
+						},
+					}),
+					chunk({ functionCall: { partialArgs: [{ jsonPath: "$.content", stringValue: "body" }] } }),
+					chunk({ functionCall: { name: "write", id: secondId, willContinue: true } }),
+					chunk({
+						functionCall: { partialArgs: [{ jsonPath: "$.content", stringValue: "second body" }] },
+						thoughtSignature: "c2Vjb25k",
+					}),
+					stop,
+				]),
+				{},
+				modelId,
+			);
+			const events = await collectEvents(first.stream);
+			const assistant = await first.stream.result();
+			const calls = completedCalls(events);
+			expect(assistant.stopReason).toBe("toolUse");
+			expect(calls).toHaveLength(2);
+			const firstId = calls[0]!.id;
+			if (serverId) {
+				expect(firstId).toBe(opaqueId);
+			} else {
+				expect(firstId).toMatch(/^write_\d+_\d+$/);
+				expect(firstId).not.toBe(secondId);
+			}
+			expect(calls).toEqual([
+				{
+					type: "toolCall",
+					id: firstId,
+					name: "write",
+					arguments: { content: "first body" },
+					thoughtSignature: "Zmlyc3Q=",
+				},
+				{
+					type: "toolCall",
+					id: secondId,
+					name: "write",
+					arguments: { content: "second body" },
+					thoughtSignature: "c2Vjb25k",
+				},
+			]);
+			expect(assistant.content).toEqual(calls);
+			const results: ToolResultMessage[] = calls.map((call, index) => ({
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: `result ${index + 1}` }],
+				isError: false,
+				timestamp: index + 2,
+			}));
+			const second = openStream(api, createSseResponse([chunk({ text: "done" }), stop]), {}, modelId, "v1", {
+				...context,
+				messages: [...context.messages, assistant, ...results],
+			});
+			expect((await second.stream.result()).stopReason).toBe("stop");
+			expect(first.requests).toHaveLength(1);
+			expect(second.requests).toHaveLength(1);
+			expect(second.requests[0]?.body.contents).toEqual([
+				{ role: "user", parts: [{ text: "write the file" }] },
+				{
+					role: "model",
+					parts: [
+						{
+							functionCall: { id: firstId, name: "write", args: { content: "first body" } },
+							thoughtSignature: "Zmlyc3Q=",
+						},
+						{
+							functionCall: { id: secondId, name: "write", args: { content: "second body" } },
+							thoughtSignature: "c2Vjb25k",
+						},
+					],
+				},
+				{
+					role: "user",
+					parts: [
+						{ functionResponse: { id: firstId, name: "write", response: { output: "result 1" } } },
+						{ functionResponse: { id: secondId, name: "write", response: { output: "result 2" } } },
+					],
+				},
+			]);
+		});
+
+		it("keeps older native Gemini requests free of call IDs and argument streaming", async () => {
+			const modelId = "gemini-2.5-pro";
+			const first = openStream(
+				api,
+				createSseResponse([
+					chunk({
+						functionCall: { name: "write", id: "older-id", args: { content: "body" } },
+						thoughtSignature: "c2ln",
+					}),
+					stop,
+				]),
+				{},
+				modelId,
+			);
+			const assistant = await first.stream.result();
+			expect(assistant.stopReason).toBe("toolUse");
+			const second = openStream(api, createSseResponse([chunk({ text: "done" }), stop]), {}, modelId, "v1", {
+				...context,
+				messages: [
+					...context.messages,
+					assistant,
+					{
+						role: "toolResult",
+						toolCallId: "older-id",
+						toolName: "write",
+						content: [{ type: "text", text: "ok" }],
+						isError: false,
+						timestamp: 2,
+					},
+				],
+			});
+			expect((await second.stream.result()).stopReason).toBe("stop");
+			expect(first.requests[0]?.body.toolConfig).toBeUndefined();
+			expect(second.requests[0]?.body.toolConfig).toBeUndefined();
+			expect(second.requests[0]?.body.contents).toEqual([
+				{ role: "user", parts: [{ text: "write the file" }] },
+				{
+					role: "model",
+					parts: [{ functionCall: { name: "write", args: { content: "body" } }, thoughtSignature: "c2ln" }],
+				},
+				{
+					role: "user",
+					parts: [{ functionResponse: { name: "write", response: { output: "ok" } } }],
+				},
+			]);
+		});
+
 		it("enables native v1 argument streaming and assembles large strings, objects and dense arrays", async () => {
 			const large = '한글\n"\\'.repeat(20_000);
 			const parts: Part[] = [
@@ -650,6 +800,51 @@ for (const api of ["google-generative-ai", "google-vertex"] as const) {
 		});
 	});
 }
+
+it.each([
+	{ api: "google-gemini-cli", modelId: "gemini-2.5-pro", idPolicy: "omit" },
+	{ api: "google-gemini-cli", modelId: "gemini-3.1-pro", idPolicy: "omit" },
+	{ api: "google-gemini-cli", modelId: "gemini-4-argon", idPolicy: "omit" },
+	{ api: "google-gemini-cli", modelId: "claude-sonnet-4-5", idPolicy: "sanitize" },
+	{ api: "google-vertex", modelId: "claude-sonnet-4-5", idPolicy: "omit" },
+	{ api: "google-vertex", modelId: "gemini-4-argon", idPolicy: "opaque" },
+	{ api: "google-generative-ai", modelId: "gemini-3.1-pro", idPolicy: "opaque" },
+] as const)("preserves $api/$modelId history ID policy: $idPolicy", async ({ api, modelId, idPolicy }) => {
+	const opaqueId = `call:/+|${"x".repeat(80)}:end`;
+	const { stream } = openStream(
+		"google-generative-ai",
+		createSseResponse([chunk({ functionCall: { name: "write", id: opaqueId, args: { content: "body" } } }), stop]),
+	);
+	const assistant = await stream.result();
+	expect(assistant.stopReason).toBe("toolUse");
+	const contents = convertMessages(
+		{ ...createBaseModel(api), provider: api, id: modelId },
+		{
+			...context,
+			messages: [
+				...context.messages,
+				assistant,
+				{
+					role: "toolResult",
+					toolCallId: opaqueId,
+					toolName: "write",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+		},
+	);
+	const expectedId =
+		idPolicy === "omit" ? {} : { id: idPolicy === "sanitize" ? `call____${"x".repeat(56)}` : opaqueId };
+	expect(contents.map(content => content.role)).toEqual(["user", "model", "user"]);
+	expect(contents[1]?.parts?.map(part => part.functionCall)).toEqual([
+		{ name: "write", args: { content: "body" }, ...expectedId },
+	]);
+	expect(contents[2]?.parts).toEqual([
+		{ functionResponse: { name: "write", response: { output: "ok" }, ...expectedId } },
+	]);
+});
 
 it("also enables streamed arguments on the v1beta1 native endpoint", async () => {
 	const { stream, requests } = openStream(
