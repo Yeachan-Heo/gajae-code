@@ -113,7 +113,7 @@ describe("Cursor inline calls through Agent", () => {
 		});
 		const agent = new Agent({
 			initialState: {
-				model: mock.model,
+				model: mock,
 				systemPrompt: [],
 				tools: [
 					{
