@@ -35,12 +35,16 @@ import { createDaemonControlHooks } from "../src/sdk/bus/telegram-daemon-cli";
 import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
 import type { NotificationSubscription } from "../src/sdk/router";
 
-function notificationSubscription(sessionId: string, generation = 1): NotificationSubscription {
+function notificationSubscription(
+	sessionId: string,
+	generation = 1,
+	subscriptionId = `test:${sessionId}:${generation}`,
+): NotificationSubscription {
 	let active = true;
 	const cursor = { generation, seq: 0 };
 	return {
 		sessionId,
-		subscriptionId: `test:${sessionId}:${generation}`,
+		subscriptionId,
 		cursor,
 		isActive: () => active,
 		send: () => undefined,
@@ -2027,6 +2031,170 @@ test("awaiting input sends once to a topic under redact without buttons and is n
 		});
 		expect(calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
 	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("a closed session resumed by a new attachment rebinds a fresh topic while the closed attachment stays fenced", async () => {
+	const agentDir = tempAgentDir();
+	const daemon = (() => {
+		const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+		let nextTopicId = 700;
+		const botApi: BotApi = {
+			call: async (method, body) => {
+				calls.push({ method, body: body as Record<string, unknown> });
+				if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+				if (method === "createForumTopic") return { ok: true, result: { message_thread_id: ++nextTopicId } };
+				if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
+				return { ok: true, result: true };
+			},
+		};
+		return {
+			calls,
+			instance: new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+				botApi,
+			}),
+		};
+	})();
+	const { calls, instance } = daemon;
+	const sent = (text: string) =>
+		calls.filter(call => call.method === "sendMessage" && String(call.body.text).includes(text));
+	try {
+		await instance.loadTopics();
+		const routing = instance.attachmentRoutingHarnessForTest();
+		const sessionId = "resumed-after-close";
+		// The resumed process is a new host registration: Router publishes it as a
+		// new subscription with its own SDK event generation.
+		const closing = notificationSubscription(sessionId, 1, "router:first-process");
+		routing.attach(closing);
+		const closed = instance.sessions.get(sessionId);
+		if (!closed) throw new Error("Expected the first routed attachment session.");
+		await instance.handleSessionMessage(closed, {
+			type: "event_replay_result",
+			id: closed.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ seq: 1, payload: { type: "identity_header", sessionId } }],
+		});
+		await instance.handleSessionMessage(closed, {
+			type: "turn_stream",
+			sessionId,
+			phase: "finalized",
+			text: "before close",
+		});
+		const firstTopic = sent("before close")[0]?.body.message_thread_id;
+		expect(firstTopic).toBe(701);
+
+		await instance.handleSessionMessage(closed, { type: "session_closed", sessionId });
+		expect(instance.sessions.has(sessionId)).toBe(false);
+		await expect(
+			instance.handleSessionMessage(closed, {
+				type: "turn_stream",
+				sessionId,
+				phase: "finalized",
+				text: "late frame from the closed process",
+			}),
+		).rejects.toThrow("trusted attachment lease is stale");
+		expect(sent("late frame from the closed process")).toHaveLength(0);
+
+		const resumed = notificationSubscription(sessionId, 2, "router:resumed-process");
+		routing.attach(resumed);
+		const successor = instance.sessions.get(sessionId);
+		if (!successor || successor === closed) throw new Error("Expected the resumed attachment session.");
+		await instance.handleSessionMessage(successor, {
+			type: "event_replay_result",
+			id: successor.replayId,
+			ok: true,
+			generation: 2,
+			lastSeq: 1,
+			events: [{ seq: 1, payload: { type: "identity_header", sessionId } }],
+		});
+		expect(instance.sessions.get(sessionId)).toBe(successor);
+		expect(resumed.isActive()).toBe(true);
+		await instance.handleSessionMessage(successor, {
+			type: "turn_stream",
+			sessionId,
+			phase: "finalized",
+			text: "after resume",
+		});
+		const resumedMessages = sent("after resume");
+		expect(resumedMessages).toHaveLength(1);
+		expect(resumedMessages[0]?.body.message_thread_id).toBe(702);
+
+		await expect(
+			instance.handleSessionMessage(closed, {
+				type: "turn_stream",
+				sessionId,
+				phase: "finalized",
+				text: "second late frame from the closed process",
+			}),
+		).rejects.toThrow("trusted attachment lease is stale");
+		expect(sent("second late frame from the closed process")).toHaveLength(0);
+	} finally {
+		instance.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("a refused replay recovery leaves a diagnostic instead of dropping the attachment silently", async () => {
+	const agentDir = tempAgentDir();
+	const warn = spyOn(logger, "warn").mockImplementation(() => undefined);
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+		installationHostId: "provider-owner",
+	});
+	try {
+		fs.mkdirSync(path.dirname(statePath), { recursive: true });
+		fs.writeFileSync(
+			statePath,
+			`${JSON.stringify({
+				version: 2,
+				installationHostId: "provider-owner",
+				topics: {
+					"other-chat": {
+						topicId: "100",
+						topicOrigin: "daemon_created",
+						sessionUuid: "other-chat-topic",
+						identitySent: true,
+						createdAt: 1,
+						authorityState: "active",
+						chatId: "99",
+					},
+				},
+			})}\n`,
+		);
+		await daemon.loadTopics();
+		const attachment = notificationSubscription("other-chat");
+		daemon.attachmentRoutingHarnessForTest().attach(attachment);
+		const session = daemon.sessions.get(attachment.sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		// Identity-less replay cannot resume a topic bound to another chat.
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: 1,
+			lastSeq: 0,
+			events: [],
+		});
+		expect(attachment.isActive()).toBe(false);
+		expect(daemon.sessions.has(attachment.sessionId)).toBe(false);
+		expect(warn.mock.calls.map(call => String(call[0]))).toContainEqual(
+			expect.stringContaining("Telegram refused attachment recovery for session other-chat: no admissible identity"),
+		);
+	} finally {
+		warn.mockRestore();
+		daemon.requestStop();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
 });

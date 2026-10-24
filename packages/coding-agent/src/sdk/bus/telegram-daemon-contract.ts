@@ -312,8 +312,10 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 210 keeps tool results in their turn's settlement provenance and
  * never anchors a lean composition on tool-loop narration, so a same-run
  * autonomous follow-up cannot displace the final answer from the idle receipt.
+ * Generation 211 fences only the exact attachment that sent session_closed, so
+ * owners that refuse every later attachment of a resumed session are replaced.
  */
-export const DAEMON_GENERATION = 210;
+export const DAEMON_GENERATION = 211;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
