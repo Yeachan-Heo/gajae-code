@@ -2094,8 +2094,10 @@ function collectInterpreterOneLinerWrites(command: string, targets: ExtractedTar
 			}
 			if (rawScript === undefined) continue;
 			// Node preload options (-r/--require) load external files that cannot be scanned,
-			// so fail closed when encountered.
-			if ((option === "-r" || option === "--require") && /^(?:node|bun)$/.test(binary)) {
+			// so fail closed when encountered. Check both space-separated (option) and
+			// equals-form (longOption) spellings.
+			const isPreloadOption = option === "-r" || option === "--require" || longOption === "--require";
+			if (isPreloadOption && /^(?:node|bun)$/.test(binary)) {
 				targets.explicitMutation = true;
 				targets.unknown = true;
 				return;
