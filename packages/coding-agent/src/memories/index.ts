@@ -197,7 +197,13 @@ export async function buildMemoryToolDeveloperInstructions(
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Delete every memory row and memory job in the shared local database, then remove
+ * only the current project's memory directory.
+ *
+ * Database deletion is not scoped to `cwd`. Filesystem cleanup removes the
+ * directory that `getMemoryRoot(agentDir, cwd)` returns. Project paths that
+ * differ only in `/`, `\`, or `:` versus `-` map to the same directory, so that
+ * shared directory is removed too.
  */
 export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
@@ -206,6 +212,7 @@ export async function clearMemoryData(agentDir: string, cwd: string): Promise<vo
 	} finally {
 		closeMemoryDb(db);
 	}
+	// Filesystem cleanup is the current project directory only.
 	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
 }
 
