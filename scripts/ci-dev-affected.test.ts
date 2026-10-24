@@ -1463,12 +1463,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
 	});
 
-	test("a source file with a directly-named test maps exclusively to that test", () => {
+	test("a source file with a directly-named test includes both the test and package check", () => {
 		const tasks = targeted(["packages/coding-agent/src/edit/foo.ts"]);
-		expect(tasks.map(task => task.key)).toEqual([
-			"test:packages/coding-agent/test/edit/foo.test.ts",
-			"native-linux-x64",
-		]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/coding-agent");
+		expect(keys).toContain("test:packages/coding-agent/test/edit/foo.test.ts");
+		expect(keys).toContain("native-linux-x64");
 	});
 
 	test("a source file with no mapped test runs the owning package check, not its test suite", () => {
@@ -1477,6 +1477,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("check:@gajae-code/coding-agent");
 		expect(keys).toContain("cli-smoke"); // coding-agent runtime smoke
 		expect(keys.some(key => key.startsWith("test:"))).toBe(false);
+	});
+
+	test("only src change in packages/agent triggers check:@gajae-code/agent-core", () => {
+		const tasks = targeted(["packages/agent/src/agent-loop.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("check:@gajae-code/agent-core");
 	});
 
 	test("main entrypoint adds its behavioral contract test without replacing owner fallback coverage", () => {

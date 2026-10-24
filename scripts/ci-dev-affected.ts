@@ -1202,6 +1202,13 @@ export function planTargetedTasks(
 		}
 
 
+		const owner = owningPackage(changedPath, packages);
+		if (owner) {
+			if (owner.manifest.scripts?.check) {
+				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
+			}
+		}
+
 		const mappedTests = mappedTestsFor(changedPath, packages, testFiles);
 		for (const testFile of mappedTests) {
 			addTestFileTask(tasks, testFile, validateTestPaths);
@@ -1215,14 +1222,16 @@ export function planTargetedTasks(
 		}
 
 		if (mappedTests.length > 0) {
+			if (isCodingAgentRuntimePath(changedPath)) {
+				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
+			}
+			if (isUnscopedWrapperPath(changedPath)) {
+				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
+			}
 			continue;
 		}
 
-		const owner = owningPackage(changedPath, packages);
 		if (owner) {
-			if (owner.manifest.scripts?.check) {
-				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
-			}
 			if (isCodingAgentRuntimePath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
