@@ -1,10 +1,22 @@
-import { describe, expect, it } from "bun:test";
-import { lstat, realpath } from "node:fs/promises";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { execFile } from "node:child_process";
+import { lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
+import * as utils from "@gajae-code/utils";
+import { getMemoriesDir } from "@gajae-code/utils";
+import fc from "fast-check";
+import { registerOwnedDeletionRoot, safeRm } from "../../../../scripts/safe-cleanup";
+import { resetActiveRulesForTests, setActiveRules } from "../../src/capability/rule";
+import { disposeAllShellSessions } from "../../src/exec/bash-executor";
 import type { Skill } from "../../src/extensibility/skills";
 import { resolveLocalUrlToPath } from "../../src/internal-urls";
+import type { ToolSession } from "../../src/tools";
+import { BashTool } from "../../src/tools/bash";
 import { expandInternalUrls, expandSkillUrls, resolveSkillUrl } from "../../src/tools/bash-skill-urls";
 import { ToolError } from "../../src/tools/tool-errors";
+import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
 /** Match bash skill expansion: real ancestor plus the components that do not exist yet. */
 async function canonicalExistingPath(target: string): Promise<string> {
@@ -202,16 +214,10 @@ describe("resolveSkillUrl skill selection", () => {
 describe("expandInternalUrls", () => {
 	it("expands context-free internal URLs in one command", async () => {
 		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
-		const router = createInternalRouter({
-			"memory://root/memory_summary.md": { sourcePath: "/tmp/memories/memory_summary.md" },
-			"rule://rs-no-unwrap": { sourcePath: "/tmp/rules/rs-no-unwrap.md" },
-		});
-		const command = "cat memory://root/memory_summary.md rule://rs-no-unwrap skill://valid-skill/scripts/init.py";
+		const command = "cat skill://valid-skill/scripts/init.py";
 		const expectedSkillPath = await canonicalExistingPath(path.join(skills[0].baseDir, "scripts/init.py"));
 
-		await expect(expandInternalUrls(command, { skills, internalRouter: router })).resolves.toBe(
-			`cat ${shellEscape("/tmp/memories/memory_summary.md")} ${shellEscape("/tmp/rules/rs-no-unwrap.md")} ${shellEscape(expectedSkillPath)}`,
-		);
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(`cat ${shellEscape(expectedSkillPath)}`);
 	});
 
 	it("rejects managed artifact and agent authority in subprocess commands", async () => {
@@ -297,9 +303,13 @@ describe("expandInternalUrls", () => {
 		const router = createInternalRouter({
 			"rule://my-rule": {},
 		});
-		await expect(expandInternalUrls("cat rule://my-rule", { skills: [], internalRouter: router })).rejects.toThrow(
-			"rule:// URL resolved without a filesystem path",
-		);
+		await expect(
+			expandInternalUrls("cat rule://my-rule", {
+				skills: [],
+				internalRouter: router,
+				sessionCwd: path.join(tmpdir(), "bash-url-session"),
+			}),
+		).rejects.toThrow("rule:// URL resolved without a filesystem path");
 	});
 
 	it("surfaces resolver errors with actionable context", async () => {
@@ -307,7 +317,11 @@ describe("expandInternalUrls", () => {
 			"memory://root/missing.md": { error: "Memory file not found" },
 		});
 		await expect(
-			expandInternalUrls("cat memory://root/missing.md", { skills: [], internalRouter: router }),
+			expandInternalUrls("cat memory://root/missing.md", {
+				skills: [],
+				internalRouter: router,
+				sessionCwd: path.join(tmpdir(), "bash-url-session"),
+			}),
 		).rejects.toThrow("Failed to resolve memory:// URL in bash command");
 	});
 
@@ -360,4 +374,865 @@ describe("expandInternalUrls", () => {
 		};
 		await expect(expandInternalUrls(command, { skills: [], localOptions })).resolves.toBe(command);
 	});
+});
+
+const execFileAsync = promisify(execFile);
+const PROPERTY_SEED = 481703;
+
+async function symlinkCreationSupported(): Promise<boolean> {
+	const windows = process.platform === "win32";
+	if (windows) {
+		return false;
+	}
+	const dir = await mkdtemp(path.join(tmpdir(), "bash-symlink-probe-"));
+	try {
+		const target = path.join(dir, "target");
+		await writeFile(target, "t");
+		await symlink(target, path.join(dir, "link"));
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		const denied = code === "EPERM" || code === "EACCES";
+		if (denied) return false;
+		throw error;
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
+const symlinkSupported = await symlinkCreationSupported();
+
+async function withGrantedHomeRoot(body: (root: string) => Promise<void>): Promise<void> {
+	const name = `.gjc-bash-ancestor-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	let canonicalBase = homedir();
+	try {
+		canonicalBase = await realpath(homedir());
+	} catch {
+		canonicalBase = homedir();
+	}
+	const root = path.join(canonicalBase, name);
+	const forget = registerOwnedDeletionRoot(root);
+	await mkdir(root);
+	try {
+		await body(path.join(homedir(), name));
+	} finally {
+		await safeRm(root, { recursive: true, force: true });
+		forget();
+	}
+}
+
+async function homeChildWritable(): Promise<boolean> {
+	try {
+		await withGrantedHomeRoot(async () => {});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+const canWriteUnderHome = await homeChildWritable();
+
+function memoryRootFor(agentDir: string, cwd: string): string {
+	const encoded = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+	return path.join(getMemoriesDir(agentDir), encoded);
+}
+
+async function expectExpandsToSource(
+	command: string,
+	options: Parameters<typeof expandInternalUrls>[1],
+	sourcePath: string,
+): Promise<void> {
+	const expanded = await expandInternalUrls(command, options);
+	const quoted = expanded.slice(expanded.indexOf(" ") + 1);
+	expect(quoted.startsWith("'") && quoted.endsWith("'")).toBe(true);
+	const got = quoted.slice(1, -1).replaceAll("'\\''", "'");
+	const lexical = path.resolve(sourcePath);
+	let real = lexical;
+	try {
+		real = await realpath(sourcePath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	expect([lexical, real]).toContain(got);
+}
+
+describe("expandInternalUrls session scope", () => {
+	it("still allows a rule file inside the session directory", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-rule-in-"));
+		try {
+			const sourcePath = path.join(cwd, "deploy.md");
+			await writeFile(sourcePath, "own-rule");
+			const router = createInternalRouter({ "rule://deploy": { sourcePath } });
+			await expectExpandsToSource(
+				"cat rule://deploy",
+				{
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(cwd, "agent"),
+				},
+				sourcePath,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows memory://root and memory://root/ when the router returns the caller file", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-mem-alias-"));
+		const agentDir = await mkdtemp(path.join(tmpdir(), "bash-mem-alias-agent-"));
+		try {
+			const sourcePath = path.join(memoryRootFor(agentDir, cwd), "memory_summary.md");
+			await mkdir(path.dirname(sourcePath), { recursive: true });
+			await writeFile(sourcePath, "own-memory");
+			const router = createInternalRouter({
+				"memory://root": { sourcePath },
+				"memory://root/": { sourcePath },
+			});
+			const options = { skills: [], internalRouter: router, sessionCwd: cwd, sessionAgentDir: agentDir };
+			await expectExpandsToSource("cat memory://root", options, sourcePath);
+			await expectExpandsToSource("cat memory://root/", options, sourcePath);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows a memory file inside the session memory root", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-mem-cwd-"));
+		const agentDir = await mkdtemp(path.join(tmpdir(), "bash-mem-agent-"));
+		try {
+			const sourcePath = path.join(memoryRootFor(agentDir, cwd), "memory_summary.md");
+			await mkdir(path.dirname(sourcePath), { recursive: true });
+			await writeFile(sourcePath, "own-memory");
+			const router = createInternalRouter({ "memory://root/memory_summary.md": { sourcePath } });
+			await expectExpandsToSource(
+				"cat memory://root/memory_summary.md",
+				{
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: agentDir,
+				},
+				sourcePath,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows a user rule file inside the session agent directory", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-rule-proj-"));
+		const agentDir = await mkdtemp(path.join(tmpdir(), "bash-rule-agent-"));
+		try {
+			const sourcePath = path.join(agentDir, "RULES.md");
+			await writeFile(sourcePath, "user-rule");
+			const router = createInternalRouter({ "rule://RULES": { sourcePath } });
+			await expectExpandsToSource(
+				"cat rule://RULES",
+				{
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: agentDir,
+				},
+				sourcePath,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!canWriteUnderHome)(
+		"expands a project rule discovered from an ancestor directory in a non-Git session",
+		async () => {
+			await withGrantedHomeRoot(async root => {
+				const project = path.join(root, "work", "project");
+				const cwd = path.join(project, "subdir");
+				const agentRule = path.join(project, ".agent", "rules", "check.md");
+				const agentsRule = path.join(project, ".agents", "rules", "check.md");
+				await mkdir(path.dirname(agentRule), { recursive: true });
+				await mkdir(path.dirname(agentsRule), { recursive: true });
+				await mkdir(cwd);
+				await writeFile(agentRule, "ancestor-rule");
+				await writeFile(agentsRule, "ancestor-rules");
+				const router = createInternalRouter({
+					"rule://check": { sourcePath: agentRule },
+					"rule://checks": { sourcePath: agentsRule },
+				});
+				const options = {
+					skills: [] as Skill[],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(root, "agent"),
+				};
+				await expectExpandsToSource("cat rule://check", options, agentRule);
+				await expectExpandsToSource("cat rule://checks", options, agentsRule);
+			});
+		},
+	);
+
+	it("expands an ancestor project rule under the trusted home when that home is not the runtime home", async () => {
+		const trusted = await mkdtemp(path.join(tmpdir(), "bash-trusted-home-"));
+		const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(trusted);
+		try {
+			const project = path.join(trusted, "work", "project");
+			const cwd = path.join(project, "subdir");
+			const rule = path.join(project, ".agent", "rules", "check.md");
+			await mkdir(path.dirname(rule), { recursive: true });
+			await mkdir(cwd);
+			await writeFile(rule, "trusted-ancestor");
+			const router = createInternalRouter({ "rule://check": { sourcePath: rule } });
+			await expectExpandsToSource(
+				"cat rule://check",
+				{
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(trusted, "agent"),
+				},
+				rule,
+			);
+		} finally {
+			spy.mockRestore();
+			await rm(trusted, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!canWriteUnderHome)(
+		"refuses an ancestor rule that is inside the runtime home but outside the trusted home",
+		async () => {
+			await withGrantedHomeRoot(async root => {
+				const trusted = await mkdtemp(path.join(tmpdir(), "bash-trusted-other-"));
+				const spy = spyOn(utils, "getTrustedHomeDir").mockReturnValue(trusted);
+				try {
+					const project = path.join(root, "work", "project");
+					const cwd = path.join(project, "subdir");
+					const rule = path.join(project, ".agent", "rules", "check.md");
+					await mkdir(path.dirname(rule), { recursive: true });
+					await mkdir(cwd);
+					await writeFile(rule, "runtime-home");
+					const router = createInternalRouter({ "rule://check": { sourcePath: rule } });
+					await expect(
+						expandInternalUrls("cat rule://check", {
+							skills: [],
+							internalRouter: router,
+							sessionCwd: cwd,
+							sessionAgentDir: path.join(root, "agent"),
+						}),
+					).rejects.toThrow(/outside this session/);
+				} finally {
+					spy.mockRestore();
+					await rm(trusted, { recursive: true, force: true });
+				}
+			});
+		},
+	);
+
+	it.skipIf(!canWriteUnderHome)(
+		"refuses a non-rule ancestor file, a sibling project rule, and a home rule in a non-Git session",
+		async () => {
+			await withGrantedHomeRoot(async root => {
+				const project = path.join(root, "work", "project");
+				const cwd = path.join(project, "subdir");
+				const notes = path.join(project, "notes.md");
+				const sibling = path.join(root, "work", "other", ".agent", "rules", "check.md");
+				const homeRule = path.join(homedir(), ".agent", "rules", "gjc-bash-home-boundary.md");
+				await mkdir(cwd, { recursive: true });
+				await mkdir(path.dirname(sibling), { recursive: true });
+				await writeFile(notes, "notes");
+				await writeFile(sibling, "sibling");
+				const router = createInternalRouter({
+					"rule://notes": { sourcePath: notes },
+					"rule://sibling": { sourcePath: sibling },
+					"rule://home": { sourcePath: homeRule },
+				});
+				const options = {
+					skills: [] as Skill[],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(root, "agent"),
+				};
+				await expect(expandInternalUrls("cat rule://notes", options)).rejects.toThrow(/outside this session/);
+				await expect(expandInternalUrls("cat rule://sibling", options)).rejects.toThrow(/outside this session/);
+				await expect(expandInternalUrls("cat rule://home", options)).rejects.toThrow(/outside this session/);
+			});
+		},
+	);
+
+	it.skipIf(!canWriteUnderHome)("refuses a rule above the Git root when the session is below home", async () => {
+		await withGrantedHomeRoot(async root => {
+			const repo = path.join(root, "repo");
+			const cwd = path.join(repo, "subdir");
+			const above = path.join(root, ".agent", "rules", "check.md");
+			await mkdir(cwd, { recursive: true });
+			await mkdir(path.dirname(above), { recursive: true });
+			await writeFile(above, "above");
+			await execFileAsync("git", ["init", "-q", repo]);
+			const router = createInternalRouter({ "rule://check": { sourcePath: above } });
+			await expect(
+				expandInternalUrls("cat rule://check", {
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(root, "agent"),
+				}),
+			).rejects.toThrow(/outside this session/);
+		});
+	});
+
+	it.skipIf(process.platform === "win32" || !symlinkSupported || !canWriteUnderHome)(
+		"refuses an ancestor rule symlink that leaves the ancestor directory",
+		async () => {
+			const outside = await mkdtemp(path.join(tmpdir(), "bash-ancestor-out-"));
+			try {
+				await withGrantedHomeRoot(async root => {
+					const project = path.join(root, "project");
+					const cwd = path.join(project, "subdir");
+					const link = path.join(project, ".agent", "rules", "check.md");
+					const secret = path.join(outside, "secret.md");
+					await mkdir(path.dirname(link), { recursive: true });
+					await mkdir(cwd);
+					await writeFile(secret, "secret");
+					await symlink(secret, link);
+					const router = createInternalRouter({ "rule://check": { sourcePath: link } });
+					await expect(
+						expandInternalUrls("cat rule://check", {
+							skills: [],
+							internalRouter: router,
+							sessionCwd: cwd,
+							sessionAgentDir: path.join(root, "agent"),
+						}),
+					).rejects.toThrow(/outside this session/);
+				});
+			} finally {
+				await rm(outside, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32" || !symlinkSupported || !canWriteUnderHome)(
+		"refuses an ancestor rule symlink that stays inside the ancestor but leaves the rule directory",
+		async () => {
+			await withGrantedHomeRoot(async root => {
+				const project = path.join(root, "project");
+				const cwd = path.join(project, "subdir");
+				const sibling = path.join(project, "other-session", "secret.md");
+				const notes = path.join(project, "notes.md");
+				await mkdir(path.dirname(sibling), { recursive: true });
+				await mkdir(cwd);
+				await writeFile(sibling, "secret");
+				await writeFile(notes, "notes");
+				for (const dirName of [".agent", ".agents"]) {
+					const rules = path.join(project, dirName, "rules");
+					await mkdir(rules, { recursive: true });
+					const toSibling = path.join(rules, "check.md");
+					const toNotes = path.join(rules, "notes.md");
+					await symlink(sibling, toSibling);
+					await symlink(notes, toNotes);
+					const router = createInternalRouter({
+						"rule://check": { sourcePath: toSibling },
+						"rule://notes": { sourcePath: toNotes },
+					});
+					const options = {
+						skills: [] as Skill[],
+						internalRouter: router,
+						sessionCwd: cwd,
+						sessionAgentDir: path.join(root, "agent"),
+					};
+					await expect(expandInternalUrls("cat rule://check", options)).rejects.toThrow(/outside this session/);
+					await expect(expandInternalUrls("cat rule://notes", options)).rejects.toThrow(/outside this session/);
+					await rm(toSibling);
+					await rm(toNotes);
+				}
+				const widened = path.join(project, "widened");
+				await mkdir(widened);
+				await writeFile(path.join(widened, "secret.md"), "widened");
+				const linkedRoot = path.join(project, ".agent", "rules");
+				await rm(linkedRoot, { recursive: true, force: true });
+				await symlink(widened, linkedRoot);
+				const widenedRule = path.join(linkedRoot, "secret.md");
+				const widenedRouter = createInternalRouter({ "rule://secret": { sourcePath: widenedRule } });
+				await expect(
+					expandInternalUrls("cat rule://secret", {
+						skills: [],
+						internalRouter: widenedRouter,
+						sessionCwd: cwd,
+						sessionAgentDir: path.join(root, "agent"),
+					}),
+				).rejects.toThrow(/outside this session/);
+			});
+		},
+	);
+
+	it("still allows a rule file at the repo root above the session directory", async () => {
+		const repo = await mkdtemp(path.join(tmpdir(), "bash-rule-repo-"));
+		try {
+			await execFileAsync("git", ["init", "-q", repo]);
+			const cwd = path.join(repo, "pkg");
+			await mkdir(cwd);
+			const sourcePath = path.join(repo, "deploy.md");
+			await writeFile(sourcePath, "repo-rule");
+			const router = createInternalRouter({ "rule://deploy": { sourcePath } });
+			await expectExpandsToSource(
+				"cat rule://deploy",
+				{
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(repo, "agent"),
+				},
+				sourcePath,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows generated rule files inside the session directory", async () => {
+		const segment = fc.stringMatching(/^[a-z][a-z0-9]{0,5}$/);
+		await fc.assert(
+			fc.asyncProperty(fc.array(segment, { minLength: 1, maxLength: 3 }), async segments => {
+				const cwd = await mkdtemp(path.join(tmpdir(), "bash-rule-prop-"));
+				try {
+					const sourcePath = path.join(cwd, ...segments, "rule.md");
+					await mkdir(path.dirname(sourcePath), { recursive: true });
+					await writeFile(sourcePath, "generated");
+					const router = createInternalRouter({ "rule://generated": { sourcePath } });
+					await expectExpandsToSource(
+						"cat rule://generated",
+						{
+							skills: [],
+							internalRouter: router,
+							sessionCwd: cwd,
+							sessionAgentDir: path.join(cwd, "agent"),
+						},
+						sourcePath,
+					);
+				} finally {
+					await rm(cwd, { recursive: true, force: true });
+				}
+			}),
+			{ seed: PROPERTY_SEED, numRuns: 64 },
+		);
+	});
+
+	it("refuses a rule file from another project", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-rule-a-"));
+		const other = await mkdtemp(path.join(tmpdir(), "bash-rule-b-"));
+		try {
+			const sourcePath = path.join(other, "deploy.md");
+			await writeFile(sourcePath, "other-rule");
+			const router = createInternalRouter({ "rule://deploy": { sourcePath } });
+			let message = "";
+			try {
+				await expandInternalUrls("printf x >> rule://deploy", {
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(cwd, "agent"),
+				});
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			expect(message).toContain("outside this session");
+			expect(message).not.toContain(path.basename(other));
+			expect(message).not.toContain(sourcePath);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(other, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a memory file from another session", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-mem-a-"));
+		const otherCwd = await mkdtemp(path.join(tmpdir(), "bash-mem-b-"));
+		const agentDir = await mkdtemp(path.join(tmpdir(), "bash-mem-agent-"));
+		try {
+			const sourcePath = path.join(memoryRootFor(agentDir, otherCwd), "memory_summary.md");
+			await mkdir(path.dirname(sourcePath), { recursive: true });
+			await writeFile(sourcePath, "other-memory");
+			const router = createInternalRouter({ "memory://root/memory_summary.md": { sourcePath } });
+			await expect(
+				expandInternalUrls("printf x >> memory://root/memory_summary.md", {
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: agentDir,
+				}),
+			).rejects.toThrow(/outside this session/);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(otherCwd, { recursive: true, force: true });
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("expands the caller memory file when the router names a foreign session file", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-mem-caller-"));
+		const otherCwd = await mkdtemp(path.join(tmpdir(), "bash-mem-foreign-"));
+		const agentDir = await mkdtemp(path.join(tmpdir(), "bash-mem-agent-"));
+		try {
+			const own = path.join(memoryRootFor(agentDir, cwd), "memory_summary.md");
+			const foreign = path.join(memoryRootFor(agentDir, otherCwd), "memory_summary.md");
+			await mkdir(path.dirname(own), { recursive: true });
+			await mkdir(path.dirname(foreign), { recursive: true });
+			await writeFile(own, "own");
+			await writeFile(foreign, "foreign");
+			const router = createInternalRouter({
+				"memory://root": { sourcePath: foreign },
+				"memory://root/": { sourcePath: foreign },
+				"memory://root/notes.md": { sourcePath: foreign },
+			});
+			const options = { skills: [], internalRouter: router, sessionCwd: cwd, sessionAgentDir: agentDir };
+			await expectExpandsToSource("cat memory://root", options, own);
+			await expectExpandsToSource("cat memory://root/", options, own);
+			const notes = path.join(memoryRootFor(agentDir, cwd), "notes.md");
+			await writeFile(notes, "notes");
+			await expectExpandsToSource("cat memory://root/notes.md", options, notes);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(otherCwd, { recursive: true, force: true });
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("expands an encoded memory namespace and a fragment or query to the caller file when the router names a foreign session file", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-mem-alias-caller-"));
+		const otherCwd = await mkdtemp(path.join(tmpdir(), "bash-mem-alias-foreign-"));
+		const agentDir = await mkdtemp(path.join(tmpdir(), "bash-mem-alias-agent-"));
+		try {
+			const own = path.join(memoryRootFor(agentDir, cwd), "memory_summary.md");
+			const foreign = path.join(memoryRootFor(agentDir, otherCwd), "memory_summary.md");
+			await mkdir(path.dirname(own), { recursive: true });
+			await mkdir(path.dirname(foreign), { recursive: true });
+			await writeFile(own, "own");
+			await writeFile(foreign, "foreign");
+			const router = createInternalRouter({
+				"memory://%72oot/": { sourcePath: foreign },
+				"memory://root/#section": { sourcePath: foreign },
+				"memory://root/?q=1": { sourcePath: foreign },
+			});
+			const options = { skills: [], internalRouter: router, sessionCwd: cwd, sessionAgentDir: agentDir };
+			await expectExpandsToSource("cat memory://%72oot/", options, own);
+			await expectExpandsToSource("cat memory://root/#section", options, own);
+			await expectExpandsToSource("cat memory://root/?q=1", options, own);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(otherCwd, { recursive: true, force: true });
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a rule file that only shares a directory prefix", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-prefix-"));
+		try {
+			const cwd = path.join(parent, "proj");
+			const sibling = path.join(parent, "proj-extra");
+			await mkdir(cwd);
+			await mkdir(sibling);
+			const sourcePath = path.join(sibling, "deploy.md");
+			await writeFile(sourcePath, "prefix");
+			const router = createInternalRouter({ "rule://deploy": { sourcePath } });
+			await expect(
+				expandInternalUrls("cat rule://deploy", {
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+					sessionAgentDir: path.join(cwd, "agent"),
+				}),
+			).rejects.toThrow(/outside this session/);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("still allows a rule and memory file in a session directory that ends with a space", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-space-ok-"));
+		try {
+			const cwd = path.join(parent, "proj ");
+			const agentDir = path.join(parent, "agent");
+			const rulePath = path.join(cwd, "own.md");
+			const memoryPath = path.join(memoryRootFor(agentDir, cwd), "MEMORY.md");
+			await mkdir(cwd);
+			await mkdir(path.dirname(memoryPath), { recursive: true });
+			await writeFile(rulePath, "own-rule");
+			await writeFile(memoryPath, "own-memory");
+			const router = createInternalRouter({
+				"rule://own": { sourcePath: rulePath },
+				"memory://own": { sourcePath: memoryPath },
+			});
+			const options = { skills: [], internalRouter: router, sessionCwd: cwd, sessionAgentDir: agentDir };
+			await expectExpandsToSource("cat rule://own", options, rulePath);
+			await expectExpandsToSource("cat memory://own", options, memoryPath);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a rule and memory file in the directory named by trimming the session directory", async () => {
+		const parent = await mkdtemp(path.join(tmpdir(), "bash-space-no-"));
+		try {
+			const cwd = path.join(parent, "proj ");
+			const trimmed = cwd.trim();
+			const agentDir = path.join(parent, "agent");
+			const rulePath = path.join(trimmed, "secret.md");
+			const memoryPath = path.join(memoryRootFor(agentDir, trimmed), "MEMORY.md");
+			await mkdir(cwd);
+			await mkdir(trimmed);
+			await mkdir(path.dirname(memoryPath), { recursive: true });
+			await writeFile(rulePath, "foreign-rule");
+			await writeFile(memoryPath, "foreign-memory");
+			const router = createInternalRouter({
+				"rule://secret": { sourcePath: rulePath },
+				"memory://secret": { sourcePath: memoryPath },
+			});
+			const options = { skills: [], internalRouter: router, sessionCwd: cwd, sessionAgentDir: agentDir };
+			await expect(expandInternalUrls("cat rule://secret", options)).rejects.toThrow(/outside this session/);
+			await expect(expandInternalUrls("cat memory://secret", options)).rejects.toThrow(/outside this session/);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32" || !symlinkSupported)(
+		"refuses a rule symlink that leaves the session",
+		async () => {
+			const cwd = await mkdtemp(path.join(tmpdir(), "bash-link-in-"));
+			const outside = await mkdtemp(path.join(tmpdir(), "bash-link-out-"));
+			try {
+				const secret = path.join(outside, "secret.md");
+				const link = path.join(cwd, "deploy.md");
+				await writeFile(secret, "secret");
+				await symlink(secret, link);
+				const router = createInternalRouter({ "rule://deploy": { sourcePath: link } });
+				await expect(
+					expandInternalUrls("cat rule://deploy", {
+						skills: [],
+						internalRouter: router,
+						sessionCwd: cwd,
+						sessionAgentDir: path.join(cwd, "agent"),
+					}),
+				).rejects.toThrow(/outside this session/);
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+				await rm(outside, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("refuses bash expansion of a rule URL when the session directory is omitted", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-omit-"));
+		try {
+			const sourcePath = path.join(cwd, "deploy.md");
+			await writeFile(sourcePath, "own");
+			const router = createInternalRouter({ "rule://deploy": { sourcePath } });
+			await expect(expandInternalUrls("cat rule://deploy", { skills: [], internalRouter: router })).rejects.toThrow(
+				/without a session directory/,
+			);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("hides foreign rule names when a bash rule URL cannot be resolved", async () => {
+		const cwd = await mkdtemp(path.join(tmpdir(), "bash-names-"));
+		try {
+			const router = {
+				canHandle: () => true,
+				resolve: async () => {
+					throw new Error("Unknown rule: missing\nAvailable: private-deploy");
+				},
+			};
+			let message = "";
+			try {
+				await expandInternalUrls("cat rule://missing", {
+					skills: [],
+					internalRouter: router,
+					sessionCwd: cwd,
+				});
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			expect(message).toContain("Unknown rule: missing");
+			expect(message).not.toContain("Available:");
+			expect(message).not.toContain("private-deploy");
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("property: rule files beside the session directory are not expanded", async () => {
+		const segment = fc.stringMatching(/^[a-z][a-z0-9]{0,5}$/);
+		await fc.assert(
+			fc.asyncProperty(segment, async name => {
+				const parent = await mkdtemp(path.join(tmpdir(), "bash-beside-"));
+				try {
+					const cwd = path.join(parent, "proj");
+					const beside = path.join(parent, `other-${name}`);
+					await mkdir(cwd);
+					await mkdir(beside);
+					const sourcePath = path.join(beside, "rule.md");
+					await writeFile(sourcePath, "beside");
+					const router = createInternalRouter({ "rule://beside": { sourcePath } });
+					await expect(
+						expandInternalUrls("cat rule://beside", {
+							skills: [],
+							internalRouter: router,
+							sessionCwd: cwd,
+							sessionAgentDir: path.join(cwd, "agent"),
+						}),
+					).rejects.toThrow(/outside this session/);
+				} finally {
+					await rm(parent, { recursive: true, force: true });
+				}
+			}),
+			{ seed: PROPERTY_SEED, numRuns: 64 },
+		);
+	});
+});
+
+function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
+	return result.content.find(part => part.type === "text")?.text ?? "";
+}
+
+function createAgentDirBashTool(cwd: string, requestedAgentDir: string, settingsAgentDir: string): BashTool {
+	const session = {
+		cwd,
+		getSessionFile: () => null,
+		getSessionId: () => "bash-agent-dir-scope",
+		getSessionAgentDir: () => requestedAgentDir,
+		skills: [],
+		settings: {
+			has(key: string) {
+				return this.get(key) !== undefined;
+			},
+			get(key: string) {
+				if (key === "bashInterceptor.enabled") return false;
+				if (key === "async.enabled") return false;
+				if (key === "bash.autoBackground.enabled") return false;
+				if (key === "bash.autoBackground.thresholdMs") return 60_000;
+				if (key === "bash.stripTrailingHeadTail") return false;
+				return undefined;
+			},
+			getBashInterceptorRules() {
+				return [];
+			},
+			getAgentDir: () => settingsAgentDir,
+			...stubBashExecutorSettings,
+		},
+	} as unknown as ToolSession;
+	return new BashTool(session);
+}
+
+describe("bash session agent directory", () => {
+	afterEach(async () => {
+		resetActiveRulesForTests();
+		await disposeAllShellSessions();
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"refuses a settings agent directory rule and accepts the requested agent directory in bash command, env, and cwd",
+		async () => {
+			const parent = await mkdtemp(path.join(tmpdir(), "bash-agent-dir-"));
+			try {
+				const project = path.join(parent, "project");
+				const settingsAgentDir = path.join(parent, "agent-a");
+				const requestedAgentDir = path.join(parent, "agent-b");
+				await mkdir(project);
+				await mkdir(settingsAgentDir);
+				await mkdir(requestedAgentDir);
+				const requestedReal = await realpath(requestedAgentDir);
+				const ruleSource = (filePath: string) => ({
+					provider: "test",
+					providerName: "test",
+					path: filePath,
+					level: "user" as const,
+				});
+				setActiveRules([
+					{
+						name: "profile-a",
+						path: settingsAgentDir,
+						content: "settings-profile",
+						_source: ruleSource(settingsAgentDir),
+					},
+					{
+						name: "profile-b",
+						path: requestedAgentDir,
+						content: "requested-profile",
+						_source: ruleSource(requestedAgentDir),
+					},
+				]);
+				const tool = createAgentDirBashTool(project, requestedAgentDir, settingsAgentDir);
+				await expect(tool.execute("call-command-a", { command: "printf '%s' rule://profile-a" })).rejects.toThrow(
+					/outside this session/,
+				);
+				await expect(
+					tool.execute("call-env-a", { command: "printf '%s' \"$FOO\"", env: { FOO: "rule://profile-a" } }),
+				).rejects.toThrow(/outside this session/);
+				await expect(tool.execute("call-cwd-a", { command: "pwd -P", cwd: "rule://profile-a" })).rejects.toThrow(
+					/outside this session/,
+				);
+				const commandResult = await tool.execute("call-command-b", { command: "printf '%s' rule://profile-b" });
+				expect(textOf(commandResult)).toContain(requestedReal);
+				const envResult = await tool.execute("call-env-b", {
+					command: "printf '%s' \"$FOO\"",
+					env: { FOO: "rule://profile-b" },
+				});
+				expect(textOf(envResult)).toContain(requestedReal);
+				const cwdResult = await tool.execute("call-cwd-b", { command: "pwd -P", cwd: "rule://profile-b" });
+				expect(textOf(cwdResult)).toContain(requestedReal);
+			} finally {
+				resetActiveRulesForTests();
+				await rm(parent, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32" || !canWriteUnderHome)(
+		"expands an ancestor project rule through bash command execution in a non-Git session",
+		async () => {
+			await withGrantedHomeRoot(async root => {
+				const project = path.join(root, "work", "project");
+				const cwd = path.join(project, "subdir");
+				const rulePath = path.join(project, ".agent", "rules", "check.md");
+				const agentDir = path.join(root, "agent");
+				await mkdir(path.dirname(rulePath), { recursive: true });
+				await mkdir(cwd);
+				await mkdir(agentDir);
+				await writeFile(rulePath, "ancestor-rule");
+				setActiveRules([
+					{
+						name: "check",
+						path: rulePath,
+						content: "ancestor-rule",
+						_source: {
+							provider: "test",
+							providerName: "test",
+							path: rulePath,
+							level: "project",
+						},
+					},
+				]);
+				try {
+					const tool = createAgentDirBashTool(cwd, agentDir, path.join(root, "settings-agent"));
+					const ruleReal = await realpath(rulePath);
+					const result = await tool.execute("call-ancestor", { command: "printf '%s' rule://check" });
+					expect(textOf(result)).toContain(ruleReal);
+					const envResult = await tool.execute("call-ancestor-env", {
+						command: "printf '%s' \"$FOO\"",
+						env: { FOO: "rule://check" },
+					});
+					expect(textOf(envResult)).toContain(ruleReal);
+					await expect(
+						tool.execute("call-ancestor-cwd", { command: "pwd -P", cwd: "rule://check" }),
+					).rejects.toThrow(/not a directory/);
+				} finally {
+					resetActiveRulesForTests();
+				}
+			});
+		},
+	);
 });
