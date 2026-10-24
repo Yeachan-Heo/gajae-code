@@ -88,7 +88,7 @@ describe("redteam: synthetic leakage under stress", () => {
 			],
 		});
 		const requests: Context[] = [];
-		const config: AgentLoopConfig = { model: mock.model, appendOnlyContext, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, appendOnlyContext, convertToLlm: identityConverter };
 		const capture = (...args: Parameters<typeof mock.stream>) => {
 			requests.push(args[1]);
 			return mock.stream(...args);
@@ -131,7 +131,7 @@ describe("redteam: synthetic leakage under stress", () => {
 		const requests: Context[] = [];
 		let steered = false;
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			getSteeringMessages: async () => {
 				if (steered) return [];
@@ -175,7 +175,7 @@ describe("redteam: one-shot recovery bound", () => {
 			],
 		});
 		const requests: Context[] = [];
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		await drain(
 			agentLoopContinue(context, config, undefined, (...args: Parameters<typeof mock.stream>) => {
@@ -217,7 +217,7 @@ describe("redteam: tool-choice integrity", () => {
 		const requests: Context[] = [];
 		const toolChoices: unknown[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			getToolChoice: () => {
 				getterCalls.push(queue.length);
@@ -261,7 +261,7 @@ describe("redteam: tool-choice integrity", () => {
 		const requests: Context[] = [];
 		const toolChoices: unknown[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			toolChoice: "required",
 		};
@@ -307,7 +307,7 @@ describe("redteam: tool execution containment", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		await drain(agentLoopContinue(context, config, undefined, mock.stream));
 
@@ -339,7 +339,7 @@ describe("redteam: append-only prefix integrity", () => {
 			],
 		});
 		const requests: Context[] = [];
-		const config: AgentLoopConfig = { model: mock.model, appendOnlyContext, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, appendOnlyContext, convertToLlm: identityConverter };
 		const capture = (...args: Parameters<typeof mock.stream>) => {
 			requests.push(args[1]);
 			return mock.stream(...args);
@@ -386,7 +386,7 @@ describe("redteam: managed fallback interaction", () => {
 		});
 		const requests: Context[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			fallbackManaged: true,
 		};
