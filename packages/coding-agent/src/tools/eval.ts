@@ -237,6 +237,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		onUpdate?: AgentToolUpdateCallback,
 		_ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
+		if (this.session?.filesystemRoot) {
+			throw new ToolError("Eval is unavailable in a confined session because its backends are not sandboxed.");
+		}
 		if (this.session && bashRestrictionBlocksEval(this.session)) {
 			throw new ToolError("Eval is unavailable while this session's bash allowlist or read-only profile is active.");
 		}

@@ -73,8 +73,19 @@ const openAuthStorages: AuthStorage[] = [];
  * never settles never runs the `catch` in {@link createSession}. The registry
  * is the only thing that can still release the handle in that case.
  */
+function closeAuthStorageForCleanup(storage: AuthStorage): void {
+	try {
+		storage.close();
+	} catch {
+		// A store another owner already closed must not hide the temp-tree removal.
+	}
+}
+
 function releaseTrackedAuthStorages(): void {
-	while (openAuthStorages.length > 0) openAuthStorages.pop()?.close();
+	while (openAuthStorages.length > 0) {
+		const storage = openAuthStorages.pop();
+		if (storage) closeAuthStorageForCleanup(storage);
+	}
 }
 
 async function createSession(
@@ -120,7 +131,7 @@ async function createSession(
 		// The caller never receives the store, so release it here instead of
 		// leaving a live handle behind for the cleanup to trip over. Closing
 		// twice is a no-op, so the registry entry can stay.
-		authStorage.close();
+		closeAuthStorageForCleanup(authStorage);
 		throw error;
 	}
 }
@@ -273,6 +284,7 @@ describe("task fork-context provider identity", () => {
 			const tempDir = tempDirs.pop();
 			if (!tempDir) continue;
 			const modelCacheClosed = closeModelCache(path.join(tempDir, "models.db"));
+			releaseTrackedAuthStorages();
 			if (!fs.existsSync(tempDir)) continue;
 			try {
 				await removeTempTree(tempDir);

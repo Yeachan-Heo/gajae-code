@@ -26,7 +26,7 @@ import {
 	invalidateFsScanAfterWrite,
 } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
-import { resolveToCwd } from "../../tools/path-utils";
+import { assertRealpathInsideActiveWorkspace, resolveToCwd } from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { ToolError } from "../../tools/tool-errors";
 import { ApplyPatchError, generateUnifiedDiffString, normalizeCreateContent } from "../diff";
@@ -657,7 +657,9 @@ export async function executePatchSingle(
 
 	enforcePlanModeWrite(session, path, { op, move: rename });
 	const resolvedPath = resolvePlanPath(session, path);
+	await assertRealpathInsideActiveWorkspace(resolvedPath);
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
+	if (resolvedRename) await assertRealpathInsideActiveWorkspace(resolvedRename);
 
 	signal?.throwIfAborted();
 	await assertEditableFile(resolvedPath, path, session.settings);

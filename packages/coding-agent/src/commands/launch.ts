@@ -143,6 +143,8 @@ export default class Index extends Command {
 		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencodego --default`,
 		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/v2-<scope>/session.jsonl`,
 		`# Use an explicit session storage directory\n  ${APP_NAME} --session-dir ./sessions`,
+		`# Confine a session to this directory and keep it out of ordinary resume\n  ${APP_NAME} --confine`,
+		`# Resume that confined session (the same flag is required)\n  ${APP_NAME} --confine --continue`,
 	];
 
 	static strict = false;

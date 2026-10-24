@@ -14,7 +14,7 @@ import type { Observation, RunResultOk, ScreenshotResult } from "./browser/tab-p
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
 import { wrapUntrustedContent } from "./fetch";
 import type { OutputMeta } from "./output-meta";
-import { resolveToCwd } from "./path-utils";
+import { assertRealpathInsideActiveWorkspace, resolveToCwd } from "./path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -151,6 +151,7 @@ async function resolveChromeProfileKind(
 ): Promise<BrowserKind> {
 	const profileDirectory = app.profile_directory ?? "Default";
 	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromeForProfile();
+	if (app.path && exe) await assertRealpathInsideActiveWorkspace(exe);
 	if (!exe) {
 		throw new ToolError(
 			'No Chrome/Chromium executable found for app.browser "chrome". Install Chrome, or pass app.path with the binary path.',
@@ -239,6 +240,19 @@ export async function isDefaultChromeUserDataDirForTest(
 	return false;
 }
 
+const CONFINED_BROWSER_PROCESS_ERROR =
+	"Spawned and connected browsers are unavailable in a confined session because those processes are not sandboxed. Use the default headless browser.";
+const UNSANDBOXED_BROWSER_ERROR =
+	"The browser process is not sandboxed in a confined session, so local-file navigation and arbitrary browser code are unavailable. Use structured actions against an http(s) page.";
+
+function isRemoteHttpUrl(value: string): boolean {
+	try {
+		const url = new URL(value.trim());
+		return url.protocol === "http:" || url.protocol === "https:";
+	} catch {
+		return false;
+	}
+}
 async function resolveBrowserKind(
 	params: BrowserParams,
 	session: ToolSession,
@@ -246,6 +260,9 @@ async function resolveBrowserKind(
 	discoveryEnv?: DiscoveryEnv,
 ): Promise<BrowserKind> {
 	const app = params.app;
+	if (session.filesystemRoot && (app?.cdp_url || app?.browser === "chrome" || app?.path)) {
+		throw new ToolError(CONFINED_BROWSER_PROCESS_ERROR);
+	}
 	if (app?.cdp_url) {
 		const cdpUrl = app.cdp_url.replace(/\/+$/, "");
 		try {
@@ -260,6 +277,7 @@ async function resolveBrowserKind(
 	}
 	if (app?.path) {
 		const exe = resolveToCwd(app.path, session.cwd);
+		await assertRealpathInsideActiveWorkspace(exe);
 		return { kind: "spawned", path: exe };
 	}
 	const headless = session.settings.get("browser.headless") as boolean;
@@ -334,6 +352,9 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
+		if (this.session.filesystemRoot && params.url !== undefined && !isRemoteHttpUrl(params.url)) {
+			throw new ToolError(UNSANDBOXED_BROWSER_ERROR);
+		}
 		const kind = await resolveBrowserKind(params, this.session, signal);
 		details.browser = kind.kind;
 
@@ -429,6 +450,9 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
+		if (this.session.filesystemRoot) {
+			throw new ToolError(UNSANDBOXED_BROWSER_ERROR);
+		}
 		if (!params.code?.trim()) {
 			throw new ToolError("Missing required parameter 'code' for action 'run'.");
 		}
@@ -469,6 +493,9 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
+		if (this.session.filesystemRoot) {
+			throw new ToolError(UNSANDBOXED_BROWSER_ERROR);
+		}
 		const steps = (params.actions ?? []) as BrowserActionStep[];
 		if (steps.length === 0) {
 			throw new ToolError("Missing required parameter 'actions' for action 'act'.");
