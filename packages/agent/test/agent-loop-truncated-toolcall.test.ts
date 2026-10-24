@@ -82,7 +82,7 @@ describe("agentLoop: truncated tool-call guard", () => {
 				{ content: ["recovered"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, fallbackManaged: true };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter, fallbackManaged: true };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop([createUserMessage("write the file")], context, config, undefined, mock.stream);
@@ -123,7 +123,7 @@ describe("agentLoop: truncated tool-call guard", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("read it")], context, config, undefined, mock.stream);
 		for await (const _ of stream) {
@@ -171,7 +171,7 @@ describe("agentLoop: reason-specific incompleteArguments guidance", () => {
 				{ content: ["recovered"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, fallbackManaged: true };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter, fallbackManaged: true };
 		const streamFn = reason === undefined ? withoutTypedReason(mock.stream) : mock.stream;
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop([createUserMessage("write the file")], context, config, undefined, streamFn);
