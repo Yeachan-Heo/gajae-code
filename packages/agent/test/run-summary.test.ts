@@ -180,8 +180,7 @@ describe("AgentRunSummary delivery", () => {
 		expect(endEvent?.telemetry?.usage.totalTokens).toBe(10);
 	});
 
-	it("emits no spans and no summary when telemetry is unset", async () => {
-		const tracer = new RecordingTracer();
+	it("emits agent_end without telemetry or coverage when telemetry is unset", async () => {
 		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
 		const config: AgentLoopConfig = {
 			model: mock.model,
@@ -197,8 +196,8 @@ describe("AgentRunSummary delivery", () => {
 			mock.stream,
 		);
 		for await (const event of stream) events.push(event);
-		expect(tracer.spans.length).toBe(0);
 		const endEvent = events.find((e): e is Extract<AgentEvent, { type: "agent_end" }> => e.type === "agent_end");
+		expect(endEvent).toBeDefined();
 		expect(endEvent?.telemetry).toBeUndefined();
 		expect(endEvent?.coverage).toBeUndefined();
 	});
