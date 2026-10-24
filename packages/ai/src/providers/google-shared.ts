@@ -34,6 +34,7 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { GoogleFunctionCallStream } from "./google-function-call-stream";
 import type {
 	Content,
 	FinishReason,
@@ -597,6 +598,8 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	let firstTokenSeen = false;
 	let providerSafetyStop = false;
+	const functionCalls = new GoogleFunctionCallStream();
+	let lastToolCall: ToolCall | undefined;
 
 	const flushCurrent = () => {
 		if (!currentBlock) return;
@@ -604,10 +607,12 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	};
 
 	for await (const chunk of googleStream) {
+		if (options?.signal?.aborted) throw new Error("Request was aborted");
 		const candidate = chunk.candidates?.[0];
 		if (candidate?.content?.parts) {
 			for (const part of candidate.content.parts) {
 				if (part.text !== undefined) {
+					lastToolCall = undefined;
 					if (!firstTokenSeen) {
 						firstTokenSeen = true;
 						onFirstToken?.();
@@ -655,22 +660,53 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 						flushCurrent();
 						currentBlock = null;
 					}
+					if (!firstTokenSeen) {
+						firstTokenSeen = true;
+						onFirstToken?.();
+					}
+					const completed = functionCalls.append(part.functionCall, part.thoughtSignature);
+					if (!completed) {
+						if (functionCalls.pending) lastToolCall = undefined;
+						else if (lastToolCall) {
+							lastToolCall.thoughtSignature = retainThoughtSignature(
+								lastToolCall.thoughtSignature,
+								part.thoughtSignature,
+							);
+						}
+						continue;
+					}
 
-					// Generate unique ID if not provided or if it's a duplicate
-					const providedId = part.functionCall.id;
-					const needsNewId = !providedId || output.content.some(b => b.type === "toolCall" && b.id === providedId);
-					const toolCallId = needsNewId ? nextToolCallId(part.functionCall.name || "tool") : providedId;
+					const providedId = completed.id;
+					const duplicateId =
+						providedId !== undefined && output.content.some(b => b.type === "toolCall" && b.id === providedId);
+					if (duplicateId && (getGeminiMajorVersion(model.id) ?? 0) >= 3) {
+						throw new Error("Invalid Google function call: duplicate call id");
+					}
+					// Preserve older models' ID collision handling, but never dispatch a
+					// streamed Gemini call twice under a freshly invented identity.
+					const toolCallId = !providedId || duplicateId ? nextToolCallId(completed.name) : providedId;
 
 					const toolCall: ToolCall = {
 						type: "toolCall",
 						id: toolCallId,
-						name: part.functionCall.name || "",
-						arguments: (part.functionCall.args ?? {}) as Record<string, any>,
-						...(part.thoughtSignature && { thoughtSignature: part.thoughtSignature }),
+						name: completed.name,
+						arguments: completed.args,
+						...(completed.thoughtSignature && { thoughtSignature: completed.thoughtSignature }),
 					};
 
+					lastToolCall = toolCall;
 					output.content.push(toolCall);
+					// JSONPath fragments are not append-only JSON text. Publish one valid delta
+					// only after structural completion; raw SSE observers still see every fragment.
 					pushToolCallEvents(toolCall, blockIndex(), output, stream);
+				} else if (part.text === undefined && part.thoughtSignature) {
+					if (functionCalls.pending) functionCalls.retainSignature(part.thoughtSignature);
+					else if (lastToolCall) {
+						lastToolCall.thoughtSignature = retainThoughtSignature(
+							lastToolCall.thoughtSignature,
+							part.thoughtSignature,
+						);
+					}
 				}
 			}
 		}
@@ -763,6 +799,8 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 		throw new Error("Request was aborted");
 	}
 
+	functionCalls.finish();
+
 	if (output.stopReason === "aborted" || output.stopReason === "error") {
 		throw new Error(output.errorMessage ?? "An unknown error occurred");
 	}
@@ -814,10 +852,12 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 
 	if (context.tools && context.tools.length > 0) {
 		const resolved = resolveToolChoice(model, options.toolChoice);
-		if (resolved.resolvedChoice) {
+		const streamArguments = (getGeminiMajorVersion(model.id) ?? 0) >= 3;
+		if (resolved.resolvedChoice || streamArguments) {
 			config.toolConfig = {
 				functionCallingConfig: {
-					mode: mapToolChoice(resolved.resolvedChoice as string),
+					mode: mapToolChoice(typeof resolved.resolvedChoice === "string" ? resolved.resolvedChoice : "auto"),
+					...(streamArguments && { streamFunctionCallArguments: true }),
 				},
 			};
 		}
@@ -952,9 +992,17 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 						reason: error.message,
 						registryKey: beforeMark.registryKey,
 					});
-					const retryParams = {
+					const streamArguments = params.config?.toolConfig?.functionCallingConfig?.streamFunctionCallArguments;
+					const retryParams: GenerateContentParameters = {
 						...params,
-						config: params.config ? { ...params.config, toolConfig: undefined } : params.config,
+						config: params.config
+							? {
+									...params.config,
+									toolConfig: streamArguments
+										? { functionCallingConfig: { mode: "AUTO", streamFunctionCallArguments: true } }
+										: undefined,
+								}
+							: params.config,
 					};
 					params = retryParams;
 					rawRequestDump = { ...rawRequestDump, body: params };
