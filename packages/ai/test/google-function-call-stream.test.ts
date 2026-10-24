@@ -85,6 +85,215 @@ beforeEach(() => clearToolChoiceIncapabilityRegistryForTests());
 
 for (const api of ["google-generative-ai", "google-vertex"] as const) {
 	describe(`${api} streamed function arguments`, () => {
+		it("replays captured todo container markers without losing nested operations", async () => {
+			const parts: Part[] = await Bun.file(
+				new URL("./fixtures/google-streamed-todo-containers.json", import.meta.url),
+			).json();
+			const { stream, requests } = openStream(
+				api,
+				createSseResponse([...parts.map(part => chunk(part)), stop]),
+				{},
+				"gemini-4-argon",
+				"v1",
+				{
+					messages: [{ role: "user", content: "update synthetic tasks", timestamp: 1 }],
+					tools: [
+						{
+							name: "todo_write",
+							description: "Update synthetic tasks",
+							parameters: { type: "object", properties: { ops: { type: "array" } } },
+						},
+					],
+				},
+			);
+			const events = await collectEvents(stream);
+			const result = await stream.result();
+			expect(result.stopReason).toBe("toolUse");
+			expect(completedCalls(events)).toEqual([
+				{
+					type: "toolCall",
+					name: "todo_write",
+					id: "eeEFgsaA",
+					arguments: {
+						ops: [
+							{
+								op: "init",
+								list: [
+									{
+										phase: "Synthetic",
+										items: ["Complete synthetic checks", "Build synthetic tables"],
+									},
+								],
+							},
+							{ op: "done", phase: "Synthetic", task: "Complete synthetic checks" },
+							{ op: "start", phase: "Synthetic", task: "Build synthetic tables" },
+						],
+					},
+				},
+			]);
+			expect(result.content).toEqual(completedCalls(events));
+			expect(events.filter(event => event.type === "toolcall_start")).toHaveLength(1);
+			expect(requests).toHaveLength(1);
+		});
+
+		it.each([
+			{
+				label: "empty root object",
+				fragments: [{ jsonPath: `\${}` }, { jsonPath: `\${}` }],
+				expected: {},
+			},
+			{
+				label: "explicit false continuation flags",
+				fragments: [
+					{ jsonPath: "$.object{}", willContinue: false },
+					{ jsonPath: "$.array[]", willContinue: false },
+					{ jsonPath: `\${}`, willContinue: false },
+				],
+				expected: { object: {}, array: [] },
+			},
+			{
+				label: "empty nested objects and arrays",
+				fragments: [
+					{ jsonPath: "$.nested.empty{}" },
+					{ jsonPath: "$.nested.items[]" },
+					{ jsonPath: "$.items[0]{}" },
+					{ jsonPath: "$.items[1][]" },
+					{ jsonPath: "$.items[]" },
+					{ jsonPath: "$.nested{}" },
+					{ jsonPath: `\${}` },
+				],
+				expected: { nested: { empty: {}, items: [] }, items: [{}, []] },
+			},
+			{
+				label: "repeated markers before and after children",
+				fragments: [
+					{ jsonPath: `\${}` },
+					{ jsonPath: "$.nested{}" },
+					{ jsonPath: "$.items[]" },
+					{ jsonPath: "$.nested.value", numberValue: 1 },
+					{ jsonPath: "$.items[0]", boolValue: true },
+					{ jsonPath: '$["nested"]{}' },
+					{ jsonPath: '$["items"][]' },
+					{ jsonPath: "$.items[]" },
+					{ jsonPath: `\${}` },
+				],
+				expected: { nested: { value: 1 }, items: [true] },
+			},
+			{
+				label: "quoted literal marker keys",
+				fragments: [
+					{ jsonPath: '$["literal[]"]', stringValue: "array suffix" },
+					{ jsonPath: "$['literal{}']", stringValue: "object suffix" },
+					{ jsonPath: '$["container[]"][]' },
+					{ jsonPath: "$['container{}']{}" },
+				],
+				expected: {
+					"literal[]": "array suffix",
+					"literal{}": "object suffix",
+					"container[]": [],
+					"container{}": {},
+				},
+			},
+			{
+				label: "maximum concrete path depth",
+				fragments: [{ jsonPath: `$${".a".repeat(128)}{}` }],
+				expected: Array.from({ length: 128 }).reduce<object>(value => ({ a: value }), {}),
+			},
+		])("accepts container markers for $label", async ({ fragments, expected }) => {
+			const { stream } = openStream(
+				api,
+				createSseResponse([chunk({ functionCall: { name: "write", partialArgs: [...fragments] } }), stop]),
+			);
+			const events = await collectEvents(stream);
+			expect((await stream.result()).stopReason).toBe("toolUse");
+			expect(completedCalls(events).map(call => call.arguments)).toEqual([expected]);
+		});
+
+		it.each(
+			[
+				[{ jsonPath: "$.a[]", stringValue: "" }],
+				[{ jsonPath: "$.a{}", numberValue: 0 }],
+				[{ jsonPath: "$.a[]", boolValue: false }],
+				[{ jsonPath: `\${}`, nullValue: null }],
+				[{ jsonPath: "$.a[]", willContinue: true }],
+				[{ jsonPath: "$[]" }],
+				[{ jsonPath: "$[0]{}" }],
+				[{ jsonPath: "$.__proto__{}" }],
+				[{ jsonPath: '$["__pro\\u0074o__"][]' }],
+				[{ jsonPath: "$.constructor{}" }],
+				[{ jsonPath: "$['prototype'][]" }],
+				[{ jsonPath: `$${".a".repeat(129)}{}` }],
+				[{ jsonPath: "$.a[][]" }],
+				[{ jsonPath: "$.a{}{}" }],
+				[{ jsonPath: "$.a[].b{}" }],
+				[{ jsonPath: "$.a[?(@.x)]{}" }],
+				[{ jsonPath: "$.a[1]{}" }],
+				[{ jsonPath: "$.a", numberValue: 1 }, { jsonPath: "$.a{}" }],
+				[{ jsonPath: "$.a", stringValue: "open", willContinue: true }, { jsonPath: "$.a[]" }],
+				[{ jsonPath: "$.a{}" }, { jsonPath: "$.a", boolValue: true }],
+				[{ jsonPath: "$.a[]" }, { jsonPath: "$.a{}" }],
+				[{ jsonPath: "$.a{}" }, { jsonPath: "$.a[]" }],
+				[{ jsonPath: "$.a[0]", numberValue: 1 }, { jsonPath: "$.a{}" }],
+				[{ jsonPath: "$.a.b", numberValue: 1 }, { jsonPath: "$.a[]" }],
+				[{ jsonPath: "$.a[]" }, { jsonPath: "$.a.b", numberValue: 1 }],
+				[{ jsonPath: "$.a{}" }, { jsonPath: "$.a[0]", numberValue: 1 }],
+			].map(fragments => ({ fragments })),
+		)("rejects invalid container fragments %j", async ({ fragments }) => {
+			const { stream } = openStream(
+				api,
+				createSseResponse([chunk({ functionCall: { name: "write", partialArgs: fragments } }), stop]),
+			);
+			const events = await collectEvents(stream);
+			expectNoDispatch(events);
+			expect((await stream.result()).content).toEqual([]);
+		});
+
+		it.each([
+			"EOF",
+			"STOP",
+			"MAX_TOKENS",
+		])("does not treat container markers as call completion at %s", async ending => {
+			const { stream } = openStream(
+				api,
+				createSseResponse([
+					chunk({
+						functionCall: {
+							name: "write",
+							partialArgs: [{ jsonPath: "$.items[]" }, { jsonPath: `\${}` }],
+							willContinue: true,
+						},
+					}),
+					...(ending === "EOF" ? [] : [{ candidates: [{ finishReason: ending }] }]),
+				]),
+			);
+			const events = await collectEvents(stream);
+			expectNoDispatch(events);
+			expect((await stream.result()).errorMessage).toContain("incomplete function call");
+		});
+
+		it("does not let container markers finish an open descendant string", async () => {
+			const { stream } = openStream(
+				api,
+				createSseResponse([
+					chunk({
+						functionCall: {
+							name: "write",
+							partialArgs: [
+								{ jsonPath: "$.items[0].value", stringValue: "open", willContinue: true },
+								{ jsonPath: "$.items[0]{}" },
+								{ jsonPath: "$.items[]" },
+								{ jsonPath: `\${}` },
+							],
+						},
+					}),
+					stop,
+				]),
+			);
+			const events = await collectEvents(stream);
+			expectNoDispatch(events);
+			expect((await stream.result()).errorMessage).toContain("incomplete argument string");
+		});
+
 		it.each([
 			{ modelId: "gemini-3.1-pro", serverId: true },
 			{ modelId: "gemini-3.1-pro", serverId: false },

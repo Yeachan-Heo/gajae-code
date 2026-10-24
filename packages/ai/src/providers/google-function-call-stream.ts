@@ -116,8 +116,23 @@ function fragmentValue(fragment: PartialArg): Primitive | undefined {
 function appendFragment(root: ArgumentNode, fragment: PartialArg): void {
 	if (!fragment || typeof fragment !== "object") invalid("invalid argument fragment");
 	checkContinuation(fragment.willContinue);
-	const path = parsePath(fragment.jsonPath);
+	if (typeof fragment.jsonPath !== "string") invalid("invalid JSONPath");
+	// Terminal container markers are not concrete path members. Quoted keys still end in a quote and ].
+	const containerKind = fragment.jsonPath.endsWith("[]")
+		? "array"
+		: fragment.jsonPath.endsWith("{}")
+			? "object"
+			: undefined;
+	const concretePath = containerKind ? fragment.jsonPath.slice(0, -2) : fragment.jsonPath;
 	const value = fragmentValue(fragment);
+	if (containerKind && (value !== undefined || fragment.willContinue === true)) {
+		invalid("container markers must be valueless and cannot continue strings");
+	}
+	if (containerKind && concretePath === "$") {
+		if (containerKind !== root.kind) invalid("arguments must be an object");
+		return;
+	}
+	const path = parsePath(concretePath);
 	if (fragment.willContinue && typeof value !== "string") invalid("only strings can continue");
 	let node = root;
 	for (let index = 0; index < path.length; index++) {
@@ -127,7 +142,10 @@ function appendFragment(root: ArgumentNode, fragment: PartialArg): void {
 		}
 		const existing: ArgumentNode | undefined = node.children.get(key);
 		if (index === path.length - 1) {
-			if (existing) {
+			if (containerKind) {
+				if (existing && existing.kind !== containerKind) invalid("inconsistent argument path types");
+				if (!existing) node.children.set(key, { kind: containerKind, children: new Map() });
+			} else if (existing) {
 				if (existing.kind !== "value" || !existing.continuing || typeof existing.value !== "string") {
 					invalid("argument overwrites a completed value");
 				}
