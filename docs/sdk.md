@@ -927,6 +927,13 @@ The result is an observation of one locked index reconciliation cut:
   lifecycle state rather than treating `unknown` as retired. Expired positive
   evidence is reported specifically as `proof_expired`.
 
+Every host start opens a new event generation no lower than the host's
+wall-clock start time in milliseconds, so a session resumed by a later process
+never reuses an earlier host's `(generation, seq)` event coordinates. Treat a
+generation as an opaque safe integer, not a counter that starts at `1`: replay
+cursors and notification publication ids recorded against one generation never
+position or deduplicate another generation's events.
+
 Proof survives Broker, Router, and consumer process restart because it is read
 from the durable session index, not Router attachment memory. Positive terminal
 proof has the session-index `maxAgeMs` lifetime (30 days by default), even when a

@@ -5,6 +5,8 @@ import { initializeExtensions } from "../../src/modes/runtime-init";
 import { createAgentSession } from "../../src/sdk";
 import { startFixtureBrokerWithLeaseForTest } from "../../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../../src/sdk/bus";
+import { SdkClient } from "../../src/sdk/client/client";
+import { SESSION_HOST_OBSERVER_CAPABILITY } from "../../src/sdk/host/host";
 import { SessionManager } from "../../src/session/session-manager";
 import {
 	cleanupFixtureRoot,
@@ -20,6 +22,12 @@ export interface ProductionSdkHost {
 	sessionId: string;
 	session: Awaited<ReturnType<typeof createAgentSession>>["session"];
 	endpointMtimeMs: number;
+	/**
+	 * The host's live endpoint/event generation. Every host start opens a fresh
+	 * generation, so fixtures that seed index or conversation authority read it
+	 * here instead of assuming the first start is generation 1.
+	 */
+	readGeneration: () => Promise<number>;
 	observed: Array<{ kind: "control" | "query"; operation: string }>;
 	dispatches: Array<{ deliverAs?: string }>;
 	triggerAsk: (
@@ -151,9 +159,26 @@ export async function startProductionSdkHost(
 					? { registered: true as const, result: authority.emitGate(spec) }
 					: { registered: false as const, reason: "authority_unavailable" as const };
 			};
+			const readGeneration = async (): Promise<number> => {
+				// Observer capability: reading the generation must not register demand.
+				const probe = new SdkClient(endpoint.url, endpoint.token, {
+					capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+					reconnectAttempts: 0,
+				});
+				await probe.connect();
+				try {
+					const replay = await probe.request({ type: "event_replay", sinceSeq: 0 });
+					if (!Number.isSafeInteger(replay.generation))
+						throw new Error("Production SDK host omitted its generation");
+					return replay.generation as number;
+				} finally {
+					await probe.close();
+				}
+			};
 			return {
 				endpoint,
 				endpointMtimeMs,
+				readGeneration,
 				sessionId: session.sessionId,
 				session,
 				observed,
