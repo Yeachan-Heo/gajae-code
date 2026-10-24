@@ -53,7 +53,7 @@ function harness(): Harness {
 		handler: { content: ["reply"] },
 	});
 	const agent = new Agent({
-		initialState: { model: mock.model, systemPrompt: ["test"], tools: [waitTool], messages: [] },
+		initialState: { model: mock, systemPrompt: ["test"], tools: [waitTool], messages: [] },
 		streamFn: mock.stream,
 	});
 	return {
