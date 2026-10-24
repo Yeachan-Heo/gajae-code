@@ -4084,6 +4084,7 @@ export const SETTINGS_SCHEMA = {
 			"synthetic",
 			"parallel",
 			"searxng",
+			"keenable",
 		] as const,
 		default: "auto",
 		ui: {
@@ -4141,6 +4142,11 @@ export const SETTINGS_SCHEMA = {
 				{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
 				{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
 				{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
+				{
+					value: "keenable",
+					label: "Keenable",
+					description: "Keyless; optional KEENABLE_API_KEY raises rate limits",
+				},
 			],
 		},
 	},
