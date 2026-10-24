@@ -17,15 +17,7 @@ function decode(value: Uint8Array): string {
 
 async function runCoreTrace(tracePath: string): Promise<TraceRecord[]> {
 	const result = Bun.spawnSync({
-		cmd: [
-			process.execPath,
-			"--preload",
-			traceLoader,
-			"-e",
-			// Access z (from zod) to trigger loading of core re-exports that use it.
-			// In Bun 1.4.4+, barrel exports don't load sub-modules until they're accessed.
-			'const m = await import("@gajae-code/ai/core"); void m.z;',
-		],
+		cmd: [process.execPath, "--preload", traceLoader, "-e", 'await import("@gajae-code/ai/core")'],
 		cwd: repoRoot,
 		env: {
 			HOME: Bun.env.HOME ?? "",
@@ -55,27 +47,14 @@ describe("core provider-free loaded edge", () => {
 		try {
 			const records = await runCoreTrace(tracePath);
 			const loadedRecords = records.filter(record => record.kind !== "source-scan");
-		
-			// Check if core.ts or any of its re-exports are loaded.
-			// In Bun 1.4.4+, the barrel export might not appear directly if Bun
-			// optimizes the import resolution. These modules must actually be loaded
-			// (not just source-scanned) to count.
-			const coreExportModules = [
-				"/packages/ai/src/core.ts",
-				"/packages/ai/src/api-registry",
-				"/packages/ai/src/model-manager",
-				"/packages/ai/src/models",
-				"/packages/ai/src/types",
-			];
-		
+			const loadedCore = loadedRecords.some(record =>
+				record.resolved.replaceAll(path.sep, "/").endsWith("/packages/ai/src/core.ts"),
+			);
 			const loadedProviders = loadedRecords.filter(record =>
 				record.resolved.replaceAll(path.sep, "/").includes("/packages/ai/src/providers/"),
 			);
 
-			// The main test is that importing @gajae-code/ai/core does NOT load any provider modules.
-			// In Bun 1.4.4+, the core modules themselves may not be loaded until their exports are
-			// accessed, which is acceptable as long as providers aren't eagerly loaded.
-			// To verify the import actually worked, we access a known export above (z from zod).
+			expect(loadedCore).toBe(true);
 			expect(loadedProviders).toEqual([]);
 		} finally {
 			await rm(tempDir, { recursive: true, force: true });
