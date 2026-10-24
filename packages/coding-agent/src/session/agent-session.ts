@@ -392,7 +392,7 @@ import {
 	type WorkflowRecoveryZeroProgressMemory,
 } from "../gjc-runtime/workflow-recovery-projection";
 import { GoalRuntime } from "../goals/runtime";
-import type { Goal, GoalModeState } from "../goals/state";
+import { normalizeGoal, type Goal, type GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import {
 	buildSkillStopOutput,
@@ -3051,6 +3051,7 @@ export class AgentSession {
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
 	#sessionIdentityChangeListeners = new Set<() => void | Promise<void>>();
+	#committedSessionSwitchListeners = new Set<() => void | Promise<void>>();
 	#eventListenerSnapshot: readonly AgentSessionEventListener[] = Object.freeze([]);
 	/** Resolution-time switches that occur before a consumer can subscribe. */
 	#pendingFallbackSwitches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
@@ -10964,6 +10965,12 @@ export class AgentSession {
 		return () => this.#sessionIdentityChangeListeners.delete(listener);
 	}
 
+	/** Fires after a different-file switch commits, including when later cleanup throws. */
+	subscribeCommittedSessionSwitch(listener: () => void | Promise<void>): () => void {
+		this.#committedSessionSwitchListeners.add(listener);
+		return () => this.#committedSessionSwitchListeners.delete(listener);
+	}
+
 	/**
 	 * Temporarily disconnect from agent events.
 	 * User listeners are preserved and will receive events again after resubscribe().
@@ -14079,6 +14086,33 @@ export class AgentSession {
 
 	setGoalModeState(state: GoalModeState | undefined): void {
 		this.#applyGoalModeState(state);
+	}
+
+	/**
+	 * The loaded session file is the mode source after a switch to a different
+	 * file. A saved goal is installed only when goal mode is enabled. A saved
+	 * plan is installed only when plan mode is enabled and tools are available.
+	 */
+	#rebindSwitchedSessionMode(sessionContext: SessionContext): void {
+		const mode = sessionContext.mode;
+		const planEligible =
+			mode === "plan" && this.settings.get("plan.enabled") && !this.isExplicitEmptyToolSelection();
+		if (planEligible) {
+			const rawPath = sessionContext.modeData?.planFilePath;
+			const planFilePath = typeof rawPath === "string" ? rawPath : "local://PLAN.md";
+			this.setPlanModeState({ enabled: true, planFilePath });
+		} else {
+			this.setPlanModeState(undefined);
+			this.#planReferenceSent = false;
+			this.#planReferencePath = "local://PLAN.md";
+		}
+
+		const savedGoal =
+			(mode === "goal" || mode === "goal_paused") && this.settings.get("goal.enabled")
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		this.setGoalModeState(savedGoal ? { enabled: mode === "goal", mode: "active", goal: savedGoal } : undefined);
+		this.#resetInjectedContextSignatures();
 	}
 
 	getWorkflowGateEmitter(): WorkflowGateEmitter | undefined {
@@ -29352,6 +29386,9 @@ export class AgentSession {
 					await exactRetirement?.commit();
 					transitionCleanupCommitted = true;
 					sessionIdentityCommitted = true;
+					// Bind plan and goal before post-commit cleanup. A cleanup failure
+					// leaves this successor active and must not keep the predecessor slots.
+					this.#rebindSwitchedSessionMode(sessionContext);
 					// A checkpoint count and entry id belong to the predecessor file.
 					// Leaving them armed lets a later rewind slice the successor and
 					// branch it from a missing entry, which falls back to the root.
@@ -29610,7 +29647,16 @@ export class AgentSession {
 				}
 			}
 			this.#endSessionTransition();
-			if (sessionIdentityCommitted) await this.notifySessionIdentityChanged();
+			if (sessionIdentityCommitted) {
+				for (const listener of [...this.#committedSessionSwitchListeners]) {
+					try {
+						await listener();
+					} catch (error) {
+						logger.warn("Committed session switch listener failed", { error: String(error) });
+					}
+				}
+				await this.notifySessionIdentityChanged();
+			}
 		}
 	}
 

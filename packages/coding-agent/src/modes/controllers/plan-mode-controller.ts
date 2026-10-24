@@ -107,7 +107,10 @@ export class PlanModeController {
 			return;
 		}
 		if (sessionContext.mode === "plan") {
-			await this.enter({ planFilePath: sessionContext.modeData?.planFilePath as string | undefined });
+			await this.enter({
+				planFilePath: sessionContext.modeData?.planFilePath as string | undefined,
+				gateLast: true,
+			});
 		} else if (sessionContext.mode === "plan_paused") {
 			this.#paused = true;
 			this.#hasEntered = true;
@@ -116,13 +119,17 @@ export class PlanModeController {
 		}
 	}
 
-	async enter(options?: { planFilePath?: string; workflow?: "parallel" | "iterative" }): Promise<void> {
+	async enter(options?: {
+		planFilePath?: string;
+		workflow?: "parallel" | "iterative";
+		gateLast?: boolean;
+	}): Promise<void> {
 		if (this.#enabled) return;
 		if (this.ctx.session.isExplicitEmptyToolSelection()) {
 			this.ctx.showWarning("Plan mode requires built-in tools and is unavailable in a --no-tools session.");
 			return;
 		}
-		if (!this.ctx.modeGate.enter("plan")) return this.ctx.showWarning("Exit goal mode first.");
+		if (!options?.gateLast && !this.ctx.modeGate.enter("plan")) return this.ctx.showWarning("Exit goal mode first.");
 		this.#paused = false;
 		const planFilePath = options?.planFilePath ?? "local://PLAN.md";
 		const previousTools = this.ctx.session.getActiveToolNames();
@@ -160,6 +167,22 @@ export class PlanModeController {
 		this.#hasEntered = true;
 		await this.#applyModel();
 		this.#updateStatus();
+		if (options?.gateLast && !this.ctx.modeGate.enter("plan")) {
+			this.ctx.session.setStandingResolveHandler?.(null);
+			this.#enabled = false;
+			this.#planFilePath = undefined;
+			this.ctx.session.setPlanModeState(undefined);
+			const previousTools = this.#previousTools;
+			this.#previousTools = undefined;
+			this.#previousMCPToolNames = undefined;
+			if (previousTools !== undefined)
+				await this.ctx.session.setActiveToolsByName([...previousTools], {
+					explicit: false,
+					persistMCPSelection: false,
+					retryOnMcpCatalogChange: true,
+				});
+			return this.ctx.showWarning("Exit goal mode first.");
+		}
 		this.ctx.sessionManager.appendModeChange("plan", { planFilePath });
 		this.ctx.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
 	}
