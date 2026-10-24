@@ -17,10 +17,14 @@
 
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getGithubCacheDbPath, logger } from "@gajae-code/utils";
+import { getGithubCacheDbPath, logger, redactCrashSecrets } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
+import type { PrDiffPayload } from "./gh";
+
+const requireGh = createRequire(import.meta.url);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Storage layer
@@ -283,12 +287,56 @@ export interface PutCachedInput<T = unknown> {
 	fetchedAt?: number;
 }
 
+/** Scrub credential-shaped text inside a value before it is JSON-encoded. */
+function scrubPersistedValue(value: unknown): unknown {
+	if (typeof value === "string") return redactCrashSecrets(value);
+	if (typeof value !== "object" || value === null) return value;
+	if (value instanceof Date) return value;
+	if (Array.isArray(value)) return value.map(scrubPersistedValue);
+	const proto = Object.getPrototypeOf(value);
+	if (proto !== Object.prototype && proto !== null) return value;
+	const out: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value)) {
+		out[redactCrashSecrets(key)] = scrubPersistedValue(child);
+	}
+	return out;
+}
+
+/**
+ * Rebuild a pull-request diff index from the scrubbed unified text.
+ * Loaded lazily: `gh.ts` imports this module.
+ */
+function persistedPrDiffPayload(payload: unknown): unknown {
+	const scrubbed = scrubPersistedValue(payload);
+	if (typeof scrubbed !== "object" || scrubbed === null || Array.isArray(scrubbed)) return scrubbed;
+	const unified = (scrubbed as { unified?: unknown }).unified;
+	if (typeof unified !== "string") return scrubbed;
+	const { parsePrUnifiedDiff } = requireGh("./gh") as {
+		parsePrUnifiedDiff: (text: string) => PrDiffPayload;
+	};
+	return parsePrUnifiedDiff(unified);
+}
+
 export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 	const db = openDb();
 	if (!db) return;
 	try {
 		const fetchedAt = input.fetchedAt ?? Date.now();
-		const payloadJson = JSON.stringify(input.payload);
+		// String values are scrubbed before JSON encoding. Encoding first glues
+		// a token to the escaped newline and the scrubber misses it. The live
+		// fetch result is not rewritten; a later hit reads this row.
+		const storedValue =
+			input.kind === "pr-diff" ? persistedPrDiffPayload(input.payload) : scrubPersistedValue(input.payload);
+		const payloadJson = JSON.stringify(storedValue);
+		const reindexedUnified =
+			input.kind === "pr-diff" &&
+			typeof storedValue === "object" &&
+			storedValue !== null &&
+			!Array.isArray(storedValue) &&
+			typeof (storedValue as { unified?: unknown }).unified === "string"
+				? (storedValue as { unified: string }).unified
+				: null;
+		const sourceUrl = input.sourceUrl ?? null;
 		db.prepare(
 			"INSERT OR REPLACE INTO github_view_cache (auth_key, repo, kind, number, include_comments, fetched_at, payload, rendered, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(
@@ -299,8 +347,8 @@ export function putCached<T = unknown>(input: PutCachedInput<T>): void {
 			input.includeComments ? 1 : 0,
 			fetchedAt,
 			payloadJson,
-			input.rendered,
-			input.sourceUrl ?? null,
+			reindexedUnified ?? redactCrashSecrets(input.rendered),
+			sourceUrl === null ? null : redactCrashSecrets(sourceUrl),
 		);
 		protectDbFiles(getGithubCacheDbPath());
 	} catch (err) {
