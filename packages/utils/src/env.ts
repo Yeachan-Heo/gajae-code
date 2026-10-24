@@ -7,9 +7,11 @@ import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 import {
+	decodeEscapedProjectLiteral,
 	parseEnvFile,
 	parseEnvFileContent,
 	parseShellEnvFile,
+	projectDeclarationIsDynamic,
 	projectEnvLayerFiles,
 	projectEnvSnapshot,
 } from "./env-file";
@@ -96,7 +98,8 @@ function loadProjectEnv(): {
 			const key = canonicalEnvKey(rawKey);
 			values[key] = value;
 			// Track dynamic provenance only for the winning declaration.
-			if (/[$`]/.test(value)) dynamic.add(key);
+			// Escaped dollars are literals, matching projectEnvSnapshot.
+			if (projectDeclarationIsDynamic(value)) dynamic.add(key);
 			else dynamic.delete(key);
 		}
 	}
@@ -127,6 +130,11 @@ function loadProjectEnv(): {
 			key,
 			expandProjectEnvValue(value, name => resolveProjectValue(canonicalEnvKey(name))),
 		);
+	}
+	// Expansion already read the raw text. Equality then uses Bun's decoded literal
+	// for a declaration that is not dynamic, including an escaped dollar.
+	for (const key of Object.keys(values)) {
+		if (!dynamic.has(key)) values[key] = decodeEscapedProjectLiteral(values[key] ?? "");
 	}
 	return { values, loadedValues: Object.fromEntries(resolved), dynamic };
 }
@@ -313,12 +321,20 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
  * It is not a project setting: foreground `gjc sdk broker run` loads dotenv
  * in-process, and a repository-controlled true value must not be treated as
  * evidence that this process is that binary.
+ * `GJC_SDK_DISABLE=1` is the operator opt-out for SDK hosting. Session startup
+ * and the harness owner read it from the process environment after this module
+ * loads, and they copy a value that is still set into the child environment.
+ * A repository `.env` must not install it. A shell export is kept unless it is
+ * the same string the project declares, or the project declaration is dynamic.
+ * A dynamic declaration is ambiguous, so a different shell value is dropped too.
+ * An escaped dollar is a literal, not a dynamic declaration.
  */
 const PROJECT_DENIED_ENV_NAMES = [
 	"NODE_TLS_REJECT_UNAUTHORIZED",
 	"GJC_HARNESS_SOCKET_DIR",
 	"GJC_HARNESS_ROOT_REGISTRY_DIR",
 	"PI_COMPILED",
+	"GJC_SDK_DISABLE",
 ] as const;
 
 // Bun may have loaded cwd/.env before JS runs. Drop a value the project declares
