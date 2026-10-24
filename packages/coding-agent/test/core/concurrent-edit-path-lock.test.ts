@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as timers from "node:timers/promises";
 import { applyPatch, type FileSystem, previewPatch } from "../../src/edit/modes/patch";
 import { withEditPathMutation } from "../../src/edit/path-mutation-lock";
 
@@ -111,29 +112,40 @@ describe("concurrent path mutation (#2900)", () => {
 
 	it("withEditPathMutation runs critical sections for one path strictly one-at-a-time", async () => {
 		const events: string[] = [];
-		await Promise.all([
-			withEditPathMutation(
-				["/tmp/gjc-edit-lock-a"],
-				async () => {
-					events.push("a-start");
-					await Bun.sleep(20);
-					events.push("a-end");
-				},
-				{ crossProcess: false },
-			),
-			withEditPathMutation(
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const first = withEditPathMutation(
+			["/tmp/gjc-edit-lock-a"],
+			async () => {
+				events.push("a-start");
+				entered.resolve();
+				await release.promise;
+				events.push("a-end");
+			},
+			{ crossProcess: false },
+		);
+		let second: Promise<void> | undefined;
+		try {
+			await Promise.race([entered.promise, first]);
+			expect(events).toEqual(["a-start"]);
+			second = withEditPathMutation(
 				["/tmp/gjc-edit-lock-a"],
 				async () => {
 					events.push("b-start");
-					await Bun.sleep(5);
 					events.push("b-end");
 				},
 				{ crossProcess: false },
-			),
-		]);
-		// Full mutual exclusion: no interleaving of start/end pairs (order of a/b is race-dependent).
-		const joined = events.join(",");
-		expect(joined === "a-start,a-end,b-start,b-end" || joined === "b-start,b-end,a-start,a-end").toBe(true);
+			);
+			// In-process acquisition has no I/O: flush ready continuations while A is explicitly held.
+			await timers.setImmediate();
+			expect(events).toEqual(["a-start"]);
+			release.resolve();
+			await Promise.all([first, second]);
+			expect(events).toEqual(["a-start", "a-end", "b-start", "b-end"]);
+		} finally {
+			release.resolve();
+			await Promise.allSettled(second ? [first, second] : [first]);
+		}
 	});
 
 	/**
