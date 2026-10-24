@@ -2042,6 +2042,7 @@ const PERMISSION_REQUIRED_TOOLS = new Set([
 	"recipe",
 	"ssh",
 	"debug",
+	"bisect",
 ]);
 
 function isShellExecutionPermissionTool(toolName: string): boolean {
@@ -2054,7 +2055,8 @@ function isExecutionPermissionTool(toolName: string): boolean {
 		toolName === "eval" ||
 		toolName === "python" ||
 		toolName === "recipe" ||
-		toolName === "debug"
+		toolName === "debug" ||
+		toolName === "bisect"
 	);
 }
 
@@ -2146,6 +2148,10 @@ function getPermissionIntent(
 	if (toolName === "recipe") {
 		const op = getStringProperty(a, "op")?.slice(0, 80);
 		return { toolName, title: op && op.length > 0 ? op : "recipe", cacheKey: toolName };
+	}
+	if (toolName === "bisect") {
+		const run = getStringProperty(a, "run")?.slice(0, 80);
+		return { toolName, title: run && run.length > 0 ? run : "bisect", cacheKey: toolName };
 	}
 	if (toolName === "delete") {
 		const p = getStringProperty(a, "path");
