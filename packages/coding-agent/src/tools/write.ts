@@ -9,7 +9,12 @@ import { stripHashlinePrefixes } from "../edit";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
-import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
+import {
+	createLspWritethrough,
+	createNoopWritethrough,
+	type FileDiagnosticsResult,
+	type WritethroughCallback,
+} from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -232,9 +237,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
+		const localProtocolOptions = session.getLocalProtocolOptions?.();
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
-			: writethroughNoop;
+			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics, localProtocolOptions })
+			: createNoopWritethrough(localProtocolOptions);
 		this.description = prompt.render(writeDescription);
 	}
 
@@ -303,7 +309,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				const { zipSync } = await loadFflate();
 				const zipBuffer = zipSync(zipEntries);
-				await writeFileAtomically(resolvedArchivePath.absolutePath, zipBuffer);
+				await writeFileAtomically(resolvedArchivePath.absolutePath, zipBuffer, {
+					localProtocolOptions: this.session.getLocalProtocolOptions?.(),
+				});
 			} catch (error) {
 				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
@@ -334,7 +342,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				const archive = new Bun.Archive(archiveEntries);
 				const archiveBytes = await archive.bytes();
-				await writeFileAtomically(resolvedArchivePath.absolutePath, archiveBytes);
+				await writeFileAtomically(resolvedArchivePath.absolutePath, archiveBytes, {
+					localProtocolOptions: this.session.getLocalProtocolOptions?.(),
+				});
 			} catch (error) {
 				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}

@@ -1141,6 +1141,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// Durable allocation failed: keep child session jsonl under local:// only.
 			// Do not advertise agent:// URIs without durable output backing.
 			const asyncLocalOptions: LocalProtocolOptions = {
+				getAgentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
 				getArtifactsDir: () => this.session.getArtifactsDir?.() ?? null,
 				isManagedDestination: session.isManagedSessionDestination,
 				getSessionId: session.getSessionId ?? (() => null),
@@ -2078,6 +2079,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		// Share the parent session's local:// root with subagents so they read/write the same scratch space
 		const localProtocolOptions: LocalProtocolOptions = {
+			getAgentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
 			getArtifactsDir: () => this.session.getArtifactsDir?.() ?? null,
 			isManagedDestination: session.isManagedSessionDestination,
 			getSessionId: session.getSessionId ?? (() => null),

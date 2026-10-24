@@ -3,6 +3,7 @@ import path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { logger, once, prompt, untilAborted } from "@gajae-code/utils";
 import type { BunFile } from "bun";
+import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
@@ -720,6 +721,8 @@ export interface WritethroughOptions {
 	enableFormat?: boolean;
 	/** Whether to get LSP diagnostics after writing */
 	enableDiagnostics?: boolean;
+	/** Local-root context owned by the session originating this write. */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Called when diagnostics arrive after the main timeout. */
 	onDeferredDiagnostics?: (diagnostics: FileDiagnosticsResult) => void;
 	/** Signal to cancel a pending deferred diagnostics fetch. */
@@ -730,6 +733,7 @@ export interface WritethroughOptions {
 type ResolvedWritethroughOptions = {
 	enableFormat: boolean;
 	enableDiagnostics: boolean;
+	localProtocolOptions?: LocalProtocolOptions;
 };
 
 /** Per-file deferred LSP diagnostics wiring for {@link WritethroughCallback}. */
@@ -758,12 +762,26 @@ export async function writethroughNoop(
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
+	return await writeNoop(dst, content, file);
+}
+
+async function writeNoop(
+	dst: string,
+	content: string,
+	file?: BunFile,
+	localProtocolOptions?: LocalProtocolOptions,
+): Promise<FileDiagnosticsResult | undefined> {
 	if (file !== undefined) {
 		await file.write(content);
 		return undefined;
 	}
-	await writeFileAtomically(dst, content);
+	await writeFileAtomically(dst, content, { localProtocolOptions });
 	return undefined;
+}
+
+/** Create the non-LSP writer with the originating session's local-root context. */
+export function createNoopWritethrough(localProtocolOptions?: LocalProtocolOptions): WritethroughCallback {
+	return async (dst, content, _signal, file) => await writeNoop(dst, content, file, localProtocolOptions);
 }
 
 interface PendingWritethrough {
@@ -782,10 +800,56 @@ interface LspWritethroughBatchState {
 	options: ResolvedWritethroughOptions;
 }
 
-const writethroughBatches = new Map<string, LspWritethroughBatchState>();
+const unscopedWritethroughBatches = new Map<string, LspWritethroughBatchState>();
+const sessionScopedWritethroughBatches = new Map<string, Map<string, LspWritethroughBatchState>>();
+const anonymousScopedWritethroughBatches = new WeakMap<LocalProtocolOptions, Map<string, LspWritethroughBatchState>>();
 
-function getOrCreateWritethroughBatch(id: string, options: ResolvedWritethroughOptions): LspWritethroughBatchState {
-	const existing = writethroughBatches.get(id);
+interface WritethroughBatchScope {
+	batches: Map<string, LspWritethroughBatchState>;
+	releaseIfEmpty(): void;
+}
+
+function writethroughBatchScope(localProtocolOptions: LocalProtocolOptions | undefined): WritethroughBatchScope {
+	if (!localProtocolOptions) {
+		return { batches: unscopedWritethroughBatches, releaseIfEmpty: () => undefined };
+	}
+	const sessionId = localProtocolOptions.getSessionId?.();
+	if (sessionId !== null && sessionId !== undefined) {
+		const agentDir = localProtocolOptions.getAgentDir?.();
+		const identity = JSON.stringify([agentDir === undefined ? null : path.resolve(agentDir), sessionId]);
+		let batches = sessionScopedWritethroughBatches.get(identity);
+		if (!batches) {
+			batches = new Map<string, LspWritethroughBatchState>();
+			sessionScopedWritethroughBatches.set(identity, batches);
+		}
+		return {
+			batches,
+			releaseIfEmpty: () => {
+				if (batches.size === 0 && sessionScopedWritethroughBatches.get(identity) === batches) {
+					sessionScopedWritethroughBatches.delete(identity);
+				}
+			},
+		};
+	}
+	let batches = anonymousScopedWritethroughBatches.get(localProtocolOptions);
+	if (!batches) {
+		batches = new Map<string, LspWritethroughBatchState>();
+		anonymousScopedWritethroughBatches.set(localProtocolOptions, batches);
+	}
+	return {
+		batches,
+		releaseIfEmpty: () => {
+			if (batches.size === 0) anonymousScopedWritethroughBatches.delete(localProtocolOptions);
+		},
+	};
+}
+
+function getOrCreateWritethroughBatch(
+	batches: Map<string, LspWritethroughBatchState>,
+	id: string,
+	options: ResolvedWritethroughOptions,
+): LspWritethroughBatchState {
+	const existing = batches.get(id);
 	if (existing) {
 		existing.options.enableFormat ||= options.enableFormat;
 		existing.options.enableDiagnostics ||= options.enableDiagnostics;
@@ -795,7 +859,7 @@ function getOrCreateWritethroughBatch(id: string, options: ResolvedWritethroughO
 		entries: new Map<string, PendingWritethrough>(),
 		options: { ...options },
 	};
-	writethroughBatches.set(id, batch);
+	batches.set(id, batch);
 	return batch;
 }
 
@@ -803,12 +867,16 @@ export async function flushLspWritethroughBatch(
 	id: string,
 	cwd: string,
 	signal?: AbortSignal,
+	localProtocolOptions?: LocalProtocolOptions,
 ): Promise<FileDiagnosticsResult | undefined> {
-	const state = writethroughBatches.get(id);
+	const scope = writethroughBatchScope(localProtocolOptions);
+	const state = scope.batches.get(id);
 	if (!state) {
+		scope.releaseIfEmpty();
 		return undefined;
 	}
-	writethroughBatches.delete(id);
+	scope.batches.delete(id);
+	scope.releaseIfEmpty();
 	return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal);
 }
 
@@ -929,7 +997,7 @@ async function runLspWritethrough(
 	const config = getConfig(cwd);
 	const servers = getServersForFile(config, dst);
 	if (servers.length === 0) {
-		return writethroughNoop(dst, content, signal, file);
+		return writeNoop(dst, content, file, options.localProtocolOptions);
 	}
 	const { lspServers, customLinterServers } = splitServers(servers);
 
@@ -938,7 +1006,7 @@ async function runLspWritethrough(
 	const writeContent = async (value: string) => {
 		try {
 			if (file !== undefined) await file.write(value);
-			else await writeFileAtomically(dst, value);
+			else await writeFileAtomically(dst, value, { localProtocolOptions: options.localProtocolOptions });
 			publishedContent = true;
 		} catch (error) {
 			if (error instanceof FileWriteNotPublishedError) {
@@ -1082,9 +1150,10 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 	const resolvedOptions: ResolvedWritethroughOptions = {
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
+		localProtocolOptions: options?.localProtocolOptions,
 	};
 	if (!resolvedOptions.enableFormat && !resolvedOptions.enableDiagnostics) {
-		return writethroughNoop;
+		return createNoopWritethrough(resolvedOptions.localProtocolOptions);
 	}
 	return async (
 		dst: string,
@@ -1107,15 +1176,17 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 			return diagnostics;
 		}
 
-		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
+		const scope = writethroughBatchScope(resolvedOptions.localProtocolOptions);
+		const state = getOrCreateWritethroughBatch(scope.batches, batch.id, resolvedOptions);
 		state.entries.set(dst, { dst, content, file });
 
 		if (!batch.flush) {
-			await writethroughNoop(dst, content, signal, file);
+			await writeNoop(dst, content, file, resolvedOptions.localProtocolOptions);
 			return undefined;
 		}
 
-		writethroughBatches.delete(batch.id);
+		scope.batches.delete(batch.id);
+		scope.releaseIfEmpty();
 		return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal, getDeferred);
 	};
 }

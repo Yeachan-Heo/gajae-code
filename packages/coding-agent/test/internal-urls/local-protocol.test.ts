@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -12,6 +13,7 @@ import {
 } from "@gajae-code/coding-agent/internal-urls";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { getLocalRootsDir } from "@gajae-code/utils";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-"));
@@ -25,7 +27,9 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 async function withLocalRoot<T>(sessionId: string, fn: (root: string) => Promise<T>): Promise<T> {
 	const root = resolveLocalRoot({ getSessionId: () => sessionId });
 	await fs.rm(root, { recursive: true, force: true });
-	await fs.mkdir(root, { recursive: true });
+	await fs.mkdir(path.dirname(root), { recursive: true, mode: 0o700 });
+	await fs.chmod(path.dirname(root), 0o700);
+	await fs.mkdir(root, { mode: 0o700 });
 
 	try {
 		return await fn(root);
@@ -90,9 +94,531 @@ it("keeps explicit local roots under artifacts while managed roots stay external
 				isManagedDestination: () => true,
 				getSessionId: () => sessionId,
 			}),
-		).toBe(path.join(os.tmpdir(), "gjc-local", sessionId));
+		).toBe(path.join(getLocalRootsDir(), sessionId));
 	});
 });
+
+it("resolves managed roots from the session's configured agent directory", async () => {
+	await withTempDir(async agentDir => {
+		const sessionId = `profile-${path.basename(agentDir)}`;
+		const options = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const expectedRoot = path.join(getLocalRootsDir(agentDir), sessionId);
+
+		expect(resolveLocalRoot(options)).toBe(expectedRoot);
+		await initializeLocalRoot(options);
+		expect(await fs.readFile(path.join(expectedRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("absent\n");
+	});
+});
+
+it("initializes a managed root when the configured temporary directory is missing", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "removed-tmp");
+		const sessionId = `missing-temp-${crypto.randomUUID()}`;
+		await fs.mkdir(temporaryRoot);
+		await fs.rm(temporaryRoot, { recursive: true });
+
+		const script = `
+import { initializeLocalRoot } from "./src/internal-urls/local-protocol.ts";
+
+const options = {
+  getAgentDir: () => process.env.GJC_CODING_AGENT_DIR,
+  getSessionId: () => ${JSON.stringify(sessionId)},
+  isManagedDestination: () => true,
+};
+console.log(await initializeLocalRoot(options));
+`;
+		const proc = Bun.spawn(["bun", "-e", script], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			env: {
+				...process.env,
+				GJC_CODING_AGENT_DIR: agentDir,
+				TMPDIR: temporaryRoot,
+				TMP: temporaryRoot,
+				TEMP: temporaryRoot,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`missing-temp local-root initialization exited ${code}\n${stdout}\n${stderr}`);
+
+		const localRoot = path.join(agentDir, "local", sessionId);
+		expect(stdout.trim()).toBe(localRoot);
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("absent\n");
+	});
+});
+
+it("keeps managed local data when temporary storage is cleaned", async () => {
+	const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-persistent-"));
+	const agentDir = path.join(sandbox, "agent");
+	const tmpDir = path.join(sandbox, "tmp");
+	const sessionId = `persistent-${crypto.randomUUID()}`;
+	await fs.mkdir(tmpDir, { recursive: true });
+	try {
+		const script = `
+import * as fs from "node:fs/promises";
+import { initializeLocalRoot, resolveLocalRoot, resolveLocalUrlToPath } from "./src/internal-urls/local-protocol.ts";
+
+const options = { getSessionId: () => ${JSON.stringify(sessionId)}, isManagedDestination: () => true };
+const root = resolveLocalRoot(options);
+await initializeLocalRoot(options);
+await fs.writeFile(resolveLocalUrlToPath("local://helper.py", options), "retained helper");
+await fs.rm(process.env.TMPDIR, { recursive: true, force: true });
+console.log(root);
+`;
+		const proc = Bun.spawn(["bun", "-e", script], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir, TMPDIR: tmpDir },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`persistent local-root probe exited ${code}\n${stdout}\n${stderr}`);
+		const root = stdout.trim();
+		expect(root).toBe(path.join(agentDir, "local", sessionId));
+		expect(await fs.readFile(path.join(root, "helper.py"), "utf8")).toBe("retained helper");
+		await expect(fs.stat(tmpDir)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await fs.rm(sandbox, { recursive: true, force: true });
+	}
+});
+
+it("migrates an existing managed root out of temporary storage", async () => {
+	const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "local-protocol-old-root-"));
+	const agentDir = path.join(sandbox, "agent");
+	const tmpDir = path.join(sandbox, "tmp");
+	const sessionId = `old-root-${crypto.randomUUID()}`;
+	await fs.mkdir(tmpDir, { recursive: true });
+	try {
+		const script = `
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { initializeLocalRoot, resolveLocalRoot, resolveLocalUrlToPath } from "./src/internal-urls/local-protocol.ts";
+
+const sessionId = ${JSON.stringify(sessionId)};
+const oldRoot = path.join(os.tmpdir(), "gjc-local", sessionId);
+await fs.mkdir(oldRoot, { recursive: true, mode: 0o700 });
+await fs.chmod(path.dirname(oldRoot), 0o700);
+await fs.chmod(oldRoot, 0o700);
+await fs.writeFile(path.join(oldRoot, "handoff.json"), "preserved handoff", { mode: 0o600 });
+await fs.writeFile(path.join(oldRoot, ".gjc-local-legacy-migrated-v1"), "verified\\n", { mode: 0o600 });
+const managedSnapshot = { rootDev: "1", rootIno: "2", entries: [] };
+let managedSourceRetired = false;
+const options = {
+  getAgentDir: () => process.env.GJC_CODING_AGENT_DIR,
+  getSessionId: () => sessionId,
+  isManagedDestination: () => true,
+  getManagedLegacyLocalMigrationSource: () => ({
+    capture: async () => ({
+      snapshot: managedSnapshot,
+      entries: [
+        { relativePath: "", kind: "directory" },
+        {
+          relativePath: "artifact-handoff.json",
+          kind: "file",
+          bytes: Buffer.from("artifact handoff"),
+          sha256: "a8b625653a58b17e51ed54aa79c0d189a1bed026b73185073dd4b18ec18e2f45",
+        },
+      ],
+    }),
+    retire: () => { managedSourceRetired = true; },
+  }),
+};
+try {
+  resolveLocalUrlToPath("local://handoff.json", {
+    ...options,
+    getManagedLegacyLocalMigrationSource: () => null,
+  });
+  throw new Error("synchronous resolution bypassed legacy migration");
+} catch (error) {
+  if (!String(error).includes("legacy migration must complete")) throw error;
+}
+await initializeLocalRoot(options);
+const root = resolveLocalRoot(options);
+if ((await fs.readFile(path.join(root, "handoff.json"), "utf8")) !== "preserved handoff") {
+  throw new Error("legacy managed root content was not preserved");
+}
+if ((await fs.readFile(path.join(root, "artifact-handoff.json"), "utf8")) !== "artifact handoff") {
+  throw new Error("artifact legacy-local content was not preserved");
+}
+if (!managedSourceRetired) throw new Error("artifact legacy-local source was not retired");
+try {
+  await fs.lstat(oldRoot);
+  throw new Error("legacy managed root was not retired");
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+}
+console.log(root);
+`;
+		const proc = Bun.spawn(["bun", "-e", script], {
+			cwd: path.resolve(import.meta.dir, "../.."),
+			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir, TMPDIR: tmpDir, TMP: tmpDir, TEMP: tmpDir },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error(`old local-root migration exited ${code}\n${stdout}\n${stderr}`);
+		const root = stdout.trim();
+		expect(root).toBe(path.join(agentDir, "local", sessionId));
+		expect(await fs.readFile(path.join(root, "handoff.json"), "utf8")).toBe("preserved handoff");
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(root, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(path.join(tmpDir, "gjc-local", sessionId))).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await fs.rm(sandbox, { recursive: true, force: true });
+	}
+});
+
+it("merges disjoint files from overlapping temporary and artifacts legacy roots", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `legacy-merge-${crypto.randomUUID()}`;
+		const previousRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(path.join(previousRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(previousRoot), 0o700);
+		await fs.chmod(previousRoot, 0o700);
+		await fs.writeFile(path.join(previousRoot, "handoffs", "from-temp.json"), "temporary handoff", {
+			mode: 0o600,
+		});
+		await fs.mkdir(path.join(artifactsLocalRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, "handoffs", "from-artifacts.json"), "artifact handoff", {
+			mode: 0o600,
+		});
+
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await initializeLocalRoot(options);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		const localRoot = resolveLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, "handoffs", "from-temp.json"), "utf8")).toBe("temporary handoff");
+		expect(await fs.readFile(path.join(localRoot, "handoffs", "from-artifacts.json"), "utf8")).toBe(
+			"artifact handoff",
+		);
+		await expect(fs.lstat(previousRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(artifactsLocalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("recovers temporary staging before migrating artifacts after temporary-root cleanup", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `legacy-staging-retry-${crypto.randomUUID()}`;
+		const previousRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const localRoot = resolveLocalRoot(options);
+		const stagingIdentity = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const interruptedStaging = path.join(path.dirname(localRoot), `.gjc-local-migration-${stagingIdentity}`);
+		await fs.mkdir(path.dirname(localRoot), { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(localRoot), 0o700);
+		await fs.mkdir(previousRoot, { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(previousRoot), 0o700);
+		await fs.chmod(previousRoot, 0o700);
+		await fs.writeFile(path.join(previousRoot, "temp-only.json"), "temporary payload", { mode: 0o600 });
+		await fs.mkdir(interruptedStaging, { mode: 0o700 });
+		await fs.writeFile(path.join(interruptedStaging, "temp-only.json"), "temporary payload", { mode: 0o600 });
+		await fs.mkdir(artifactsLocalRoot, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, "artifact-only.json"), "artifact payload", { mode: 0o600 });
+
+		// The prior process staged temporary data and then the temporary root was swept.
+		await fs.rm(previousRoot, { recursive: true });
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await initializeLocalRoot(options);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "temp-only.json"), "utf8")).toBe("temporary payload");
+		expect(await fs.readFile(path.join(localRoot, "artifact-only.json"), "utf8")).toBe("artifact payload");
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(interruptedStaging)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(artifactsLocalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("preserves literal backslashes in migrated POSIX filenames", async () => {
+	if (process.platform === "win32") return;
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const sessionId = `legacy-backslash-${crypto.randomUUID()}`;
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		const literalName = "report\\raw.json";
+		await fs.mkdir(artifactsLocalRoot, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, literalName), "literal backslash", { mode: 0o600 });
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+
+		await initializeLocalRoot(options);
+
+		const localRoot = resolveLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, literalName), "utf8")).toBe("literal backslash");
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(artifactsLocalRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("preserves conflicting files when overlapping legacy directories cannot merge", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `legacy-conflict-${crypto.randomUUID()}`;
+		const previousRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const artifactsDir = path.join(sandbox, "artifacts", sessionId);
+		const artifactsLocalRoot = path.join(artifactsDir, "local");
+		await fs.mkdir(path.join(previousRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(previousRoot), 0o700);
+		await fs.chmod(previousRoot, 0o700);
+		await fs.writeFile(path.join(previousRoot, "handoffs", "shared.json"), "temporary version", {
+			mode: 0o600,
+		});
+		await fs.mkdir(path.join(artifactsLocalRoot, "handoffs"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsLocalRoot, "handoffs", "shared.json"), "artifact version", {
+			mode: 0o600,
+		});
+
+		const options = {
+			getAgentDir: () => agentDir,
+			getArtifactsDir: () => artifactsDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await expect(initializeLocalRoot(options)).rejects.toThrow("destination is ambiguous");
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		const localRoot = resolveLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, "handoffs", "shared.json"), "utf8")).toBe("temporary version");
+		expect(await fs.readFile(path.join(artifactsLocalRoot, "handoffs", "shared.json"), "utf8")).toBe(
+			"artifact version",
+		);
+		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+});
+
+it("serializes first managed-root migration across independent processes", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `cross-process-${crypto.randomUUID()}`;
+		const legacyRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+		const legacyPayload = path.join(legacyRoot, "payloads");
+		const payloadCount = 512;
+		const payload = Buffer.alloc(64 * 1024, "x");
+		await fs.mkdir(legacyPayload, { recursive: true, mode: 0o700 });
+		await fs.chmod(path.dirname(legacyRoot), 0o700);
+		await fs.chmod(legacyRoot, 0o700);
+		for (let index = 0; index < payloadCount; index++) {
+			await fs.writeFile(path.join(legacyPayload, `item-${String(index).padStart(4, "0")}.bin`), payload, {
+				mode: 0o600,
+			});
+		}
+
+		const localRoot = path.join(agentDir, "local", sessionId);
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const stagingPayload = path.join(
+			path.dirname(localRoot),
+			`.gjc-local-migration-${stagingName}-temporary`,
+			"payloads",
+		);
+		const script = `
+import { initializeLocalRoot } from "./src/internal-urls/local-protocol.ts";
+
+const options = {
+  getAgentDir: () => process.env.GJC_CODING_AGENT_DIR,
+  getSessionId: () => ${JSON.stringify(sessionId)},
+  isManagedDestination: () => true,
+};
+console.log(await initializeLocalRoot(options));
+`;
+		const startMigration = () =>
+			Bun.spawn(["bun", "-e", script], {
+				cwd: path.resolve(import.meta.dir, "../.."),
+				env: {
+					...process.env,
+					GJC_CODING_AGENT_DIR: agentDir,
+					TMPDIR: temporaryRoot,
+					TMP: temporaryRoot,
+					TEMP: temporaryRoot,
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+
+		const first = startMigration();
+		const firstStdout = new Response(first.stdout).text();
+		const firstStderr = new Response(first.stderr).text();
+		const firstExit = first.exited;
+		const copyDeadline = Date.now() + 30_000;
+		let copiedEntries = 0;
+		while (Date.now() < copyDeadline && copiedEntries < 2) {
+			try {
+				copiedEntries = (await fs.readdir(stagingPayload)).length;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (copiedEntries < 2) await Bun.sleep(2);
+		}
+		expect(copiedEntries).toBeGreaterThanOrEqual(2);
+
+		const second = startMigration();
+		const secondStdout = new Response(second.stdout).text();
+		const secondStderr = new Response(second.stderr).text();
+		const secondExit = second.exited;
+		const [firstOutput, firstError, firstCode, secondOutput, secondError, secondCode] = await Promise.all([
+			firstStdout,
+			firstStderr,
+			firstExit,
+			secondStdout,
+			secondStderr,
+			secondExit,
+		]);
+		if (firstCode !== 0)
+			throw new Error(`first local-root migration exited ${firstCode}\n${firstOutput}\n${firstError}`);
+		if (secondCode !== 0)
+			throw new Error(`second local-root migration exited ${secondCode}\n${secondOutput}\n${secondError}`);
+
+		expect(firstOutput.trim()).toBe(localRoot);
+		expect(secondOutput.trim()).toBe(localRoot);
+		expect(await fs.readFile(path.join(localRoot, "payloads", "item-0000.bin"))).toEqual(payload);
+		expect(await fs.readFile(path.join(localRoot, "payloads", "item-0511.bin"))).toEqual(payload);
+		expect(await fs.readdir(path.join(localRoot, "payloads"))).toHaveLength(payloadCount);
+		expect(["verified\n", "cleanup_pending\n"]).toContain(
+			await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8"),
+		);
+		await expect(fs.lstat(legacyRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("recovers validated migration staging after the legacy temporary root disappears", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `staging-recovery-${crypto.randomUUID()}`;
+		const options = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const localRoot = resolveLocalRoot(options);
+		const scratchParent = path.dirname(localRoot);
+		await fs.mkdir(temporaryRoot, { recursive: true });
+		await fs.mkdir(scratchParent, { recursive: true, mode: 0o700 });
+		await fs.chmod(scratchParent, 0o700);
+		await fs.mkdir(localRoot, { mode: 0o700 });
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const staging = path.join(scratchParent, `.gjc-local-migration-${stagingName}`);
+		await fs.mkdir(staging, { mode: 0o700 });
+		await fs.writeFile(path.join(localRoot, "01-installed"), "already published", { mode: 0o600 });
+		await fs.writeFile(path.join(staging, "01-installed"), "already published", { mode: 0o600 });
+		await fs.mkdir(path.join(staging, "nested"), { mode: 0o700 });
+		await fs.writeFile(path.join(staging, "nested", "02-pending"), "still recoverable", { mode: 0o600 });
+
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await initializeLocalRoot(options);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "01-installed"), "utf8")).toBe("already published");
+		expect(await fs.readFile(path.join(localRoot, "nested", "02-pending"), "utf8")).toBe("still recoverable");
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("verified\n");
+		await expect(fs.lstat(staging)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+it("leaves conflicting source-absent migration staging untouched", async () => {
+	await withTempDir(async sandbox => {
+		const agentDir = path.join(sandbox, "agent");
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const sessionId = `staging-conflict-${crypto.randomUUID()}`;
+		const options = {
+			getAgentDir: () => agentDir,
+			getSessionId: () => sessionId,
+			isManagedDestination: () => true,
+		};
+		const localRoot = resolveLocalRoot(options);
+		const scratchParent = path.dirname(localRoot);
+		await fs.mkdir(temporaryRoot, { recursive: true });
+		await fs.mkdir(scratchParent, { recursive: true, mode: 0o700 });
+		await fs.chmod(scratchParent, 0o700);
+		await fs.mkdir(localRoot, { mode: 0o700 });
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const staging = path.join(scratchParent, `.gjc-local-migration-${stagingName}`);
+		await fs.mkdir(staging, { mode: 0o700 });
+		await fs.writeFile(path.join(localRoot, "handoff.json"), "current destination", { mode: 0o600 });
+		await fs.writeFile(path.join(staging, "handoff.json"), "recoverable staged data", { mode: 0o600 });
+
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await expect(initializeLocalRoot(options)).rejects.toThrow(
+				"Legacy local:// migration destination is ambiguous",
+			);
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "handoff.json"), "utf8")).toBe("current destination");
+		expect(await fs.readFile(path.join(staging, "handoff.json"), "utf8")).toBe("recoverable staged data");
+		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	});
+});
+
 it("migrates opaque managed legacy topology, retires exactly once, and verifies the marker", async () => {
 	const sessionId = `managed-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
@@ -164,7 +690,7 @@ it("coalesces concurrent managed migration for the same local root", async () =>
 	});
 });
 
-it("rolls back a sorted managed partial install and retries the same identity", async () => {
+it("keeps a sorted managed partial install recoverable after a destination conflict", async () => {
 	const sessionId = `managed-collision-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
 	let retired = 0;
@@ -195,7 +721,7 @@ it("rolls back a sorted managed partial install and retries the same identity", 
 			}),
 		};
 		await expect(initializeLocalRoot(options)).rejects.toThrow("destination is ambiguous");
-		await expect(fs.lstat(path.join(localRoot, "01-first"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
 		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("existing");
 		expect(retired).toBe(0);
 		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
@@ -208,6 +734,140 @@ it("rolls back a sorted managed partial install and retries the same identity", 
 		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("second");
 		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("verified\n");
 		expect(retired).toBe(1);
+	});
+});
+
+it("does not replace a concurrent destination during legacy publication", async () => {
+	for (const sourceKind of ["managed", "artifacts"] as const) {
+		await withTempDir(async sandbox => {
+			const sessionId = `publish-race-${sourceKind}-${crypto.randomUUID()}`;
+			const artifactsDir = path.join(sandbox, "artifacts");
+			const legacyPayload = Buffer.from("legacy content");
+			const destinationContent = "concurrent content";
+			const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
+			let retired = 0;
+			if (sourceKind === "artifacts") {
+				await fs.mkdir(path.join(artifactsDir, "local"), { recursive: true });
+				await fs.writeFile(path.join(artifactsDir, "local", "payload.txt"), legacyPayload);
+			}
+
+			await withLocalRoot(sessionId, async localRoot => {
+				const destination = path.join(localRoot, "payload.txt");
+				const options =
+					sourceKind === "managed"
+						? {
+								getSessionId: () => sessionId,
+								getManagedLegacyLocalMigrationSource: () => ({
+									capture: async () => ({
+										snapshot,
+										entries: [
+											{ relativePath: "", kind: "directory" as const },
+											{
+												relativePath: "payload.txt",
+												kind: "file" as const,
+												bytes: legacyPayload,
+												sha256: createHash("sha256").update(legacyPayload).digest("hex"),
+											},
+										],
+									}),
+									retire: () => retired++,
+								}),
+							}
+						: localOptions(sessionId, artifactsDir);
+				const lstat = fs.lstat.bind(fs);
+				let raced = false;
+				const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation((async (
+					target: nodeFs.PathLike,
+					options?: nodeFs.StatOptions,
+				) => {
+					if (!raced && path.resolve(String(target)) === destination) {
+						raced = true;
+						await fs.writeFile(destination, destinationContent, { flag: "wx" });
+						throw Object.assign(new Error("simulated destination race"), { code: "ENOENT" });
+					}
+					return await lstat(target, options);
+				}) as unknown as typeof fs.lstat);
+				try {
+					await expect(initializeLocalRoot(options)).rejects.toThrow("destination is ambiguous");
+				} finally {
+					lstatSpy.mockRestore();
+				}
+
+				expect(raced).toBe(true);
+				expect(await fs.readFile(destination, "utf8")).toBe(destinationContent);
+				expect(retired).toBe(0);
+				await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+				if (sourceKind === "artifacts") {
+					expect(await fs.readFile(path.join(artifactsDir, "local", "payload.txt"))).toEqual(legacyPayload);
+				}
+			});
+		});
+	}
+});
+
+it("resumes an interrupted managed migration from its retained source", async () => {
+	const sessionId = `managed-interrupted-${crypto.randomUUID()}`;
+	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
+	let retired = 0;
+	await withLocalRoot(sessionId, async localRoot => {
+		const options = {
+			getSessionId: () => sessionId,
+			getManagedLegacyLocalMigrationSource: () => ({
+				capture: async () => ({
+					snapshot,
+					entries: [
+						{ relativePath: "", kind: "directory" as const },
+						{
+							relativePath: "01-first",
+							kind: "file" as const,
+							bytes: Buffer.from("first"),
+							sha256: "a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e",
+						},
+						{
+							relativePath: "02-second",
+							kind: "file" as const,
+							bytes: Buffer.from("second"),
+							sha256: "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4",
+						},
+					],
+				}),
+				retire: () => retired++,
+			}),
+		};
+		const lstat = fs.lstat.bind(fs);
+		let interrupted = false;
+		const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation((async (
+			target: nodeFs.PathLike,
+			options?: nodeFs.StatOptions,
+		) => {
+			if (!interrupted && path.resolve(String(target)) === path.join(localRoot, "02-second")) {
+				interrupted = true;
+				throw new Error("simulated migration interruption");
+			}
+			return await lstat(target, options);
+		}) as unknown as typeof fs.lstat);
+		try {
+			await expect(initializeLocalRoot(options)).rejects.toThrow("simulated migration interruption");
+		} finally {
+			lstatSpy.mockRestore();
+		}
+
+		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
+		await expect(fs.lstat(path.join(localRoot, "02-second"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(retired).toBe(0);
+		const stagingName = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+		const interruptedStaging = path.join(path.dirname(localRoot), `.gjc-local-migration-${stagingName}`);
+		await fs.mkdir(interruptedStaging, { mode: 0o700 });
+		await fs.writeFile(path.join(interruptedStaging, "02-second"), "second", { mode: 0o600 });
+
+		await initializeLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
+		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("second");
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("verified\n");
+		expect(retired).toBe(1);
+		await expect(fs.lstat(interruptedStaging)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
 
@@ -246,6 +906,76 @@ it("fails closed for real managed payloads above the 64 MiB safe size without wr
 	});
 });
 
+it("rejects oversized pre-persistence local files before buffering them", async () => {
+	const sessionId = `managed-legacy-oversize-${crypto.randomUUID()}`;
+	await withTempDir(async sandbox => {
+		const temporaryRoot = path.join(sandbox, "tmp");
+		const legacyParent = path.join(temporaryRoot, "gjc-local");
+		const legacyRoot = path.join(legacyParent, sessionId);
+		const payload = path.join(legacyRoot, "oversized.bin");
+		await fs.mkdir(legacyRoot, { recursive: true, mode: 0o700 });
+		await fs.chmod(legacyParent, 0o700);
+		await fs.writeFile(payload, "", { mode: 0o600 });
+		await fs.truncate(payload, 64 * 1024 * 1024 + 1);
+		const temporaryDirectory = vi.spyOn(os, "tmpdir").mockReturnValue(temporaryRoot);
+		try {
+			await withLocalRoot(sessionId, async localRoot => {
+				const options = { getSessionId: () => sessionId, isManagedDestination: () => true };
+				const realOpen = fs.open.bind(fs);
+				const openedPayloads: string[] = [];
+				const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+					if (path.resolve(String(target)) === path.resolve(payload)) openedPayloads.push(String(target));
+					return realOpen(target, flags, mode);
+				});
+				try {
+					await expect(initializeLocalRoot(options)).rejects.toThrow("exceeds the safe size limit");
+					expect(openedPayloads).toEqual([]);
+					await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+						code: "ENOENT",
+					});
+				} finally {
+					open.mockRestore();
+				}
+			});
+		} finally {
+			temporaryDirectory.mockRestore();
+		}
+	});
+});
+
+it("rejects oversized artifact-local files before buffering them", async () => {
+	const sessionId = `artifacts-legacy-oversize-${crypto.randomUUID()}`;
+	await withTempDir(async artifactsDir => {
+		const legacyRoot = path.join(artifactsDir, "local");
+		const payload = path.join(legacyRoot, "oversized.bin");
+		await fs.mkdir(legacyRoot, { recursive: true });
+		await fs.writeFile(payload, "");
+		await fs.truncate(payload, 64 * 1024 * 1024 + 1);
+		await withLocalRoot(sessionId, async localRoot => {
+			const options = {
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => sessionId,
+				isManagedDestination: () => true,
+			};
+			const realOpen = fs.open.bind(fs);
+			const openedPayloads: string[] = [];
+			const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+				if (path.resolve(String(target)) === path.resolve(payload)) openedPayloads.push(String(target));
+				return realOpen(target, flags, mode);
+			});
+			try {
+				await expect(initializeLocalRoot(options)).rejects.toThrow("exceeds the safe size limit");
+				expect(openedPayloads).toEqual([]);
+				await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+					code: "ENOENT",
+				});
+			} finally {
+				open.mockRestore();
+			}
+		});
+	});
+});
+
 describe("LocalProtocolHandler", () => {
 	beforeEach(() => {
 		LocalProtocolHandler.resetOverrideForTests();
@@ -266,6 +996,7 @@ describe("LocalProtocolHandler", () => {
 			kind: "main",
 			status: "running",
 			session: {
+				getSessionAgentDir: () => "/registry-agent",
 				sessionManager: {
 					getArtifactsDir: () => "/registry-artifacts",
 					getSessionId: () => "registry-session",
@@ -279,12 +1010,14 @@ describe("LocalProtocolHandler", () => {
 
 		dispose();
 		const fallback = LocalProtocolHandler.resolveOptions();
+		expect(fallback?.getAgentDir?.()).toBe("/registry-agent");
 		expect(fallback?.getArtifactsDir?.()).toBe("/registry-artifacts");
 		expect(fallback?.getSessionId?.()).toBe("registry-session");
 	});
 
 	it("uses only live main registry sessions as the fallback", () => {
 		const session = {
+			getSessionAgentDir: () => "/registry-agent",
 			sessionManager: {
 				getArtifactsDir: () => "/registry-artifacts",
 				getSessionId: () => "registry-session",
@@ -303,6 +1036,7 @@ describe("LocalProtocolHandler", () => {
 		};
 
 		const idle = resolveForStatus("idle");
+		expect(idle?.getAgentDir?.()).toBe("/registry-agent");
 		expect(idle?.getArtifactsDir?.()).toBe("/registry-artifacts");
 		expect(idle?.getSessionId?.()).toBe("registry-session");
 		expect(resolveForStatus("completed")).toBeUndefined();
@@ -352,7 +1086,7 @@ describe("LocalProtocolHandler", () => {
 				LocalProtocolHandler.setOverride(localOptions(sessionId, artifactsDir));
 				const resource = await InternalUrlRouter.instance().resolve("local://");
 
-				expect(localRoot).toBe(path.join(os.tmpdir(), "gjc-local", sessionId));
+				expect(localRoot).toBe(path.join(getLocalRootsDir(), sessionId));
 				expect(resource.sourcePath).toBe(await fs.realpath(localRoot));
 				expect(resource.content).toContain("handoff.json");
 				expect(resource.content).toContain("legacy.json");
@@ -506,6 +1240,9 @@ describe("LocalProtocolHandler", () => {
 				LocalProtocolHandler.setOverride(localOptions(sessionId, path.join(tempDir, "artifacts")));
 				const router = InternalUrlRouter.instance();
 				const listing = await router.resolve("local://");
+				expect(listing.content).toContain(
+					"Keep files you reuse across turns here or in the project tree, not in /tmp",
+				);
 				expect(listing.content).toContain("[report%3Araw.txt](local://report%253Araw.txt)");
 				expect(listing.content).toContain("[report:raw.txt](local://report%3Araw.txt)");
 				expect(listing.content).toContain("[report).txt](local://report%29.txt)");
@@ -598,15 +1335,21 @@ describe("LocalProtocolHandler", () => {
 	});
 
 	it("resolves a stable external path before initialization", async () => {
+		const sessionId = `session/fallback-${crypto.randomUUID()}`;
 		const options = {
-			getSessionId: () => "session/fallback",
+			getSessionId: () => sessionId,
 			getArtifactsDir: () => null,
 		};
 		const root = resolveLocalRoot(options);
-		expect(root).toBe(path.join(os.tmpdir(), "gjc-local", "session_fallback"));
-		expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
-		await initializeLocalRoot(options);
-		expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+		const safeSessionId = sessionId.replaceAll("/", "_");
+		try {
+			expect(root).toBe(path.join(getLocalRootsDir(), safeSessionId));
+			expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+			await initializeLocalRoot(options);
+			expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("resolves against a cleanup_pending root the async gate already settled", async () => {
@@ -861,7 +1604,13 @@ describe("LocalProtocolHandler", () => {
 		try {
 			const proc = Bun.spawn(["bun", "-e", PARENT_WRITABLE_SCRIPT], {
 				cwd: packageRoot,
-				env: { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp },
+				env: {
+					...process.env,
+					GJC_CODING_AGENT_DIR: path.join(tmp, "agent"),
+					TMPDIR: tmp,
+					TMP: tmp,
+					TEMP: tmp,
+				},
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -938,12 +1687,12 @@ describe("LocalProtocolHandler", () => {
 
 const PARENT_WRITABLE_SCRIPT = `
 import { LocalProtocolHandler, resolveLocalUrlToPath } from "./src/internal-urls/local-protocol.ts";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const sessionId = "parent-open";
-const root = path.join(os.tmpdir(), "gjc-local", sessionId);
+const root = path.join(getLocalRootsDir(), sessionId);
 const parent = path.dirname(root);
 await fs.mkdir(parent, { recursive: true });
 await fs.chmod(parent, 0o777);

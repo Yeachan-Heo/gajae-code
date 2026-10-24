@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { getLocalRootsDir } from "@gajae-code/utils";
 import { getDefault } from "../src/config/settings-schema";
 import { collectEmptyDeleteReceipts, runEmptyDeleteGc } from "../src/gjc-runtime/empty-delete-gc";
 import {
@@ -27,8 +28,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Every test runs against a private state root. `GJC_CODING_AGENT_DIR` pins the
- * agent dir, `GJC_HARNESS_ROOT_REGISTRY_DIR` pins the harness registry and
- * `TMPDIR` pins the `local://` root parent, so nothing here can reach ~/.gjc.
+ * agent dir, `GJC_HARNESS_ROOT_REGISTRY_DIR` pins the harness registry, and the
+ * local-root scan uses that isolated agent dir, so nothing here can reach ~/.gjc.
  */
 interface TestRoot {
 	root: string;
@@ -56,7 +57,7 @@ async function makeTestRoot(): Promise<TestRoot> {
 		env: {
 			GJC_CODING_AGENT_DIR: agentDir,
 			GJC_HARNESS_ROOT_REGISTRY_DIR: path.join(root, "harness-roots"),
-			TMPDIR: path.join(root, "tmp"),
+			[process.platform === "win32" ? "TEMP" : "TMPDIR"]: path.join(root, "tmp"),
 		},
 	};
 }
@@ -309,6 +310,42 @@ describe("gjc gc --disk --prune (sessions)", () => {
 			expect(reasonById(disk, "sessions").get("hosted-session")).toBe("keep:referenced_by_live_surface");
 			expect(await Bun.file(hosted).exists()).toBe(true);
 			expect(disk.surfaces.sessions.reclaimed).toBe(0);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps an unopened legacy local-root session until its temp root disappears", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const sessionId = "unopened-legacy-session";
+			const stale = await writeSession(fixture, "repo-a", sessionId, { ageDays: 90 });
+			await writeSession(fixture, "repo-a", "recent-session", { ageDays: 1 });
+			const artifacts = await writeArtifacts(
+				fixture,
+				"repo-a",
+				sessionId,
+				{ "1.bash.log": "legacy session artifact" },
+				90,
+			);
+			const temporaryRoot = fixture.env.TMPDIR ?? fixture.env.TEMP ?? fixture.env.TMP ?? os.tmpdir();
+			const legacyRoot = path.join(temporaryRoot, "gjc-local", sessionId);
+			await fsp.mkdir(legacyRoot, { recursive: true });
+			await Bun.write(path.join(legacyRoot, "handoff.json"), "unmigrated local data");
+
+			const beforeMigration = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+			expect(reasonById(beforeMigration, "sessions").get(sessionId)).toBe("keep:referenced_by_live_surface");
+			expect(reasonById(beforeMigration, "artifacts").get(`${sessionId}/1.bash.log`)).toBe(
+				"keep:referenced_by_live_surface",
+			);
+			expect(await Bun.file(stale).exists()).toBe(true);
+			expect(await Bun.file(path.join(artifacts, "1.bash.log")).exists()).toBe(true);
+
+			await fsp.rm(legacyRoot, { recursive: true, force: true });
+			const afterSourceGone = requireDisk(await runDisk(fixture, ["--disk", "--json"]));
+			expect(reasonById(afterSourceGone, "sessions").get(sessionId)).toBe("would_reclaim:older_than_max_age(30d)");
+			expect(await Bun.file(stale).exists()).toBe(true);
+			expect(await Bun.file(path.join(artifacts, "1.bash.log")).exists()).toBe(true);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
@@ -1775,7 +1812,7 @@ describe("gjc gc --disk (session tool artifacts)", () => {
 
 	test("reclaims nothing and names the reason when the live-surface scan is incomplete", async () => {
 		const fixture = await makeTestRoot();
-		const localRoots = path.join(fixture.env.TMPDIR!, "gjc-local");
+		const localRoots = getLocalRootsDir(fixture.agentDir);
 		try {
 			await writeSession(fixture, "repo-a", "worked-session", { ageDays: 10 });
 			await writeSession(fixture, "repo-a", "newest-session", { ageDays: 0 });

@@ -18026,9 +18026,14 @@ export class SessionManager {
 						throw error;
 					}
 				}
-				let totalBytes = 0;
-				for (const entry of snapshot.entries) if (entry.kind === "file") totalBytes += Number(entry.size);
-				if (totalBytes > 64 * 1024 * 1024) throw new Error("Legacy local:// migration exceeds the safe size limit");
+				let totalBytes = 0n;
+				for (const entry of snapshot.entries) {
+					if (entry.kind !== "file") continue;
+					totalBytes += BigInt(entry.size);
+					if (totalBytes > 64n * 1024n * 1024n) {
+						throw new Error("Legacy local:// migration exceeds the safe size limit");
+					}
+				}
 				const entries = snapshot.entries.map(entry => {
 					if (entry.kind === "directory") return { relativePath: entry.relativePath, kind: "directory" as const };
 					const captured = store.readExpected(path.posix.join(legacyLocalRoot, entry.relativePath));

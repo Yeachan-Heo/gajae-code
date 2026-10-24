@@ -653,6 +653,7 @@ describe("task no-session output refs", () => {
 			if (!targetFile) throw new Error("Expected managed target session file");
 			const targetSessionId = target.getSessionId();
 			const targetLocalRoot = internalUrls.resolveLocalRoot({
+				getAgentDir: () => agentDir,
 				isManagedDestination: () => true,
 				getSessionId: () => targetSessionId,
 			});
@@ -704,6 +705,7 @@ describe("task no-session output refs", () => {
 			expect(await pathExists(fallbackRoot)).toBe(false);
 			expect(owner.isArtifactManagerAuthorized(fallbackManager)).toBe(false);
 			const localPath = internalUrls.resolveLocalUrlToPath("local://legacy.txt", {
+				getAgentDir: () => agentDir,
 				getArtifactsDir: () => owner.getArtifactsDir(),
 				isManagedDestination: () => owner.isManagedDestination(),
 				getManagedLegacyLocalMigrationSource: () => owner.getManagedLegacyLocalMigrationSource(),

@@ -284,6 +284,17 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("Never spend an extended turn repeatedly trying to ingest the same blocked video");
 	});
 
+	test("system-prompt directs reusable files to persistent storage", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, baseRenderContext);
+
+		expect(rendered).toContain("<persistence>");
+		expect(rendered).toContain("prefer the project tree for project files or `local://` for session-scoped work");
+		expect(rendered).toContain("Do not keep the only copy of reusable scripts or data in `/tmp`");
+		expect(rendered).toContain("Use `/tmp` only for disposable scratch files");
+	});
+
 	test("system-prompt distinguishes informational questions from explicit implementation requests", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
 		const template = await Bun.file(templatePath).text();

@@ -213,6 +213,11 @@ For image understanding, call `{{toolRefs.read}}` on the image path; the image i
 - Never spend an extended turn repeatedly trying to ingest the same blocked video without producing an intermediate deliverable or asking for missing evidence.
 </media-ingestion>
 
+<persistence>
+- Keep files needed across turns or restarts in persistent storage: prefer the project tree for project files or `local://` for session-scoped work.
+- Do not keep the only copy of reusable scripts or data in `/tmp`; it may be cleared on reboot. Use `/tmp` only for disposable scratch files.
+</persistence>
+
 <before-editing>
 - Reuse existing patterns; parallel conventions are prohibited.
 {{#has tools "lsp"}}- Run `{{toolRefs.lsp}} references` before modifying exported symbols.{{/has}}

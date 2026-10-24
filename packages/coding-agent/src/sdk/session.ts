@@ -663,7 +663,7 @@ export interface CreateAgentSessionOptions {
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
 
-	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
+	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's agent directory, artifacts dir, and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
 
 	/** Settings instance. Default: a scope-local Settings.loadForScope({ cwd, agentDir }). */
@@ -2938,6 +2938,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		};
 
+		const getArtifactsDir = () => sessionManager.getArtifactsDir();
+		const getLocalProtocolOptions = (): LocalProtocolOptions =>
+			options.localProtocolOptions ?? {
+				getAgentDir: () => session?.getSessionAgentDir() ?? options.agentDir ?? settings.getAgentDir(),
+				getArtifactsDir,
+				isManagedDestination: () => sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => sessionManager.getSessionId(),
+				getCredentialSessionId: () => credentialSessionId,
+			};
+
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
@@ -3371,6 +3382,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			mcpConfigPath: explicitMcpConfigPath,
 			settings,
+			getLocalProtocolOptions,
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
@@ -3384,14 +3396,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// caller's own `sessionManager.getArtifactsDir()` plus, when this session
 		// adopted a shared `ArtifactManager` (subagent tree membership),
 		// `getAuthorizedArtifactsDirs` below. There is no registry-wide lookup.
-		const getArtifactsDir = () => sessionManager.getArtifactsDir();
-		const localProtocolOptions = options.localProtocolOptions ?? {
-			getArtifactsDir,
-			isManagedDestination: () => sessionManager.isManagedDestination(),
-			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
-			getSessionId: () => sessionManager.getSessionId(),
-			getCredentialSessionId: () => credentialSessionId,
-		};
+		const localProtocolOptions = getLocalProtocolOptions();
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);

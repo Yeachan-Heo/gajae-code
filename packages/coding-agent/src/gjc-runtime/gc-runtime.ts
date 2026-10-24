@@ -21,6 +21,7 @@ import { exactRemoveDirectoryTree, exactUnlink, snapshotDirectoryTree } from "@g
 import {
 	getAgentDir,
 	getBlobsDir,
+	getLocalRootsDir,
 	getSessionsDir,
 	isEnoent,
 	loadedProjectEnvSnapshot,
@@ -142,6 +143,7 @@ export interface GcContext {
 	force: boolean;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
+	agentDir?: string;
 }
 
 /**
@@ -676,13 +678,13 @@ export async function runGjcGcCommand(
 		}
 	}
 	const resolvedAdapters = adapters ?? (await defaultGcAdapters());
-	const ctx: GcContext = { probe: gcPidProbe, force: parsed.prune, env, cwd };
+	const agentDir = resolveGcAgentDir(env, loadedProjectEnv);
+	const ctx: GcContext = { probe: gcPidProbe, force: parsed.prune, env, cwd, agentDir };
 	// A failed explicit empty-delete discovery or cleanup is a safety gate: report
 	// ordinary candidates, but never perform their destructive prune in that run.
 	const ordinaryPrune = parsed.prune && (emptyDeleteReceipts?.errors.length ?? 0) === 0;
 	const report = await collectGcReport(resolvedAdapters, ctx, ordinaryPrune);
 	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
-	const agentDir = resolveGcAgentDir(env, loadedProjectEnv);
 	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, agentDir);
 	if (parsed.disk) {
 		report.disk = await collectGcDiskReport({
@@ -1119,11 +1121,25 @@ async function collectGcSessionReferences(agentDir: string, env: NodeJS.ProcessE
 	}
 
 	// 3. `local://` session roots: one directory per session id.
-	const localRoots = path.join(env.TMPDIR?.trim() || os.tmpdir(), "gjc-local");
+	const localRoots = getLocalRootsDir(agentDir);
 	try {
 		for (const name of await fsp.readdir(localRoots)) ids.add(name);
 	} catch (error) {
 		if (!isEnoent(error)) incomplete("local_root_parent_unreadable");
+	}
+
+	// Legacy managed local roots are migrated lazily when their session is opened.
+	// Keep the session referenced while its old temp root exists so disk GC cannot
+	// retire an unopened session before that migration has a chance to run.
+	const temporaryRoot =
+		process.platform === "win32"
+			? env.TEMP || env.TMP || os.tmpdir()
+			: env.TMPDIR || env.TMP || env.TEMP || os.tmpdir();
+	const legacyLocalRoots = path.join(temporaryRoot, "gjc-local");
+	try {
+		for (const name of await fsp.readdir(legacyLocalRoots)) ids.add(name);
+	} catch (error) {
+		if (!isEnoent(error)) incomplete("legacy_local_root_parent_unreadable");
 	}
 
 	return { ids, complete, notes };

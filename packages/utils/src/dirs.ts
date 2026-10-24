@@ -942,6 +942,11 @@ export function getAgentModulesDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "modules");
 }
 
+/** Get the per-user session-local roots directory under the agent state category. */
+export function getLocalRootsDir(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "local", "state");
+}
+
 /** Get the memories directory (~/.gjc/agent/memories). */
 export function getMemoriesDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "memories", "state");

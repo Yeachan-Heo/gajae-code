@@ -1,11 +1,12 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
-import { isEnoent } from "@gajae-code/utils";
+import { getLocalRootsDir, isEnoent } from "@gajae-code/utils";
+import { withFileLock } from "../config/file-lock";
 import { AgentRegistry } from "../registry/agent-registry";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
@@ -13,7 +14,7 @@ import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
 type NativeLocalBindings = Pick<
 	typeof import("@gajae-code/natives"),
-	"exactRemoveDirectoryTree" | "snapshotDirectoryTree"
+	"exactRemoveDirectoryTree" | "renameNoReplacePathAsync" | "snapshotDirectoryTree"
 >;
 
 let nativeLocalBindings: NativeLocalBindings | undefined;
@@ -42,6 +43,8 @@ export interface ManagedLegacyLocalMigrationSource {
 }
 
 export interface LocalProtocolOptions {
+	/** Agent-state directory for this session's profile-scoped managed local root. */
+	getAgentDir?: () => string | undefined;
 	getArtifactsDir?: () => string | null;
 	isManagedDestination?: () => boolean;
 	getManagedLegacyLocalMigrationSource?: () => ManagedLegacyLocalMigrationSource | null;
@@ -124,7 +127,8 @@ async function buildListing(url: InternalUrl, localRoot: string): Promise<Intern
 			: files.map(file => `- [${localListingLabel(file)}](local://${localListingHref(file)})`).join("\n");
 	const content =
 		`# Local\n\n` +
-		`Session-scoped scratch space for large intermediate data, subagent handoffs, and reusable planning artifacts.\n\n` +
+		`Persistent session-scoped storage for large intermediate data, subagent handoffs, and reusable planning artifacts. ` +
+		`Keep files you reuse across turns here or in the project tree, not in /tmp; /tmp may be cleared on reboot.\n\n` +
 		`Root: ${localRoot}\n\n` +
 		`${files.length} file${files.length === 1 ? "" : "s"} available:\n\n` +
 		`${listing}\n`;
@@ -284,6 +288,8 @@ function isSettledRecreatedManagedRoot(localRoot: string, rootStat: DirectoryIde
 
 const LEGACY_MIGRATION_MARKER = ".gjc-local-legacy-migrated-v1";
 const MAX_LEGACY_LOCAL_BYTES = 64 * 1024 * 1024;
+const LEGACY_MIGRATION_STAGING_SOURCES = ["temporary", "artifacts"] as const;
+type LegacyMigrationStagingSource = (typeof LEGACY_MIGRATION_STAGING_SOURCES)[number];
 
 type LegacyMigrationState = "complete" | "cleanup_pending";
 
@@ -342,9 +348,16 @@ async function canonicalLegacyRoot(artifactsDir: string): Promise<CanonicalLegac
 	return { root: canonicalRoot, identity: lexicalIdentity };
 }
 
-async function snapshotRegularFile(filePath: string, relativePath: string): Promise<LegacyEntrySnapshot> {
+async function snapshotRegularFile(
+	filePath: string,
+	relativePath: string,
+	options: { maxBytes: bigint; sizeLimitError?: string },
+): Promise<LegacyEntrySnapshot> {
 	const before = await fs.lstat(filePath, { bigint: true });
 	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Unsafe legacy local:// migration source");
+	if (before.size > options.maxBytes) {
+		throw new Error(options.sizeLimitError ?? "Legacy local:// migration exceeds the safe size limit");
+	}
 	const flags = fsSync.constants.O_RDONLY | (process.platform === "win32" ? 0 : (fsSync.constants.O_NOFOLLOW ?? 0));
 	const handle = await fs.open(filePath, flags);
 	try {
@@ -352,7 +365,13 @@ async function snapshotRegularFile(filePath: string, relativePath: string): Prom
 		const identity = { relativePath, dev: before.dev, ino: before.ino, size: before.size };
 		if (!opened.isFile() || !matchesSnapshot(opened, identity))
 			throw new Error("Legacy local:// migration source changed during capture");
-		const bytes = await handle.readFile();
+		const bytes = Buffer.alloc(Number(before.size));
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const { bytesRead } = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
+			if (bytesRead === 0) throw new Error("Legacy local:// migration source changed during capture");
+			offset += bytesRead;
+		}
 		const after = await fs.lstat(filePath, { bigint: true });
 		if (!matchesSnapshot(after, identity)) throw new Error("Legacy local:// migration source changed during capture");
 		return { ...identity, digest: createHash("sha256").update(bytes).digest("hex"), bytes };
@@ -395,7 +414,9 @@ async function captureLegacyManifest(
 			if (entry.name === LEGACY_MIGRATION_MARKER) throw new Error("Unsafe legacy local:// migration source");
 			if (entry.isDirectory()) await captureDirectory(entryPath, entryRelativePath);
 			else {
-				const file = await snapshotRegularFile(entryPath, entryRelativePath);
+				const file = await snapshotRegularFile(entryPath, entryRelativePath, {
+					maxBytes: BigInt(MAX_LEGACY_LOCAL_BYTES) - copiedBytes,
+				});
 				copiedBytes += file.size;
 				if (copiedBytes > BigInt(MAX_LEGACY_LOCAL_BYTES))
 					throw new Error("Legacy local:// migration exceeds the safe size limit");
@@ -426,7 +447,10 @@ async function copyLegacyManifest(
 			await fs.mkdir(to, { mode: 0o700 });
 			continue;
 		}
-		const captured = await snapshotRegularFile(from, entry.relativePath);
+		const captured = await snapshotRegularFile(from, entry.relativePath, {
+			maxBytes: entry.size,
+			sizeLimitError: "Legacy local:// migration source changed during capture",
+		});
 		if (captured.digest !== entry.digest || !matchesSnapshot(captured, entry))
 			throw new Error("Legacy local:// migration source changed during capture");
 		if (entry.bytes === undefined) throw new Error("Legacy local:// migration snapshot is incomplete");
@@ -435,6 +459,345 @@ async function copyLegacyManifest(
 		if (createHash("sha256").update(copied).digest("hex") !== entry.digest)
 			throw new Error("Legacy local:// migration destination verification failed");
 	}
+}
+
+interface MigrationContentEntry {
+	readonly relativePath: string;
+	readonly kind: "directory" | "file";
+	readonly size?: bigint;
+	readonly sha256?: string;
+}
+
+type MigrationStagingEntry = NativeDirectoryTreeSnapshot["entries"][number];
+
+function sameMigrationContent(
+	expected: readonly MigrationContentEntry[],
+	actual: readonly MigrationContentEntry[],
+): boolean {
+	if (expected.length !== actual.length) return false;
+	const byPath = (left: MigrationContentEntry, right: MigrationContentEntry) =>
+		left.relativePath.localeCompare(right.relativePath);
+	const orderedExpected = [...expected].sort(byPath);
+	const orderedActual = [...actual].sort(byPath);
+	return orderedExpected.every((entry, index) => {
+		const observed = orderedActual[index];
+		if (!observed || entry.relativePath !== observed.relativePath || entry.kind !== observed.kind) return false;
+		return entry.kind === "directory" || (entry.size === observed.size && entry.sha256 === observed.sha256);
+	});
+}
+
+function relativeToMigrationTop(relativePath: string, top: string): string {
+	return relativePath === top ? "" : relativePath.slice(top.length + 1).replaceAll(path.sep, "/");
+}
+
+function legacyContentForTop(manifest: readonly LegacyEntrySnapshot[], top: string): MigrationContentEntry[] {
+	return manifest
+		.filter(entry => entry.relativePath === top || entry.relativePath.startsWith(`${top}${path.sep}`))
+		.map(entry => ({
+			relativePath: relativeToMigrationTop(entry.relativePath, top),
+			kind: entry.digest === undefined ? "directory" : "file",
+			...(entry.digest === undefined ? {} : { size: entry.size, sha256: entry.digest }),
+		}));
+}
+
+function managedContentForTop(
+	entries: readonly ManagedLegacyLocalMigrationEntry[],
+	top: string,
+): MigrationContentEntry[] {
+	return entries
+		.filter(entry => entry.relativePath === top || entry.relativePath.startsWith(`${top}/`))
+		.map(entry => ({
+			relativePath: relativeToMigrationTop(entry.relativePath, top),
+			kind: entry.kind,
+			...(entry.kind === "file" ? { size: BigInt(entry.bytes?.byteLength ?? 0), sha256: entry.sha256 } : {}),
+		}));
+}
+
+function stagingContentForTop(entries: readonly MigrationContentEntry[], top: string): MigrationContentEntry[] {
+	return entries
+		.filter(entry => entry.relativePath === top || entry.relativePath.startsWith(`${top}/`))
+		.map(entry => ({
+			relativePath: relativeToMigrationTop(entry.relativePath, top),
+			kind: entry.kind,
+			...(entry.kind === "file" ? { size: entry.size, sha256: entry.sha256 } : {}),
+		}));
+}
+
+function migrationContentContains(
+	expected: readonly MigrationContentEntry[],
+	actual: readonly MigrationContentEntry[],
+): boolean {
+	const actualByPath = new Map(actual.map(entry => [entry.relativePath, entry]));
+	return expected.every(entry => {
+		const observed = actualByPath.get(entry.relativePath);
+		if (!observed || entry.kind !== observed.kind) return false;
+		return entry.kind === "directory" || (entry.size === observed.size && entry.sha256 === observed.sha256);
+	});
+}
+
+function destinationDirectoryContent(destination: string): MigrationContentEntry[] {
+	const captured = nativeLocal().snapshotDirectoryTree(destination);
+	if (!captured.ok || !captured.snapshot) throw new Error("Unsafe local:// migration destination");
+	return captured.snapshot.entries.map(entry => {
+		if (entry.kind !== "directory" && entry.kind !== "file") {
+			throw new Error("Unsafe local:// migration destination");
+		}
+		return {
+			relativePath: entry.relativePath,
+			kind: entry.kind,
+			...(entry.kind === "file" ? { size: BigInt(entry.size), sha256: entry.sha256 } : {}),
+		};
+	});
+}
+
+async function mergeStagedMigrationDirectory(
+	stagedEntry: string,
+	destination: string,
+	expected: readonly MigrationContentEntry[],
+): Promise<void> {
+	if (expected[0]?.kind !== "directory") {
+		throw new Error("Legacy local:// migration destination is ambiguous");
+	}
+	if (migrationContentContains(expected, destinationDirectoryContent(destination))) return;
+
+	const entries = expected
+		.filter(entry => entry.relativePath !== "")
+		.toSorted((left, right) => {
+			const depthDifference = left.relativePath.split("/").length - right.relativePath.split("/").length;
+			return depthDifference || left.relativePath.localeCompare(right.relativePath);
+		});
+	for (const entry of entries) {
+		const target = path.join(destination, entry.relativePath);
+		if (entry.kind === "directory") {
+			try {
+				await fs.mkdir(target, { mode: 0o700 });
+			} catch (error) {
+				if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+			}
+			const stat = await fs.lstat(target);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+			continue;
+		}
+
+		if (entry.size === undefined || !entry.sha256) {
+			throw new Error("Legacy local:// migration snapshot is incomplete");
+		}
+		try {
+			const stat = await fs.lstat(target, { bigint: true });
+			if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== entry.size) {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+			const observed = await snapshotRegularFile(target, "", {
+				maxBytes: entry.size,
+				sizeLimitError: "Legacy local:// migration destination changed during verification",
+			});
+			if (observed.digest !== entry.sha256) {
+				throw new Error("Legacy local:// migration destination is ambiguous");
+			}
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			await publishMigrationEntryNoReplace(path.join(stagedEntry, entry.relativePath), target, [
+				{ relativePath: "", kind: "file", size: entry.size, sha256: entry.sha256 },
+			]);
+		}
+	}
+
+	if (!migrationContentContains(expected, destinationDirectoryContent(destination))) {
+		throw new Error("Legacy local:// migration destination verification failed");
+	}
+}
+
+async function destinationContentMatches(
+	destination: string,
+	expected: readonly MigrationContentEntry[],
+): Promise<boolean> {
+	const root = expected[0];
+	if (!root) return false;
+	if (root.kind === "file") {
+		if (root.size === undefined) return false;
+		const stat = await fs.lstat(destination, { bigint: true });
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== root.size) return false;
+		const observed = await snapshotRegularFile(destination, "", {
+			maxBytes: root.size,
+			sizeLimitError: "Legacy local:// migration destination changed during verification",
+		});
+		return sameMigrationContent(expected, [
+			{ relativePath: "", kind: "file", size: observed.size, sha256: observed.digest },
+		]);
+	}
+	return sameMigrationContent(expected, destinationDirectoryContent(destination));
+}
+
+async function publishMigrationEntryNoReplace(
+	stagedEntry: string,
+	destination: string,
+	expected: readonly MigrationContentEntry[],
+): Promise<void> {
+	const root = expected[0];
+	if (!root) throw new Error("Legacy local:// migration snapshot is incomplete");
+	let destinationExists = true;
+	try {
+		await fs.lstat(destination);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		destinationExists = false;
+	}
+	if (destinationExists) {
+		if (root.kind === "directory") {
+			await mergeStagedMigrationDirectory(stagedEntry, destination, expected);
+			return;
+		}
+		if (await destinationContentMatches(destination, expected)) return;
+		throw new Error("Legacy local:// migration destination is ambiguous");
+	}
+
+	const published = await nativeLocal().renameNoReplacePathAsync(stagedEntry, destination);
+	if (!published.ok) {
+		if (published.code !== "destination_exists" && published.reason !== "destination_exists") {
+			throw new Error(`Legacy local:// migration publication failed: ${published.code ?? published.reason}`);
+		}
+		if (root.kind === "directory") {
+			await mergeStagedMigrationDirectory(stagedEntry, destination, expected);
+			return;
+		}
+		let destinationMatches = false;
+		try {
+			destinationMatches = await destinationContentMatches(destination, expected);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		if (destinationMatches) return;
+		throw new Error("Legacy local:// migration destination is ambiguous");
+	}
+	if (!(await destinationContentMatches(destination, expected))) {
+		throw new Error("Legacy local:// migration destination verification failed");
+	}
+}
+
+function topLevelMigrationNames(relativePaths: readonly string[]): string[] {
+	return [
+		...new Set(
+			relativePaths.flatMap(relativePath => {
+				if (!relativePath) return [];
+				const top = path.normalize(relativePath).split(path.sep, 1)[0];
+				return top ? [top] : [];
+			}),
+		),
+	].sort((a, b) => a.localeCompare(b));
+}
+
+function migrationStagingPath(localRoot: string, scratchParent: string, source?: LegacyMigrationStagingSource): string {
+	const identity = createHash("sha256").update(path.resolve(localRoot)).digest("hex").slice(0, 20);
+	const suffix = source ? `-${source}` : "";
+	return path.join(scratchParent, `.gjc-local-migration-${identity}${suffix}`);
+}
+
+async function clearMigrationStaging(staging: string): Promise<void> {
+	try {
+		const stat = await fs.lstat(staging);
+		assertAdoptedManagedRoot(stat);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe local:// migration staging");
+		await fs.rm(staging, { recursive: true, force: true });
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+}
+
+async function removeEmptyMigrationStaging(localRoot: string, scratchParent: string): Promise<void> {
+	const stagingPaths = [
+		migrationStagingPath(localRoot, scratchParent),
+		...LEGACY_MIGRATION_STAGING_SOURCES.map(source => migrationStagingPath(localRoot, scratchParent, source)),
+	];
+	for (const staging of stagingPaths) {
+		try {
+			const stat = await fs.lstat(staging);
+			assertAdoptedManagedRoot(stat);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe local:// migration staging");
+			await fs.rmdir(staging);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+	}
+}
+
+function validatedMigrationStagingManifest(entries: readonly MigrationStagingEntry[]): MigrationContentEntry[] {
+	const root = entries.find(entry => entry.relativePath === "");
+	if (root?.kind !== "directory") throw new Error("Unsafe local:// migration staging");
+
+	let copiedBytes = 0n;
+	const manifest: MigrationContentEntry[] = [];
+	for (const entry of entries) {
+		const relativePath = entry.relativePath;
+		if (relativePath) {
+			const segments = relativePath.split("/");
+			if (
+				segments.some(
+					segment => segment === "" || segment === "." || segment === ".." || segment === LEGACY_MIGRATION_MARKER,
+				)
+			) {
+				throw new Error("Unsafe local:// migration staging");
+			}
+		}
+		if (entry.kind === "directory") {
+			manifest.push({ relativePath, kind: "directory" });
+			continue;
+		}
+		if (entry.kind !== "file" || !entry.sha256 || !/^[a-f0-9]{64}$/.test(entry.sha256)) {
+			throw new Error("Unsafe local:// migration staging");
+		}
+		const size = BigInt(entry.size);
+		copiedBytes += size;
+		if (size < 0n || copiedBytes > BigInt(MAX_LEGACY_LOCAL_BYTES)) {
+			throw new Error("Legacy local:// migration exceeds the safe size limit");
+		}
+		manifest.push({ relativePath, kind: "file", size, sha256: entry.sha256 });
+	}
+	return manifest;
+}
+
+/** Recover every isolated source stage, including the legacy destination-keyed stage. */
+async function recoverMigrationStaging(localRoot: string, scratchParent: string): Promise<boolean> {
+	const stagingPaths = [
+		migrationStagingPath(localRoot, scratchParent),
+		...LEGACY_MIGRATION_STAGING_SOURCES.map(source => migrationStagingPath(localRoot, scratchParent, source)),
+	];
+	let recovered = false;
+	for (const staging of stagingPaths) {
+		let stagingStat: fsSync.Stats;
+		try {
+			stagingStat = await fs.lstat(staging);
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+		assertAdoptedManagedRoot(stagingStat);
+		if (!stagingStat.isDirectory() || stagingStat.isSymbolicLink()) {
+			throw new Error("Unsafe local:// migration staging");
+		}
+
+		const captured = nativeLocal().snapshotDirectoryTree(staging);
+		if (
+			!captured.ok ||
+			!captured.snapshot ||
+			captured.snapshot.rootDev !== String(stagingStat.dev) ||
+			captured.snapshot.rootIno !== String(stagingStat.ino)
+		) {
+			throw new Error("Unsafe local:// migration staging");
+		}
+		const manifest = validatedMigrationStagingManifest(captured.snapshot.entries);
+		const topLevelNames = topLevelMigrationNames(manifest.map(entry => entry.relativePath));
+		for (const top of topLevelNames) {
+			const expected = stagingContentForTop(manifest, top);
+			const stagedTop = path.join(staging, top);
+			const destination = path.join(localRoot, top);
+			await publishMigrationEntryNoReplace(stagedTop, destination, expected);
+			await fs.rm(stagedTop, { recursive: true, force: true });
+			recovered = true;
+		}
+	}
+	return recovered;
 }
 
 async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEntrySnapshot[]): Promise<void> {
@@ -465,17 +828,138 @@ async function retireLegacyTree(legacyRoot: string, manifest: readonly LegacyEnt
 	const removed = nativeLocal().exactRemoveDirectoryTree(legacyRoot, captured.snapshot);
 	if (!removed.ok) throw new Error(`Legacy local:// migration retirement failed: ${removed.code}`);
 }
+
+function previousManagedLocalRoot(options: LocalProtocolOptions): string | null {
+	if (options.isManagedDestination?.() === false || !options.getSessionId?.()) return null;
+	let temporaryRoot: string;
+	try {
+		temporaryRoot = fsSync.realpathSync(os.tmpdir());
+	} catch (error) {
+		if (isEnoent(error)) return null;
+		throw error;
+	}
+	return path.join(temporaryRoot, "gjc-local", safeSessionId(options));
+}
+
+/** The pre-persistence root is kept as an exact-removal authority until its copy is verified. */
+function previousManagedLocalMigrationSource(options: LocalProtocolOptions): ManagedLegacyLocalMigrationSource | null {
+	const legacyRoot = previousManagedLocalRoot(options);
+	if (!legacyRoot) return null;
+	const legacyParent = path.dirname(legacyRoot);
+	return {
+		capture: async () => {
+			let rootStat: fsSync.Stats;
+			try {
+				rootStat = await fs.lstat(legacyRoot);
+			} catch (error) {
+				if (isEnoent(error)) return null;
+				throw error;
+			}
+			assertAdoptedManagedRoot(await fs.lstat(legacyParent));
+			assertAdoptedManagedRoot(rootStat);
+			const captured = nativeLocal().snapshotDirectoryTree(legacyRoot);
+			if (!captured.ok || !captured.snapshot) {
+				throw new Error(`Unsafe legacy local:// migration source: ${captured.code ?? "unknown"}`);
+			}
+			const rootEntry = captured.snapshot.entries.find(entry => entry.relativePath === "");
+			if (
+				rootEntry?.kind !== "directory" ||
+				rootEntry.dev !== rootStat.dev.toString() ||
+				rootEntry.ino !== rootStat.ino.toString()
+			) {
+				throw new Error("Legacy local:// migration source changed during capture");
+			}
+
+			let sourceBytes = 0n;
+			for (const entry of captured.snapshot.entries) {
+				if (entry.kind !== "file") continue;
+				const size = BigInt(entry.size);
+				if (entry.relativePath === LEGACY_MIGRATION_MARKER) {
+					if (size > 32n) throw new Error("Unsafe legacy local:// migration source");
+					continue;
+				}
+				sourceBytes += size;
+				if (sourceBytes > BigInt(MAX_LEGACY_LOCAL_BYTES)) {
+					throw new Error("Legacy local:// migration exceeds the safe size limit");
+				}
+			}
+
+			let retainedBytes = 0n;
+			const entries: ManagedLegacyLocalMigrationEntry[] = [];
+			for (const entry of captured.snapshot.entries) {
+				if (entry.relativePath === "") {
+					entries.push({ relativePath: "", kind: "directory" });
+					continue;
+				}
+				if (entry.kind === "directory") {
+					entries.push({ relativePath: entry.relativePath, kind: "directory" });
+					continue;
+				}
+				if (entry.kind !== "file") throw new Error("Unsafe legacy local:// migration source");
+				const isMarker = entry.relativePath === LEGACY_MIGRATION_MARKER;
+				const file = await snapshotRegularFile(path.join(legacyRoot, entry.relativePath), entry.relativePath, {
+					maxBytes: isMarker ? 32n : BigInt(MAX_LEGACY_LOCAL_BYTES) - retainedBytes,
+					sizeLimitError: isMarker
+						? "Unsafe legacy local:// migration source"
+						: "Legacy local:// migration exceeds the safe size limit",
+				});
+				if (
+					file.dev.toString() !== entry.dev ||
+					file.ino.toString() !== entry.ino ||
+					file.size.toString() !== entry.size ||
+					file.digest !== entry.sha256 ||
+					file.bytes === undefined
+				) {
+					throw new Error("Legacy local:// migration source changed during capture");
+				}
+				if (isMarker) {
+					if (file.bytes.byteLength > 32 || !isSettledMigrationMarkerValue(file.bytes.toString("utf8"))) {
+						throw new Error("Unsafe legacy local:// migration source");
+					}
+					continue;
+				}
+				retainedBytes += file.size;
+				entries.push({ relativePath: entry.relativePath, kind: "file", bytes: file.bytes, sha256: file.digest });
+			}
+
+			const verified = nativeLocal().snapshotDirectoryTree(legacyRoot);
+			if (
+				!verified.ok ||
+				!verified.snapshot ||
+				JSON.stringify(verified.snapshot) !== JSON.stringify(captured.snapshot)
+			) {
+				throw new Error("Legacy local:// migration source changed during capture");
+			}
+			return { snapshot: captured.snapshot, entries };
+		},
+		retire: snapshot => {
+			assertAdoptedManagedRoot(fsSync.lstatSync(legacyParent));
+			const rootStat = fsSync.lstatSync(legacyRoot);
+			assertAdoptedManagedRoot(rootStat);
+			const captured = nativeLocal().snapshotDirectoryTree(legacyRoot);
+			if (!captured.ok || !captured.snapshot || JSON.stringify(captured.snapshot) !== JSON.stringify(snapshot)) {
+				throw new Error("Legacy local:// migration source changed during retirement");
+			}
+			const removed = nativeLocal().exactRemoveDirectoryTree(legacyRoot, snapshot);
+			if (!removed.ok)
+				throw new Error(
+					removed.code === "cleanup_pending"
+						? "cleanup_pending"
+						: `Legacy local:// migration retirement failed: ${removed.code}`,
+				);
+		},
+	};
+}
+
+/** Publishes a retained legacy tree, merging only nonconflicting entries into an existing directory. */
 async function migrateManagedLegacyLocal(
 	source: ManagedLegacyLocalMigrationSource,
 	localRoot: string,
 	scratchParent: string,
-	marker: string,
-): Promise<void> {
+	stagingSource: LegacyMigrationStagingSource,
+): Promise<"verified" | "cleanup_pending" | null> {
 	const captured = await source.capture();
-	if (!captured) {
-		await fs.writeFile(marker, "absent\n", { mode: 0o600, flag: "wx" });
-		return;
-	}
+	if (!captured) return null;
 	let copiedBytes = 0;
 	for (const entry of captured.entries) {
 		if (entry.kind === "file") {
@@ -485,13 +969,15 @@ async function migrateManagedLegacyLocal(
 				throw new Error("Legacy local:// migration exceeds the safe size limit");
 		}
 	}
-	const staging = path.join(scratchParent, `.gjc-local-migration-${randomUUID()}`);
-	const installed: Array<{ readonly path: string; readonly dev: bigint; readonly ino: bigint }> = [];
-	let sourceRetired = false;
+	const staging = migrationStagingPath(localRoot, scratchParent, stagingSource);
+	await clearMigrationStaging(staging);
 	try {
 		await fs.mkdir(staging, { mode: 0o700 });
 		for (const entry of captured.entries) {
 			if (entry.relativePath === "") continue;
+			if (entry.relativePath === LEGACY_MIGRATION_MARKER) {
+				throw new Error("Unsafe legacy local:// migration source");
+			}
 			const target = path.join(staging, entry.relativePath);
 			if (entry.kind === "directory") await fs.mkdir(target, { mode: 0o700 });
 			else {
@@ -501,36 +987,20 @@ async function migrateManagedLegacyLocal(
 					throw new Error("Legacy local:// migration destination verification failed");
 			}
 		}
-		for (const entry of (await fs.readdir(staging)).sort()) {
-			const destination = path.join(localRoot, entry);
-			try {
-				await fs.lstat(destination);
-				throw new Error("Legacy local:// migration destination is ambiguous");
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
-			}
-			await fs.rename(path.join(staging, entry), destination);
-			const identity = await fs.lstat(destination, { bigint: true });
-			installed.push({ path: destination, dev: identity.dev, ino: identity.ino });
+		for (const entry of topLevelMigrationNames(captured.entries.map(value => value.relativePath))) {
+			await publishMigrationEntryNoReplace(
+				path.join(staging, entry),
+				path.join(localRoot, entry),
+				managedContentForTop(captured.entries, entry),
+			);
 		}
 		try {
 			source.retire(captured.snapshot);
-			sourceRetired = true;
 		} catch (error) {
-			if (!(error instanceof Error) || error.message !== "cleanup_pending") throw error;
-			await fs.writeFile(marker, "cleanup_pending\n", { mode: 0o600, flag: "wx" });
-			return;
+			if (error instanceof Error && error.message === "cleanup_pending") return "cleanup_pending";
+			throw error;
 		}
-		await fs.writeFile(marker, "verified\n", { mode: 0o600, flag: "wx" });
-	} catch (error) {
-		if (!sourceRetired) {
-			for (const destination of installed.reverse()) {
-				const current = await fs.lstat(destination.path, { bigint: true }).catch(() => null);
-				if (current?.dev === destination.dev && current.ino === destination.ino)
-					await fs.rm(destination.path, { recursive: true, force: true });
-			}
-		}
-		throw error;
+		return "verified";
 	} finally {
 		await fs.rm(staging, { recursive: true, force: true });
 	}
@@ -538,7 +1008,10 @@ async function migrateManagedLegacyLocal(
 
 async function readMigrationMarker(marker: string): Promise<LegacyMigrationState | null> {
 	try {
-		const snapshot = await snapshotRegularFile(marker, LEGACY_MIGRATION_MARKER);
+		const snapshot = await snapshotRegularFile(marker, LEGACY_MIGRATION_MARKER, {
+			maxBytes: 32n,
+			sizeLimitError: "Unsafe local:// migration marker",
+		});
 		if (snapshot.size > 32n || snapshot.bytes === undefined) throw new Error("Unsafe local:// migration marker");
 		const value = snapshot.bytes.toString("utf8");
 		if (value === "cleanup_pending\n") return "cleanup_pending";
@@ -557,42 +1030,60 @@ async function migrateLegacyLocal(
 ): Promise<void> {
 	const marker = path.join(localRoot, LEGACY_MIGRATION_MARKER);
 	if (await readMigrationMarker(marker)) return;
+	let foundSource = false;
+	let cleanupPending = false;
+	const previousSource = previousManagedLocalMigrationSource(options);
+	if (previousSource) {
+		const state = await migrateManagedLegacyLocal(previousSource, localRoot, scratchParent, "temporary");
+		if (state) foundSource = true;
+		if (state === "cleanup_pending") cleanupPending = true;
+	}
 	const managedSource = options.getManagedLegacyLocalMigrationSource?.();
 	if (managedSource) {
-		await migrateManagedLegacyLocal(managedSource, localRoot, scratchParent, marker);
-		return;
+		const state = await migrateManagedLegacyLocal(managedSource, localRoot, scratchParent, "artifacts");
+		if (state) foundSource = true;
+		if (state === "cleanup_pending") cleanupPending = true;
+	} else {
+		const artifactsDir = options.getArtifactsDir?.();
+		if (artifactsDir) {
+			const state = await migrateArtifactsLegacyLocal(artifactsDir, localRoot, scratchParent);
+			if (state) foundSource = true;
+			if (state === "cleanup_pending") cleanupPending = true;
+		}
 	}
-	const artifactsDir = options.getArtifactsDir?.();
-	if (!artifactsDir) {
-		await fs.writeFile(marker, "absent\n", { mode: 0o600, flag: "wx" });
-		return;
-	}
+	if (await recoverMigrationStaging(localRoot, scratchParent)) foundSource = true;
+	await removeEmptyMigrationStaging(localRoot, scratchParent);
+	const value = cleanupPending ? "cleanup_pending\n" : foundSource ? "verified\n" : "absent\n";
+	await fs.writeFile(marker, value, { mode: 0o600, flag: "wx" });
+}
+
+async function migrateArtifactsLegacyLocal(
+	artifactsDir: string,
+	localRoot: string,
+	scratchParent: string,
+): Promise<"verified" | "cleanup_pending" | null> {
 	let legacySource: CanonicalLegacyRoot;
 	let manifest: readonly LegacyEntrySnapshot[];
 	try {
 		legacySource = await canonicalLegacyRoot(artifactsDir);
 		manifest = await captureLegacyManifest(legacySource.root, legacySource.identity);
 	} catch (error) {
-		if (isEnoent(error)) {
-			await fs.writeFile(marker, "absent\n", { mode: 0o600, flag: "wx" });
-			return;
-		}
+		if (isEnoent(error)) return null;
 		throw error;
 	}
-	const staging = path.join(scratchParent, `.gjc-local-migration-${randomUUID()}`);
+	const staging = migrationStagingPath(localRoot, scratchParent, "artifacts");
+	await clearMigrationStaging(staging);
 	try {
 		await copyLegacyManifest(legacySource.root, staging, manifest);
 		const verifiedManifest = await captureLegacyManifest(legacySource.root, legacySource.identity);
 		if (!manifestsMatch(verifiedManifest, manifest))
 			throw new Error("Legacy local:// migration source changed during capture");
-		for (const entry of await fs.readdir(staging)) {
-			try {
-				await fs.lstat(path.join(localRoot, entry));
-				throw new Error("Legacy local:// migration destination is ambiguous");
-			} catch (error) {
-				if (!isEnoent(error)) throw error;
-			}
-			await fs.rename(path.join(staging, entry), path.join(localRoot, entry));
+		for (const entry of topLevelMigrationNames(manifest.map(value => value.relativePath))) {
+			await publishMigrationEntryNoReplace(
+				path.join(staging, entry),
+				path.join(localRoot, entry),
+				legacyContentForTop(manifest, entry),
+			);
 		}
 		try {
 			await retireLegacyTree(legacySource.root, manifest);
@@ -602,10 +1093,9 @@ async function migrateLegacyLocal(
 				error.message !== "Legacy local:// migration retirement failed: cleanup_pending"
 			)
 				throw error;
-			await fs.writeFile(marker, "cleanup_pending\n", { mode: 0o600, flag: "wx" });
-			return;
+			return "cleanup_pending";
 		}
-		await fs.writeFile(marker, "verified\n", { mode: 0o600, flag: "wx" });
+		return "verified";
 	} finally {
 		await fs.rm(staging, { recursive: true, force: true });
 	}
@@ -701,7 +1191,10 @@ async function initializeManagedLocalRoot(options: LocalProtocolOptions, localRo
 	const recorded = initializedLocalRoots.get(localRoot);
 	acceptManagedRootForInit(localRoot, rootStat, recorded, adoptedExisting);
 	if (!adoptedExisting) pendingCreatedRoots.set(localRoot, managedRootIdentity(rootStat));
-	await migrateLegacyLocal(options, localRoot, scratchParent);
+	await withFileLock(migrationStagingPath(localRoot, scratchParent), async () => {
+		// Another process may have completed the migration while this one waited.
+		await migrateLegacyLocal(options, localRoot, scratchParent);
+	});
 
 	const resolvedScratchParent = await fs.realpath(scratchParent);
 	const resolvedLocalRoot = await fs.realpath(localRoot);
@@ -778,6 +1271,17 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 	if (artifactsDir && fsSync.existsSync(path.resolve(artifactsDir, "local"))) {
 		throw new Error("local:// legacy migration must complete before path resolution");
 	}
+	const previousRoot = previousManagedLocalRoot(options);
+	if (previousRoot) {
+		let previousRootExists = false;
+		try {
+			fsSync.lstatSync(previousRoot);
+			previousRootExists = true;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		if (previousRootExists) throw new Error("local:// legacy migration must complete before path resolution");
+	}
 	try {
 		fsSync.writeFileSync(marker, "absent\n", { mode: 0o600, flag: "wx" });
 	} catch (error) {
@@ -791,7 +1295,7 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 }
 
 export function resolveLocalRoot(options: LocalProtocolOptions): string {
-	return explicitLocalRoot(options) ?? path.join(os.tmpdir(), "gjc-local", safeSessionId(options));
+	return explicitLocalRoot(options) ?? path.join(getLocalRootsDir(options.getAgentDir?.()), safeSessionId(options));
 }
 
 export function resolveLocalUrlToPath(input: string | InternalUrl, options: LocalProtocolOptions): string {
@@ -875,8 +1379,10 @@ export class LocalProtocolHandler implements ProtocolHandler {
 			.list()
 			.find(ref => ref.kind === "main" && ref.session && (ref.status === "running" || ref.status === "idle"));
 		const sessionManager = main?.session?.sessionManager;
-		if (!sessionManager) return undefined;
+		const session = main?.session;
+		if (!sessionManager || !session) return undefined;
 		return {
+			getAgentDir: () => session.getSessionAgentDir(),
 			getArtifactsDir: () => sessionManager.getArtifactsDir(),
 			isManagedDestination: () => sessionManager.isManagedDestination(),
 			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),

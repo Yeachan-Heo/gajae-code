@@ -5,7 +5,12 @@ import { isEnoent, logger, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getNativeDiffBindings } from "../internal/native-diff";
-import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
+import {
+	createLspWritethrough,
+	createNoopWritethrough,
+	type FileDiagnosticsResult,
+	type WritethroughCallback,
+} from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import vimDescription from "../prompts/tools/vim.md" with { type: "text" };
 import { CachedOutputBlock } from "../tui/output-block";
@@ -462,9 +467,10 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
+		const localProtocolOptions = session.getLocalProtocolOptions?.();
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
-			: writethroughNoop;
+			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics, localProtocolOptions })
+			: createNoopWritethrough(localProtocolOptions);
 		this.description = prompt.render(vimDescription);
 	}
 

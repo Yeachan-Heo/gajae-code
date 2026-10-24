@@ -1329,6 +1329,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			expect(readiness).toHaveBeenCalledTimes(2);
 
 			const localOptions = {
+				getAgentDir: () => session.getSessionAgentDir(),
 				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
 				isManagedDestination: () => session.sessionManager.isManagedDestination(),
 				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
