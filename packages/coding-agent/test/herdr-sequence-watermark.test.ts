@@ -71,18 +71,21 @@ function restoreShared(snapshot: SharedSnapshot): void {
 }
 
 /**
- * `main` imports this module, and `createHerdrReporter` seeds the same watermark.
- * A fresh process is required because the floor is read once at module load.
+ * A fresh process is required to observe module initialization and sequence
+ * persistence without state carried over from another import.
  */
-async function runReporter(home: string): Promise<{ code: number; stderr: string }> {
+async function runReporter(home: string, emitSequence = true): Promise<{ code: number; stderr: string }> {
 	const href = pathToFileURL(path.join(import.meta.dir, "../src/utils/herdr-pane.ts")).href;
 	const script = `
 		const { createHerdrReporter } = await import(${JSON.stringify(href)});
-		createHerdrReporter(
-			{ paneId: "pane-7", binPath: "/usr/bin/herdr" },
-			() => () => {},
-			{ spawn() { return { exited: Promise.resolve(0), kill() {}, unref() {} }; } },
-		);
+		if (${JSON.stringify(emitSequence)}) {
+			const reporter = createHerdrReporter(
+				{ paneId: "pane-7", binPath: "/usr/bin/herdr" },
+				() => () => {},
+				{ spawn() { return { exited: Promise.resolve(0), kill() {}, unref() {} }; } },
+			);
+			reporter.report("working");
+		}
 	`;
 	const proc = Bun.spawn([process.execPath, "-e", script], {
 		cwd: path.resolve(import.meta.dir, "../../.."),
@@ -105,6 +108,13 @@ function readInteger(file: string): number | undefined {
 }
 
 describe("Herdr sequence watermark", () => {
+	test("does not create the agent watermark when the module is only imported", async () => {
+		const home = makeHome();
+		const imported = await runReporter(home, false);
+		expect(imported.code, imported.stderr).toBe(0);
+		expect(fs.existsSync(privateWatermark(home))).toBe(false);
+	});
+
 	test("keeps a rising Herdr sequence watermark across processes", async () => {
 		const home = makeHome();
 		const first = await runReporter(home);

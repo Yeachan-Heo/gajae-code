@@ -171,7 +171,6 @@ function persistSequenceFloor(value: number): void {
 
 function initialSeq(): number {
 	sequenceFloor = Math.max(sequenceFloor + 1001, readSequenceFloor() + 1001, Date.now() * 1000);
-	persistSequenceFloor(sequenceFloor);
 	return sequenceFloor;
 }
 
@@ -188,9 +187,10 @@ function nextSequence(current: number): number {
  * reporter instance: `setSessionTerminalTitle` is called from controllers that
  * never see the reporter.
  */
-let metadataSeq = initialSeq();
+let metadataSeq = 0;
 
 function nextMetadataSeq(): number {
+	if (metadataSeq === 0) metadataSeq = initialSeq();
 	metadataSeq = nextSequence(metadataSeq);
 	return metadataSeq;
 }
