@@ -10,6 +10,7 @@ type TraceRecord = {
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const traceLoader = path.join(repoRoot, "scripts", "trace-loader.ts");
+const coreEntry = Bun.resolveSync("@gajae-code/ai/core", repoRoot);
 
 function decode(value: Uint8Array): string {
 	return new TextDecoder().decode(value);
@@ -17,7 +18,10 @@ function decode(value: Uint8Array): string {
 
 async function runCoreTrace(tracePath: string): Promise<TraceRecord[]> {
 	const result = Bun.spawnSync({
-		cmd: [process.execPath, "--preload", traceLoader, "-e", 'await import("@gajae-code/ai/core")'],
+		// Resolve the package export first and import the resulting file. Bun 1.4.4 skips
+		// runtime-plugin onResolve hooks for a bare workspace-package import from the entry
+		// and for that module's direct imports, which would hide every core -> provider edge.
+		cmd: [process.execPath, "--preload", traceLoader, "-e", `await import(${JSON.stringify(coreEntry)})`],
 		cwd: repoRoot,
 		env: {
 			HOME: Bun.env.HOME ?? "",
