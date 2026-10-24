@@ -42,7 +42,7 @@ jobs:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Resolve immutable release identity
            id: release
            shell: bash
@@ -132,7 +132,7 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
@@ -166,7 +166,7 @@ jobs:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Compute full Main CI task matrix
            id: plan
            run: bun scripts/ci-dev-affected.ts --matrix-json
@@ -183,7 +183,7 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
@@ -242,7 +242,7 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
            if: ${{ matrix.rust }}
            with:
@@ -309,7 +309,7 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
@@ -447,7 +447,7 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
@@ -557,7 +557,7 @@ jobs:
               fetch-depth: 0
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
@@ -644,7 +644,7 @@ jobs:
               fetch-depth: 0
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
@@ -1073,7 +1073,7 @@ jobs:
               persist-credentials: false
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.4.0"
+              bun-version-file: package.json
          - name: Download pre-publication package evidence
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:

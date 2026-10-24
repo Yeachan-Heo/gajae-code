@@ -179,7 +179,7 @@ jobs:
           fi
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-08-12
@@ -300,7 +300,7 @@ jobs:
           printf 'guard evidence: base %s@%s; event head %s; fetched head %s@%s; descendant proof %s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${GITHUB_HEAD_SHA}" "${HEAD_REPOSITORY}" "${head_ref_sha}" "${head_ref_descends_from_event_head:-not-applicable}"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
@@ -331,7 +331,7 @@ jobs:
           if ($head -ne $env:CI_DEV_SOURCE_SHA) { throw "Checked-out SHA $head does not match $env:CI_DEV_SOURCE_SHA" }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-08-12
@@ -459,7 +459,7 @@ jobs:
           if ($head -ne $env:CI_DEV_SOURCE_SHA) { throw "Checked-out SHA $head does not match $env:CI_DEV_SOURCE_SHA" }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-08-12
@@ -496,7 +496,7 @@ jobs:
           if ($head -ne $env:CI_DEV_SOURCE_SHA) { throw "Checked-out SHA $head does not match $env:CI_DEV_SOURCE_SHA" }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-08-12
@@ -575,7 +575,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-08-12
@@ -703,7 +703,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -778,7 +778,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-08-12
@@ -875,7 +875,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -975,7 +975,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Download canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -1098,7 +1098,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Validate finalized Darwin smoke receipt
         if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
         env:
@@ -1131,7 +1131,7 @@ jobs:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Resolve GJC state gate relevance
         id: relevance
         run: bun scripts/ci-gjc-state-gates.ts --emit-relevance
@@ -1153,7 +1153,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-08-12
@@ -1218,7 +1218,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Restore bun dependency cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
@@ -1297,7 +1297,7 @@ jobs:
           test "$head" = "$CI_VI_HEAD_SHA" || { echo "Checked-out SHA $head does not match $CI_VI_HEAD_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.4.0"
+          bun-version-file: package.json
       - name: Select authoritative terminal-green dev base
         id: green-dev
         env:
