@@ -187,10 +187,17 @@ function nextSequence(current: number): number {
  * Module scope because the title is a property of the process, not of one
  * reporter instance: `setSessionTerminalTitle` is called from controllers that
  * never see the reporter.
+ *
+ * Lazy-initialized on first use to avoid writing the herdr sequence watermark
+ * during module load (which would violate the read-only contract of commands
+ * like `gjc doctor` that import this module but never use the herdr reporter).
  */
-let metadataSeq = initialSeq();
+let metadataSeq: number | undefined;
 
 function nextMetadataSeq(): number {
+	if (metadataSeq === undefined) {
+		metadataSeq = initialSeq();
+	}
 	metadataSeq = nextSequence(metadataSeq);
 	return metadataSeq;
 }

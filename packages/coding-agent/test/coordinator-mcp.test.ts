@@ -346,7 +346,7 @@ describe("mcp serve check command compatibility", () => {
 				incarnation,
 				host: "127.0.0.1",
 				port: 54321,
-				url: "ws://127.0.0.1:54321/error-sentinel",
+				url: "ws://127.0.0.1:54321/",
 				token: "token-sentinel",
 				startedAt: Date.now(),
 				heartbeatAt: Date.now(),
