@@ -1,4 +1,13 @@
-import { $credentialEnv, extractHttpStatusFromError, logger, structuredCloneJSON } from "@gajae-code/utils";
+import {
+	$credentialEnv,
+	assertEndpointConfiguration,
+	type EndpointConfiguration,
+	extractHttpStatusFromError,
+	isDefaultOpenAIBaseUrl,
+	logger,
+	readEndpointConfiguration,
+	structuredCloneJSON,
+} from "@gajae-code/utils";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
 	Tool as OpenAITool,
@@ -144,15 +153,6 @@ const OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE =
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_DEFAULT_BASE_URL_HOST = "api.openai.com";
 
-function isDefaultOpenAIBaseUrl(baseUrl: string): boolean {
-	try {
-		const url = new URL(baseUrl);
-		return url.hostname === OPENAI_DEFAULT_BASE_URL_HOST && (url.pathname === "" || url.pathname === "/v1");
-	} catch {
-		return baseUrl === OPENAI_DEFAULT_BASE_URL;
-	}
-}
-
 function isCanonicalOpenAIAffinityOrigin(baseUrl: string | undefined): boolean {
 	if (!baseUrl) return false;
 	try {
@@ -229,12 +229,13 @@ function isOpenAIHostBaseUrl(baseUrl: string): boolean {
 function resolveOpenAIProviderBaseUrl(
 	baseUrl: string | undefined,
 	authCredentialType: "api_key" | "oauth" | undefined,
+	endpointConfiguration?: EndpointConfiguration,
 ): string {
 	if (authCredentialType === "oauth") return OPENAI_DEFAULT_BASE_URL;
 	// Trusted sources only: this base URL becomes the request endpoint that carries
 	// the OpenAI credential, and `$env` merges the caller's `cwd/.env`, so reading it
 	// there would let repository content redirect authenticated traffic.
-	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
+	const envBaseUrl = readEndpointConfiguration(endpointConfiguration, "OPENAI_BASE_URL");
 	const configuredBaseUrl = baseUrl?.trim();
 	if (envBaseUrl && (!configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl))) {
 		return envBaseUrl;
@@ -246,8 +247,9 @@ function resolveOpenAIProviderBaseUrl(
 export function resolveOpenAIProviderBaseUrlForTest(
 	baseUrl: string | undefined,
 	authCredentialType: "api_key" | "oauth" | undefined,
+	endpointConfiguration?: EndpointConfiguration,
 ): string {
-	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
+	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType, endpointConfiguration);
 }
 
 function appendUrlPath(baseUrl: string | undefined, path: string): string | undefined {
@@ -380,6 +382,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 	context: Context,
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
+	assertEndpointConfiguration(options?.endpointConfiguration);
 	const stream = new AssistantMessageEventStream();
 
 	// Start async processing
@@ -401,7 +404,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			// Keep request headers and prompt-cache routing on the same session-derived value.
 			const cacheSessionId = getOpenAIResponsesCacheSessionId(options);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention ?? model.cacheRetention);
-			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
+			const apiKey = options?.apiKey || getEnvApiKey(model.provider, options?.endpointConfiguration) || "";
 			const { client, copilotPremiumRequests, baseUrl, requestBaseUrl, requestQuery } = createClient(
 				model,
 				context,
@@ -419,6 +422,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.attemptScope,
 				options?.streamFirstEventTimeoutMs,
 				options?.streamIdleTimeoutMs,
+				options?.endpointConfiguration,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -617,6 +621,7 @@ function createClient(
 	attemptScope?: import("../types.js").AttemptScopeRef,
 	streamFirstEventTimeoutOverride?: number,
 	effectiveIdleTimeoutOverride?: number,
+	endpointConfiguration?: EndpointConfiguration,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -646,7 +651,9 @@ function createClient(
 	let copilotPremiumRequests: number | undefined;
 
 	let baseUrl =
-		model.provider === "openai" ? resolveOpenAIProviderBaseUrl(model.baseUrl, authCredentialType) : model.baseUrl;
+		model.provider === "openai"
+			? resolveOpenAIProviderBaseUrl(model.baseUrl, authCredentialType, endpointConfiguration)
+			: model.baseUrl;
 	if (model.provider === "openai" && !baseUrl) {
 		baseUrl = OPENAI_DEFAULT_BASE_URL;
 	}
