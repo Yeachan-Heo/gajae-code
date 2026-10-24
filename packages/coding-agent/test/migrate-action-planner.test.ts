@@ -772,3 +772,108 @@ describe("executeActions — mcp destination safety", () => {
 		expect(written.mcpServers.alpha.command).toBe("new-bin");
 	});
 });
+
+describe("planMigration — hooks", () => {
+	test("hook destination is in hooks/post/ for discovery", async () => {
+		const { actions } = await planMigration({
+			results: [
+				{
+					mcpCandidates: [],
+					skillCandidates: [],
+					slashCommandCandidates: [],
+					agentCandidates: [],
+					hookCandidates: [
+						{
+							source: "claude-code",
+							event: "PostToolUse",
+							command: 'echo "test"',
+						},
+					],
+					instructionCandidates: [],
+					diagnostics: [],
+					manualActions: [],
+				},
+			],
+			destinations: dest,
+			force: false,
+		});
+
+		expect(actions).toHaveLength(1);
+		const hookAction = actions[0];
+		expect(hookAction?.type).toBe("hook");
+		expect(hookAction?.destination).toBe(path.join(dest.hooksDir, "post", "migrated-claude-code.ts"));
+		expect(hookAction?.operation).toBe("create");
+		expect(hookAction?.status).toBe("imported");
+	});
+
+	test("Stop event is marked skipped_unmappable", async () => {
+		const { actions } = await planMigration({
+			results: [
+				{
+					mcpCandidates: [],
+					skillCandidates: [],
+					slashCommandCandidates: [],
+					agentCandidates: [],
+					hookCandidates: [
+						{
+							source: "claude-code",
+							event: "Stop",
+							command: 'echo "cleanup"',
+						},
+					],
+					instructionCandidates: [],
+					diagnostics: [],
+					manualActions: [],
+				},
+			],
+			destinations: dest,
+			force: false,
+		});
+
+		expect(actions).toHaveLength(1);
+		expect(actions[0]).toMatchObject({
+			type: "hook",
+			name: "Stop",
+			operation: "skip",
+			status: "skipped_unmappable",
+			reason: expect.stringContaining("Stop has no faithful gjc hook event"),
+		});
+	});
+
+	test("mixed supported and unsupported hooks: unsupported are skipped, supported are imported", async () => {
+		const { actions } = await planMigration({
+			results: [
+				{
+					mcpCandidates: [],
+					skillCandidates: [],
+					slashCommandCandidates: [],
+					agentCandidates: [],
+					hookCandidates: [
+						{
+							source: "claude-code",
+							event: "PreToolUse",
+							command: 'echo "pre"',
+						},
+						{
+							source: "claude-code",
+							event: "Stop",
+							command: 'echo "cleanup"',
+						},
+					],
+					instructionCandidates: [],
+					diagnostics: [],
+					manualActions: [],
+				},
+			],
+			destinations: dest,
+			force: false,
+		});
+
+		expect(actions).toHaveLength(2);
+		// Unsupported hooks are processed first, then supported hooks
+		const [unsupportedAction, supportedAction] = actions;
+		expect(unsupportedAction?.status).toBe("skipped_unmappable");
+		expect(supportedAction?.operation).toBe("create");
+		expect(supportedAction?.status).toBe("imported");
+	});
+});

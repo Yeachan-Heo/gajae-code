@@ -579,7 +579,7 @@ describe("end-to-end import", () => {
 		try {
 			const report = await runMigrate(opts({ from: ["claude-code"] }));
 			const hookAction = report.actions.find(action => action.type === "hook" && action.status === "imported");
-			expect(hookAction?.destination).toBe(path.join(cwd, ".gjc", "hooks", "migrated-claude-code.ts"));
+			expect(hookAction?.destination).toBe(path.join(cwd, ".gjc", "hooks", "post", "migrated-claude-code.ts"));
 			// The unsupported event is reported instead of silently dropped.
 			expect(report.actions).toContainEqual(
 				expect.objectContaining({ type: "hook", name: "Notification", status: "skipped_unmappable" }),
