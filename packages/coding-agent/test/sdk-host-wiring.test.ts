@@ -2275,14 +2275,17 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 	const sessionContext = context(cwd, sessionId);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceGeneration: 1, sinceSeq: 0 }));
+	// Omitting sinceGeneration replays the host's current generation.
+	socket.send(JSON.stringify({ type: "event_replay", id: "replay-1", sinceSeq: 0 }));
 	await waitFor(
 		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "replay-1"),
 		"event replay response",
 	);
 	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "replay-1");
-	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true, generation: 1 });
+	expect(replay).toMatchObject({ type: "event_replay_result", id: "replay-1", ok: true });
+	expect(replay).not.toHaveProperty("gap");
 	const replayEvents = replay?.events as Array<Record<string, unknown>>;
+	expect(replayEvents.every(event => event.generation === replay?.generation)).toBe(true);
 	expect(replayEvents.length).toBeGreaterThanOrEqual(4);
 	expect(replayEvents.map(event => event.seq)).toEqual(replayEvents.map((_event, index) => index + 1));
 	expect(replayEvents.slice(0, 2)).toEqual([

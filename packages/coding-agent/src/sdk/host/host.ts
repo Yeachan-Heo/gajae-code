@@ -84,6 +84,13 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	connectionCapabilities?: (connectionId: string) => ReadonlySet<string> | undefined;
 	/** Readiness publication mode; defaults to the stock immediate contract. */
 	readiness?: SessionReadinessMode;
+	/**
+	 * Lower bound for each started event generation; defaults to wall-clock
+	 * milliseconds. Every host process starts a fresh event stream, so a resumed
+	 * session must not reuse an earlier host's `(generation, seq)` namespace:
+	 * notification publication ids and replay cursors are keyed by it.
+	 */
+	eventGenerationFloor?: () => number;
 
 	/**
 	 * Authorization for a deferred activation. It is consulted on every attempt
@@ -301,7 +308,7 @@ export class SessionSdkHost {
 	async start(): Promise<"started" | "already"> {
 		if (this.#started) return "already";
 		this.#reportedActivityState = undefined;
-		this.events.restart();
+		this.events.restart((this.#options.eventGenerationFloor ?? Date.now)());
 		if (isAutoroutingInactive(this)) this.emitAutoroutingInactiveNotice();
 		if (this.#options.readiness !== "deferred") this.#publishReadiness();
 		else

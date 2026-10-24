@@ -132,6 +132,7 @@ describe("SessionSdkHost", () => {
 			sessionId: "s",
 			stateRoot: "/tmp/s",
 			token: "t",
+			eventGenerationFloor: () => 1_000,
 			sendFrame: () => {
 				return "written";
 			},
@@ -149,12 +150,52 @@ describe("SessionSdkHost", () => {
 		});
 		expect(await host.start()).toBe("started");
 		expect(await host.start()).toBe("already");
-		expect(registered).toEqual([1]);
+		expect(registered).toEqual([1_000]);
 		expect(handler).toBeDefined();
 		expect(await host.stop()).toBe("stopped");
 		expect(await host.stop()).toBe("already");
 		expect(await host.start()).toBe("started");
-		expect(registered).toEqual([1, 2]);
+		// A restart inside one stream advances even when the floor has not moved.
+		expect(registered).toEqual([1_000, 1_001]);
+	});
+
+	test("a recreated host for the same session never reuses an earlier host's event namespace", async () => {
+		let clock = 5_000;
+		const createHost = () =>
+			new SessionSdkHost({
+				sessionId: "resumed",
+				stateRoot: "/tmp/resumed",
+				token: "t",
+				eventGenerationFloor: () => clock,
+				sendFrame: () => "written",
+				onFrame: () => () => {},
+			});
+		const first = createHost();
+		await first.start();
+		const firstEvent = first.emitEvent({ kind: "notice", payload: { type: "notice", message: "first" } });
+		await first.stop();
+		clock = 9_000;
+		const resumed = createHost();
+		await resumed.start();
+		const resumedEvent = resumed.emitEvent({ kind: "notice", payload: { type: "notice", message: "resumed" } });
+		// Each process restarts its sequence, so only the generation keeps the
+		// resumed host's (generation, seq) coordinates apart from the closed host's.
+		expect(resumedEvent.seq).toBe(firstEvent.seq);
+		expect(firstEvent.generation).toBe(5_000);
+		expect(resumedEvent.generation).toBe(9_000);
+		await resumed.stop();
+
+		const before = Date.now();
+		const wallClock = new SessionSdkHost({
+			sessionId: "wall-clock",
+			stateRoot: "/tmp/wall-clock",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await wallClock.start();
+		expect(wallClock.generation).toBeGreaterThanOrEqual(before);
+		await wallClock.stop();
 	});
 
 	test("reports the idle host state and only records activity transitions", async () => {
@@ -539,6 +580,8 @@ describe("SessionSdkHost", () => {
 			sessionId: "s",
 			stateRoot: "/tmp/s",
 			token: "t",
+			// Pin generation numbering for the exact wire assertions below.
+			eventGenerationFloor: () => 0,
 			sendFrame: (connectionId, frame) => {
 				sent.push({ connectionId, frame });
 				return "written";

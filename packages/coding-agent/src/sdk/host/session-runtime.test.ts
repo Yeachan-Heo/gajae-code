@@ -4267,11 +4267,21 @@ describe("SessionSdkSessionRuntime", () => {
 			// Optional registration now completes independently of the event handler.
 			const deadline = Date.now() + 15_000;
 			await handlers.get("turn_start")?.({}, context);
-			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+			const registeredBroker = broker;
+			const indexedGeneration = async (): Promise<number> => {
+				await registeredBroker.index.refresh();
+				return (
+					registeredBroker.index.listSessions().sessions.find(session => session.sessionId === sessionId)
+						?.endpointGeneration ?? 0
+				);
+			};
+			let endpointGeneration = await indexedGeneration();
+			let endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 			while (!endpoint.ok && Date.now() < deadline) {
 				await Bun.sleep(20);
 				await handlers.get("turn_start")?.({}, context);
-				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+				endpointGeneration = await indexedGeneration();
+				endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration });
 			}
 			expect(endpoint).toMatchObject({
 				ok: true,
@@ -4282,18 +4292,19 @@ describe("SessionSdkSessionRuntime", () => {
 			// a matching generation on a terminal row is terminally gone (no endpoint will
 			// ever be issued again, and close takes its signal fallback), while a rotated
 			// generation is still merely stale and worth re-reading.
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
-				{
-					ok: false,
-					error: { code: "resource_gone", message: "session endpoint record is gone" },
-				},
-			);
-			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 2 })).toMatchObject(
-				{
-					ok: false,
-					error: { code: "endpoint_stale", message: "session endpoint is stale" },
-				},
-			);
+			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration })).toMatchObject({
+				ok: false,
+				error: { code: "resource_gone", message: "session endpoint record is gone" },
+			});
+			expect(
+				await broker.handleRequest("session.get_endpoint", {
+					sessionId,
+					endpointGeneration: endpointGeneration + 1,
+				}),
+			).toMatchObject({
+				ok: false,
+				error: { code: "endpoint_stale", message: "session endpoint is stale" },
+			});
 		} finally {
 			await broker?.stop();
 			await rm(cwd, { recursive: true, force: true });
