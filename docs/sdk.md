@@ -1279,3 +1279,32 @@ blindly re-sent), close mutates only an exactly re-proven substrate, and
 orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
+
+Managed tmux startup on macOS and Linux publishes a private (`0600` file in a
+`0700` lifecycle root) child binding before the supervised child starts, for
+every launch. A Broker-redacted launch publishes an opaque binding that carries
+neither the launch command nor a command digest; an ordinary launch publishes a
+recoverable binding with its exact command and digest. The CLI validates its
+exact session, generation, run, incarnation and child token through
+`readOwnerOnlyFile`, a bounded native read (at most 64 KiB) that keeps the
+acquired descriptor authority for the whole read, reads the bytes twice, and
+fails on any link, ownership, mode, ACL, size, or metadata change. Launcher and
+supervisor publish sibling evidence in the same private lifecycle root, so a
+read whose metadata changed mid-window (`metadata_changed`) is re-acquired from
+scratch a bounded number of times; identity, link-count, ownership and ACL
+failures are never retried. There is no pathname fallback.
+
+Opaque bindings never grant crash-recovery authority. Recoverable predecessor
+bindings and SIGABRT receipts remain a separate Linux-only capability backed by
+recovery-fs; stale binding schemas are rejected rather than migrated.
+
+Admission denial does not depend on being able to save a diagnostic. Unsafe or
+unavailable storage never receives a fallback pathname write: the child stays
+blocked with exit 75, and when the durable handoff cannot be persisted through
+retained private authority (always the case off Linux) it writes the bounded
+`managed_owner_admission_blocked: handoff_not_persisted` diagnostic.
+
+Source installations must rebuild the native addon (`bun run build:native`)
+when updating this admission boundary; compiled installations need a matching
+CLI/native build. Editing source or replacing files does not update a running
+Broker.

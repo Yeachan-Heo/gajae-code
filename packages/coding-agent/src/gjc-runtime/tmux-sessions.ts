@@ -3,11 +3,14 @@ import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { Process } from "@gajae-code/natives";
+import { type Process, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { startupProjectEnvSnapshot } from "@gajae-code/utils/env";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
+import {
+	managedSecurityFailureClassification,
+	prepareManagedDirectoryRoot,
+} from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	MANAGED_OWNER_COMMAND_ENV,
@@ -783,6 +786,14 @@ export function createGjcTmuxSession(
 		tmuxRuntimeSessionPath(cwd, launch?.childSessionId ?? filteredGjcSessionId, buildGjcTmuxSessionSlug(sessionName));
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
+	if (launch) {
+		const lifecycleRoot = lifecyclePaths(stateDir, sessionId, generation).root;
+		if (fsSync.existsSync(lifecycleRoot) && !verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+		prepareManagedDirectoryRoot(lifecycleRoot);
+		if (!verifyOwnerOnlyPathSecurity(lifecycleRoot, "directory").ok)
+			throw new Error("gjc_tmux_managed_storage_unsafe");
+	}
 	const authority = bindGjcTmuxProviderAuthority(provider, { stateDir, sessionId, generation });
 	const managedEnvironment: Record<string, string> = {
 		GJC_TMUX_LAUNCHED: "1",
