@@ -10028,7 +10028,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const terminalPublication = Promise.withResolvers<SdkOnlyDeadlineRecoveryCheckpoint>();
 		const recoveryCheckpoints: SdkOnlyDeadlineRecoveryCheckpoint[] = [];
 		const persistenceLog: Array<PersistenceInstrumentationEvent & { label: string }> = [];
-		let boundaryWaitStarted = false;
+		const boundaryWaitStarted = Promise.withResolvers<void>();
 		let abortCalls = 0;
 		let sends = 0;
 		let harness: InvocationHarness | undefined;
@@ -10059,7 +10059,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 							terminalPublication.resolve(checkpoint);
 					},
 					pendingToolExecutions: () => {
-						if (activeTools.size > 0) boundaryWaitStarted = true;
+						if (activeTools.size > 0) boundaryWaitStarted.resolve();
 						const pending = [...activeTools];
 						if (pending.length === 0) toolDrainObserved.resolve();
 						return pending;
@@ -10089,9 +10089,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				toolName: "apply_patch",
 				args: {},
 			});
-			const waitDeadline = Date.now() + 2_000;
-			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
-			expect(boundaryWaitStarted).toBe(true);
+			await boundaryWaitStarted.promise;
 			await harness.emit("agent_end", { stopReason: "cancelled" });
 			await Bun.sleep(5_200);
 			expect(abortCalls).toBe(0);
