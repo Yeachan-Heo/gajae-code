@@ -635,38 +635,72 @@ describe("managed owner admission", () => {
 		},
 	);
 
-	it("turns a recovery admission into a durable terminal handoff without changing B0 or dirty files", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-"));
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-cwd-"));
-		try {
-			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
-			await writeBinding(root, "predecessor");
-			await writeSigabrtReceipt(root, "predecessor");
-			const transcript = await writeRecoveryEvidence(cwd);
-			const goals = path.join(sessionUltragoalDir(cwd, "session-2681"), "goals.json");
-			const ledger = path.join(sessionUltragoalDir(cwd, "session-2681"), "ledger.jsonl");
-			const [beforeGoals, beforeLedger] = await Promise.all([
-				fs.readFile(goals, "utf8"),
-				fs.readFile(ledger, "utf8"),
-			]);
-			const dirty = path.join(cwd, "dirty.ts");
-			await fs.writeFile(dirty, "export const dirty = true;\n");
-			const result = await recover(stateDir, cwd, "predecessor", transcript);
-			expect(result).toEqual({ kind: "handoff", exitCode: 75 });
-			expect(await fs.readFile(dirty, "utf8")).toBe("export const dirty = true;\n");
-			expect(await fs.readFile(goals, "utf8")).toBe(beforeGoals);
-			expect(await fs.readFile(ledger, "utf8")).toBe(beforeLedger);
-			const handoffs = (await fs.readdir(root)).filter(file => file.startsWith("admission-handoff-"));
-			expect(handoffs).toHaveLength(1);
-			expect(JSON.parse(await fs.readFile(path.join(root, handoffs[0]!), "utf8"))).toMatchObject({
-				state: "fail_closed_handoff",
-				reason: "safe_session_resume_seam_unavailable",
-				terminal_reconciliation: "unavailable_without_owning_store_cas",
-				b0_preserved: true,
-			});
-		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
-			await fs.rm(cwd, { recursive: true, force: true });
-		}
-	});
+	it.skipIf(process.platform !== "linux")(
+		"turns a recovery admission into a durable terminal handoff without changing B0 or dirty files",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-"));
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-cwd-"));
+			try {
+				const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+				await writeBinding(root, "predecessor");
+				await writeSigabrtReceipt(root, "predecessor");
+				const transcript = await writeRecoveryEvidence(cwd);
+				const goals = path.join(sessionUltragoalDir(cwd, "session-2681"), "goals.json");
+				const ledger = path.join(sessionUltragoalDir(cwd, "session-2681"), "ledger.jsonl");
+				const [beforeGoals, beforeLedger] = await Promise.all([
+					fs.readFile(goals, "utf8"),
+					fs.readFile(ledger, "utf8"),
+				]);
+				const dirty = path.join(cwd, "dirty.ts");
+				await fs.writeFile(dirty, "export const dirty = true;\n");
+				const result = await recover(stateDir, cwd, "predecessor", transcript);
+				expect(result).toEqual({ kind: "handoff", exitCode: 75 });
+				expect(await fs.readFile(dirty, "utf8")).toBe("export const dirty = true;\n");
+				expect(await fs.readFile(goals, "utf8")).toBe(beforeGoals);
+				expect(await fs.readFile(ledger, "utf8")).toBe(beforeLedger);
+				const handoffs = (await fs.readdir(root)).filter(file => file.startsWith("admission-handoff-"));
+				expect(handoffs).toHaveLength(1);
+				expect(JSON.parse(await fs.readFile(path.join(root, handoffs[0]!), "utf8"))).toMatchObject({
+					state: "fail_closed_handoff",
+					reason: "safe_session_resume_seam_unavailable",
+					terminal_reconciliation: "unavailable_without_owning_store_cas",
+					b0_preserved: true,
+				});
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "linux")(
+		"keeps a recovery admission blocked off Linux without persisting a handoff or changing B0 or dirty files",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-"));
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-cwd-"));
+			try {
+				const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+				await writeBinding(root, "predecessor");
+				await writeSigabrtReceipt(root, "predecessor");
+				const transcript = await writeRecoveryEvidence(cwd);
+				const goals = path.join(sessionUltragoalDir(cwd, "session-2681"), "goals.json");
+				const ledger = path.join(sessionUltragoalDir(cwd, "session-2681"), "ledger.jsonl");
+				const [beforeGoals, beforeLedger] = await Promise.all([
+					fs.readFile(goals, "utf8"),
+					fs.readFile(ledger, "utf8"),
+				]);
+				const dirty = path.join(cwd, "dirty.ts");
+				await fs.writeFile(dirty, "export const dirty = true;\n");
+				// Durable private publication needs Linux owner-only directory authority.
+				expect(await recover(stateDir, cwd, "predecessor", transcript)).toEqual({ kind: "blocked", exitCode: 75 });
+				expect(await fs.readFile(dirty, "utf8")).toBe("export const dirty = true;\n");
+				expect(await fs.readFile(goals, "utf8")).toBe(beforeGoals);
+				expect(await fs.readFile(ledger, "utf8")).toBe(beforeLedger);
+				expect((await fs.readdir(root)).filter(file => file.startsWith("admission-handoff-"))).toEqual([]);
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+	);
 });

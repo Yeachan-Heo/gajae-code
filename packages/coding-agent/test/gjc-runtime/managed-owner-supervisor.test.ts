@@ -612,51 +612,95 @@ setInterval(() => {}, 1_000);`;
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "Managed supervisor verification or teardown failed");
 	}, 20_000);
-	it("routes a replacement supervisor child through predecessor recovery before normal CLI", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-cwd-"));
-		try {
-			const predecessor = await runSupervisor(stateDir, fastSigabrtCommand());
-			expect(predecessor.exitCode).toBe(134);
-			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
-			const bindingFile = (await fs.readdir(root)).find(
-				file => file.startsWith("child-") && file.endsWith(".binding.json"),
-			);
-			expect(bindingFile).toBeDefined();
-			const predecessorToken = bindingFile!.slice("child-".length, -".binding.json".length);
-			const ultragoal = sessionUltragoalDir(cwd, "session-2681");
-			await fs.mkdir(ultragoal, { recursive: true });
-			await fs.writeFile(path.join(ultragoal, "goals.json"), '{"goals":[]}');
-			await fs.writeFile(path.join(ultragoal, "ledger.jsonl"), '{"event":"started"}\n');
-			const transcript = path.join(cwd, "predecessor.jsonl");
-			await fs.writeFile(
-				transcript,
-				'{"id":"yield-1","parentId":null,"type":"yield","result":{"status":"success"}}\n{"id":"result-1","parentId":"yield-1","type":"toolResult","toolCallId":"yield-1","content":[]}\n',
-			);
-			const childScript = `import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from ${JSON.stringify(admissionModule)}; process.chdir(${JSON.stringify(cwd)}); const admission = await admitManagedOwnerBeforeCli(); const terminal = admission.kind === "recovery" ? await completeManagedOwnerRecovery(admission.context) : admission; console.log(JSON.stringify({ kind: terminal.kind }));`;
-			const replacement = await runSupervisor(stateDir, [process.execPath, "-e", childScript], {
-				GJC_TMUX_OWNER_GENERATION: "replacement-generation-2681",
-				GJC_MANAGED_OWNER_RUN_ID: "replacement-run-2681",
-				GJC_MANAGED_OWNER_INCARNATION: "replacement-incarnation-2681",
-				GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: predecessorToken,
-				GJC_MANAGED_OWNER_PREDECESSOR_GENERATION: "generation-2681",
-				GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID: "run-2681",
-				GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION: "incarnation-2681",
-				GJC_MANAGED_OWNER_TRANSCRIPT_PATH: transcript,
-			});
-			expect(replacement.exitCode).toBe(75);
-			expect(replacement.stdout).toContain('"kind":"handoff"');
-			const handoffFile = (await fs.readdir(root)).find(
-				file => file.startsWith("admission-handoff-") && file.endsWith(".json"),
-			);
-			expect(handoffFile).toBeDefined();
-			expect(JSON.parse(await fs.readFile(path.join(root, handoffFile!), "utf8"))).toMatchObject({
-				state: "fail_closed_handoff",
-				reason: "safe_session_resume_seam_unavailable",
-			});
-		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
-			await fs.rm(cwd, { recursive: true, force: true });
-		}
-	});
+	it.skipIf(process.platform !== "linux")(
+		"routes a replacement supervisor child through predecessor recovery before normal CLI",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-cwd-"));
+			try {
+				const predecessor = await runSupervisor(stateDir, fastSigabrtCommand());
+				expect(predecessor.exitCode).toBe(134);
+				const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+				const bindingFile = (await fs.readdir(root)).find(
+					file => file.startsWith("child-") && file.endsWith(".binding.json"),
+				);
+				expect(bindingFile).toBeDefined();
+				const predecessorToken = bindingFile!.slice("child-".length, -".binding.json".length);
+				const ultragoal = sessionUltragoalDir(cwd, "session-2681");
+				await fs.mkdir(ultragoal, { recursive: true });
+				await fs.writeFile(path.join(ultragoal, "goals.json"), '{"goals":[]}');
+				await fs.writeFile(path.join(ultragoal, "ledger.jsonl"), '{"event":"started"}\n');
+				const transcript = path.join(cwd, "predecessor.jsonl");
+				await fs.writeFile(
+					transcript,
+					'{"id":"yield-1","parentId":null,"type":"yield","result":{"status":"success"}}\n{"id":"result-1","parentId":"yield-1","type":"toolResult","toolCallId":"yield-1","content":[]}\n',
+				);
+				const childScript = `import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from ${JSON.stringify(admissionModule)}; process.chdir(${JSON.stringify(cwd)}); const admission = await admitManagedOwnerBeforeCli(); const terminal = admission.kind === "recovery" ? await completeManagedOwnerRecovery(admission.context) : admission; console.log(JSON.stringify({ kind: terminal.kind }));`;
+				const replacement = await runSupervisor(stateDir, [process.execPath, "-e", childScript], {
+					GJC_TMUX_OWNER_GENERATION: "replacement-generation-2681",
+					GJC_MANAGED_OWNER_RUN_ID: "replacement-run-2681",
+					GJC_MANAGED_OWNER_INCARNATION: "replacement-incarnation-2681",
+					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: predecessorToken,
+					GJC_MANAGED_OWNER_PREDECESSOR_GENERATION: "generation-2681",
+					GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID: "run-2681",
+					GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION: "incarnation-2681",
+					GJC_MANAGED_OWNER_TRANSCRIPT_PATH: transcript,
+				});
+				expect(replacement.exitCode).toBe(75);
+				expect(replacement.stdout).toContain('"kind":"handoff"');
+				const handoffFile = (await fs.readdir(root)).find(
+					file => file.startsWith("admission-handoff-") && file.endsWith(".json"),
+				);
+				expect(handoffFile).toBeDefined();
+				expect(JSON.parse(await fs.readFile(path.join(root, handoffFile!), "utf8"))).toMatchObject({
+					state: "fail_closed_handoff",
+					reason: "safe_session_resume_seam_unavailable",
+				});
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+	);
+	it.skipIf(process.platform === "linux")(
+		"keeps a replacement supervisor child blocked off Linux without persisting a predecessor handoff",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-cwd-"));
+			try {
+				const predecessor = await runSupervisor(stateDir, fastSigabrtCommand());
+				expect(predecessor.exitCode).toBe(134);
+				const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+				const bindingFile = (await fs.readdir(root)).find(
+					file => file.startsWith("child-") && file.endsWith(".binding.json"),
+				);
+				expect(bindingFile).toBeDefined();
+				const predecessorToken = bindingFile!.slice("child-".length, -".binding.json".length);
+				const transcript = path.join(cwd, "predecessor.jsonl");
+				await fs.writeFile(
+					transcript,
+					'{"id":"yield-1","parentId":null,"type":"yield","result":{"status":"success"}}\n{"id":"result-1","parentId":"yield-1","type":"toolResult","toolCallId":"yield-1","content":[]}\n',
+				);
+				const childScript = `import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from ${JSON.stringify(admissionModule)}; process.chdir(${JSON.stringify(cwd)}); const admission = await admitManagedOwnerBeforeCli(); const terminal = admission.kind === "recovery" ? await completeManagedOwnerRecovery(admission.context) : admission; console.log(JSON.stringify({ kind: terminal.kind }));`;
+				const replacement = await runSupervisor(stateDir, [process.execPath, "-e", childScript], {
+					GJC_TMUX_OWNER_GENERATION: "replacement-generation-2681",
+					GJC_MANAGED_OWNER_RUN_ID: "replacement-run-2681",
+					GJC_MANAGED_OWNER_INCARNATION: "replacement-incarnation-2681",
+					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: predecessorToken,
+					GJC_MANAGED_OWNER_PREDECESSOR_GENERATION: "generation-2681",
+					GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID: "run-2681",
+					GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION: "incarnation-2681",
+					GJC_MANAGED_OWNER_TRANSCRIPT_PATH: transcript,
+				});
+				// Durable private publication needs Linux owner-only directory authority.
+				expect(replacement.exitCode).toBe(75);
+				expect(replacement.stdout).toContain('"kind":"blocked"');
+				expect(replacement.stderr).toContain("managed_owner_admission_blocked: handoff_not_persisted");
+				expect((await fs.readdir(root)).filter(file => file.startsWith("admission-handoff-"))).toEqual([]);
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+	);
 });

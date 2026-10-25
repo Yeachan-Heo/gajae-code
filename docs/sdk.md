@@ -1296,7 +1296,13 @@ failures are never retried. There is no pathname fallback.
 
 Opaque bindings never grant crash-recovery authority. Recoverable predecessor
 bindings and SIGABRT receipts remain a separate Linux-only capability backed by
-recovery-fs; stale binding schemas are rejected rather than migrated.
+recovery-fs; stale binding schemas are rejected rather than migrated. Windows
+managed-owner admission is unsupported: managed tmux/psmux launches are rejected
+before supervisor or session allocation and lifecycle-state writes, with the
+bounded reason `gjc_tmux_managed_launch_platform_unsupported:win32`. The Broker
+reports `substrate_proof_failed` without silently falling back to headless.
+Ordinary unmanaged Windows launches and independent headless selection are
+unchanged.
 
 Admission denial does not depend on being able to save a diagnostic. Unsafe or
 unavailable storage never receives a fallback pathname write: the child stays
