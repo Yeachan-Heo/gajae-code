@@ -88,21 +88,22 @@ test("4356 router distinguishes unpublished and expired requests before dispatch
 			{ deadline: undefined, reason: "session not published" },
 			{ deadline: Date.now() - 1, reason: "deadline elapsed during router preparation" },
 		]) {
-			const error = await router
-				.request("session-4356", { type: "get_state" }, undefined, undefined, {
-					deadline,
-					beforeDispatch: () => {
-						dispatches++;
-					},
-				})
-				.catch((error: unknown) => error);
-			expect(error).toBeInstanceOf(SessionRouterError);
-			expect(error).toMatchObject({ phase: "pre_send", message: expect.stringContaining(reason) });
+			const request = router.request("session-4356", { type: "get_state" }, undefined, undefined, {
+				deadline,
+				beforeDispatch: () => {
+					dispatches++;
+				},
+			});
+			await expect(request).rejects.toBeInstanceOf(SessionRouterError);
+			await expect(request).rejects.toMatchObject({ phase: "pre_send", message: expect.stringContaining(reason) });
 			expect(dispatches).toBe(0);
 		}
 	} finally {
-		await router.stop();
-		await fs.rm(agentDir, { recursive: true, force: true });
+		try {
+			await router.stop();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
 	}
 });
 
