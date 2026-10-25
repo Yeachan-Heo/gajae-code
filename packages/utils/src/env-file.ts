@@ -336,6 +336,37 @@ function readBoundedEnvFile(filePath: string, maxFileBytes: number): { content?:
 	}
 }
 
+/**
+ * True when Bun expands the declaration at load time.
+ * A backslash before `$` is a literal dollar, the same rule as project-value
+ * expansion. Any other `$`, and any backtick, is still an expansion.
+ */
+export function projectDeclarationIsDynamic(value: string): boolean {
+	for (let index = 0; index < value.length; index++) {
+		const char = value[index];
+		if (char === "\\" && value[index + 1] === "$") {
+			index++;
+			continue;
+		}
+		if (char === "$" || char === "`") return true;
+	}
+	return false;
+}
+
+/** Bun drops a backslash before `$`. Equality uses that decoded literal. */
+export function decodeEscapedProjectLiteral(value: string): string {
+	let result = "";
+	for (let index = 0; index < value.length; index++) {
+		if (value[index] === "\\" && value[index + 1] === "$") {
+			result += "$";
+			index++;
+			continue;
+		}
+		result += value[index] ?? "";
+	}
+	return result;
+}
+
 export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnapshotOptions = {}): ProjectEnvSnapshot {
 	if (
 		options.maxFileBytes !== undefined &&
@@ -370,10 +401,13 @@ export function projectEnvSnapshot(cwd = process.cwd(), options: ProjectEnvSnaps
 		for (const [rawKey, value] of Object.entries(parseEnvFileContent(content))) {
 			const key = canonicalEnvKey(rawKey);
 			seen.add(key);
-			values[key] = value;
 			// A quoted declaration Bun may decode differently is refused, same as `$`.
 			// Unquoted values, and one plain pair of quotes, still compare by text.
-			if (quoted.has(key) || /[$`]/.test(value)) dynamic.add(key);
+			// An escaped dollar is a literal. Store Bun's decoded text so equality
+			// still sees the project value. A real `$` or backtick stays dynamic.
+			const expands = projectDeclarationIsDynamic(value);
+			values[key] = expands || quoted.has(key) ? value : decodeEscapedProjectLiteral(value);
+			if (quoted.has(key) || expands) dynamic.add(key);
 			else dynamic.delete(key);
 		}
 		// The line parser drops a key when `.` cannot cross a carriage return, or

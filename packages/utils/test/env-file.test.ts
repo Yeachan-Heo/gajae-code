@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import fc from "fast-check";
 import { canonicalEnvKey, parseEnvFileContent, projectEnvSnapshot } from "../src/env-file";
 
 const tempDirs: string[] = [];
@@ -212,6 +213,59 @@ describe("projectEnvSnapshot quoted declarations", () => {
 		const snapshot = projectEnvSnapshot(cwd);
 		expect(snapshot.dynamic.has("GJC_CODING_AGENT_DIR")).toBe(true);
 	});
+
+	test("does not mark an escaped dollar dynamic", () => {
+		const cwd = tempDir("gjc-env-escaped-dollar-");
+		fs.writeFileSync(path.join(cwd, ".env"), "LITERAL=\\$UNSET\nREAL=$UNSET\nTICK=`UNSET`\n");
+		const snapshot = projectEnvSnapshot(cwd);
+		expect(snapshot.values.LITERAL).toBe("$UNSET");
+		expect(snapshot.dynamic.has("LITERAL")).toBe(false);
+		expect(snapshot.dynamic.has("REAL")).toBe(true);
+		expect(snapshot.dynamic.has("TICK")).toBe(true);
+	});
+});
+
+describe("project declaration expansion", () => {
+	test("treats an escaped dollar as a literal and a real expansion as dynamic", async () => {
+		const name = fc.stringMatching(/^[A-Za-z_][A-Za-z0-9_]{0,12}$/);
+		fc.assert(
+			fc.property(name, ident => {
+				const cwd = tempDir("gjc-env-dyn-prop-");
+				fs.writeFileSync(
+					path.join(cwd, ".env"),
+					`LITERAL=\\$${ident}\nREAL=$${ident}\nTICK=\`${ident}\`\nMIX=pre\\$${ident}$${ident}\n`,
+				);
+				const snapshot = projectEnvSnapshot(cwd);
+				expect(snapshot.values.LITERAL).toBe(`$${ident}`);
+				expect(snapshot.dynamic.has("LITERAL")).toBe(false);
+				expect(snapshot.dynamic.has("REAL")).toBe(true);
+				expect(snapshot.dynamic.has("TICK")).toBe(true);
+				expect(snapshot.dynamic.has("MIX")).toBe(true);
+			}),
+			{ seed: 7219, numRuns: 64 },
+		);
+
+		const cwd = tempDir("gjc-env-dyn-bun-");
+		const home = tempDir("gjc-env-dyn-bun-home-");
+		fs.writeFileSync(path.join(cwd, ".env"), "LITERAL=\\$UNSET\n");
+		const snapshot = projectEnvSnapshot(cwd);
+		const script = path.join(cwd, "loaded-literal.ts");
+		await Bun.write(script, "console.log(JSON.stringify({ loaded: process.env.LITERAL ?? null }));\n");
+		const childEnv: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
+		delete childEnv.LITERAL;
+		const proc = Bun.spawn([process.execPath, script], {
+			cwd,
+			env: childEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = await new Response(proc.stdout).text();
+		const stderr = await new Response(proc.stderr).text();
+		expect(await proc.exited, stderr).toBe(0);
+		const loaded = (JSON.parse(stdout.trim()) as { loaded: string | null }).loaded;
+		expect(loaded).toBe(snapshot.values.LITERAL);
+		expect(loaded).toBe("$UNSET");
+	});
 });
 
 describe("projectEnvSnapshot bounded reads", () => {
@@ -280,6 +334,55 @@ async function printedAgentDir(cwd: string, env: Record<string, string | undefin
 }
 
 describe("getAgentDir quote provenance", () => {
+	test("does not adopt an escaped-dollar project agent directory", async () => {
+		const cwd = tempDir("gjc-env-esc-agent-");
+		const home = tempDir("gjc-env-esc-home-");
+		const plantedRoot = tempDir("gjc-env-esc-plant-");
+		const planted = path.join(plantedRoot, "$UNSET");
+		fs.mkdirSync(planted);
+		fs.writeFileSync(path.join(planted, ".env"), "OPENAI_API_KEY=planted-project-secret\n");
+		fs.writeFileSync(path.join(cwd, ".env"), `GJC_CODING_AGENT_DIR=${plantedRoot}/\\$UNSET\n`);
+		const agentDir = await printedAgentDir(cwd, { HOME: home, USERPROFILE: home });
+		expect(agentDir.includes("$UNSET")).toBe(false);
+		expect(agentDir.includes(plantedRoot)).toBe(false);
+	});
+
+	test("does not trust a credential file in an escaped-dollar project agent directory", async () => {
+		const cwd = tempDir("gjc-env-esc-cred-");
+		const home = tempDir("gjc-env-esc-cred-home-");
+		const plantedRoot = tempDir("gjc-env-esc-cred-plant-");
+		const planted = path.join(plantedRoot, "$UNSET");
+		fs.mkdirSync(planted);
+		fs.writeFileSync(path.join(planted, ".env"), "OPENAI_API_KEY=planted-project-secret\n");
+		fs.writeFileSync(path.join(cwd, ".env"), `GJC_CODING_AGENT_DIR=${plantedRoot}/\\$UNSET\n`);
+		const envSource = path.join(import.meta.dir, "../src/env.ts");
+		const script = path.join(cwd, "print-agent-cred.ts");
+		await Bun.write(
+			script,
+			`import { getAgentDir } from ${JSON.stringify(dirsSource)};\n` +
+				`import { $credentialEnv } from ${JSON.stringify(envSource)};\n` +
+				`console.log(JSON.stringify({ agentDir: getAgentDir(), key: $credentialEnv("OPENAI_API_KEY") ?? null }));\n`,
+		);
+		const childEnv: Record<string, string | undefined> = { ...process.env, HOME: home, USERPROFILE: home };
+		delete childEnv.GJC_CODING_AGENT_DIR;
+		delete childEnv.PI_CODING_AGENT_DIR;
+		delete childEnv.GJC_CONFIG_DIR;
+		delete childEnv.PI_CONFIG_DIR;
+		delete childEnv.OPENAI_API_KEY;
+		const proc = Bun.spawn([process.execPath, script], {
+			cwd,
+			env: childEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = await new Response(proc.stdout).text();
+		const stderr = await new Response(proc.stderr).text();
+		expect(await proc.exited, stderr).toBe(0);
+		const parsed = JSON.parse(stdout.trim()) as { agentDir: string; key: string | null };
+		expect(parsed.agentDir.includes("$UNSET")).toBe(false);
+		expect(parsed.key).toBeNull();
+	});
+
 	test("does not follow a double-quoted newline planted by the project .env", async () => {
 		const cwd = tempDir("gjc-env-quote-nl-");
 		const home = tempDir("gjc-env-quote-home-");

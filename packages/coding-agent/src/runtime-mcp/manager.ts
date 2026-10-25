@@ -34,7 +34,11 @@ import {
 	MCPPoolLeaseObsoleteError,
 	MCPPoolLeaseReleaseError,
 } from "./pool";
-import { decideUntrustedProjectConfigValue, isUntrustedProjectMcpSource } from "./project-host-values";
+import {
+	decideUntrustedProjectConfigValue,
+	isUntrustedLifecycleToolsOnlySource,
+	isUntrustedProjectMcpSource,
+} from "./project-host-values";
 import type { MCPProtocolObservation } from "./protocol";
 import { DEFAULT_MCP_STARTUP_WAIT_MS, MAX_MCP_STARTUP_WAIT_MS, MCP_STARTUP_WAIT_GRACE_MS } from "./startup-policy";
 import type { MCPToolDetails } from "./tool-bridge";
@@ -347,6 +351,8 @@ export interface MCPDiscoverOptions {
 	onConnecting?: (serverNames: string[]) => void;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
+	/** This exact file was written by the lifecycle host, not chosen by the caller. */
+	lifecycleOrigin?: boolean;
 	/** Idle retention for shared MCP pool entries. */
 	sharedPoolIdleMs?: number;
 }
@@ -1215,6 +1221,7 @@ export class MCPManager {
 			autoloadOnly: options?.autoloadOnly,
 			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
+			lifecycleOrigin: options?.lifecycleOrigin,
 		});
 		omitUnapprovedProjectStdio(configs, sources, this.#allowUntrustedProjectStdio, this.#toolsOnly);
 		if (this.#toolCacheServerNames !== undefined) {
@@ -3287,7 +3294,12 @@ export class MCPManager {
 		// Discovery already stores the transport default. /mcp test passes the raw
 		// file entry. The client treats a missing or null type as stdio.
 		const serverType = resolved.type ?? "stdio";
-		const untrustedProject = isUntrustedProjectMcpSource(source, this.#toolsOnly);
+		// Lifecycle temp files are tools-only, but their env and headers came from
+		// the session launch request. Apply the project host-value policy there
+		// without dropping the server (omitUnapprovedProjectStdio stays unchanged).
+		const untrustedProject =
+			isUntrustedProjectMcpSource(source, this.#toolsOnly) ||
+			isUntrustedLifecycleToolsOnlySource(source, this.#toolsOnly);
 		if (serverType === "stdio" && (this.#toolsOnly || untrustedProject)) {
 			resolved = { ...resolved, type: "stdio", noInheritEnv: true } as MCPServerConfig;
 		}

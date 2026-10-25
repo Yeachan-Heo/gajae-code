@@ -92,7 +92,7 @@ function spansByName(spans: ReadableSpan[], name: string): ReadableSpan[] {
 describe("agent-loop OTEL instrumentation", () => {
 	it("emits no spans when telemetry is unset (zero-cost path)", async () => {
 		const mock = createMockModel({ ...MOCK_IDENT, responses: [{ content: ["ok"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
 		await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
 
@@ -118,7 +118,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			sessionId: "conv-42",
 			temperature: 0.7,
@@ -179,7 +179,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			agentLoop(
 				[createUserMessage("hi")],
 				{ systemPrompt: [], messages: [], tools: [] },
-				{ model: googleMock.model, convertToLlm: identityConverter, telemetry: {} },
+				{ model: googleMock, convertToLlm: identityConverter, telemetry: {} },
 				undefined,
 				googleMock.stream,
 			),
@@ -200,7 +200,7 @@ describe("agent-loop OTEL instrumentation", () => {
 				[createUserMessage("hi")],
 				{ systemPrompt: [], messages: [], tools: [] },
 				{
-					model: openAiMock.model,
+					model: openAiMock,
 					convertToLlm: identityConverter,
 					serviceTier: "priority",
 					telemetry: {},
@@ -223,7 +223,7 @@ describe("agent-loop OTEL instrumentation", () => {
 				provider: "openai",
 				responses: [{ content: ["ok"] }],
 			});
-			const model = { ...mock.model, compat: { supportsUltrafastTier } };
+			const model = { ...mock, compat: { supportsUltrafastTier } };
 			await runAndDrain(
 				agentLoop(
 					[createUserMessage("hi")],
@@ -303,7 +303,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {},
 		};
@@ -348,7 +348,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {},
 		};
@@ -384,7 +384,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {},
 		};
@@ -447,7 +447,7 @@ describe("agent-loop OTEL instrumentation", () => {
 					{ content: ["done"] },
 				],
 			});
-			const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, telemetry: {} };
+			const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter, telemetry: {} };
 			const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
 			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
 
@@ -466,7 +466,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			responses: [{ throw: "provider returned 500" }],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {},
 		};
@@ -486,7 +486,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			responses: [{ content: ["hi back"], stopReason: "stop" }],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: { captureMessageContent: true },
 		};
@@ -512,7 +512,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			responses: [{ content: ["hi back"], stopReason: "stop" }],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: { captureMessageContent: "summary" },
 		};
@@ -543,7 +543,7 @@ describe("agent-loop OTEL instrumentation", () => {
 				responses: [{ content: ["hi back"], stopReason: "stop" }],
 			});
 			const config: AgentLoopConfig = {
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				telemetry: {},
 			};
@@ -572,7 +572,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			});
 			const warnings: unknown[] = [];
 			const config: AgentLoopConfig = {
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				telemetry: { onTelemetryWarning: warning => warnings.push(warning) },
 			};
@@ -616,7 +616,7 @@ describe("agent-loop OTEL instrumentation", () => {
 				responses: [{ content: ["hi back"], stopReason: "stop" }],
 			});
 			const config: AgentLoopConfig = {
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				telemetry: {},
 			};
@@ -644,7 +644,7 @@ describe("agent-loop OTEL instrumentation", () => {
 				responses: [{ content: ["hi back"], stopReason: "stop" }],
 			});
 			const config: AgentLoopConfig = {
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				telemetry: { captureMessageContent: true },
 			};
@@ -678,7 +678,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				costEstimator: input => ({
@@ -722,7 +722,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		}> = [];
 
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				agent: { name: "prefix.worker" },
@@ -754,7 +754,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			responses: [{ content: ["ok"], stopReason: "stop" }],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: { costEstimator: () => ({ unavailable: "unsupported_tier" }) },
 		};
@@ -779,7 +779,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		});
 		const events: ChatUsageEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				agent: { id: "agent-1", name: "worker" },
@@ -816,7 +816,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		});
 		const events: ChatUsageEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				costEstimator: () => ({ usd: 0.05, inputUsd: 0.01, outputUsd: 0.04 }),
@@ -851,7 +851,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		let resolveCalls = 0;
 		const runEnds: Array<{ summary: AgentRunSummary; coverage: AgentRunCoverage }> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				spans: false,
@@ -910,7 +910,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		);
 		const mock = createMockModel({ ...MOCK_IDENT, responses: [] });
 		const span = await recordManualChatTelemetry(telemetry, {
-			model: mock.model,
+			model: mock,
 			responseModel: "manual-model",
 			stepNumber: 0,
 			usage: { input: 5, output: 3, totalTokens: 8 } as never,
@@ -926,7 +926,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		const mock = createMockModel({ ...MOCK_IDENT, responses: [] });
 		const runEnds: Array<{ summary: AgentRunSummary; coverage: AgentRunCoverage }> = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			syncContextBeforeModelCall: () => {
 				throw new Error("usage-only sync failure");
@@ -968,7 +968,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
 		};
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				spans: false,
@@ -995,7 +995,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		});
 		const events: ChatUsageEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				costEstimator: () => ({ unavailable: "unsupported_tier" }),
@@ -1024,14 +1024,14 @@ describe("agent-loop OTEL instrumentation", () => {
 		);
 		const mock = createMockModel({ ...MOCK_IDENT, responses: [] });
 		await recordManualChatTelemetry(telemetry, {
-			model: mock.model,
+			model: mock,
 			responseModel: "manual-model",
 			stepNumber: 0,
 		});
 		expect(events).toHaveLength(0);
 
 		await recordManualChatTelemetry(telemetry, {
-			model: mock.model,
+			model: mock,
 			responseModel: "manual-model",
 			usage: {
 				input: 7,
@@ -1056,7 +1056,7 @@ describe("agent-loop OTEL instrumentation", () => {
 		});
 		const warnings: string[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				onChatUsage: async () => {
@@ -1082,7 +1082,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {
 				agent: { id: "a", name: "main" },
@@ -1136,7 +1136,7 @@ describe("agent-loop OTEL instrumentation", () => {
 
 		const mock = createMockModel({ ...MOCK_IDENT });
 		await recordManualChatTelemetry(telemetry, {
-			model: mock.model,
+			model: mock,
 			usage: {
 				input: 10,
 				output: 5,
@@ -1189,7 +1189,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: cfg,
 		};
@@ -1302,7 +1302,7 @@ describe("ChatUsageEvent.headers and pi.gen_ai.gateway.* span attributes", () =>
 		});
 		const events: ChatUsageEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: { onChatUsage: event => void events.push(event) },
 		};
@@ -1324,7 +1324,7 @@ describe("ChatUsageEvent.headers and pi.gen_ai.gateway.* span attributes", () =>
 		});
 		const events: ChatUsageEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: { onChatUsage: event => void events.push(event) },
 		};
@@ -1351,7 +1351,7 @@ describe("ChatUsageEvent.headers and pi.gen_ai.gateway.* span attributes", () =>
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {},
 		};
@@ -1362,7 +1362,7 @@ describe("ChatUsageEvent.headers and pi.gen_ai.gateway.* span attributes", () =>
 		expect(chat?.attributes[PiGenAIAttr.GatewayName]).toBe("litellm");
 		expect(chat?.attributes[PiGenAIAttr.GatewayCallId]).toBe("ll-call-abc");
 		expect(chat?.attributes[PiGenAIAttr.GatewayRoutedTo]).toBe("anthropic/claude-sonnet-4-7");
-		expect(chat?.attributes[PiGenAIAttr.GatewayEndpoint]).toBe(mock.model.baseUrl);
+		expect(chat?.attributes[PiGenAIAttr.GatewayEndpoint]).toBe(mock.baseUrl);
 	});
 
 	it("does not stamp gateway attributes when headers carry no known pattern", async () => {
@@ -1377,7 +1377,7 @@ describe("ChatUsageEvent.headers and pi.gen_ai.gateway.* span attributes", () =>
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			telemetry: {},
 		};
@@ -1403,7 +1403,7 @@ describe("ChatUsageEvent.headers and pi.gen_ai.gateway.* span attributes", () =>
 			],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onResponse: response => {
 				seen.push({ ...response.headers });

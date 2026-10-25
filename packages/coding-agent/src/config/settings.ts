@@ -369,6 +369,46 @@ function hasPathValue(obj: Record<string, unknown>, dottedPath: string): boolean
 }
 
 /**
+ * Replace the pending-retirement marker in place. The final component must
+ * already be a regular file, or be absent. A symlink, FIFO, or other
+ * non-file is refused before any write, and the opened descriptor is checked
+ * against that identity so a swap after the stat is not followed. Mode is
+ * applied with fchmod on that descriptor, including when the file already
+ * existed at a wider mode.
+ */
+async function writePendingRetirementMarker(markerPath: string, payload: string): Promise<void> {
+	let existing: fs.Stats | undefined;
+	try {
+		existing = await fs.promises.lstat(markerPath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	if (existing && !existing.isFile()) {
+		throw new Error("pending-retirement marker is not a regular file");
+	}
+	const noFollow = process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+	const nonBlock = process.platform === "win32" ? 0 : (fs.constants.O_NONBLOCK ?? 0);
+	const handle = await fs.promises.open(
+		markerPath,
+		fs.constants.O_WRONLY | fs.constants.O_CREAT | noFollow | nonBlock,
+		0o600,
+	);
+	try {
+		const opened = await handle.stat();
+		if (!opened.isFile()) throw new Error("pending-retirement marker is not a regular file");
+		if (existing && (opened.dev !== existing.dev || opened.ino !== existing.ino)) {
+			throw new Error("pending-retirement marker identity changed");
+		}
+		await handle.truncate(0);
+		await handle.writeFile(payload);
+		await handle.chmod(0o600);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
+/**
  * Get a nested value from an object by path segments.
  */
 function getByPath(obj: RawSettings, segments: string[]): unknown {
@@ -399,10 +439,17 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"skills.enablePiProject",
 ]);
 /**
- * Project-layer task.agentModelOverrides is ignored.
+ * Project-layer values ignored at merge.
  * User config and runtime overrides still apply.
+ * Clipboard transport and host choose the copy/paste egress destination.
  */
-const PROJECT_LAYER_DENIED_SETTINGS = new Set<SettingPath>(["task.agentModelOverrides"]);
+const PROJECT_LAYER_DENIED_SETTINGS = new Set<SettingPath>([
+	"task.agentModelOverrides",
+	"clipboard.transport",
+	"clipboard.sshHost",
+	// Operator extension disable list. A project file must not clear or replace it.
+	"disabledExtensions",
+]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
 	light: "blue-crab",
@@ -2472,15 +2519,10 @@ export class Settings implements NotificationSettingsReader {
 					// lost marker while config.yml already exists. A replaced marker
 					// (a previous interrupted run) is overwritten.
 					try {
-						const markerHandle = await fs.promises.open(pendingRetirementPath, "w", 0o600);
-						try {
-							await markerHandle.writeFile(
-								nodeCrypto.createHash("sha256").update(settingsJsonRaw).digest("hex"),
-							);
-							await markerHandle.sync();
-						} finally {
-							await markerHandle.close();
-						}
+						await writePendingRetirementMarker(
+							pendingRetirementPath,
+							nodeCrypto.createHash("sha256").update(settingsJsonRaw).digest("hex"),
+						);
 						await fs.promises
 							.open(path.dirname(pendingRetirementPath), "r")
 							.then(async dirHandle => {
@@ -2644,12 +2686,15 @@ export class Settings implements NotificationSettingsReader {
 			await this.#storage?.clearSettings();
 			logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 		}
-		// The combined migration committed (database validated and the merged
-		// values published): retire the settings.json source now. Any earlier
-		// failure path (malformed database row, unreadable marker, drain
-		// failure) returns above with the source still in place for the next
-		// load.
-		if (settingsJsonRetirementPending || (await this.#pathExists(`${settingsJsonPath}.pending-retirement`))) {
+		// Retire settings.json only when this load could publish the current
+		// bytes. A rejected pending-marker write leaves the marker flag false
+		// and skips publication; path presence in an older config.yml is not
+		// those bytes. Keep the source active for the next load. A persisted
+		// marker is the gate that lets publication run before retirement.
+		if (
+			(!settingsJsonRetirementPending || settingsJsonMarkerPersisted) &&
+			(settingsJsonRetirementPending || (await this.#pathExists(`${settingsJsonPath}.pending-retirement`)))
+		) {
 			// Revalidate the source BEFORE retiring it: an edit or replacement
 			// after the bytes were read but while this method awaited database
 			// retries, the config transaction, or the drain must NOT be moved to
@@ -6468,6 +6513,15 @@ export class Settings implements NotificationSettingsReader {
 	#mergeSettingsLayers(global: RawSettings, projectLayer: RawSettings, overrideLayer: RawSettings): RawSettings {
 		const project = structuredClone(projectLayer);
 		const overrides = structuredClone(overrideLayer);
+		// A non-object project clipboard value would replace the user clipboard
+		// object. Drop that parent; nested objects still lose only the denied leaves.
+		const projectClipboard = project.clipboard;
+		if (
+			projectClipboard !== undefined &&
+			(projectClipboard === null || typeof projectClipboard !== "object" || Array.isArray(projectClipboard))
+		) {
+			delete project.clipboard;
+		}
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
 			const segments = settingPath.split(".");
 			deleteByPath(project, segments);

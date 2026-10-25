@@ -927,6 +927,21 @@ The result is an observation of one locked index reconciliation cut:
   lifecycle state rather than treating `unknown` as retired. Expired positive
   evidence is reported specifically as `proof_expired`.
 
+Every host start takes a new event generation from the agent directory's
+per-session generation authority (`sdk/event-generations/`). Allocation runs
+under a cross-process file lock and returns a value strictly above every
+generation previously issued for the session, with the host's wall-clock start
+time in milliseconds only as a floor. A session resumed by a later process
+therefore never reuses an earlier host's `(generation, seq)` event coordinates,
+still outranks the earlier host's retained index identity after the clock steps
+backward, and two hosts started in the same millisecond never share a
+generation. A host that cannot reach the authority keeps serving its local
+endpoint but publishes to the session index only after the authority reserves
+exactly the generation it serves. Treat a generation as an opaque safe integer,
+not a counter that starts at `1`: replay cursors and notification publication
+ids recorded against one generation never position or deduplicate another
+generation's events.
+
 Proof survives Broker, Router, and consumer process restart because it is read
 from the durable session index, not Router attachment memory. Positive terminal
 proof has the session-index `maxAgeMs` lifetime (30 days by default), even when a

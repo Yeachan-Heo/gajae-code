@@ -1674,6 +1674,7 @@ describe("chat daemon worker", () => {
 			root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-production-host-"));
 			const agentDir = path.join(root, ".gjc", "agent");
 			const host = await startProductionSdkHost(root);
+			const endpointGeneration = await host.readGeneration();
 			const endpointIdentity = await fs.stat(path.join(root, ".gjc", "state", "sdk", `${host.sessionId}.json`), {
 				bigint: true,
 			});
@@ -1725,7 +1726,7 @@ describe("chat daemon worker", () => {
 					type: "host_registered",
 					sessionId: host.sessionId,
 					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
-					endpointGeneration: 1,
+					endpointGeneration,
 					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
 				});
@@ -1738,12 +1739,12 @@ describe("chat daemon worker", () => {
 					channelId: "channel",
 					rootTs: "root",
 					sessionId: host.sessionId,
-					endpointGeneration: 1,
+					endpointGeneration,
 					// Derive through the Router's identity helper using the exact host
 					// process tuple; hand-rolled or test-runner pids create stale roots.
 					attachmentAuthorityId: sessionAttachmentAuthorityId({
 						sessionId: host.sessionId,
-						generation: 1,
+						generation: endpointGeneration,
 						pid: host.endpoint.pid,
 						endpointMtimeMs: host.endpointMtimeMs,
 						url: host.endpoint.url,

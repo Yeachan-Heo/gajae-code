@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import {
 	describeRetainedLockTransition,
@@ -1089,6 +1090,83 @@ async function replaceAtomically(file: string, contents: Buffer | string): Promi
 		throw new AggregateError([primaryError, cleanupError], "session-index replace and cleanup failed");
 	if (primaryError) throw primaryError;
 	if (cleanupError) throw cleanupError;
+}
+
+const EVENT_GENERATION_RECORD_VERSION = 1;
+const eventGenerationFor = (agentDir: string, sessionId: string) =>
+	path.join(agentDir, "sdk", "event-generations", `${createHash("sha256").update(sessionId).digest("hex")}.json`);
+
+/**
+ * Allocate the event generation for one SDK host start of `sessionId`.
+ *
+ * Every host start opens a fresh event stream, and this index orders a session's
+ * identities by endpoint generation before registration order. A generation
+ * taken from wall time alone falls behind a retained identity once the clock
+ * steps backward — the resumed host then loses authority to the retained row and
+ * disappears from Router consumers — and repeats for two starts in one
+ * millisecond. Allocation therefore reads and advances a durable per-session
+ * high-water mark under a cross-process file lock, so every result is strictly
+ * above every generation previously allocated for the session in this agent
+ * dir. The result is at least `floor`: a host start passes its wall time, which
+ * keeps a session without a high-water mark ahead of hosts that predate it, and
+ * a host reserving a generation it already serves passes that generation, which
+ * comes back unchanged only while no host has been issued it or anything above.
+ */
+export async function allocateSessionEventGeneration(
+	agentDir: string,
+	sessionId: string,
+	floor: number,
+): Promise<number> {
+	if (sessionId.length === 0) throw new Error("SDK event generation allocation requires a session id.");
+	if (!Number.isSafeInteger(floor) || floor < 0)
+		throw new Error("SDK event generation floor must be a non-negative safe integer.");
+	const file = eventGenerationFor(agentDir, sessionId);
+	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	return await withFileLock(
+		file,
+		async () => {
+			// Generation 0 is reserved for the direct-session GC fence row.
+			const next = Math.max((await readEventGenerationHighWater(file, sessionId)) + 1, floor, 1);
+			if (!Number.isSafeInteger(next)) throw new Error("SDK event generation is exhausted.");
+			await replaceAtomically(
+				file,
+				`${JSON.stringify({ version: EVENT_GENERATION_RECORD_VERSION, sessionId, generation: next })}\n`,
+			);
+			return next;
+		},
+		await sessionIndexLockOptions(agentDir, SESSION_INDEX_LOCK_OPTIONS),
+	);
+}
+
+/**
+ * A missing record is the only bootstrap state. A record that cannot be read
+ * back exactly is never treated as empty: restarting from the wall-clock floor
+ * would reopen the regression the high-water mark exists to close.
+ */
+async function readEventGenerationHighWater(file: string, sessionId: string): Promise<number> {
+	let source: string;
+	try {
+		source = await fs.readFile(file, "utf8");
+	} catch (error) {
+		if (isEnoent(error)) return 0;
+		throw error;
+	}
+	let record: unknown;
+	try {
+		record = JSON.parse(source);
+	} catch {
+		record = undefined;
+	}
+	const { version, sessionId: recordedSessionId, generation } = (record ?? {}) as Record<string, unknown>;
+	if (
+		version !== EVENT_GENERATION_RECORD_VERSION ||
+		recordedSessionId !== sessionId ||
+		typeof generation !== "number" ||
+		!Number.isSafeInteger(generation) ||
+		generation < 1
+	)
+		throw new Error(`SDK event generation record is unreadable: ${file}`);
+	return generation;
 }
 
 function alive(pid: number): boolean {

@@ -575,6 +575,8 @@ export interface CreateAgentSessionOptions {
 	/** Load MCP tools for a top-level session only from this caller-owned absolute config file path.
 	 * Mutually exclusive with mcpManager. */
 	mcpConfigPath?: string;
+	/** Lifecycle host wrote this exact file. Caller-selected `--mcp-config` omits it. @internal */
+	lifecycleMcpOrigin?: boolean;
 	/**
 	 * Whether conventional MCP autoload is enabled for a top-level standalone
 	 * session (default: true). When false, native user `~/.gjc/agent/mcp.json`
@@ -1634,6 +1636,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	const cwd = options.cwd ?? getProjectDir();
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
+	const lifecycleMcpOrigin = options.lifecycleMcpOrigin === true && explicitMcpConfigPath !== undefined;
 	const agentDir = options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir();
 	const profileAuthority =
 		options.profileAuthority ??
@@ -3466,7 +3469,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let inheritedMcpManagerToolNames: string[] = [];
 		let inheritedMcpToolsSnapshot: readonly CustomTool[] = [];
 		let pendingInheritedMcpToolsSnapshot: readonly CustomTool[] | undefined;
-		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
+		let deferredExactMcpConfig: { manager: MCPManager; configPath: string; lifecycleOrigin?: boolean } | undefined;
 		let deferredConventionalMcp:
 			| {
 					manager: MCPManager;
@@ -3782,9 +3785,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			ownsMcpManager = true;
 			registerOwnedMcpManagerCleanup(owned);
 			if (options.deferMcpConfigStartup) {
-				deferredExactMcpConfig = { manager: owned, configPath: explicitMcpConfigPath };
+				deferredExactMcpConfig = {
+					manager: owned,
+					configPath: explicitMcpConfigPath,
+					lifecycleOrigin: lifecycleMcpOrigin,
+				};
 			} else {
-				const result = await owned.discoverAndConnect({ configPath: explicitMcpConfigPath });
+				const result = lifecycleMcpOrigin
+					? await owned.discoverAndConnect({
+							configPath: explicitMcpConfigPath,
+							lifecycleOrigin: true,
+						})
+					: await owned.discoverAndConnect({ configPath: explicitMcpConfigPath });
 				const resultTools = result.tools as CustomTool[];
 				exactMcpToolNames.push(...resultTools.map(tool => tool.name));
 				customTools.push(...resultTools);
@@ -6079,7 +6091,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						let loadedToolCount = 0;
 						let hasErrors = false;
 						if (exact) {
-							const result = await exact.manager.discoverAndConnect({ configPath: exact.configPath });
+							const result = await exact.manager.discoverAndConnect({
+								configPath: exact.configPath,
+								...(exact.lifecycleOrigin === true ? { lifecycleOrigin: true } : {}),
+							});
 							// A slash control may commit while the deferred startup flight is
 							// loading. Re-read the manager's fenced publication rather than
 							// replaying the stale startup snapshot into the session registry. A

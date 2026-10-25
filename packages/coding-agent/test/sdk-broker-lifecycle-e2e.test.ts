@@ -9422,10 +9422,17 @@ test("delayed lifecycle host cleanup does not unregister a file-only same-genera
 		child.kill("SIGTERM");
 		expect(await child.exited).toBe(0);
 		const reopened = await new SessionIndex(agentDir).open();
-		expect(reopened.indexSeq).toBe(successor.indexSeq);
+		const appendedRows = (
+			Bun.JSONL.parse(
+				await Bun.file(path.join(agentDir, "sdk", "sessions", "index.jsonl")).text(),
+			) as SessionIndexEvent[]
+		).filter(event => event.indexSeq > successor.indexSeq);
 		const current = reopened.listSessionIdentities().find(session => session.sessionId === sessionId)!;
 		expect(current).toMatchObject({ terminal: false, endpointFileId: successor.endpointFileId });
 		expect(endpointIncarnation(current, sessionId)).toBe(endpointIncarnation(successor, sessionId));
+		// A host heartbeat already in flight can append after this registration; only
+		// retirement of either registration would violate this cleanup contract.
+		expect(appendedRows.every(event => event.type === "host_heartbeat")).toBe(true);
 		expect(reopened.hostUnregisteredAfter(registered)).toBeUndefined();
 		expect(reopened.hostUnregisteredAfter(successor)).toBeUndefined();
 	} finally {

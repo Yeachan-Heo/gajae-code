@@ -107,7 +107,12 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
+import {
+	allocateSessionEventGeneration,
+	resolveSessionLocator,
+	SessionIndex,
+	type SessionIndexEvent,
+} from "../broker/session-index";
 import {
 	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
@@ -5075,6 +5080,8 @@ export function createNotificationsExtension(
 		const lifecycleAgentDir = lifecycleRequired ? settings?.getAgentDir?.() : undefined;
 		if (lifecycleRequired && !lifecycleAgentDir)
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
+		// The session index this host publishes to; it also owns the session's event-generation authority.
+		const brokerAgentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const queuedRemovalTerminals = new Map<string, Promise<boolean>>();
@@ -8254,6 +8261,12 @@ export function createNotificationsExtension(
 
 		sdkRuntime = new SessionSdkSessionRuntime({
 			masterOwnerSessionId: options.masterOwnerSessionId,
+			...(brokerAgentDir === undefined
+				? {}
+				: {
+						allocateEventGeneration: (sessionId: string, floor: number) =>
+							allocateSessionEventGeneration(brokerAgentDir, sessionId, floor),
+					}),
 			transport: {
 				sessionId: id,
 				stateRoot,
@@ -9482,7 +9495,7 @@ export function createNotificationsExtension(
 				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}
-			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
+			const agentDir = brokerAgentDir;
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
 			if (lifecycleRequired && !lifecycleRequestId)
 				throw new Error("Lifecycle SDK host requires a capability-bound request identity.");

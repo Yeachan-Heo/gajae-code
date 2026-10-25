@@ -5316,6 +5316,7 @@ export class TelegramNotificationDaemon {
 	attachmentRoutingHarnessForTest() {
 		return {
 			attach: (subscription: NotificationSubscription) => this.#onAttachment(subscription),
+			ready: (subscription: NotificationSubscription) => this.#onAttachmentReady(subscription),
 			remove: async (
 				subscription: NotificationSubscription,
 				reason: "removed" | "replaced" | "replaced_same_generation",
@@ -5446,12 +5447,16 @@ export class TelegramNotificationDaemon {
 					"ephemeral_turn_v1",
 				],
 			});
+			// A stored cursor positions only the host generation that produced it. A
+			// resumed session's host opens a new generation, and replaying from another
+			// generation answers with a generation reset that strict admission refuses.
 			const cursor = this.topics.replayCursor(session.sessionId);
+			const currentCursor = cursor?.generation === session.replayGeneration ? cursor : undefined;
 			await this.#sendAttachment(session, {
 				type: "event_replay",
 				id: session.replayId,
-				sinceGeneration: cursor?.generation ?? session.replayGeneration,
-				sinceSeq: cursor?.seq ?? 0,
+				sinceGeneration: session.replayGeneration,
+				sinceSeq: currentCursor?.seq ?? 0,
 				capabilities: [TOOL_ACTIVITY_CAPABILITY],
 			});
 		} catch (error) {

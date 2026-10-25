@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -15,6 +16,7 @@ import {
 	testSetExtensionHandlerTimeoutMs,
 } from "../src/extensibility/extensions/runner";
 import { mapAgentWireEventPayloadToAcpSessionUpdates } from "../src/modes/acp/acp-event-mapper";
+import { initializeExtensions } from "../src/modes/runtime-init";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
 import { createReconciliationStore, type ReconciliationStore } from "../src/sdk/bus/reconciliation-store";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "../src/sdk/host/host";
@@ -366,6 +368,107 @@ describe("SDK host turn streaming", () => {
 			});
 		} finally {
 			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps startup fallback replay for the UI while SDK streams survive unsubscribe and reconnect", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-startup-fallback-"));
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Expected bundled fallback model");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const sessionManager = SessionManager.inMemory(cwd);
+		const runner = new ExtensionRunner([], new ExtensionRuntime(), cwd, sessionManager, modelRegistry);
+		const mock = createMockModel();
+		let nextCall = 0;
+		const queueResponse = () => {
+			mock.push({ content: ["hello", { type: "toolCall", id: `call_${nextCall++}`, name: "read", arguments: {} }] });
+			mock.push({ content: ["done"] });
+		};
+		const session = new AgentSession({
+			agent: new Agent({ initialState: { model, tools: [], messages: [] }, streamFn: mock.stream }),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
+			modelRegistry,
+			extensionRunner: runner,
+		});
+		const skipped = "unregistered-provider/unregistered-model";
+		const selected = `${model.provider}/${model.id}`;
+		session.setConfiguredModelChain("default", [skipped, selected], "profile-activation");
+		session.seedDefaultFallbackResolution(1, [{ selector: skipped, reason: "unknown_model" }]);
+		const produced: AgentSessionEvent[] = [];
+		const notices: AgentSessionEvent[] = [];
+		const contentKinds = new Set(["message_update", "message_end", "tool_execution_start", "tool_execution_end"]);
+		let harness: HostHarness | undefined;
+		try {
+			await initializeExtensions(session, {
+				reportSendError: (_action, error) => {
+					throw error;
+				},
+				reportRuntimeError: error => {
+					throw new Error(error.error);
+				},
+			});
+			const onSessionEvent = runner.createContext().onSessionEvent;
+			harness = await createHostHarness(SESSION_ID, cwd, { onSessionEvent });
+			// The real SDK runtime is already subscribed and filters this event from its wire stream.
+			let stopUi = session.subscribe(event => {
+				if (event.type === "model_fallback_switched") notices.push(event);
+			});
+			expect(notices).toEqual([
+				expect.objectContaining({ type: "model_fallback_switched", from: skipped, to: selected }),
+			]);
+			session.subscribe(event => {
+				if (contentKinds.has(event.type)) produced.push(event);
+			});
+
+			for (let connection = 0; connection < 2; connection++) {
+				if (connection > 0) {
+					harness = await createHostHarness(SESSION_ID, cwd, { onSessionEvent });
+					stopUi();
+					stopUi = session.subscribe(event => {
+						if (event.type === "model_fallback_switched") notices.push(event);
+					});
+				}
+				expect(notices).toHaveLength(1);
+				expect((await harness.control("turn.prompt", { text: "stream this" })).ok).toBe(true);
+				await harness.emit("agent_start");
+				await waitForStartOnWire(harness);
+				harness.clearFrames();
+				produced.length = 0;
+				queueResponse();
+				await session.prompt("stream this");
+				await session.waitForIdle();
+				const frames = harness.sent.filter(
+					entry => entry.frame.type === "event" && contentKinds.has(String(entry.frame.kind)),
+				);
+				expect(produced.some(event => event.type === "message_update")).toBe(true);
+				expect(produced.some(event => event.type === "tool_execution_start")).toBe(true);
+				expect(produced.some(event => event.type === "tool_execution_end")).toBe(true);
+				expect(frames.map(entry => entry.frame.payload)).toEqual(produced.map(toAgentWireEventPayload));
+				expect(frames.every(entry => entry.connectionId === "client")).toBe(true);
+				expect(
+					[...harness.sent.map(entry => entry.frame), ...harness.broadcasts].some(
+						frame => frame.kind === "model_fallback_switched",
+					),
+				).toBe(false);
+				await harness.stop();
+				harness.clearFrames();
+				produced.length = 0;
+				queueResponse();
+				await session.prompt("after unsubscribe");
+				await session.waitForIdle();
+				expect(produced.some(event => event.type === "message_update")).toBe(true);
+				expect(harness.sent).toEqual([]);
+				expect(harness.broadcasts).toEqual([]);
+			}
+			stopUi();
+		} finally {
+			await harness?.stop();
+			await session.dispose();
+			authStorage.close();
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});

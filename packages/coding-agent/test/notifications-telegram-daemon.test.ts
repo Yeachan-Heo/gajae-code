@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
+import { allocateSessionEventGeneration } from "../src/sdk/broker/session-index";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../src/sdk/bus/notification-service";
@@ -33,6 +34,7 @@ import {
 } from "../src/sdk/bus/telegram-daemon";
 import { createDaemonControlHooks } from "../src/sdk/bus/telegram-daemon-cli";
 import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
+import { SessionSdkHost } from "../src/sdk/host";
 import type { NotificationSubscription } from "../src/sdk/router";
 
 function notificationSubscription(
@@ -2232,6 +2234,143 @@ test("awaiting input refuses flat fallback into a non-private chat", async () =>
 		});
 		expect(calls).not.toContain("sendMessage");
 	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("attachment handshake resumes a stored replay cursor only within its host generation", async () => {
+	const agentDir = tempAgentDir();
+	const now = Date.now();
+	const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: topicAdmissionBot().bot,
+		installationHostId: "provider-owner",
+	});
+	try {
+		fs.mkdirSync(path.dirname(statePath), { recursive: true });
+		fs.writeFileSync(
+			statePath,
+			`${JSON.stringify({
+				version: 2,
+				installationHostId: "provider-owner",
+				topics: {
+					"cursor-session": {
+						topicId: "100",
+						topicOrigin: "daemon_created",
+						sessionUuid: "cursor-topic",
+						identitySent: true,
+						createdAt: now,
+						authorityState: "active",
+						chatId: "42",
+						leaseOwner: "provider-owner",
+						leaseHeartbeatAt: now,
+						leaseExpiresAt: now + 60_000,
+						replayGeneration: 5_000,
+						replaySeq: 726,
+					},
+				},
+			})}\n`,
+		);
+		await daemon.loadTopics();
+		const routing = daemon.attachmentRoutingHarnessForTest();
+		const replayRequest = async (generation: number) => {
+			const sent: Record<string, unknown>[] = [];
+			const subscription = {
+				...notificationSubscription("cursor-session", generation),
+				send: (frame: Record<string, unknown>) => {
+					sent.push(frame);
+				},
+			};
+			routing.attach(subscription);
+			await routing.ready(subscription);
+			return sent.find(frame => frame.type === "event_replay");
+		};
+		// A reconnect to the same host continues after the durably consumed event.
+		expect(await replayRequest(5_000)).toMatchObject({ sinceGeneration: 5_000, sinceSeq: 726 });
+		// A resumed session's host restarted its sequence in a new generation; the
+		// previous host's position must not be replayed against it.
+		expect(await replayRequest(9_000)).toMatchObject({ sinceGeneration: 9_000, sinceSeq: 0 });
+	} finally {
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("a restarted host's events are not suppressed by the previous host's publication receipts", async () => {
+	const agentDir = tempAgentDir();
+	const { bot, calls } = topicAdmissionBot();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "provider-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		botApi: bot,
+	});
+	const sessionId = "restarted-host-session";
+	const hosts: SessionSdkHost[] = [];
+	// Each process hosts the session with a fresh SDK event stream, exactly as
+	// `gjc --resume` does after the previous process exited, and takes its
+	// generation from the production per-session authority.
+	const startHost = async (question: string): Promise<SessionSdkHost> => {
+		const host = new SessionSdkHost({
+			sessionId,
+			stateRoot: path.join(agentDir, "state"),
+			token: "token",
+			allocateEventGeneration: (id, floor) => allocateSessionEventGeneration(agentDir, id, floor),
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		hosts.push(host);
+		await host.start();
+		host.emitEvent({ kind: "identity_header", payload: { type: "identity_header", sessionId } });
+		host.emitEvent({
+			kind: "action_needed",
+			payload: { type: "action_needed", id: "ask-1", kind: "ask", sessionId, question, options: ["Yes", "No"] },
+		});
+		return host;
+	};
+	const replayInto = async (host: SessionSdkHost, subscriptionId: string): Promise<void> => {
+		const subscription = notificationSubscription(sessionId, host.generation, subscriptionId);
+		daemon.attachmentRoutingHarnessForTest().attach(subscription);
+		const session = daemon.sessions.get(sessionId);
+		if (!session) throw new Error("Expected routed attachment session.");
+		await daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			ok: true,
+			generation: host.generation,
+			lastSeq: host.events.sequence,
+			events: host.events.replay(0).events,
+		});
+	};
+	const asked = (question: string) =>
+		calls.filter(
+			call =>
+				(call.method === "sendMessage" || call.method === "sendRichMessage") &&
+				JSON.stringify(call.body).includes(question),
+		).length;
+	try {
+		await daemon.loadTopics();
+		const first = await startHost("first process question");
+		await replayInto(first, "router:first");
+		expect(asked("first process question")).toBe(1);
+		await first.stop();
+
+		const resumed = await startHost("resumed process question");
+		await replayInto(resumed, "router:resumed");
+		expect(asked("resumed process question")).toBe(1);
+
+		// A second attachment to the same host replays the same publications.
+		await replayInto(resumed, "router:resumed-reattach");
+		expect(asked("resumed process question")).toBe(1);
+		expect(asked("first process question")).toBe(1);
+	} finally {
+		for (const host of hosts) await host.stop();
+		daemon.requestStop();
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
 });

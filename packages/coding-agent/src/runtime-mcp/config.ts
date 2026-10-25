@@ -45,6 +45,8 @@ export interface LoadMCPConfigsOptions {
 	nativeOnly?: boolean;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
+	/** This exact file was written by the lifecycle host. Skips sensitive `${VAR}` expansion. */
+	lifecycleOrigin?: boolean;
 	/**
 	 * Agent directory that holds the user scope (`<agentDir>/mcp.json`).
 	 * Default: `getAgentDir()`. Sessions created with their own `agentDir` pass it
@@ -146,7 +148,11 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let configurationWarning = false;
 	let warnings: string[] = [];
 	if (exactConfig) {
-		const result = await loadMCPJsonFile(options.configPath!, "project", { quiet: true });
+		const lifecycleOrigin = options?.lifecycleOrigin === true;
+		const result = await loadMCPJsonFile(options.configPath!, "project", {
+			quiet: true,
+			skipSensitiveEnvNames: lifecycleOrigin,
+		});
 		servers = result.items;
 		disabledServers = new Set(result.disabledServers);
 		warnings = result.warnings ?? [];
@@ -196,7 +202,10 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 			continue;
 		}
 		configs[server.name] = config;
-		sources[server.name] = server._source;
+		sources[server.name] =
+			exactConfig && options?.lifecycleOrigin === true
+				? { ...server._source, lifecycleOrigin: true }
+				: server._source;
 	}
 
 	let exaApiKeys: string[] = [];

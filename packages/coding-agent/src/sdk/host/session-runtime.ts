@@ -64,6 +64,7 @@ import {
 	sdkInternalRuntimeImage,
 } from "../broker/runtime";
 import {
+	allocateSessionEventGeneration,
 	type MasterRoleAttestationV2,
 	resolveSessionLocator,
 	SessionIndex,
@@ -7757,6 +7758,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			allocateEventGeneration: (sessionId, floor) =>
+				allocateSessionEventGeneration(options.agentDir, sessionId, floor),
 			onDisconnected: connectionId => imageUploads?.disconnect(connectionId),
 			eventRevision: () =>
 				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function"
