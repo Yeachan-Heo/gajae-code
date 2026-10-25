@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -3452,6 +3453,13 @@ describe("cli registration", () => {
 			...inherited,
 			HOME: home,
 			USERPROFILE: home,
+			GJC_CONFIG_DIR: ".gjc",
+			PI_CONFIG_DIR: undefined,
+			PI_CODING_AGENT_DIR: undefined,
+			XDG_CONFIG_HOME: undefined,
+			XDG_DATA_HOME: undefined,
+			XDG_STATE_HOME: undefined,
+			XDG_CACHE_HOME: undefined,
 			GJC_CODING_AGENT_DIR: path.join(home, "agent"),
 			GJC_SDK_BROKER_AUTOSTART: "0",
 			GJC_MANAGED_OWNER_CHILD_TOKEN: undefined,
@@ -3493,48 +3501,111 @@ describe("cli registration", () => {
 		const privateSource = path.join(home, ".gjc", "settings.json");
 		const externalSource = path.join(externalProfile, ".gjc", "settings.json");
 		const externalSettings = JSON.stringify({ "gjc.ralplan.maxIterations": 4 });
+		const externalData = path.join(externalProfile, "xdg-data");
+		const externalDatabase = path.join(externalData, "gjc", "agent.db");
 		try {
 			await Bun.write(privateSource, JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
 			await Bun.write(externalSource, externalSettings);
-			const result = Bun.spawnSync(
-				[process.execPath, path.join(import.meta.dir, "fixtures/daemon-control-profile-probe.ts"), root],
-				{
-					cwd: root,
-					env: privateDaemonEnv(home, {
-						...process.env,
-						HOME: externalProfile,
-						USERPROFILE: externalProfile,
-						GJC_CONFIG_DIR: ".gjc",
-						PI_CONFIG_DIR: undefined,
-					}),
-					stdin: "ignore",
-					stdout: "pipe",
-					stderr: "pipe",
-					timeout: 10_000,
-					killSignal: "SIGKILL",
-				},
-			);
-			expect(result.exitCode, result.stderr.toString()).toBe(0);
-			const observed = JSON.parse(result.stdout.toString()) as {
-				userProfile: string;
-				home: string;
-				configRoot: string;
-				agentDir: string;
-				maxIterations: number;
-			};
-			expect(observed.userProfile).toBe(home);
-			expect(observed.home).toBe(home);
-			expect(observed.configRoot).toBe(path.join(home, ".gjc"));
-			expect(observed.agentDir).toBe(path.join(home, "agent"));
-			expect(observed.maxIterations).toBe(7);
+			fs.mkdirSync(path.dirname(externalDatabase), { recursive: true });
+			const seed = new Database(externalDatabase);
+			try {
+				seed.run(
+					"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0)",
+				);
+				seed.run("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)");
+				seed.run("INSERT INTO schema_version (version) VALUES (5)");
+				seed.run("INSERT INTO settings (key, value, updated_at) VALUES ('gjc.ralplan.maxIterations', ?, 0)", ["4"]);
+			} finally {
+				seed.close();
+			}
+			const externalDatabaseBytes = await Bun.file(externalDatabase).bytes();
+			for (const configAliases of [
+				{ GJC_CONFIG_DIR: ".", PI_CONFIG_DIR: "." },
+				{ GJC_CONFIG_DIR: undefined, PI_CONFIG_DIR: "." },
+			]) {
+				const env = privateDaemonEnv(home, {
+					...process.env,
+					HOME: externalProfile,
+					USERPROFILE: externalProfile,
+					...configAliases,
+					XDG_DATA_HOME: externalData,
+					XDG_STATE_HOME: path.join(externalProfile, "xdg-state"),
+					XDG_CACHE_HOME: path.join(externalProfile, "xdg-cache"),
+					XDG_CONFIG_HOME: path.join(externalProfile, "xdg-config"),
+				});
+				const result = Bun.spawnSync(
+					[process.execPath, path.join(import.meta.dir, "fixtures/daemon-control-profile-probe.ts"), home],
+					{
+						cwd: root,
+						env,
+						stdin: "ignore",
+						stdout: "pipe",
+						stderr: "pipe",
+						timeout: 10_000,
+						killSignal: "SIGKILL",
+					},
+				);
+				expect(result.exitCode, result.stderr.toString()).toBe(0);
+				const observed = JSON.parse(result.stdout.toString()) as {
+					userProfile: string;
+					home: string;
+					configRoot: string;
+					agentDir: string;
+					agentDbPath: string;
+					legacyConfigDir: string | null;
+					xdgHomes: (string | null)[];
+					maxIterations: number;
+				};
+				expect(observed.userProfile).toBe(home);
+				expect(observed.home).toBe(home);
+				expect(observed.configRoot).toBe(path.join(home, ".gjc"));
+				expect(observed.agentDir).toBe(path.join(home, "agent"));
+				expect(observed.agentDbPath).toBe(path.join(home, "agent", "agent.db"));
+				expect(observed.legacyConfigDir).toBeNull();
+				expect(observed.xdgHomes).toEqual([null, null, null, null]);
+				expect(observed.maxIterations).toBe(7);
+				const status = Bun.spawnSync(
+					[
+						process.execPath,
+						path.join(import.meta.dir, "../src/cli.ts"),
+						"daemon",
+						"status",
+						"telegram",
+						"--json",
+					],
+					{
+						cwd: home,
+						env,
+						stdin: "ignore",
+						stdout: "pipe",
+						stderr: "pipe",
+						timeout: 10_000,
+						killSignal: "SIGKILL",
+					},
+				);
+				expect(status.exitCode, status.stderr.toString()).toBe(0);
+				expect(status.stderr.toString()).toBe("");
+				expect((JSON.parse(status.stdout.toString()) as DaemonStatus[]).map(value => value.kind)).toEqual([
+					"telegram",
+				]);
+			}
 			expect(await Bun.file(privateSource).exists()).toBe(false);
 			expect(await Bun.file(`${privateSource}.bak`).exists()).toBe(true);
 			expect(await Bun.file(externalSource).text()).toBe(externalSettings);
 			expect(await Bun.file(`${externalSource}.bak`).exists()).toBe(false);
+			const retained = new Database(externalDatabase, { readonly: true });
+			try {
+				expect(retained.query("SELECT key, value, updated_at FROM settings").all()).toEqual([
+					{ key: "gjc.ralplan.maxIterations", value: "4", updated_at: 0 },
+				]);
+			} finally {
+				retained.close();
+			}
+			expect(await Bun.file(externalDatabase).bytes()).toEqual(externalDatabaseBytes);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
-	}, 15_000);
+	}, 45_000);
 });
 
 describe("topic registry reload persistence", () => {
