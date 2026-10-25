@@ -1299,10 +1299,12 @@ bindings and SIGABRT receipts remain a separate Linux-only capability backed by
 recovery-fs; stale binding schemas are rejected rather than migrated. Windows
 managed-owner admission is unsupported: managed tmux/psmux launches are rejected
 before supervisor or session allocation and lifecycle-state writes, with the
-bounded reason `gjc_tmux_managed_launch_platform_unsupported:win32`. The Broker
-reports `substrate_proof_failed` without silently falling back to headless.
-Ordinary unmanaged Windows launches and independent headless selection are
-unchanged.
+bounded reason `gjc_tmux_managed_launch_platform_unsupported:win32`. This guard
+is defense in depth for direct managed launches: the Broker never requests one
+on Windows, because it selects the headless substrate before launch (see the
+lifecycle-owner resolution notes below), so Windows `session.spawn` is not
+rejected. A rejected managed launch is never retried as headless. Ordinary
+unmanaged Windows launches are unchanged.
 
 Admission denial does not depend on being able to save a diagnostic. Unsafe or
 unavailable storage never receives a fallback pathname write: the child stays

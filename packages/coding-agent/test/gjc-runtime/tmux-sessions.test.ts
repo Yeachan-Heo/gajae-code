@@ -893,7 +893,11 @@ describe("GJC tmux session management", () => {
 		expect(plannedArgv).not.toContain("-u");
 	});
 	for (const entry of ["direct", "managed", "broker"] as const) {
-		it(`rejects Windows managed launch through ${entry} before probes, allocation, or state writes`, async () => {
+		const title =
+			entry === "broker"
+				? "selects headless for a Windows Broker launch before managed probes, allocation, or state writes"
+				: `rejects Windows managed launch through ${entry} before probes, allocation, or state writes`;
+		it(title, async () => {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-windows-managed-rejected-"));
 			fixtureDirectories.push(cwd);
 			const launch = {
@@ -920,21 +924,26 @@ describe("GJC tmux session management", () => {
 			__setCreateOwnerIsolationForTests({ execute });
 			const reason = "gjc_tmux_managed_launch_platform_unsupported:win32";
 			if (entry === "broker") {
+				// The Broker never reaches the managed launch guard on Windows: it
+				// selects headless first. Stop at that boundary to observe zero
+				// managed effects.
+				const selectMultiplexer = vi.fn(() => "tmux" as const);
 				const startHeadless = vi.fn(() => {
-					throw new Error("unexpected headless fallback");
+					throw new Error("headless selected");
 				});
 				const provider = createSpawnSubstrateProvider({
 					platform: "win32",
 					env,
-					selectMultiplexer: () => "psmux",
+					selectMultiplexer,
 					startHeadless,
 				});
 				expect(await provider.launch(launch)).toEqual({
 					ok: false,
-					code: "substrate_proof_failed",
-					message: `psmux substrate launch failed: ${reason}; psmux substrate cleanup could not be verified`,
+					code: "substrate_unavailable",
+					message: "No safe spawn substrate is available.",
 				});
-				expect(startHeadless).not.toHaveBeenCalled();
+				expect(selectMultiplexer).not.toHaveBeenCalled();
+				expect(startHeadless).toHaveBeenCalledTimes(1);
 			} else {
 				const create = () =>
 					entry === "direct"
