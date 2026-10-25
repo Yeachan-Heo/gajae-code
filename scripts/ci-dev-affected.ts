@@ -1214,15 +1214,18 @@ export function planTargetedTasks(
 			addCodingAgentSdkProductionHostTask(tasks);
 		}
 
+		// Lint/typecheck is cheap and test mapping never covers it: every touched
+		// package gets its check, even when a mapped test replaces its suite.
+		const owner = owningPackage(changedPath, packages);
+		if (owner?.manifest.scripts?.check) {
+			add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
+		}
+
 		if (mappedTests.length > 0) {
 			continue;
 		}
 
-		const owner = owningPackage(changedPath, packages);
 		if (owner) {
-			if (owner.manifest.scripts?.check) {
-				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
-			}
 			if (isCodingAgentRuntimePath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}

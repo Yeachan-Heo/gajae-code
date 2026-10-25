@@ -398,6 +398,16 @@ const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>([
 	"skills.trustProjectSkills",
 	"skills.enablePiProject",
 ]);
+/**
+ * Project-layer values ignored at merge.
+ * User config and runtime overrides still apply.
+ * Clipboard transport and host choose the copy/paste egress destination.
+ */
+const PROJECT_LAYER_DENIED_SETTINGS = new Set<SettingPath>([
+	"task.agentModelOverrides",
+	"clipboard.transport",
+	"clipboard.sshHost",
+]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
 	light: "blue-crab",
@@ -6463,10 +6473,22 @@ export class Settings implements NotificationSettingsReader {
 	#mergeSettingsLayers(global: RawSettings, projectLayer: RawSettings, overrideLayer: RawSettings): RawSettings {
 		const project = structuredClone(projectLayer);
 		const overrides = structuredClone(overrideLayer);
+		// A non-object project clipboard value would replace the user clipboard
+		// object. Drop that parent; nested objects still lose only the denied leaves.
+		const projectClipboard = project.clipboard;
+		if (
+			projectClipboard !== undefined &&
+			(projectClipboard === null || typeof projectClipboard !== "object" || Array.isArray(projectClipboard))
+		) {
+			delete project.clipboard;
+		}
 		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
 			const segments = settingPath.split(".");
 			deleteByPath(project, segments);
 			deleteByPath(overrides, segments);
+		}
+		for (const settingPath of PROJECT_LAYER_DENIED_SETTINGS) {
+			deleteByPath(project, settingPath.split("."));
 		}
 		const merged = this.#deepMerge(this.#deepMerge({}, global), project);
 		return this.#deepMerge(merged, overrides);

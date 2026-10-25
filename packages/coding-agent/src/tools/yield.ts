@@ -14,6 +14,8 @@ import {
 	tryEnforceStrictSchema,
 	validateJsonSchemaValue,
 } from "@gajae-code/ai/utils/schema";
+import { wrapUntrustedContent } from "../session/messages";
+import { truncateMiddle, truncateTail } from "../session/streaming-output";
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { ToolSession } from ".";
 import { jtdToJsonSchema, normalizeSchema } from "./jtd-to-json-schema";
@@ -32,6 +34,95 @@ function formatSchema(schema: unknown): string {
 	} catch {
 		return "[unserializable schema]";
 	}
+}
+
+/** Finished fence, after closer escaping, stays within this many bytes. */
+const YIELD_SCHEMA_TEXT_MAX_BYTES = 4096;
+
+const SCHEMA_PROSE_KEYS = new Set(["description", "title", "$comment"]);
+const SCHEMA_LITERAL_KEYS = new Set(["default", "const", "enum", "examples", "example"]);
+const SCHEMA_MAP_KEYS = new Set([
+	"properties",
+	"patternProperties",
+	"dependencies",
+	"dependentSchemas",
+	"$defs",
+	"definitions",
+]);
+const SCHEMA_LIST_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
+
+function cutSchemaExcerpt(text: string, budget: number, direction: "tail" | "head-tail"): string {
+	if (budget <= 0) return "";
+	const limits = { maxBytes: budget, maxLines: 10_000 };
+	const cut =
+		direction === "tail"
+			? truncateTail(text, limits)
+			: truncateMiddle(text, {
+					...limits,
+					maxHeadBytes: Math.floor(budget / 2),
+					maxHeadLines: 5_000,
+				});
+	return cut.content;
+}
+
+/**
+ * Truncate repository schema text first, then frame it. Closer escaping can grow
+ * the excerpt, so the raw budget shrinks until the finished fence fits. The
+ * fence itself is never sliced.
+ */
+function frameYieldSchemaText(text: string, direction: "tail" | "head-tail"): string {
+	let budget = Buffer.byteLength(text, "utf-8");
+	let excerpt = text;
+	let framed = wrapUntrustedContent(excerpt);
+	while (Buffer.byteLength(framed, "utf-8") > YIELD_SCHEMA_TEXT_MAX_BYTES) {
+		const framedBytes = Buffer.byteLength(framed, "utf-8");
+		const scaled = Math.floor((budget * YIELD_SCHEMA_TEXT_MAX_BYTES) / Math.max(1, framedBytes));
+		const next = Math.max(0, Math.min(budget - 1, scaled));
+		if (next === 0) return wrapUntrustedContent("");
+		budget = next;
+		excerpt = cutSchemaExcerpt(text, budget, direction);
+		framed = wrapUntrustedContent(excerpt);
+	}
+	return framed;
+}
+
+function frameSchemaMap(map: Record<string, unknown>, seen: WeakSet<object>): Record<string, unknown> {
+	const output: Record<string, unknown> = {};
+	for (const name of Object.keys(map)) output[name] = frameSchemaProse(map[name], seen);
+	return output;
+}
+
+function frameSchemaProse(value: unknown, seen: WeakSet<object>, keepRootDescription = false): unknown {
+	if (!value || typeof value !== "object") return value;
+	if (seen.has(value)) return value;
+	seen.add(value);
+	if (Array.isArray(value)) return value.map(item => frameSchemaProse(item, seen));
+	const output: Record<string, unknown> = {};
+	for (const key of Object.keys(value)) {
+		const child = (value as Record<string, unknown>)[key];
+		if (SCHEMA_MAP_KEYS.has(key) && child && typeof child === "object" && !Array.isArray(child)) {
+			output[key] = frameSchemaMap(child as Record<string, unknown>, seen);
+			continue;
+		}
+		if (SCHEMA_LIST_KEYS.has(key) && Array.isArray(child)) {
+			output[key] = child.map(item => frameSchemaProse(item, seen));
+			continue;
+		}
+		if (SCHEMA_LITERAL_KEYS.has(key)) {
+			output[key] = child;
+			continue;
+		}
+		if (keepRootDescription && key === "description") {
+			output[key] = child;
+			continue;
+		}
+		if (SCHEMA_PROSE_KEYS.has(key) && typeof child === "string") {
+			output[key] = frameYieldSchemaText(child, "tail");
+			continue;
+		}
+		output[key] = frameSchemaProse(child, seen);
+	}
+	return output;
 }
 
 function formatJsonSchemaIssues(issues: ReadonlyArray<JsonSchemaValidationIssue> | undefined): string {
@@ -139,8 +230,8 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 
 			const schemaHint = formatSchema(normalizedSchema ?? session.outputSchema);
 			const schemaDescription = schemaError
-				? `Structured JSON output (output schema invalid; accepting unconstrained object): ${schemaError}`
-				: `Structured output matching the schema:\n${schemaHint}`;
+				? `Structured JSON output (output schema invalid; accepting unconstrained object):\n${frameYieldSchemaText(schemaError, "tail")}`
+				: `Structured output matching the schema:\n${frameYieldSchemaText(schemaHint, "head-tail")}`;
 			let sanitizedSchema: Record<string, unknown> | undefined;
 			if (
 				!schemaError &&
@@ -170,7 +261,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 				if (hasUnresolvedRefs(resolved)) {
 					throw new Error("schema contains unresolved $ref after dereferencing");
 				}
-				dataSchema = resolved;
+				dataSchema = frameSchemaProse(resolved, new WeakSet(), true) as Record<string, unknown>;
 			} else {
 				this.strict = false;
 				dataSchema = looseRecordSchema(
@@ -183,7 +274,9 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err);
 			parameters = wrapYieldParameters(
-				looseRecordSchema(`Structured JSON output (schema processing failed: ${errorMsg})`),
+				looseRecordSchema(
+					`Structured JSON output (schema processing failed):\n${frameYieldSchemaText(errorMsg, "tail")}`,
+				),
 			);
 			validate = undefined;
 			this.strict = false;

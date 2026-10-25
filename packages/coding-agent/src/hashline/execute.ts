@@ -5,6 +5,7 @@ import { getFileReadCache } from "../edit/file-read-cache";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "../edit/normalize";
 import { readEditFileText, serializeEditFileText } from "../edit/read-file";
 import type { EditToolDetails } from "../edit/renderer";
+import { wrapUntrustedContent } from "../session/messages";
 import { truncateLine } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
 import { assertEditableFileContent } from "../tools/auto-generated-guard";
@@ -60,6 +61,18 @@ function getHashlineApplyOptions(session: ToolSession): HashlineApplyOptions {
 
 function getTextContent(result: AgentToolResult<EditToolDetails>): string {
 	return result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+}
+
+/** Frame a finished preview once, after warning text is appended and before any later tail window. */
+function frameHashlineModelResult(
+	result: AgentToolResult<EditToolDetails, typeof hashlineEditParamsSchema>,
+): AgentToolResult<EditToolDetails, typeof hashlineEditParamsSchema> {
+	return {
+		...result,
+		content: result.content.map(part =>
+			part.type === "text" ? { ...part, text: wrapUntrustedContent(part.text) } : part,
+		),
+	};
 }
 
 function getEditDetails(result: AgentToolResult<EditToolDetails>): EditToolDetails {
@@ -321,7 +334,9 @@ export async function executeHashlineSingle(
 	);
 
 	// Fast path: a single section needs no preflight pass.
-	if (sections.length === 1) return executeHashlineSection({ ...options, ...sections[0] });
+	if (sections.length === 1) {
+		return frameHashlineModelResult(await executeHashlineSection({ ...options, ...sections[0] }));
+	}
 
 	// Multi-section: validate everything up front so we don't apply a partial batch.
 	for (const section of sections) await preflightHashlineSection({ ...options, ...section });
@@ -332,7 +347,12 @@ export async function executeHashlineSingle(
 	}
 
 	return {
-		content: [{ type: "text", text: results.map(({ result }) => getTextContent(result)).join("\n\n") }],
+		content: [
+			{
+				type: "text",
+				text: wrapUntrustedContent(results.map(({ result }) => getTextContent(result)).join("\n\n")),
+			},
+		],
 		details: {
 			diff: results.map(({ result }) => getEditDetails(result).diff).join("\n"),
 			perFileResults: results.map(({ path: resultPath, result }) => {

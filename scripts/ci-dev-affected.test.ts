@@ -1445,7 +1445,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual(["native-linux-x64"]);
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
-		expect(keys).not.toContain("check:@gajae-code/coding-agent");
+		expect(keys).toContain("check:@gajae-code/coding-agent");
 
 		const entries = describeTasks(tasks);
 		const liveShard = entries.find(entry => entry.key === "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts");
@@ -1463,10 +1463,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(entries.find(entry => entry.key === "native-linux-x64")?.nativeBuild).toBe(true);
 	});
 
-	test("a source file with a directly-named test maps exclusively to that test", () => {
+	test("a source file with a directly-named test maps to that test plus the owning package check", () => {
 		const tasks = targeted(["packages/coding-agent/src/edit/foo.ts"]);
 		expect(tasks.map(task => task.key)).toEqual([
 			"test:packages/coding-agent/test/edit/foo.test.ts",
+			"check:@gajae-code/coding-agent",
 			"native-linux-x64",
 		]);
 	});

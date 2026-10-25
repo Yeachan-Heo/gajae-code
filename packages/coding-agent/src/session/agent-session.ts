@@ -548,6 +548,7 @@ import {
 	readPendingDisplayTag,
 	SILENT_ABORT_MARKER,
 	SKILL_PROMPT_MESSAGE_TYPE,
+	ttsrPromptFields,
 } from "./messages";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 import { readSdkRunCapability } from "./sdk-run-capability";
@@ -9624,7 +9625,7 @@ export class AgentSession {
 		if (this.#pendingTtsrInjections.length === 0) return undefined;
 		const rules = this.#pendingTtsrInjections;
 		const content = rules
-			.map(r => prompt.render(ttsrInterruptTemplate, { name: r.name, path: r.path, content: r.content }))
+			.map(r => prompt.render(ttsrInterruptTemplate, ttsrPromptFields(r)))
 			.join("\n\n");
 		this.#pendingTtsrInjections = [];
 		return { content, rules };
@@ -9726,7 +9727,7 @@ export class AgentSession {
 		if (!rules || rules.length === 0) return undefined;
 		this.#perToolTtsrInjections.delete(ctx.toolCall.id);
 		const reminder = rules
-			.map(r => prompt.render(ttsrToolReminderTemplate, { name: r.name, path: r.path, content: r.content }))
+			.map(r => prompt.render(ttsrToolReminderTemplate, ttsrPromptFields(r)))
 			.join("\n\n");
 		const block: TextContent = { type: "text", text: reminder };
 		this.#perToolTtsrFolded.set(ctx.toolCall.id, { rules, block });

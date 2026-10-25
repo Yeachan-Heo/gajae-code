@@ -9,6 +9,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
+import { wrapUntrustedContent } from "../session/messages";
 import { assertWorkflowMutationRawPathsAllowed } from "../skill-state/workflow-mutation-guard";
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
@@ -282,7 +283,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				const parseMessage = cappedParseErrors.length
 					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
-				return toolResult(baseDetails).text(`No replacements made${parseMessage}`).done();
+				return toolResult(baseDetails)
+					.text(wrapUntrustedContent(`No replacements made${parseMessage}`))
+					.done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
@@ -438,7 +441,10 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				fileReplacements,
 				displayContent: displayLines.join("\n"),
 			};
-			return toolResult(details).text(outputLines.join("\n")).done();
+			// Line clips (120 chars) are already applied. Frame the joined preview once.
+			return toolResult(details)
+				.text(wrapUntrustedContent(outputLines.join("\n")))
+				.done();
 		});
 	}
 }
