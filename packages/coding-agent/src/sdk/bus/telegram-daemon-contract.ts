@@ -314,8 +314,12 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * autonomous follow-up cannot displace the final answer from the idle receipt.
  * Generation 211 fences only the exact attachment that sent session_closed, so
  * owners that refuse every later attachment of a resumed session are replaced.
+ * Generation 212 allocates each SDK host start's event generation from the
+ * agent dir's per-session authority and resumes a stored replay cursor only
+ * within its own generation, replacing owners that reuse the previous host's
+ * replay position or publication receipts for a resumed session.
  */
-export const DAEMON_GENERATION = 211;
+export const DAEMON_GENERATION = 212;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
