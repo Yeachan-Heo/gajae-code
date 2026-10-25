@@ -4798,6 +4798,16 @@ function createControlSurface(
 		abortAndPrompt: async text => {
 			const invalid = validateRequiredPromptText("turn.abort_and_prompt", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
+			// Replacement is the same authority as turn.abort: a connection that
+			// does not own the active run (another client's prompt, or a turn the
+			// host itself started) must not stop it. The replacement text degrades
+			// to a queued steer for that run instead.
+			const connectionId = sdkControlRequesterContext.getStore();
+			if (connectionId !== undefined && ctx.isIdle?.() === false && !requesterOwnsActiveRun(connectionId)) {
+				const correlation = newCorrelation();
+				await sendSdkUserMessage(text, { deliverAs: "steer" });
+				return { accepted: true, ...correlation, aborted: false, queuedAs: "steer" };
+			}
 			await ctx.abort();
 			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),

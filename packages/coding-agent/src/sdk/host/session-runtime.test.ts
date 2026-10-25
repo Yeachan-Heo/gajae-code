@@ -11113,6 +11113,88 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	const replacementOwnerHarness = async (name: string, cwd: string) => {
+		const state = {
+			idle: false,
+			abortCalls: 0,
+			deliveries: [] as Array<{ content: unknown; deliverAs?: string }>,
+			// A started prompt's submission settles only when its run ends.
+			runs: Promise.withResolvers<void>(),
+		};
+		const harness = await invocationHarness(name, cwd, {
+			isIdle: () => state.idle,
+			abort: () => {
+				state.abortCalls += 1;
+				state.idle = true;
+			},
+			sendUserMessage: async (content, options) => {
+				state.deliveries.push({ content, deliverAs: options?.deliverAs });
+				await options?.onPreflightAcceptCommit?.();
+				if (options?.deliverAs === undefined) await state.runs.promise;
+			},
+		});
+		return { harness, state };
+	};
+
+	test("abort_and_prompt replaces a run the requester owns but queues another connection's text as a steer", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-owner-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-owner", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			state.idle = true;
+			const owned = await harness.controlAs("connection-a", "turn.prompt", { text: "owned by a" });
+			expect(owned).toMatchObject({ ok: true, result: { accepted: true } });
+			state.idle = false;
+			await harness.emit("agent_start", { sdkRunToken: `${owned.result?.commandId}:${owned.result?.turnId}` });
+			// agent_start lifecycle bookkeeping is fire-and-forget; let it adopt the owner.
+			await Bun.sleep(25);
+			state.deliveries.length = 0;
+
+			const foreign = await harness.controlAs("connection-b", "turn.abort_and_prompt", { text: "from b" });
+			expect(foreign).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "from b", deliverAs: "steer" }]);
+
+			state.deliveries.length = 0;
+			const replaced = await harness.controlAs("connection-a", "turn.abort_and_prompt", { text: "from a" });
+			expect(replaced).toMatchObject({ ok: true, result: { accepted: true } });
+			expect(replaced.result).not.toHaveProperty("queuedAs");
+			expect(state.abortCalls).toBe(1);
+			expect(state.deliveries.map(delivery => delivery.content)).toEqual(["from a"]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort_and_prompt never stops a run the host started itself", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-host-run-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-host-run", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			const response = await harness.controlAs("connection-b", "turn.abort_and_prompt", {
+				text: "host replacement",
+			});
+			expect(response).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer", commandId: expect.any(String) },
+			});
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "host replacement", deliverAs: "steer" }]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a zero-progress drained batch stays nonterminal without an exact run proof", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-batch-"));
 		let promptDeadlineMs = 600_000;
