@@ -3460,6 +3460,7 @@ describe("cli registration", () => {
 							HOME: agentDir,
 							GJC_CODING_AGENT_DIR: path.join(agentDir, "agent"),
 							GJC_SDK_BROKER_AUTOSTART: "0",
+							GJC_MANAGED_OWNER_CHILD_TOKEN: undefined,
 							GJC_COORDINATOR_SESSION_ID: undefined,
 							GJC_COORDINATOR_SESSION_STATE_FILE: undefined,
 						},
