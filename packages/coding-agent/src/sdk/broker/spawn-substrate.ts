@@ -16,7 +16,7 @@ import {
 import { observeProcessIncarnation, processIncarnation } from "./process-incarnation";
 import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof, SpawnSubstrateProvider } from "./spawn-authority";
 
-export type SpawnMultiplexerSelection = "none" | "tmux" | "psmux" | "proof_failed";
+export type SpawnMultiplexerSelection = "none" | "tmux" | "proof_failed";
 
 export interface SpawnHeadlessProcess {
 	pid: number;
@@ -93,7 +93,7 @@ function messageFor(code: "substrate_unavailable" | "substrate_proof_failed"): s
 		: "The selected spawn substrate could not be proven exactly.";
 }
 
-function launchFailureMessage(selected: "tmux" | "psmux" | "headless", error: unknown): string {
+function launchFailureMessage(selected: "tmux" | "headless", error: unknown): string {
 	const detail = error instanceof Error ? error.message : String(error);
 	const bounded = detail
 		.replace(/[\u0000-\u001f\u007f]/g, " ")
@@ -102,7 +102,7 @@ function launchFailureMessage(selected: "tmux" | "psmux" | "headless", error: un
 	return `${selected} substrate launch failed${bounded ? `: ${bounded}` : ""}`;
 }
 
-function cleanupFailureMessage(selected: "tmux" | "psmux", error: unknown): string {
+function cleanupFailureMessage(selected: "tmux", error: unknown): string {
 	const detail = error instanceof Error ? error.message : String(error);
 	const bounded = detail
 		.replace(/[\u0000-\u001f\u007f]/g, " ")
@@ -111,7 +111,7 @@ function cleanupFailureMessage(selected: "tmux" | "psmux", error: unknown): stri
 	return `${selected} substrate cleanup failed${bounded ? `: ${bounded}` : ""}`;
 }
 
-function cleanupUncertaintyMessage(selected: "tmux" | "psmux"): string {
+function cleanupUncertaintyMessage(selected: "tmux"): string {
 	return `${selected} substrate cleanup could not be verified`;
 }
 
@@ -228,21 +228,24 @@ function commandAvailable(command: string): boolean {
 	return Bun.which(command) !== null;
 }
 
+/**
+ * Platforms where the managed supervisor admits its child and exposes it as the
+ * verified direct child, so `resolveLifecycleOwner` can name the real SDK host.
+ * Windows managed admission has no owner-only binding reader, so a psmux child
+ * could never be admitted or resolved; the Broker selects headless there before
+ * any launch instead of a substrate whose owner is always unresolvable.
+ */
+function managedLifecycleOwnerPlatform(platform: NodeJS.Platform): boolean {
+	return platform === "darwin" || platform === "linux";
+}
+
 function defaultMultiplexerSelection(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): SpawnMultiplexerSelection {
 	try {
-		if (platform === "darwin" || platform === "linux") {
-			const binary = resolveGjcTmuxBinary({ env, platform });
-			if (!commandAvailable(binary.command)) return "none";
-			if (binary.isPsmux) return "proof_failed";
-			const provider = resolveGjcTmuxProviderContext({ env, platform, binary });
-			return provider.kind === "native-tmux" ? "tmux" : "proof_failed";
-		}
-		if (platform !== "win32") return "none";
 		const binary = resolveGjcTmuxBinary({ env, platform });
 		if (!commandAvailable(binary.command)) return "none";
-		if (!binary.isPsmux) return env.GJC_TMUX_COMMAND?.trim() ? "proof_failed" : "none";
+		if (binary.isPsmux) return "proof_failed";
 		const provider = resolveGjcTmuxProviderContext({ env, platform, binary });
-		return provider.kind === "windows-psmux" ? "psmux" : "proof_failed";
+		return provider.kind === "native-tmux" ? "tmux" : "proof_failed";
 	} catch {
 		return "proof_failed";
 	}
@@ -472,10 +475,10 @@ export function createSpawnSubstrateProvider(
 					});
 			}
 			const launchEnv: NodeJS.ProcessEnv = { ...inherited.environment, ...(spec.env ?? {}) };
-			const selected = selectMultiplexer();
+			const selected = managedLifecycleOwnerPlatform(platform) ? selectMultiplexer() : "none";
 			if (selected === "proof_failed")
 				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
-			if (selected === "tmux" || selected === "psmux") {
+			if (selected === "tmux") {
 				let managed: ManagedTmuxLaunchProof;
 				try {
 					managed = launchManaged(spec, launchEnv, platform);
@@ -572,7 +575,7 @@ export function createSpawnSubstrateProvider(
 				if (expired()) return timeout;
 				if (
 					proof.substrateKind !== "headless" &&
-					(proof.substrateKind !== "tmux" || (platform !== "darwin" && platform !== "linux"))
+					(proof.substrateKind !== "tmux" || !managedLifecycleOwnerPlatform(platform))
 				)
 					return { ok: false, code: "owner_unsupported" };
 				if (!isPositiveInteger(proof.pid) || !isNonEmptyString(proof.processIncarnation)) return failed;

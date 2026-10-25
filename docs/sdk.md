@@ -1335,6 +1335,12 @@ must match that host's pid and incarnation and the lifecycle request marker.
 The supervisor proof remains separate cleanup authority; an empty process
 observation is not proof of absence, and ambiguous or replaced children are not
 adopted. A generic registration uncertainty is not permission to retry seed
-delivery or discard the Broker claim. Editing source or replacing files does not
+delivery or discard the Broker claim. The Broker selects a managed multiplexer
+only where that host can be resolved (macOS and Linux tmux). Windows managed
+admission has no owner-only binding reader, so a psmux child could never
+register; Windows `session.spawn` therefore selects the headless substrate
+before launch, the same substrate used when no multiplexer is installed. An
+owner that cannot be resolved fails as `lifecycle_owner_unresolved` once the
+substrate release is proven, and stays `terminal_uncertain` while it is not. Editing source or replacing files does not
 update a running Broker; verify a fresh isolated runtime before a separately
 controlled Broker replacement.
