@@ -3447,11 +3447,38 @@ describe("cli registration", () => {
 		}
 	}, 15_000);
 
-	test("gjc daemon is registered in the explicit command registry", () => {
-		const cliSource = fs.readFileSync(path.join(import.meta.dir, "../src/cli-main.ts"), "utf8");
-		expect(cliSource).toContain('{ name: "daemon"');
-		expect(cliSource).toContain('import("./commands/daemon")');
-	});
+	test("registered daemon dispatch returns statuses for each selected provider", () => {
+		const agentDir = tempAgentDir();
+		try {
+			for (const kind of ["telegram", "slack"] as const) {
+				const result = Bun.spawnSync(
+					[process.execPath, path.join(import.meta.dir, "../src/cli.ts"), "daemon", "status", kind, "--json"],
+					{
+						cwd: agentDir,
+						env: {
+							...process.env,
+							HOME: agentDir,
+							GJC_CODING_AGENT_DIR: path.join(agentDir, "agent"),
+							GJC_SDK_BROKER_AUTOSTART: "0",
+							GJC_COORDINATOR_SESSION_ID: undefined,
+							GJC_COORDINATOR_SESSION_STATE_FILE: undefined,
+						},
+						stdin: "ignore",
+						stdout: "pipe",
+						stderr: "pipe",
+						timeout: 10_000,
+						killSignal: "SIGKILL",
+					},
+				);
+				expect(result.exitCode, result.stderr.toString()).toBe(0);
+				expect(result.stderr.toString()).toBe("");
+				const statuses = JSON.parse(result.stdout.toString()) as DaemonStatus[];
+				expect(statuses.map(status => status.kind)).toEqual([kind]);
+			}
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 15_000);
 });
 
 describe("topic registry reload persistence", () => {
