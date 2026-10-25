@@ -3447,6 +3447,19 @@ describe("cli registration", () => {
 		}
 	}, 15_000);
 
+	function privateDaemonEnv(home: string, inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+		return {
+			...inherited,
+			HOME: home,
+			USERPROFILE: home,
+			GJC_CODING_AGENT_DIR: path.join(home, "agent"),
+			GJC_SDK_BROKER_AUTOSTART: "0",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: undefined,
+			GJC_COORDINATOR_SESSION_ID: undefined,
+			GJC_COORDINATOR_SESSION_STATE_FILE: undefined,
+		};
+	}
+
 	test("registered daemon dispatch returns statuses for each selected provider", () => {
 		const agentDir = tempAgentDir();
 		try {
@@ -3455,15 +3468,7 @@ describe("cli registration", () => {
 					[process.execPath, path.join(import.meta.dir, "../src/cli.ts"), "daemon", "status", kind, "--json"],
 					{
 						cwd: agentDir,
-						env: {
-							...process.env,
-							HOME: agentDir,
-							GJC_CODING_AGENT_DIR: path.join(agentDir, "agent"),
-							GJC_SDK_BROKER_AUTOSTART: "0",
-							GJC_MANAGED_OWNER_CHILD_TOKEN: undefined,
-							GJC_COORDINATOR_SESSION_ID: undefined,
-							GJC_COORDINATOR_SESSION_STATE_FILE: undefined,
-						},
+						env: privateDaemonEnv(agentDir),
 						stdin: "ignore",
 						stdout: "pipe",
 						stderr: "pipe",
@@ -3478,6 +3483,56 @@ describe("cli registration", () => {
 			}
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	test("private daemon environment preserves inherited external profile settings", async () => {
+		const root = tempAgentDir();
+		const home = path.join(root, "private-home");
+		const externalProfile = path.join(root, "external-profile");
+		const privateSource = path.join(home, ".gjc", "settings.json");
+		const externalSource = path.join(externalProfile, ".gjc", "settings.json");
+		const externalSettings = JSON.stringify({ "gjc.ralplan.maxIterations": 4 });
+		try {
+			await Bun.write(privateSource, JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
+			await Bun.write(externalSource, externalSettings);
+			const result = Bun.spawnSync(
+				[process.execPath, path.join(import.meta.dir, "fixtures/daemon-control-profile-probe.ts"), root],
+				{
+					cwd: root,
+					env: privateDaemonEnv(home, {
+						...process.env,
+						HOME: externalProfile,
+						USERPROFILE: externalProfile,
+						GJC_CONFIG_DIR: ".gjc",
+						PI_CONFIG_DIR: undefined,
+					}),
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+					timeout: 10_000,
+					killSignal: "SIGKILL",
+				},
+			);
+			expect(result.exitCode, result.stderr.toString()).toBe(0);
+			const observed = JSON.parse(result.stdout.toString()) as {
+				userProfile: string;
+				home: string;
+				configRoot: string;
+				agentDir: string;
+				maxIterations: number;
+			};
+			expect(observed.userProfile).toBe(home);
+			expect(observed.home).toBe(home);
+			expect(observed.configRoot).toBe(path.join(home, ".gjc"));
+			expect(observed.agentDir).toBe(path.join(home, "agent"));
+			expect(observed.maxIterations).toBe(7);
+			expect(await Bun.file(privateSource).exists()).toBe(false);
+			expect(await Bun.file(`${privateSource}.bak`).exists()).toBe(true);
+			expect(await Bun.file(externalSource).text()).toBe(externalSettings);
+			expect(await Bun.file(`${externalSource}.bak`).exists()).toBe(false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	}, 15_000);
 });
