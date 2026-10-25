@@ -1308,3 +1308,18 @@ Source installations must rebuild the native addon (`bun run build:native`)
 when updating this admission boundary; compiled installations need a matching
 CLI/native build. Editing source or replacing files does not update a running
 Broker.
+
+Darwin has no identity-bound signal API for an external process, so managed
+shutdown there uses the existing generation-fenced owner intent instead of
+signaling a reconstructed supervisor PID. `forceCloseGjcTmuxSession` proves the
+pinned supervisor, its single private child binding and the tmux session
+metadata, then publishes the intent no-replace while holding the generation
+lock that the supervisor also takes. The supervisor polls for that intent,
+validates it against its own binding, generation and server key, and relays
+SIGTERM exactly once through its original child spawn handle. A close succeeds
+only when both the pinned supervisor has exited and the terminal verdict
+matching the published intent exists; publication alone, a timeout, an exit
+without a verdict, or a verdict while the supervisor is still alive is not
+success, and guarded session cleanup is skipped. A plain OS SIGTERM to the
+supervisor still stops its child but never claims an operator verdict. Linux
+keeps its kernel-signaled owner path.
