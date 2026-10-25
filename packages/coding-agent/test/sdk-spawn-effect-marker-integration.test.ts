@@ -2,6 +2,14 @@ import { expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Process } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { executeTmuxOwnerIsolationPlanSync } from "../src/gjc-runtime/tmux-owner-isolation";
+import {
+	__setCreateOwnerIsolationForTests,
+	createManagedGjcTmuxSession,
+	type ManagedTmuxLaunchProof,
+} from "../src/gjc-runtime/tmux-sessions";
 import { Broker, type SpawnPromptLayer } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest, writeSessionLifecycleFailure } from "../src/sdk/broker/lifecycle";
@@ -121,6 +129,7 @@ for (const scenario of [
 					return { ok: true, proof: launchedProof };
 				},
 				verify: async () => (scenario === "unproven_verify" ? "mismatch" : "verified"),
+				resolveLifecycleOwner: async () => ({ ok: true, owner: { pid: 4321, incarnation: "inc-4321" } }),
 				close: async () => {
 					closes += 1;
 					return { ok: scenario !== "unproven_close" };
@@ -182,6 +191,170 @@ for (const scenario of [
 		}
 	});
 }
+
+const sourceCli = path.resolve(import.meta.dir, "../src/cli.ts");
+
+// A real Linux service cgroup needs the existing user bus to establish its
+// isolated owner scope. Do not inherit unrelated host configuration or state.
+const linuxUserBusEnvironment: NodeJS.ProcessEnv = {};
+if (process.platform === "linux") {
+	for (const name of ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] as const) {
+		const value = process.env[name];
+		if (value !== undefined) linuxUserBusEnvironment[name] = value;
+	}
+}
+
+function captureScopedBootstrap(
+	launch: () => ManagedTmuxLaunchProof,
+	environment: NodeJS.ProcessEnv,
+	diagnostics: string[],
+): ManagedTmuxLaunchProof {
+	__setCreateOwnerIsolationForTests({
+		execute: (plan, dependencies) =>
+			executeTmuxOwnerIsolationPlanSync(plan, {
+				...dependencies,
+				spawn: (argv, stdinLine) => {
+					const result = dependencies.spawn(argv, stdinLine);
+					if (plan.ok && plan.execution.mode === "scoped" && diagnostics.length < 2) {
+						const secrets = [plan.execution.attempt.token, ...Object.values(environment)].filter(
+							(value): value is string => typeof value === "string" && value.length > 0,
+						);
+						const redact = (text: string) => {
+							for (const secret of secrets) text = text.replaceAll(secret, "[redacted]");
+							return text.slice(0, 4096);
+						};
+						diagnostics.push(
+							JSON.stringify({
+								exitCode: result.exitCode,
+								stdout: redact(result.stdout ?? ""),
+								stderr: redact(result.stderr ?? ""),
+							}),
+						);
+					}
+					return result;
+				},
+			}),
+	});
+	try {
+		return launch();
+	} finally {
+		__setCreateOwnerIsolationForTests(null);
+	}
+}
+
+test("managed wrong outer cannot register a valid inner CLI or substitute headless", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-wrong-outer-"));
+	const env = {
+		...linuxUserBusEnvironment,
+		PATH: process.env.PATH ?? "",
+		LANG: process.platform === "darwin" ? "en_US.UTF-8" : "C.UTF-8",
+		HOME: root,
+		TMPDIR: root,
+		TMUX_TMPDIR: root,
+		BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
+	};
+	let launched: SpawnSubstrateProof | undefined;
+	const retained: { process: Process | null } = { process: null };
+	let allocations = 0;
+	let validInnerObserved = false;
+	let headlessAttempts = 0;
+	let passed = false;
+	let cleanupProven = false;
+	const bootstrapDiagnostics: string[] = [];
+	const provider = createSpawnSubstrateProvider({
+		env,
+		selectMultiplexer: () => "tmux",
+		startHeadless: () => {
+			headlessAttempts += 1;
+			throw new Error("Forbidden headless fallback");
+		},
+		launchManaged: (spec, environment, platform) => {
+			allocations += 1;
+			expect(spec.argv).toEqual([process.execPath, "run", sourceCli, "sdk", "session-host-internal"]);
+			validInnerObserved = true;
+			// A genuine allocated tmux pane, but deliberately not a GJC supervisor.
+			// Its bounded natural exit is containment, never readiness success.
+			return captureScopedBootstrap(
+				() =>
+					createManagedGjcTmuxSession(spec, environment, {
+						platform,
+						supervisorArgvForTest: ["/bin/sleep", "5"],
+					}),
+				environment,
+				bootstrapDiagnostics,
+			);
+		},
+	});
+	const broker = new Broker({
+		agentDir: path.join(root, "agent"),
+		masterCapabilityVerifier: verifier,
+		spawnSubstrateProvider: {
+			...provider,
+			launch: async spec => {
+				const result = await provider.launch({ ...spec, inheritedEnv: env });
+				if (result.ok) {
+					launched = result.proof;
+					retained.process = nativeProcessBindings().Process.fromPid(result.proof.pid!);
+				}
+				return result;
+			},
+			resolveLifecycleOwner: (proof, deadline) =>
+				provider.resolveLifecycleOwner(proof, Math.min(deadline, Date.now() + 1_000)),
+		},
+	});
+	setLifecycleCommandResolverForTest(broker, () => ({
+		file: process.execPath,
+		args: ["run", sourceCli, "sdk", "session-host-internal"],
+	}));
+	try {
+		await broker.start();
+		await attest(broker, root);
+		const response = await spawn(broker, root);
+		expect(response.ok).toBe(false);
+		expect(allocations).toBe(1);
+		expect(validInnerObserved).toBe(true);
+		expect(headlessAttempts).toBe(0);
+		expect(broker.index.listSessionIdentities().filter(row => row.sessionId !== ownerId)).toHaveLength(0);
+		const ledger = await Bun.file(path.join(broker.settings.agentDir, "sdk", "spawn-authority.jsonl")).text();
+		for (const state of ["authority_active", "seed_prepared", "dispatching", "accepted"])
+			expect(ledger).not.toContain(`"${state}"`);
+		if (!launched) throw new Error(`Wrong-outer allocation proof was not captured; retained ${root}`);
+		if (launched) {
+			expect(launched.substrateKind).toBe("tmux");
+			expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			if (!retained.process) throw new Error(`Missing exact wrong-outer reference; retained ${root}`);
+			expect(await retained.process.waitForExit({ timeoutMs: 5_000 })).toBe(true);
+			expect(await provider.verify(launched)).toBe("gone");
+		}
+		// This fixture owns an isolated socket namespace. Observe absence only;
+		// never kill a whole server or guess which allocated pane to remove.
+		const listing = Bun.spawn(["tmux", "list-sessions", "-F", "#{session_id}"], {
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr] = await Promise.all([
+			new Response(listing.stdout).text(),
+			new Response(listing.stderr).text(),
+		]);
+		const exit = await listing.exited;
+		expect(stdout.trim()).toBe("");
+		expect(exit).not.toBe(0);
+		expect(stderr).toMatch(/no server running|failed to connect|error connecting/);
+		cleanupProven = true;
+		passed = true;
+	} catch (error) {
+		process.stderr.write(`${JSON.stringify({ fixture: "wrong-outer", scopedBootstrap: bootstrapDiagnostics })}\n`);
+		throw new AggregateError(
+			[error],
+			`Wrong-outer fixture failed; scoped bootstrap: ${bootstrapDiagnostics.join("; ")}`,
+		);
+	} finally {
+		await broker.stop();
+		setLifecycleCommandResolverForTest(broker, undefined);
+		if (passed && cleanupProven) await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
 
 test("real session.spawn publishes lifecycle authority and registers a live child before seed delivery", async () => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-real-marker-"));
@@ -287,6 +460,7 @@ test("managed task.dag advance still publishes lifecycle authority before seed d
 				};
 			},
 			verify: async () => "verified",
+			resolveLifecycleOwner: async () => ({ ok: true, owner: { pid: 4321, incarnation: "inc-4321" } }),
 			close: async () => ({ ok: true }),
 		},
 	});

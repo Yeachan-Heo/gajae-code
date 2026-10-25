@@ -1323,3 +1323,15 @@ without a verdict, or a verdict while the supervisor is still alive is not
 success, and guarded session cleanup is skipped. A plain OS SIGTERM to the
 supervisor still stops its child but never claims an operator verdict. Linux
 keeps its kernel-signaled owner path.
+
+Substrate supervisor identity and registered SDK-host identity are distinct
+proofs. Before publishing the lifecycle marker, the Broker resolves the actual
+host under the original readiness deadline: the headless process itself, or the
+positively verified direct child of the pinned managed supervisor. Registration
+must match that host's pid and incarnation and the lifecycle request marker.
+The supervisor proof remains separate cleanup authority; an empty process
+observation is not proof of absence, and ambiguous or replaced children are not
+adopted. A generic registration uncertainty is not permission to retry seed
+delivery or discard the Broker claim. Editing source or replacing files does not
+update a running Broker; verify a fresh isolated runtime before a separately
+controlled Broker replacement.
