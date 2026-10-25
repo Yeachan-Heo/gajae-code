@@ -3987,7 +3987,9 @@ export class SelectorController {
 									const removalTargets = authStorage.listCredentialRemovalTargets(selectedProviderId);
 									const targetToRemove = removalTargets.find(target => target.id === credentialId);
 									if (targetToRemove) {
-										const result = authStorage.removeAuthCredentialsHard(selectedProviderId, [targetToRemove]);
+										const result = authStorage.removeAuthCredentialsHard(selectedProviderId, [
+											targetToRemove,
+										]);
 										if (result.kind !== "removed") {
 											this.ctx.showError("Failed to clear disabled credential. Retry or re-login manually.");
 											return;
