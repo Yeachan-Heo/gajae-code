@@ -2814,6 +2814,10 @@ function sdkControlSurface(
 	// Hands a queued submission's lease handle to the runtime when that
 	// submission is promoted to its own run; the run's agent_start adopts it.
 	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
+	// Whether `connectionId` may replace the active run: true when no run is
+	// active or the run belongs to that connection's accepted prompt. A run the
+	// host started itself (interactive TUI, monitor, cron) has no SDK owner.
+	requesterOwnsActiveRun: (connectionId: string) => boolean = () => true,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2997,6 +3001,19 @@ function sdkControlSurface(
 		);
 	};
 	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
+	// turn.abort_and_prompt carries the same authority as turn.abort: a
+	// connection replaces only work it owns. Another connection's pending
+	// preflight or a run the requester did not start keeps running.
+	const mayReplaceActiveWork = (connectionId: string | undefined): boolean =>
+		connectionId === undefined ||
+		([...pendingPreflightCancellations.values()].every(entry => entry.connectionId === connectionId) &&
+			requesterOwnsActiveRun(connectionId));
+	const cancelPendingPreflightsForReplacement = async () => {
+		const requesterConnectionId = controlRequesterContext.getStore();
+		if (requesterConnectionId !== undefined && !mayReplaceActiveWork(requesterConnectionId))
+			await cancelPendingPreflightsForConnection(requesterConnectionId);
+		else await cancelPendingPreflights();
+	};
 	const awaitAbortReady = async () => {
 		await cancelPendingPreflights();
 		await (ctx.abort as () => unknown)();
@@ -3497,10 +3514,15 @@ function sdkControlSurface(
 			};
 		},
 		abortAndPrompt: async text => {
+			const requesterConnectionId = controlRequesterContext.getStore();
+			if (!mayReplaceActiveWork(requesterConnectionId))
+				return { ...(await sendSteer(text)), aborted: false, queuedAs: "steer" };
 			await awaitAbortReady();
-			return await submitPrompt(text, undefined, true, undefined, false, controlRequesterContext.getStore());
+			return await submitPrompt(text, undefined, true, undefined, false, requesterConnectionId);
 		},
-		cancelPendingPreflights,
+		// Dispatch cancels pending preflights before the replacement is
+		// serialized; a non-owner cancels only its own.
+		cancelPendingPreflights: cancelPendingPreflightsForReplacement,
 		cancelPendingPreflightsForConnection,
 		answerAsk: (id, answer) => {
 			const pending = pendingInteractive.get(id);
@@ -8148,6 +8170,20 @@ export function createNotificationsExtension(
 			trackReconciliationProducer,
 			workLease,
 			promoteWorkLease,
+			connectionId => {
+				const ownedBy = (correlation: { commandId: string; turnId: string }) =>
+					promptSubmissions.get(promptSubmissionKey(correlation))?.connectionId === connectionId;
+				// Another connection's accepted prompt that has not started yet is
+				// foreign work too: replacing would wait on, then preempt, it.
+				if (
+					!pendingPromptCorrelations.every(ownedBy) ||
+					![...pendingPromptCorrelationsBySdkRunToken.values()].every(ownedBy)
+				)
+					return false;
+				if (runtime?.busy !== true && ctx.isIdle?.() !== false) return true;
+				const active = runtime?.activePromptCorrelation;
+				return active !== undefined && ownedBy(active);
+			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
