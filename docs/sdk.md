@@ -1314,7 +1314,10 @@ shutdown there uses the existing generation-fenced owner intent instead of
 signaling a reconstructed supervisor PID. `forceCloseGjcTmuxSession` proves the
 pinned supervisor, its single private child binding and the tmux session
 metadata, then publishes the intent no-replace while holding the generation
-lock that the supervisor also takes. The supervisor polls for that intent,
+lock that the supervisor also takes. A close that arrives before the supervisor
+has published its binding waits, inside the same close deadline, only while that
+exact supervisor stays live; an untrusted, ambiguous, or still-missing binding
+fails closed. The supervisor polls for that intent,
 validates it against its own binding, generation and server key, and relays
 SIGTERM exactly once through its original child spawn handle. A close succeeds
 only when both the pinned supervisor has exited and the terminal verdict

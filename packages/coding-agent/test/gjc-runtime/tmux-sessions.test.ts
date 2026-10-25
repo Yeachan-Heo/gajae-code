@@ -36,6 +36,7 @@ import {
 	__setCreateOwnerIsolationForTests,
 	__setMutationServerProofForTests,
 	attachGjcTmuxSession,
+	awaitCooperativeSupervisorBinding,
 	createGjcTmuxSession,
 	createManagedGjcTmuxSession,
 	forceCloseGjcTmuxSession,
@@ -2460,5 +2461,125 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 			fs.access(path.join(stateDir, sessionId, "owner-lifecycle", `intent-${generation}.json.cancelled`)),
 		).resolves.toBeNull();
 		await fs.rm(stateDir, { recursive: true, force: true });
+	});
+});
+
+describe("cooperative supervisor binding discovery", () => {
+	const identity = (stateDir: string) => ({
+		sessionId: "cooperative-session",
+		stateDir,
+		socketKey: "managed",
+		generation: "cooperative-generation",
+		pid: 4242,
+		startTime: "darwin:4242:1",
+	});
+	const binding = {
+		schema_version: 3,
+		binding_kind: "opaque",
+		generation: "cooperative-generation",
+		session_id: "cooperative-session",
+		run_id: "run",
+		endpoint_incarnation: "incarnation",
+		child_token: "token",
+		supervisor_pid: 4242,
+		supervisor_start_time: "darwin:4242:1",
+		created_at: "2026-01-01T00:00:00.000Z",
+	} as const;
+	const fixture = async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-binding-"));
+		const root = lifecyclePaths(stateDir, "cooperative-session", "cooperative-generation").root;
+		await fs.mkdir(root, { recursive: true, mode: 0o700 });
+		const publish = () =>
+			fs.writeFile(path.join(root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, { mode: 0o600 });
+		return { stateDir, publish };
+	};
+
+	it("waits for the same exact supervisor to publish its binding", async () => {
+		const { stateDir, publish } = await fixture();
+		let polls = 0;
+		let supervisorChecks = 0;
+		try {
+			const discovered = await awaitCooperativeSupervisorBinding(identity(stateDir), {
+				assertSameSupervisor: () => {
+					supervisorChecks += 1;
+				},
+				sleep: async () => {
+					polls += 1;
+					if (polls === 2) await publish();
+				},
+				now: () => new Date(0),
+				deadline: 1_000,
+			});
+			expect(discovered).toEqual(binding);
+			expect(polls).toBe(2);
+			expect(supervisorChecks).toBe(4);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("stops waiting when the supervisor changes before its binding appears", async () => {
+		const { stateDir, publish } = await fixture();
+		let polls = 0;
+		try {
+			await expect(
+				awaitCooperativeSupervisorBinding(identity(stateDir), {
+					assertSameSupervisor: () => {
+						if (polls > 0) throw new Error("managed_owner_supervisor_changed");
+					},
+					sleep: async () => {
+						polls += 1;
+					},
+					now: () => new Date(0),
+					deadline: 1_000,
+				}),
+			).rejects.toThrow("managed_owner_supervisor_changed");
+			expect(polls).toBe(1);
+			await publish();
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed with the unavailable binding once the close deadline passes", async () => {
+		const { stateDir } = await fixture();
+		let nowMs = 0;
+		try {
+			await expect(
+				awaitCooperativeSupervisorBinding(identity(stateDir), {
+					assertSameSupervisor: () => {},
+					sleep: async () => {
+						nowMs += 600;
+					},
+					now: () => new Date(nowMs),
+					deadline: 1_000,
+				}),
+			).rejects.toThrow("managed_owner_binding_unavailable");
+			expect(nowMs).toBe(1_200);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not retry untrusted binding evidence", async () => {
+		const { stateDir } = await fixture();
+		const root = lifecyclePaths(stateDir, "cooperative-session", "cooperative-generation").root;
+		await fs.writeFile(path.join(root, "child-token.binding.json"), "{}\n", { mode: 0o600 });
+		let polls = 0;
+		try {
+			await expect(
+				awaitCooperativeSupervisorBinding(identity(stateDir), {
+					assertSameSupervisor: () => {},
+					sleep: async () => {
+						polls += 1;
+					},
+					now: () => new Date(0),
+					deadline: 1_000,
+				}),
+			).rejects.toThrow("managed_owner_binding_untrusted");
+			expect(polls).toBe(0);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
 	});
 });
