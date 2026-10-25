@@ -233,9 +233,9 @@ describe("OAuth selector filtering", () => {
 			authStorage.close();
 		}
 	});
-	test("a disabled OAuth account defaults Enter to adding a fresh account", async () => {
+	test("a disabled OAuth account triggers re-login when selected", async () => {
 		const authStorage = await AuthStorage.create(":memory:");
-		const added: boolean[] = [];
+		const relogins: number[] = [];
 		let selector: OAuthSelectorComponent | undefined;
 		try {
 			await authStorage.set("anthropic", [
@@ -259,16 +259,16 @@ describe("OAuth selector filtering", () => {
 				() => {},
 				{
 					accountProviderId: "anthropic",
-					onAddAccount: () => {
-						added.push(true);
+					onReloginAccount: (id: number) => {
+						relogins.push(id);
 					},
 				},
 			);
 
 			selector.handleInput("\n");
 
-			expect(added).toEqual([true]);
-			expect(renderedText(selector)).not.toContain("This account is not selectable.");
+			expect(relogins).toEqual([credential.id]);
+			expect(renderedText(selector)).toContain(`disabled: oauth refresh failed: invalid_grant`);
 		} finally {
 			selector?.dispose();
 			authStorage.close();
@@ -356,5 +356,61 @@ describe("OAuth selector filtering", () => {
 		selector.handleInput("\n");
 
 		expect(selected).toEqual(["bizrouter"]);
+	});
+
+	test("logout can select and remove a disabled OAuth account", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const removed: unknown[][] = [];
+		let selector: OAuthSelectorComponent | undefined;
+
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "disabled-access",
+					refresh: "disabled-refresh",
+					expires: Date.now() - 60_000,
+					accountId: "disabled-account",
+					email: "disabled@example.com",
+				},
+			]);
+			const credential = authStorage.listCredentialInventory("anthropic")[0];
+			if (!credential) throw new Error("Expected OAuth credential fixture");
+			expect(authStorage.disableCredentialById(credential.id, "oauth refresh failed: invalid_grant")).toBe(true);
+
+			selector = new OAuthSelectorComponent(
+				"logout",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onAccountRemove: targets => {
+						removed.push([...targets]);
+					},
+				},
+			);
+
+			// Disabled account should be listed and selectable for removal in logout mode
+			const rendered = renderedText(selector);
+			expect(rendered).toContain("disabled@example.com");
+
+			// Select the disabled account and request removal
+			selector.handleInput("\n");
+
+			expect(removed).toHaveLength(0); // Not removed yet, waiting for confirmation
+			expect(renderedText(selector)).toContain("Remove this account? Enter to confirm, Esc to cancel");
+
+			// Confirm removal
+			selector.handleInput("\n");
+
+			expect(removed).toHaveLength(1);
+			const [targets] = removed;
+			expect(targets).toHaveLength(1);
+			expect(String(JSON.stringify(targets))).toContain(`"id":${credential.id}`);
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
 	});
 });

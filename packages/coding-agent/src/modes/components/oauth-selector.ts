@@ -19,6 +19,7 @@ export interface OAuthSelectorAccountOptions {
 	onAccountSelect?: (selector: AuthCredentialSelector) => void | Promise<void>;
 	onAutoSelect?: () => void | Promise<void>;
 	onAddAccount?: () => void | Promise<void>;
+	onReloginAccount?: (id: number) => void | Promise<void>;
 	onAccountRemove?: (targets: readonly CredentialRemovalTarget[]) => void | Promise<void>;
 }
 
@@ -67,6 +68,7 @@ export class OAuthSelectorComponent extends Container {
 	#onAccountSelect?: (selector: AuthCredentialSelector) => void | Promise<void>;
 	#onAutoSelect?: () => void | Promise<void>;
 	#onAddAccount?: () => void | Promise<void>;
+	#onReloginAccount?: (id: number) => void | Promise<void>;
 	#onAccountRemove?: (targets: readonly CredentialRemovalTarget[]) => void | Promise<void>;
 	#pendingAccountRemovalTargets?: readonly CredentialRemovalTarget[];
 
@@ -95,6 +97,7 @@ export class OAuthSelectorComponent extends Container {
 		this.#onAccountSelect = options?.onAccountSelect;
 		this.#onAutoSelect = options?.onAutoSelect;
 		this.#onAddAccount = options?.onAddAccount;
+		this.#onReloginAccount = options?.onReloginAccount;
 		this.#onAccountRemove = options?.onAccountRemove;
 
 		if (this.#accountProviderId) this.#loadAccountEntries();
@@ -156,7 +159,7 @@ export class OAuthSelectorComponent extends Container {
 			target: targets.get(row.id),
 			selectable:
 				this.#mode === "login"
-					? row.credentialKind === "oauth" && !apiKeyOverrideActive && !row.disabled
+					? row.credentialKind === "oauth" && !apiKeyOverrideActive
 					: targets.has(row.id),
 		}));
 		if (this.#mode === "login") {
@@ -164,15 +167,6 @@ export class OAuthSelectorComponent extends Container {
 				{ kind: "auto", selectable: true },
 				{ kind: "add", selectable: this.#onAddAccount !== undefined },
 			);
-			const firstAccount = this.#accountEntries.find(entry => entry.kind === "account");
-			if (firstAccount && !firstAccount.selectable) {
-				const addAccountIndex =
-					firstAccount.row.disabled && this.#onAddAccount !== undefined
-						? this.#accountEntries.findIndex(entry => entry.kind === "add" && entry.selectable)
-						: -1;
-				this.#selectedIndex =
-					addAccountIndex >= 0 ? addAccountIndex : this.#accountEntries.findIndex(entry => entry.selectable);
-			}
 		} else if (this.#accountEntries.some(entry => entry.kind === "account" && entry.selectable)) {
 			this.#accountEntries.push({ kind: "all", selectable: this.#onAccountRemove !== undefined });
 		}
@@ -457,7 +451,11 @@ export class OAuthSelectorComponent extends Container {
 			if (selected.kind === "account") {
 				if (this.#mode === "login") {
 					if (selected.row.credentialKind !== "oauth") return;
-					void this.#onAccountSelect?.({ kind: "id", value: String(selected.row.id) });
+					if (selected.row.disabled) {
+						void this.#onReloginAccount?.(selected.row.id);
+					} else {
+						void this.#onAccountSelect?.({ kind: "id", value: String(selected.row.id) });
+					}
 				} else if (selected.target) {
 					this.#confirmOrArmAccountRemoval([selected.target], "Remove this account?");
 				}
