@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
+import { allocateSessionEventGeneration } from "../src/sdk/broker/session-index";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../src/sdk/bus/notification-service";
@@ -2148,12 +2149,14 @@ test("a restarted host's events are not suppressed by the previous host's public
 	const sessionId = "restarted-host-session";
 	const hosts: SessionSdkHost[] = [];
 	// Each process hosts the session with a fresh SDK event stream, exactly as
-	// `gjc --resume` does after the previous process exited.
+	// `gjc --resume` does after the previous process exited, and takes its
+	// generation from the production per-session authority.
 	const startHost = async (question: string): Promise<SessionSdkHost> => {
 		const host = new SessionSdkHost({
 			sessionId,
 			stateRoot: path.join(agentDir, "state"),
 			token: "token",
+			allocateEventGeneration: (id, floor) => allocateSessionEventGeneration(agentDir, id, floor),
 			sendFrame: () => "written",
 			onFrame: () => () => {},
 		});
@@ -2192,7 +2195,6 @@ test("a restarted host's events are not suppressed by the previous host's public
 		await replayInto(first, "router:first");
 		expect(asked("first process question")).toBe(1);
 		await first.stop();
-		await Bun.sleep(2);
 
 		const resumed = await startHost("resumed process question");
 		await replayInto(resumed, "router:resumed");

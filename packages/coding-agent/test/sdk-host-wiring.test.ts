@@ -625,6 +625,13 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			lifecycleRequired: true,
 		});
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		// Every host start allocates a fresh event generation; the rollback proof must
+		// carry the generation this host actually published to the session index.
+		const endpointGeneration = (await new SessionIndex(cwd).open())
+			.listSessions()
+			.sessions.find(session => session.sessionId === sessionId)?.endpointGeneration;
+		if (endpointGeneration === undefined) throw new Error("Lifecycle host was not published to the session index.");
+		expect(endpointGeneration).toBeGreaterThan(1);
 
 		// Drive the production session_shutdown handler through a real ExtensionRunner
 		// so the onError seam proves the retained owner-release failure is NOT surfaced
@@ -660,7 +667,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			),
 		).toBe(true);
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: false,
 			runtimeRemoved: true,
 			hostStopped: false,
@@ -674,7 +681,7 @@ test("lifecycle teardown swallows dual owner failures without surfacing an exten
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
 		expect(tracker.result).toEqual({
-			endpointGeneration: 1,
+			endpointGeneration,
 			fenced: true,
 			runtimeRemoved: true,
 			hostStopped: true,

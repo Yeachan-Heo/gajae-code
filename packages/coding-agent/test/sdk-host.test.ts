@@ -132,7 +132,7 @@ describe("SessionSdkHost", () => {
 			sessionId: "s",
 			stateRoot: "/tmp/s",
 			token: "t",
-			eventGenerationFloor: () => 1_000,
+			allocateEventGeneration: async () => 1_000,
 			sendFrame: () => {
 				return "written";
 			},
@@ -155,18 +155,18 @@ describe("SessionSdkHost", () => {
 		expect(await host.stop()).toBe("stopped");
 		expect(await host.stop()).toBe("already");
 		expect(await host.start()).toBe("started");
-		// A restart inside one stream advances even when the floor has not moved.
+		// A restart inside one stream advances even when the authority repeats itself.
 		expect(registered).toEqual([1_000, 1_001]);
 	});
 
-	test("a recreated host for the same session never reuses an earlier host's event namespace", async () => {
-		let clock = 5_000;
+	test("a recreated host takes its event namespace from the generation authority", async () => {
+		let issued = 5_000;
 		const createHost = () =>
 			new SessionSdkHost({
 				sessionId: "resumed",
 				stateRoot: "/tmp/resumed",
 				token: "t",
-				eventGenerationFloor: () => clock,
+				allocateEventGeneration: async () => issued++,
 				sendFrame: () => "written",
 				onFrame: () => () => {},
 			});
@@ -174,7 +174,6 @@ describe("SessionSdkHost", () => {
 		await first.start();
 		const firstEvent = first.emitEvent({ kind: "notice", payload: { type: "notice", message: "first" } });
 		await first.stop();
-		clock = 9_000;
 		const resumed = createHost();
 		await resumed.start();
 		const resumedEvent = resumed.emitEvent({ kind: "notice", payload: { type: "notice", message: "resumed" } });
@@ -182,20 +181,99 @@ describe("SessionSdkHost", () => {
 		// resumed host's (generation, seq) coordinates apart from the closed host's.
 		expect(resumedEvent.seq).toBe(firstEvent.seq);
 		expect(firstEvent.generation).toBe(5_000);
-		expect(resumedEvent.generation).toBe(9_000);
+		expect(resumedEvent.generation).toBe(5_001);
 		await resumed.stop();
 
-		const before = Date.now();
-		const wallClock = new SessionSdkHost({
-			sessionId: "wall-clock",
-			stateRoot: "/tmp/wall-clock",
+		// Without an authority the generation only advances inside the host's own stream.
+		const local = new SessionSdkHost({
+			sessionId: "local",
+			stateRoot: "/tmp/local",
 			token: "t",
 			sendFrame: () => "written",
 			onFrame: () => () => {},
 		});
-		await wallClock.start();
-		expect(wallClock.generation).toBeGreaterThanOrEqual(before);
-		await wallClock.stop();
+		await local.start();
+		expect(local.generation).toBe(1);
+		await local.stop();
+		await local.start();
+		expect(local.generation).toBe(2);
+		await local.stop();
+	});
+
+	test("an unreserved generation serves locally and is published only once the authority reserves it", async () => {
+		const floors: number[] = [];
+		let authority: (floor: number) => number = () => {
+			throw new Error("generation authority unavailable");
+		};
+		const registered: number[] = [];
+		const host = new SessionSdkHost({
+			sessionId: "unreserved",
+			stateRoot: "/tmp/unreserved",
+			token: "t",
+			allocateEventGeneration: async (_sessionId, floor) => {
+				floors.push(floor);
+				return authority(floor);
+			},
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		const before = Date.now();
+		expect(await host.start()).toBe("started");
+		const generation = host.generation;
+		expect(generation).toBeGreaterThanOrEqual(before);
+		expect(host.events.replay(0).events).toMatchObject([{ name: "session_ready", generation }]);
+
+		const writer = {
+			register: ({ endpointGeneration }: { endpointGeneration: number }) => void registered.push(endpointGeneration),
+		};
+		await expect(host.registerWithBroker(writer)).rejects.toThrow("generation authority unavailable");
+		// The authority already issued this generation to another host.
+		authority = floor => floor + 1;
+		await expect(host.registerWithBroker(writer)).rejects.toThrow(
+			`SDK event generation ${generation} was superseded by ${generation + 1}`,
+		);
+		expect(registered).toEqual([]);
+
+		authority = floor => floor;
+		await host.registerWithBroker(writer);
+		await host.registerWithBroker(writer);
+		expect(registered).toEqual([generation, generation]);
+		// Start floors are wall time; reservations ask for exactly the served generation, once.
+		expect(floors.slice(1)).toEqual([generation, generation, generation]);
+		await host.stop();
+	});
+
+	test("concurrent starts share one allocation and a stop during allocation stops that start", async () => {
+		const allocation = Promise.withResolvers<number>();
+		let allocations = 0;
+		const registered: number[] = [];
+		const unregistered: number[] = [];
+		const host = new SessionSdkHost({
+			sessionId: "pending-allocation",
+			stateRoot: "/tmp/pending-allocation",
+			token: "t",
+			allocateEventGeneration: () => {
+				allocations++;
+				return allocation.promise;
+			},
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.registerWithBroker({
+			register: ({ endpointGeneration }) => void registered.push(endpointGeneration),
+			unregister: ({ endpointGeneration }) => void unregistered.push(endpointGeneration),
+		});
+		const first = host.start();
+		const second = host.start();
+		const stopped = host.stop();
+		allocation.resolve(7_000);
+		expect(await first).toBe("started");
+		expect(await second).toBe("already");
+		expect(await stopped).toBe("stopped");
+		expect(allocations).toBe(1);
+		expect(registered).toEqual([7_000]);
+		expect(unregistered).toEqual([7_000]);
+		expect(host.started).toBe(false);
 	});
 
 	test("reports the idle host state and only records activity transitions", async () => {
@@ -580,8 +658,6 @@ describe("SessionSdkHost", () => {
 			sessionId: "s",
 			stateRoot: "/tmp/s",
 			token: "t",
-			// Pin generation numbering for the exact wire assertions below.
-			eventGenerationFloor: () => 0,
 			sendFrame: (connectionId, frame) => {
 				sent.push({ connectionId, frame });
 				return "written";
