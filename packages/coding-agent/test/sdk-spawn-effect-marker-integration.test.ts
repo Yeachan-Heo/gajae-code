@@ -193,6 +193,80 @@ for (const scenario of [
 	});
 }
 
+// An unresolved owner is a deterministic failure only once the substrate release
+// is proven; a release that cannot be proven keeps the claim uncertain.
+for (const release of ["proven", "unproven"] as const) {
+	test(`unresolved lifecycle owner with ${release} release writes no marker or seed`, async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-owner-release-"));
+		let childId = "";
+		let closes = 0;
+		let registrations = 0;
+		const stateRoot = path.join(root, ".gjc", "state");
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			masterCapabilityVerifier: verifier,
+			spawnPromptLayer: {
+				awaitRegistration: async () => {
+					registrations += 1;
+					return { ok: false };
+				},
+				dispatch: async () => {
+					throw new Error("Seed must not be sent");
+				},
+				reconcile: async () => ({ status: "unknown" }),
+			},
+			spawnSubstrateProvider: {
+				launch: async spec => {
+					childId = spec.childSessionId;
+					return { ok: true, proof: { ...proof, substrateKind: "tmux" } };
+				},
+				verify: async () => "verified",
+				resolveLifecycleOwner: async () => ({ ok: false, code: "owner_deadline" }),
+				close: async () => {
+					closes += 1;
+					return { ok: release === "proven" };
+				},
+			},
+		});
+		await broker.start();
+		try {
+			await attest(broker, root);
+			const response = await spawn(broker, root);
+			const store = new SpawnAuthorityStore(
+				broker.settings.agentDir,
+				await getBrokerIdentityKey(broker.settings.agentDir),
+			);
+			await store.open();
+			const claims = store.claims();
+			expect(claims).toHaveLength(1);
+			if (release === "proven") {
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
+				});
+				expect(claims[0]).toMatchObject({
+					state: "pre_send_rejected",
+					failure: { code: "lifecycle_owner_unresolved" },
+				});
+			} else {
+				expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(claims[0]).toMatchObject({
+					state: "uncertain",
+					failure: { code: "child_registration_release_unproven" },
+				});
+			}
+			expect(claims[0]?.seed).toBeUndefined();
+			expect(closes).toBe(1);
+			expect(registrations).toBe(0);
+			expect(await Bun.file(path.join(stateRoot, "sdk", `${childId}.lifecycle.json`)).exists()).toBe(false);
+			expect(broker.index.listSessionIdentities().filter(row => row.sessionId !== ownerId)).toHaveLength(0);
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+}
+
 const sourceCli = path.resolve(import.meta.dir, "../src/cli.ts");
 const compiledCli = path.resolve(import.meta.dir, "../dist/gjc");
 const compiledAvailable = await Bun.file(compiledCli).exists();
@@ -394,7 +468,33 @@ test("managed wrong outer cannot register a valid inner CLI or substitute headle
 		if (!launched) throw new Error(`Wrong-outer allocation proof was not captured; retained ${root}`);
 		if (launched) {
 			expect(launched.substrateKind).toBe("tmux");
-			expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			const store = new SpawnAuthorityStore(
+				broker.settings.agentDir,
+				await getBrokerIdentityKey(broker.settings.agentDir),
+			);
+			await store.open();
+			const claims = store.claims();
+			expect(claims).toHaveLength(1);
+			if (process.platform === "linux") {
+				// Linux closes the exact pane through its kernel-signaled owner path, so
+				// the Broker proves the release and reports a deterministic failure.
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
+				});
+				expect(claims[0]).toMatchObject({
+					state: "pre_send_rejected",
+					failure: { code: "lifecycle_owner_unresolved" },
+				});
+			} else {
+				// Darwin close is cooperative and needs the supervisor's published
+				// binding. A wrong outer never publishes one, so release stays unproven.
+				expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(claims[0]).toMatchObject({
+					state: "uncertain",
+					failure: { code: "child_registration_release_unproven" },
+				});
+			}
 			if (!retained.process) throw new Error(`Missing exact wrong-outer reference; retained ${root}`);
 			expect(await retained.process.waitForExit({ timeoutMs: 5_000 })).toBe(true);
 			expect(await provider.verify(launched)).toBe("gone");

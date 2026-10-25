@@ -369,31 +369,48 @@ describe("Broker spawn substrate provider", () => {
 		expect(drops).toEqual([["FOO-BAR", "TOO_LARGE"]]);
 	});
 
-	it("uses the psmux substrate kind only for the Windows multiplexer selection", async () => {
-		const psmux = managedProof({
-			providerIdentity: '["windows-psmux","C:\\\\psmux.exe","namespace","volume:42"]',
-			psmuxIncarnation: "psmux-incarnation",
-		});
+	it("selects headless on Windows before any managed launch so the host stays resolvable", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "spawn-windows-"));
+		temporaryDirectories.push(directory);
+		let selections = 0;
+		let managedLaunches = 0;
+		let headlessLaunches = 0;
+		const reference: SpawnLifecycleProcess = {
+			pid: 701,
+			incarnation: "windows:701",
+			ppid: 1,
+			status: () => "running",
+			children: () => [],
+		};
 		const provider = createSpawnSubstrateProvider({
 			platform: "win32",
-			selectMultiplexer: () => "psmux",
-			launchManaged: () => psmux,
-			verifyManaged: () => "verified",
-			closeManaged: async () => {},
-			processIncarnation: () => "windows:701",
-		});
-		const result = await provider.launch(launchSpec("C:\\repo"));
-		expect(result).toEqual({
-			ok: true,
-			proof: {
-				...substrateProof(psmux),
-				substrateKind: "psmux",
-				processIncarnation: "windows:701",
-				stateFileProof: {
-					...substrateProof(psmux).stateFileProof,
-					psmuxIncarnation: "psmux-incarnation",
-				},
+			selectMultiplexer: () => {
+				selections += 1;
+				return "tmux";
 			},
+			launchManaged: () => {
+				managedLaunches += 1;
+				throw new Error("managed launch must not be attempted on Windows");
+			},
+			startHeadless: () => {
+				headlessLaunches += 1;
+				return { pid: 701, terminate() {} };
+			},
+			processIncarnation: () => "windows:701",
+			openLifecycleProcess: () => reference,
+			now: () => 0,
+		});
+		const result = await provider.launch(launchSpec(directory));
+		if (!result.ok) throw new Error("fixture launch failed");
+		expect(result.proof).toMatchObject({ substrateKind: "headless", pid: 701, processIncarnation: "windows:701" });
+		expect({ selections, managedLaunches, headlessLaunches }).toEqual({
+			selections: 0,
+			managedLaunches: 0,
+			headlessLaunches: 1,
+		});
+		expect(await provider.resolveLifecycleOwner(result.proof, 125)).toEqual({
+			ok: true,
+			owner: { pid: 701, incarnation: "windows:701" },
 		});
 	});
 

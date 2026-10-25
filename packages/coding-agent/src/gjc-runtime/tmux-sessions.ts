@@ -1915,6 +1915,35 @@ function proveCooperativeSupervisorBinding(identity: ExactOwnerIdentity): Manage
 }
 
 /**
+ * @internal Bounded discovery of the exact supervisor's binding.
+ *
+ * The launch proof can return before the supervisor durably publishes its binding.
+ * Only an absent binding is retried, and only while the same exact supervisor stays
+ * live; untrusted, ambiguous, or changed evidence still fails closed immediately.
+ */
+export async function awaitCooperativeSupervisorBinding(
+	identity: ExactOwnerIdentity,
+	deps: {
+		assertSameSupervisor: () => void;
+		sleep: (ms: number) => Promise<void>;
+		now: () => Date;
+		deadline: number;
+	},
+): Promise<ManagedOwnerBinding> {
+	for (;;) {
+		try {
+			return proveCooperativeSupervisorBinding(identity);
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "managed_owner_binding_unavailable") throw error;
+			if (deps.now().getTime() >= deps.deadline) throw error;
+		}
+		deps.assertSameSupervisor();
+		await deps.sleep(FORCE_CLOSE_VERDICT_POLL_MS);
+		deps.assertSameSupervisor();
+	}
+}
+
+/**
  * Requests an exact tagged owner shutdown. Session cleanup is compatibility-only
  * and follows a validated SIGTERM verdict; it never authorizes the close.
  */
@@ -1988,7 +2017,17 @@ export async function forceCloseGjcTmuxSession(
 		process.platform === "darwin" && deps.shutdownModeForTest !== "kernel_signal"
 			? exactManagedOwnerSupervisor(identity.pid, identity.startTime)
 			: null;
-	const cooperativeBinding = cooperativeSupervisor ? proveCooperativeSupervisorBinding(identity) : null;
+	const cooperativeBinding = cooperativeSupervisor
+		? await awaitCooperativeSupervisorBinding(identity, {
+				assertSameSupervisor: () => {
+					if (exactManagedOwnerSupervisor(identity.pid, identity.startTime).pid !== cooperativeSupervisor.pid)
+						throw new Error("managed_owner_supervisor_changed");
+				},
+				sleep,
+				now,
+				deadline: verdictDeadline,
+			})
+		: null;
 	let operatorVerdict: Promise<OwnerVerdict> | null = cooperativeSupervisor
 		? null
 		: (deps.waitForOwnerExitVerdict?.() ?? null);
