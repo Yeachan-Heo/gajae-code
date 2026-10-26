@@ -76,7 +76,10 @@ const controls = [
 	["turn.steer", "Steer the active turn."],
 	["turn.follow_up", "Queue a follow-up turn."],
 	["turn.abort", "Abort the active turn."],
-	["turn.abort_and_prompt", "Abort the active turn and submit a replacement prompt."],
+	[
+		"turn.abort_and_prompt",
+		"Abort the requester's own active turn and submit a replacement prompt; a run another client owns gets the text as a queued steer instead.",
+	],
 	["ask.answer", "Answer an outstanding user question."],
 	["workflow.gate_answer", "Answer a workflow gate."],
 	["workflow.plan_approve", "Approve a workflow plan."],
