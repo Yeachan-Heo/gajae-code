@@ -4936,6 +4936,42 @@ export class TelegramNotificationDaemon {
 		});
 	}
 
+	/**
+	 * Resolve the session id a `/session_resume` outcome actually resumed, or
+	 * `undefined` for anything that was not an unambiguous success.
+	 */
+	#resumedSessionIdFromOutcome(
+		outcome: SessionCreateOutcome | SessionCloseOutcome | SessionResumeOutcome | ExternalSessionResumeResult,
+	): string | undefined {
+		const resumeOutcome = "kind" in outcome ? (outcome.kind === "result" ? outcome.outcome : undefined) : outcome;
+		return resumeOutcome?.ok === true && resumeOutcome.operation === "session.resume"
+			? resumeOutcome.result.sessionId
+			: undefined;
+	}
+
+	/**
+	 * A successful `/session_resume` reattaches the SDK session host, but that
+	 * alone never re-arms the Telegram topic's message-routing lease: the lease
+	 * and the SDK host are tracked independently, and the lease's own
+	 * disconnect-grace window may already have lapsed by the time the user
+	 * issues this command — leaving the topic "reattached" yet silently dropping
+	 * every later plain-text message because it stays fenced in disconnect_grace
+	 * forever. The command itself is stronger, explicit, already-authenticated
+	 * liveness evidence than an unattended heartbeat, so when it was issued
+	 * inside the resumed session's own topic, force-renew that topic's lease
+	 * past its grace deadline.
+	 */
+	async #reArmResumedTopicLease(
+		outcome: SessionCreateOutcome | SessionCloseOutcome | SessionResumeOutcome | ExternalSessionResumeResult,
+		threadId: number,
+	): Promise<void> {
+		const resumedSessionId = this.#resumedSessionIdFromOutcome(outcome);
+		if (resumedSessionId === undefined) return;
+		const topic = this.topics.get(resumedSessionId);
+		if (topic?.topicId !== String(threadId) || topic.chatId !== String(this.opts.chatId)) return;
+		await this.#renewTopicLease(resumedSessionId, undefined, { bypassGraceDeadline: true });
+	}
+
 	/** Handle a paired-chat /session_* command through the SDK lifecycle service. */
 	private async handleLifecycleCommand(
 		text: string | undefined,
@@ -5039,6 +5075,9 @@ export class TelegramNotificationDaemon {
 				certainty: "uncertain",
 				error: { code: "terminal_uncertain", message: "lifecycle outcome is uncertain" },
 			} as SessionCreateOutcome;
+		}
+		if (parsed.kind === "resume" && threadId !== undefined) {
+			await this.#reArmResumedTopicLease(outcome, threadId);
 		}
 		await reply(this.#formatLifecycleResponse(outcome, verb, requestKey, parsed));
 		return true;
@@ -7099,7 +7138,11 @@ export class TelegramNotificationDaemon {
 				? undefined
 				: { session, token: 0, logicalSessionId };
 	}
-	async #renewTopicLease(sessionId: string, session?: AttachmentSession): Promise<boolean> {
+	async #renewTopicLease(
+		sessionId: string,
+		session?: AttachmentSession,
+		options?: { bypassGraceDeadline?: boolean },
+	): Promise<boolean> {
 		if (!this.#topicRegistryMutationAllowed() || !this.#topicAdmissionAllows(session)) return false;
 		const record = this.topics.get(sessionId);
 		if (!record) return true;
@@ -7119,6 +7162,7 @@ export class TelegramNotificationDaemon {
 					this.runtime.now(),
 					HEARTBEAT_TTL_MS,
 					ORPHAN_TOPIC_GRACE_MS,
+					options,
 				),
 			() => {
 				const current = this.topics.get(sessionId);
