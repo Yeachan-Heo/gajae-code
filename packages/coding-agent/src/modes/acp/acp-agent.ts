@@ -1815,6 +1815,9 @@ export class AcpAgent implements Agent {
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
+			// Receive turns the attached host runs for another owner (a terminal-typed
+			// turn) while still counting as demand for a broker-launched host.
+			turnStream: true,
 			attachFilter: sessionId =>
 				this.#sessions.has(sessionId) ||
 				this.#pendingRouterAdapters.has(sessionId) ||

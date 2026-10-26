@@ -930,12 +930,15 @@ describe("SDK host turn streaming", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("relays mid-turn content to attached observers without duplicating the owner frame", async () => {
+	test("relays mid-turn content to stream connections without duplicating the owner frame", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-observer-"));
 		const harness = await createHostHarness(SESSION_ID, cwd);
 		try {
+			// An ACP client negotiates turn_stream on the same connection it prompts from.
+			harness.setCapabilities("client", [TURN_STREAM_CAPABILITY]);
 			harness.setCapabilities("observer", [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY]);
-			harness.setCapabilities("ordinary", [TURN_STREAM_CAPABILITY]);
+			harness.setCapabilities("stream-only", [TURN_STREAM_CAPABILITY]);
+			harness.setCapabilities("observer-only", [SESSION_HOST_OBSERVER_CAPABILITY]);
 			const accepted = await harness.control("turn.prompt", { text: "observe this" });
 			expect(accepted.ok).toBe(true);
 			await harness.emit("agent_start");
@@ -944,16 +947,15 @@ describe("SDK host turn streaming", () => {
 
 			await harness.emit("tool_execution_start", toolStart());
 
-			expect(harness.sent).toHaveLength(2);
-			expect(harness.sent[0]).toMatchObject({
-				connectionId: "client",
+			expect(harness.sent.map(entry => entry.connectionId).sort()).toEqual(["client", "observer", "stream-only"]);
+			expect(harness.sent.find(entry => entry.connectionId === "client")).toMatchObject({
 				frame: { type: "event", kind: "tool_execution_start", commandId: accepted.result?.commandId },
 			});
-			expect(harness.sent[1]).toMatchObject({
-				connectionId: "observer",
-				frame: { type: "event", kind: "tool_execution_start" },
-			});
-			expect(harness.sent.some(entry => entry.connectionId === "ordinary")).toBe(false);
+			for (const id of ["observer", "stream-only"]) {
+				const copy = harness.sent.find(entry => entry.connectionId === id)?.frame;
+				expect(copy).toMatchObject({ type: "event", kind: "tool_execution_start" });
+				expect(copy?.commandId).toBeUndefined();
+			}
 		} finally {
 			await harness.stop();
 			await rm(cwd, { recursive: true, force: true });
@@ -977,77 +979,30 @@ describe("SDK host turn streaming", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	test("streams an SDK-unowned turn only to an explicit observer", async () => {
+	test("streams a turn no SDK client owns (typed in the terminal) to every turn_stream connection", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-unowned-observer-"));
 		const harness = await createHostHarness(SESSION_ID, cwd);
 		try {
 			harness.setCapabilities("observer", [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY]);
-			harness.setCapabilities("ordinary", [TURN_STREAM_CAPABILITY]);
+			// The ACP client: demanding, but following turns it did not submit.
+			harness.setCapabilities("acp", [TURN_STREAM_CAPABILITY]);
+			harness.setCapabilities("observer-only", [SESSION_HOST_OBSERVER_CAPABILITY]);
 			await harness.emit("agent_start");
 			await waitForStartOnWire(harness);
 			harness.clearFrames();
 
-			await harness.emit("message_update", textDelta("observer-only"));
-
-			expect(harness.sent).toHaveLength(1);
-			expect(harness.sent[0]).toMatchObject({
-				connectionId: "observer",
-				frame: { type: "event", kind: "message_update" },
-			});
-		} finally {
-			await harness.stop();
-			await rm(cwd, { recursive: true, force: true });
-		}
-	});
-
-	test("gates observer content on both the stream and observer capabilities", async () => {
-		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-observer-gate-"));
-		const harness = await createHostHarness(SESSION_ID, cwd);
-		try {
-			harness.setCapabilities("observer", [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY]);
-			harness.setCapabilities("stream-only", [TURN_STREAM_CAPABILITY]);
-			const accepted = await harness.control("turn.prompt", { text: "observe this" });
-			expect(accepted.ok).toBe(true);
-			await harness.emit("agent_start");
-			await waitForStartOnWire(harness);
-			harness.clearFrames();
-
+			await harness.emit("message_update", textDelta("terminal turn"));
 			await harness.emit("tool_execution_start", toolStart());
 
-			expect(harness.sent).toHaveLength(2);
-			expect(harness.sent[0]).toMatchObject({
-				connectionId: "client",
-				frame: { type: "event", kind: "tool_execution_start", commandId: accepted.result?.commandId },
-			});
-			expect(harness.sent[1]).toMatchObject({
-				connectionId: "observer",
-				frame: { type: "event", kind: "tool_execution_start" },
-			});
-			expect(harness.sent.some(entry => entry.connectionId === "stream-only")).toBe(false);
-		} finally {
-			await harness.stop();
-			await rm(cwd, { recursive: true, force: true });
-		}
-	});
-
-	test("streams an SDK-unowned turn only to an explicit observer", async () => {
-		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-unowned-observer-"));
-		const harness = await createHostHarness(SESSION_ID, cwd);
-		try {
-			harness.setCapabilities("observer", [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY]);
-			harness.setCapabilities("stream-only", [TURN_STREAM_CAPABILITY]);
-			await harness.emit("agent_start");
-			await waitForStartOnWire(harness);
-			harness.clearFrames();
-
-			await harness.emit("message_update", textDelta("observer-only"));
-
-			expect(harness.sent).toHaveLength(1);
-			expect(harness.sent[0]).toMatchObject({
-				connectionId: "observer",
-				frame: { type: "event", kind: "message_update" },
-			});
-			expect(harness.sent.some(entry => entry.connectionId === "stream-only")).toBe(false);
+			for (const id of ["observer", "acp"]) {
+				expect(harness.sent.filter(entry => entry.connectionId === id).map(entry => entry.frame.kind)).toEqual([
+					"message_update",
+					"tool_execution_start",
+				]);
+			}
+			// Delivery is gated on turn_stream; the observer capability alone carries no content.
+			expect(harness.sent.some(entry => entry.connectionId === "observer-only")).toBe(false);
+			expect(harness.sent.some(entry => entry.connectionId === "client")).toBe(false);
 		} finally {
 			await harness.stop();
 			await rm(cwd, { recursive: true, force: true });
