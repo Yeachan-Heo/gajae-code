@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type ControlValue = unknown;
 export type AbortMode = "turn" | "terminal";
 export type AbortScope = "turn" | "owned";
@@ -36,7 +38,12 @@ export interface ControlSurface {
 	abort(): Promise<ControlValue> | ControlValue;
 	/** Terminal abort: stop the current root turn (and optionally exact owned work). */
 	abortTerminal?(input: TerminalAbortInput, idempotencyKey?: string): Promise<ControlValue> | ControlValue;
-	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
+	/**
+	 * Replace the active run, or queue the text as a steer when the requester does
+	 * not own it. `idempotencyKey` binds that steer to the request (see
+	 * `abortAndPromptSteerClientRef`), so a retry replays it instead of queueing it again.
+	 */
+	abortAndPrompt(text: string, idempotencyKey?: string): Promise<ControlValue> | ControlValue;
 	answerAsk(id: string, answer: ControlValue): Promise<ControlValue> | ControlValue;
 	answerGate(
 		id: string,
@@ -92,4 +99,16 @@ export interface ControlSurface {
 	/** Installed per-session registry rows. Dispatch rejects other rows before invoking a surface method. */
 	installedOperations?: ReadonlySet<string>;
 	revisionProvider?(resource: string): Promise<string | undefined> | string | undefined;
+}
+
+/**
+ * Durable steer clientRef for a `turn.abort_and_prompt` request that degraded to a
+ * steer. It is derived from the request idempotency key, so every retry of that
+ * request names the same steer reservation; the prefix keeps it disjoint from
+ * clientRefs that callers choose for `turn.steer`. Without a key there is no
+ * stable identity and the steer is not deduplicated.
+ */
+export function abortAndPromptSteerClientRef(idempotencyKey: string | undefined): string | undefined {
+	if (idempotencyKey === undefined) return undefined;
+	return `abort-and-prompt:${createHash("sha256").update(idempotencyKey).digest("hex")}`;
 }

@@ -11188,6 +11188,70 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("an exact-key abort_and_prompt retry replays its steer instead of queueing or replacing again", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-replacement-steer-replay-"));
+		let harness: InvocationHarness | undefined;
+		try {
+			const fixture = await replacementOwnerHarness("replacement-steer-replay", cwd);
+			harness = fixture.harness;
+			const { state } = fixture;
+			await harness.emit("agent_start");
+			await Bun.sleep(25);
+			const first = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued once" },
+				"replacement-key",
+			);
+			expect(first).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			const identity = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			expect(identity.commandId).toEqual(expect.any(String));
+
+			const retried = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued once" },
+				"replacement-key",
+			);
+			expect(retried).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
+			});
+
+			// The run the steer targeted has ended: a retry of the same request still
+			// replays the steer rather than starting a replacement run with its text.
+			state.idle = true;
+			const afterRun = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued once" },
+				"replacement-key",
+			);
+			expect(afterRun).toMatchObject({
+				ok: true,
+				result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
+			});
+			expect(state.abortCalls).toBe(0);
+			expect(state.deliveries).toEqual([{ content: "queued once", deliverAs: "steer" }]);
+
+			// A different request is a different steer.
+			state.idle = false;
+			const other = await harness.controlAs(
+				"connection-b",
+				"turn.abort_and_prompt",
+				{ text: "queued twice" },
+				"another-key",
+			);
+			expect(other).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+			expect(other.result?.commandId).not.toBe(identity.commandId);
+			expect(state.deliveries.map(delivery => delivery.content)).toEqual(["queued once", "queued twice"]);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a zero-progress drained batch stays nonterminal without an exact run proof", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-lease-batch-"));
 		let promptDeadlineMs = 600_000;

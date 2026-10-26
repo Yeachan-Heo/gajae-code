@@ -126,7 +126,13 @@ import {
 	TURN_STREAM_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
+import {
+	type AbortScope,
+	abortAndPromptSteerClientRef,
+	type ControlSurface,
+	dispatchControl,
+	TypedControlError,
+} from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { PromptImageUploadStore, retirePromptImageReservation } from "../host/prompt-image-upload";
@@ -2798,6 +2804,7 @@ function sdkControlSurface(
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		reserveSteer?: KindAwareReconciliation["reserveSteer"];
 		settleSteer?: KindAwareReconciliation["settleSteer"];
+		lookupSteer?: KindAwareReconciliation["lookupSteer"];
 	},
 	terminalAbortSeams?: {
 		getTerminalTurnEpoch: () => number | undefined;
@@ -3513,10 +3520,25 @@ function sdkControlSurface(
 				...(outcome.stored ? { replay: outcome.stored } : {}),
 			};
 		},
-		abortAndPrompt: async text => {
+		abortAndPrompt: async (text, idempotencyKey) => {
 			const requesterConnectionId = controlRequesterContext.getStore();
-			if (!mayReplaceActiveWork(requesterConnectionId))
-				return { ...(await sendSteer(text)), aborted: false, queuedAs: "steer" };
+			// A retry of a request that already degraded to a steer replays that steer,
+			// even when the run it targeted has since ended: the text was delivered once
+			// and must neither be queued again nor start a replacement run.
+			const steerClientRef =
+				skillRecon?.reserveSteer && skillRecon.settleSteer && skillRecon.lookupSteer
+					? abortAndPromptSteerClientRef(idempotencyKey)
+					: undefined;
+			const queueAsSteer = async () => {
+				const steer = await sendSteer(text, steerClientRef);
+				// A durable steer reports its reconciliation status; only an accepted
+				// one acknowledges delivery.
+				const accepted = "accepted" in steer ? steer.accepted : steer.status === "accepted";
+				return { ...steer, accepted, aborted: false, queuedAs: "steer" };
+			};
+			if (steerClientRef !== undefined && skillRecon?.lookupSteer?.(steerClientRef).status !== "unknown")
+				return await queueAsSteer();
+			if (!mayReplaceActiveWork(requesterConnectionId)) return await queueAsSteer();
 			await awaitAbortReady();
 			return await submitPrompt(text, undefined, true, undefined, false, requesterConnectionId);
 		},
@@ -8164,6 +8186,7 @@ export function createNotificationsExtension(
 				lookup: selector => kindReconciliation.lookup("skill", selector),
 				reserveSteer: kindReconciliation.reserveSteer,
 				settleSteer: kindReconciliation.settleSteer,
+				lookupSteer: kindReconciliation.lookupSteer,
 			},
 			terminalAbortSeams,
 			// #4743: join fire-and-forget reconciliation producers at teardown.
