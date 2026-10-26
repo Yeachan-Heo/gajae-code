@@ -2501,6 +2501,119 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(Object.keys(transaction.canonical.turns)).toEqual([firstTurnId]);
 	});
 
+	it("keeps the active turn when the runtime degrades a non-owner abort-and-prompt to a steer", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control =>
+				control.operation === "turn.abort_and_prompt"
+					? {
+							accepted: true,
+							commandId: "steer-command",
+							turnId: "steer-runtime-turn",
+							aborted: false,
+							queuedAs: "steer",
+						}
+					: { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" },
+		});
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "steer-initial",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, status: "active" });
+		const firstTurnId = first.turn_id;
+		if (typeof firstTurnId !== "string") throw new Error("missing_first_turn_id");
+		const degraded = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "steer the run instead",
+			force: true,
+			idempotency_key: "steer-force",
+			allow_mutation: true,
+		});
+		expect(degraded).toMatchObject({
+			ok: true,
+			operation: "turn.abort_and_prompt",
+			delivery: "steer",
+			aborted: false,
+			turn_id: firstTurnId,
+			active_turn_id: firstTurnId,
+			result: {
+				accepted: true,
+				command_id: "steer-command",
+				turn_id: "steer-runtime-turn",
+				aborted: false,
+				queued_as: "steer",
+			},
+		});
+		expect(degraded).not.toHaveProperty("turn");
+		expect(await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" })).toMatchObject({
+			ok: true,
+			session_state: { state: "running", ready_for_input: false, current_turn_id: firstTurnId },
+		});
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const transaction = JSON.parse(await fs.readFile(transactionPath(paths, "visible-session"), "utf8")) as {
+			canonical: {
+				queue: { active_turn_id: string | null };
+				turns: Record<string, { status?: string }>;
+			};
+			requests: { prompts: Record<string, { operation?: string }> };
+		};
+		// Nothing was superseded and no replacement turn or accepted prompt request remains.
+		expect(transaction.canonical.queue.active_turn_id).toBe(firstTurnId);
+		expect(transaction.canonical.turns[firstTurnId]?.status).toBe("active");
+		expect(Object.keys(transaction.canonical.turns)).toEqual([firstTurnId]);
+		expect(
+			Object.values(transaction.requests.prompts).filter(request => request.operation === "turn.abort_and_prompt"),
+		).toEqual([]);
+		// An exact-key retry replays the cached tool response instead of dispatching again.
+		const retried = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "steer the run instead",
+			force: true,
+			idempotency_key: "steer-force",
+			allow_mutation: true,
+		});
+		expect(retried).toMatchObject({ ok: true, delivery: "steer", turn_id: firstTurnId });
+		expect(lifecycleControls(controls).map(control => control.operation)).toEqual([
+			"turn.prompt",
+			"turn.abort_and_prompt",
+		]);
+	});
+
+	it("rejects an abort-and-prompt acknowledgement with an unknown queuedAs disposition", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control =>
+				control.operation === "turn.abort_and_prompt"
+					? { accepted: true, commandId: "odd-command", turnId: "odd-turn", aborted: false, queuedAs: "follow_up" }
+					: { accepted: true, command_id: "initial-command", turn_id: "initial-runtime-turn" },
+		});
+		await registerSdkSession(server, root);
+		const first = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep this turn active",
+			idempotency_key: "odd-initial",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, status: "active" });
+		const odd = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "unknown disposition",
+			force: true,
+			idempotency_key: "odd-force",
+			allow_mutation: true,
+		});
+		expect(odd).toMatchObject({ ok: false, error: { code: "unavailable" } });
+		expect(await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" })).toMatchObject({
+			ok: true,
+			session_state: { current_turn_id: first.turn_id },
+		});
+	});
+
 	it("surfaces Router request timeout errors without persisting a turn", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

@@ -1578,6 +1578,12 @@ interface RuntimePromptAcknowledgement {
 	accepted: true;
 	command_id: string;
 	turn_id: string;
+	/**
+	 * Set when `turn.abort_and_prompt` came from a connection that does not own
+	 * the active run: the runtime aborted nothing and queued the text as a steer
+	 * for that run, so no replacement prompt lifecycle exists for it.
+	 */
+	queued_as?: "steer";
 }
 
 function sdkResultPayload(result: unknown): Record<string, unknown> | null {
@@ -1611,10 +1617,14 @@ function normalizeRuntimePromptAcknowledgement(result: unknown): RuntimePromptAc
 	const acknowledgement = sdkResultPayload(result);
 	if (acknowledgement?.accepted !== true)
 		throw new SdkClientError("unavailable", "SDK did not acknowledge prompt delivery.");
+	const queuedAs = Object.hasOwn(acknowledgement, "queuedAs") ? acknowledgement.queuedAs : undefined;
+	if (queuedAs !== undefined && (queuedAs !== "steer" || acknowledgement.aborted !== false))
+		throw new SdkClientError("unavailable", "SDK prompt acknowledgement has an invalid queuedAs disposition.");
 	return {
 		accepted: true,
 		command_id: runtimeAcknowledgementIdentity(acknowledgement, "commandId", "command_id"),
 		turn_id: runtimeAcknowledgementIdentity(acknowledgement, "turnId", "turn_id"),
+		...(queuedAs === "steer" ? { queued_as: "steer" as const } : {}),
 	};
 }
 
@@ -1623,6 +1633,7 @@ function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<
 		accepted: true,
 		command_id: result.command_id,
 		turn_id: result.turn_id,
+		...(result.queued_as === undefined ? {} : { aborted: false, queued_as: result.queued_as }),
 	};
 }
 
@@ -7553,6 +7564,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await discardUnacceptedPromptReservation(sessionId, promptKey);
 			throw error;
 		}
+		if (acknowledgement.queued_as === "steer") {
+			// The runtime refused to replace a run this connection does not own and
+			// queued the text as a steer for that run instead. No prompt lifecycle
+			// exists for the reserved turn, so it must not be persisted as accepted.
+			// A crash before this discard leaves the reservation `remote_started`; the
+			// exact-key retry replays the same SDK request and lands here again.
+			await discardUnacceptedPromptReservation(sessionId, promptKey);
+			return acknowledgement;
+		}
 		// Persist the receipt before touching projections. A crash after the SDK
 		// accepts the command can then rebuild the turn without dispatching again.
 		await persistPromptReceipt(sessionId, promptKey, acknowledgement);
@@ -10609,6 +10629,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								idempotencyKey,
 								promptKey,
 							);
+							if (acknowledgement.queued_as === "steer") {
+								// A steer for a run another client owns: nothing was superseded
+								// and no coordinator turn was created for this text.
+								const activeTurnId = previousActiveTurn?.turn_id ?? null;
+								return {
+									ok: true,
+									session_id: sessionId,
+									turn_id: activeTurnId,
+									active_turn_id: activeTurnId,
+									delivery: "steer",
+									queued: false,
+									aborted: false,
+									operation,
+									result: publicSdkAcknowledgement(acknowledgement),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+								};
+							}
 							const turn = await recordAcceptedPrompt(
 								sessionId,
 								prompt,
