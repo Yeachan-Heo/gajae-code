@@ -579,9 +579,12 @@ prompt.
 the active run (another connection's prompt, or a turn the host started itself, such
 as an interactive terminal turn), nothing is aborted: the replacement text is queued
 as a steer for the running turn and the result is
-`{ accepted: true, commandId, turnId, aborted: false, queuedAs: "steer" }`. The
-replacement also leaves other connections' pending prompt preflights in place. An
-owner's replacement result is unchanged.
+`{ accepted: true, commandId, turnId, aborted: false, queuedAs: "steer" }`. When the
+request carries an `idempotencyKey`, that steer is recorded durably under the key: a
+retry with the same key returns the recorded steer, with the same `commandId` and
+`turnId`, without queueing the text again or starting a replacement run, even after
+the targeted run has ended. The replacement also leaves other connections' pending
+prompt preflights in place. An owner's replacement result is unchanged.
 
 `sdk.promptDeadlineMs` defaults to `3_600_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting

@@ -6984,30 +6984,48 @@ test("SDK host abort-and-prompt queues a steer instead of stopping a run the con
 		socket.addEventListener("open", () => resolve(), { once: true });
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
+	const replace = async (id: string) => {
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id,
+				operation: "turn.abort_and_prompt",
+				input: { text: "replacement" },
+				idempotencyKey: "foreign-replacement-key",
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+			`foreign abort-and-prompt response ${id}`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id) as {
+			result?: { commandId?: string; turnId?: string };
+		};
+	};
 	// A run the host started itself (interactive TUI turn): no SDK connection owns it.
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "foreign-replacement",
-			operation: "turn.abort_and_prompt",
-			input: { text: "replacement" },
-		}),
-	);
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "foreign-replacement"),
-		"foreign abort-and-prompt response",
-	);
+	const first = await replace("foreign-replacement");
 	expect(abortCalls).toBe(0);
 	expect(deliveries).toHaveLength(1);
 	expect(deliveries[0]?.[0]).toBe("replacement");
 	expect(deliveries[0]?.[1]).toMatchObject({ deliverAs: "steer" });
-	expect(frames.find(frame => frame.type === "control_response" && frame.id === "foreign-replacement")).toMatchObject({
+	expect(first).toMatchObject({ ok: true, result: { accepted: true, aborted: false, queuedAs: "steer" } });
+	const identity = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+	expect(identity.commandId).toEqual(expect.any(String));
+	// An exact-key retry replays the recorded steer instead of queueing it again.
+	expect(await replace("foreign-replacement-retry")).toMatchObject({
 		ok: true,
-		result: { accepted: true, aborted: false, queuedAs: "steer" },
+		result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
 	});
 	live.idle = true;
 	await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+	// Even after the targeted run ended, the retry neither queues nor starts a replacement.
+	expect(await replace("foreign-replacement-after-run")).toMatchObject({
+		ok: true,
+		result: { accepted: true, aborted: false, queuedAs: "steer", ...identity },
+	});
+	expect(abortCalls).toBe(0);
+	expect(deliveries).toHaveLength(1);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 

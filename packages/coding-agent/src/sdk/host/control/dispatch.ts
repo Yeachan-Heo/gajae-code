@@ -280,7 +280,7 @@ function invoke(
 		case "turn.abort":
 			return invokeAbort(surface, input, confirm, idempotencyKey);
 		case "turn.abort_and_prompt":
-			return surface.abortAndPrompt(text(input));
+			return surface.abortAndPrompt(text(input), idempotencyKey);
 		case "ask.answer":
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
