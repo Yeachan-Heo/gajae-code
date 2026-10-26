@@ -27,7 +27,7 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../types";
-import { normalizeSystemPrompts } from "../utils";
+import { neutralizeReservedControlTokens, normalizeSystemPrompts } from "../utils";
 import { kProviderResolvedToolCall } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
@@ -3662,6 +3662,23 @@ function toolResultToText(toolResult: ToolResultMessage): string {
 	return toolResult.content.map(item => (item.type === "text" ? item.text : `[${item.mimeType} image]`)).join("\n");
 }
 
+const CURSOR_TOOL_RESULT_OPEN = "<untrusted-content>\n";
+const CURSOR_TOOL_RESULT_CLOSE = "\n</untrusted-content>";
+
+/**
+ * Frame one tool-result string at the Cursor prompt boundary.
+ * `neutralizeReservedControlTokens` breaks reserved `<|...|>` markers.
+ * Fence-tag spellings inside the tool text are escaped so they cannot close this frame.
+ * The frame wraps the full string from `toolResultToText`; this path does not slice it afterward.
+ */
+function frameCursorToolResultText(text: string): string {
+	const body = neutralizeReservedControlTokens(text).replace(
+		/<\/?\s*untrusted-content(?=[\s>/]|$)/gi,
+		tag => `&lt;${tag.slice(1)}`,
+	);
+	return `${CURSOR_TOOL_RESULT_OPEN}[Tool Result]\n${body}${CURSOR_TOOL_RESULT_CLOSE}`;
+}
+
 function toolResultWasTruncated(toolResult: ToolResultMessage): boolean {
 	if (!toolResult.details || typeof toolResult.details !== "object") {
 		return false;
@@ -4902,7 +4919,7 @@ function buildRootPromptMessagesJson(
 			if (!text) continue;
 			pushJson({
 				role: "user",
-				content: [{ type: "text", text: `[Tool Result]\n${text}` }],
+				content: [{ type: "text", text: frameCursorToolResultText(text) }],
 			});
 		}
 	}
@@ -4984,7 +5001,7 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 					const step = create(ConversationStepSchema, {
 						message: {
 							case: "assistantMessage",
-							value: create(AssistantMessageSchema, { text: `[Tool Result]\n${text}` }),
+							value: create(AssistantMessageSchema, { text: frameCursorToolResultText(text) }),
 						},
 					});
 					stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
@@ -5033,12 +5050,14 @@ export function hashCursorConversationValueForTest(value: unknown): string {
 export function buildCursorHistoryForTest(messages: Message[]): {
 	rootPromptMessagesJson: unknown[];
 	turnUserMessagesJson: JsonValue[];
+	turnStepTexts: string[];
 } {
 	const blobStore = new Map<string, Uint8Array>();
 	const rootPromptMessagesJson = buildRootPromptMessagesJson(messages, [], blobStore).map(blobId =>
 		JSON.parse(new TextDecoder().decode(readCursorBlob(blobStore, blobId))),
 	);
 	const turnUserMessagesJson: JsonValue[] = [];
+	const turnStepTexts: string[] = [];
 	for (const turnBlobId of buildConversationTurns(messages, blobStore)) {
 		const turn = fromBinary(ConversationTurnStructureSchema, readCursorBlob(blobStore, turnBlobId));
 		if (turn.turn.case !== "agentConversationTurn") {
@@ -5046,8 +5065,14 @@ export function buildCursorHistoryForTest(messages: Message[]): {
 		}
 		const userMessage = fromBinary(UserMessageSchema, readCursorBlob(blobStore, turn.turn.value.userMessage));
 		turnUserMessagesJson.push(toJson(UserMessageSchema, userMessage));
+		for (const stepBlobId of turn.turn.value.steps) {
+			const step = fromBinary(ConversationStepSchema, readCursorBlob(blobStore, stepBlobId));
+			if (step.message.case === "assistantMessage") {
+				turnStepTexts.push(step.message.value.text);
+			}
+		}
 	}
-	return { rootPromptMessagesJson, turnUserMessagesJson };
+	return { rootPromptMessagesJson, turnUserMessagesJson, turnStepTexts };
 }
 function createCursorUserMessage(
 	content: string | (TextContent | ImageContent)[],
