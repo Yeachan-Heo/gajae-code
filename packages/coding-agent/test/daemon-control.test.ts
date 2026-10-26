@@ -20,6 +20,7 @@ import {
 	resolveDaemonAction,
 } from "../src/daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../src/daemon/runtime";
+import { setPrivateAgentDir, tempAgentDir } from "./helpers/daemon-control-fixture";
 import {
 	isProcessIncarnation,
 	parseDarwinProcessIncarnation,
