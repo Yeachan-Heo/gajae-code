@@ -20,7 +20,6 @@ import {
 	resolveDaemonAction,
 } from "../src/daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../src/daemon/runtime";
-import { setPrivateAgentDir, tempAgentDir } from "./helpers/daemon-control-fixture";
 import {
 	isProcessIncarnation,
 	parseDarwinProcessIncarnation,
@@ -43,6 +42,7 @@ import {
 	writeTelegramControlRequest,
 } from "../src/sdk/bus/telegram-daemon-control";
 import { TopicRegistry } from "../src/sdk/bus/topic-registry";
+import { setPrivateAgentDir, tempAgentDir } from "./helpers/daemon-control-fixture";
 
 const BOT_TOKEN = "123456:secret-token";
 function testProcessReference(
