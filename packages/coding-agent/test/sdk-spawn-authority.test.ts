@@ -2074,6 +2074,61 @@ describe("Broker spawn close and orphan reaper", () => {
 	});
 
 	it.each([
+		"gone after its failed close",
+		"gone before close",
+	] as const)("keeps a managed close that failed retained when its substrate is %s", async phase => {
+		const agentDir = await temp();
+		let verdict: "verified" | "gone" = "verified";
+		const closes: string[] = [];
+		const hostCloses: string[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "tmux" as const,
+						providerIdentity: "managed-close-provider",
+						nativeSessionId: "$7",
+						pid: 995,
+						processIncarnation: "inc-995",
+						ownerGeneration: 3,
+					},
+				}),
+				verify: async () => verdict,
+				close: async () => {
+					// The cooperative close failed (no matching verdict), but the session went away.
+					closes.push("close");
+					verdict = "gone";
+					return { ok: false, code: "substrate_close_failed" };
+				},
+			},
+			spawnPromptLayer: {
+				...promptLayer,
+				close: async () => {
+					hostCloses.push("close");
+					return "accepted" as const;
+				},
+			},
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `managed-failed-close-${phase}`);
+			// Managed close keeps its pre-existing contract for an already-gone session too.
+			if (phase === "gone before close") verdict = "gone";
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			// Only the matching terminal verdict closes a managed owner; absence is not enough.
+			expect(closed).toMatchObject({ ok: false, error: { code: "close_refused" } });
+			expect(closes).toEqual(["close"]);
+			// A managed owner is never asked to close through the host endpoint.
+			expect(hostCloses).toEqual([]);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it.each([
 		["the Broker lifecycle marker", "lifecycle-marker-close"],
 		["no lifecycle marker", undefined],
 	] as const)("sends the production host close over the pinned endpoint with %s", async (_label, marker) => {

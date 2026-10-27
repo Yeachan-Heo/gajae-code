@@ -3748,16 +3748,19 @@ export class Broker {
 				).authority!;
 			}
 			if (verdict === "verified" || verdict === "gone") {
-				// Absence of the exact substrate is the close proof. A host that exits on its
-				// own (after a lost acknowledgement, at the grace boundary, or before an
-				// earlier retained attempt) is closed without any signal; the substrate close
-				// re-verifies and refuses an already-gone identity, so it is never asked to.
+				// A headless child is closed by the proven absence of its exact process, so one
+				// that exits on its own (after a lost acknowledgement, at the grace boundary,
+				// or before an earlier retained attempt) closes without any signal; its
+				// substrate close would refuse an already-gone identity. A managed substrate
+				// is closed only by its own successful close (the matching terminal verdict).
+				const headless = proof.substrateKind === "headless";
 				let current =
-					verdict === "verified" && proof.substrateKind === "headless"
+					verdict === "verified" && headless
 						? await this.#closeSpawnHostGracefully(authority, proof, provider)
 						: verdict;
-				if (current === "verified") {
+				if (current === "verified" || (!headless && current === "gone")) {
 					const closedSubstrate = await provider.close(proof);
+					if (!closedSubstrate.ok && !headless) return "retained";
 					current = await provider.verify(proof);
 					if (!closedSubstrate.ok && current !== "gone") return "retained";
 				}
