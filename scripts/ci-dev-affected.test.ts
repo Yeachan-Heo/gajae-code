@@ -1975,17 +1975,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(targeted(["packages/coding-agent/changelog.d/5491-rebase-free-release-notes.md"])).toEqual([]);
 	});
 
-	// docs/ is the source the embedded docs index is generated from, so shipping a
-	// docs edit without regenerating that index is the one drift class a docs-only
-	// change can introduce. Both planners must select that gate, because dev CI runs
-	// on push as well as pull_request. The gate reads the generated corpus through the
-	// package barrel, so it is a native consumer: it has to bring its own producer, or
-	// the shard's `if: matrix.native` download step asks for an artifact that the
-	// skipped `affected-native` job never uploaded.
 	test("runtime Markdown keeps direct consumer tests in PR plans without broad suites", () => {
 		for (const changed of [
 			"packages/coding-agent/src/prompts/agents/planner.md",
-			"packages/coding-agent/src/prompts/agent-fragments/ralplan-persistence.md",
 			"packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md",
 			"packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
 		]) {
@@ -1994,6 +1986,30 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(keys).toContain("native-linux-x64");
 			expect(keys).toContain("check:@gajae-code/coding-agent");
 			expect(keys.some(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toBe(false);
+		}
+	});
+
+	test("prompt fragments select their actual consumers before skipping CLI smoke", () => {
+		for (const [fragment, consumer] of [
+			["browser-aside", "sdk-browser-aside-backend.test.ts"],
+			["ralplan-persistence", "gjc-runtime/ralplan-worktree-root.test.ts"],
+		]) {
+			const keys = targeted([`packages/coding-agent/src/prompts/agent-fragments/${fragment}.md`]).map(task => task.key);
+			expect(keys).toContain(`test:packages/coding-agent/test/${consumer}`);
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).not.toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
+			expect(keys).not.toContain("cli-smoke");
+		}
+	});
+
+	test("unmapped prompt fragments keep CLI smoke rather than an unrelated definitions test", () => {
+		for (const fragment of ["restricted-bash", "future-fragment"]) {
+			const keys = targeted([`packages/coding-agent/src/prompts/agent-fragments/${fragment}.md`]).map(task => task.key);
+			expect(keys).toContain("cli-smoke");
+			expect(keys).toContain("check:@gajae-code/coding-agent");
+			expect(keys).toContain("native-linux-x64");
+			expect(keys).not.toContain("test:packages/coding-agent/test/default-gjc-definitions.test.ts");
 		}
 	});
 
@@ -2021,6 +2037,22 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("cli-smoke");
 	});
 
+	test("custom provider recipes select runtime loader validation in both planning modes", () => {
+		for (const tasks of [targeted(["docs/custom-providers-and-multi-account.md"]), planTasks(["docs/custom-providers-and-multi-account.md"], packages)]) {
+			const keys = tasks.map(task => task.key);
+			expect(keys).toContain("test:packages/coding-agent/test/custom-provider-docs.test.ts");
+			expect(keys).toContain(EMBEDDED_DOCS_GATE_KEY);
+			expect(keys).toContain("native-linux-x64");
+		}
+	});
+
+	// docs/ is the source the embedded docs index is generated from, so shipping a
+	// docs edit without regenerating that index is the one drift class a docs-only
+	// change can introduce. Both planners must select that gate, because dev CI runs
+	// on push as well as pull_request. The gate reads the generated corpus through the
+	// package barrel, so it is a native consumer: it has to bring its own producer, or
+	// the shard's `if: matrix.native` download step asks for an artifact that the
+	// skipped `affected-native` job never uploaded.
 	test("docs-only changes select the embedded-docs gate and its native producer", () => {
 		const changed = ["docs/guide.md", "docs/nested/other.md"];
 		for (const keys of [targeted(changed), planTasks(changed, packages)].map(tasks =>
