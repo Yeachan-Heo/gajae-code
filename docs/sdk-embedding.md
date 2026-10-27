@@ -185,7 +185,9 @@ package root. They are trusted embedding compositions, not new managed operation
   Completed restore outcomes separately report observer and runtime failures. After
   a blocked reconnect, a failed runtime fence does not guarantee a durable inactive
   marker; a restore-time marker conflict may not protect the restored identity or
-  notify observers of a retained marker. Treat these cases as degraded. Owner IDs
+  notify observers of a retained marker. A blocked reconnect after both receipts
+  restore also does not establish a durable marker for the restored identity.
+  Treat these cases as degraded. Owner IDs
   originate in daemon state and cannot be assumed free of unknown foreign secrets.
   Discard prepared configuration on cancellation; prepare a fresh draft after a consumed
   commit attempt. Forged, copied, foreign, discarded or replayed provider drafts return `invalid_draft` without
