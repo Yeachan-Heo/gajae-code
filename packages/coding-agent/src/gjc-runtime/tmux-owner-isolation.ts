@@ -986,8 +986,10 @@ export interface LifecyclePaths {
 	supervisorIndexFile: string;
 	/** Darwin: durable proof that the exact supervisor delivered SIGTERM for one intent. */
 	relayFile: string;
-	/** Darwin: published before delivery; only a confirmed delivery renames it to `relayFile`. */
+	/** Darwin: published before delivery; removed once a confirmed delivery publishes `relayFile`. */
 	relayPendingFile: string;
+	/** Darwin: SQLite lock its closer holds for as long as it waits on the intent. */
+	closerLockFile: string;
 }
 export function lifecyclePaths(stateDir: string, sessionId: string, generation: string): LifecyclePaths {
 	const root = path.join(stateDir, sessionId, "owner-lifecycle");
@@ -1006,6 +1008,7 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		supervisorIndexFile: path.join(root, `supervisor-${generation}.json`),
 		relayFile: path.join(root, `relay-${generation}.json`),
 		relayPendingFile: path.join(root, `relay-${generation}.pending.json`),
+		closerLockFile: path.join(root, `closer-${generation}.sqlite`),
 	};
 }
 
@@ -1485,6 +1488,59 @@ async function acquireSqliteLock(paths: LifecyclePaths, waitMs: number): Promise
 	return null;
 }
 
+/**
+ * Darwin: the closer holds this lock from before its intent is visible until it stops
+ * waiting. The OS releases it when the closer exits or crashes, so "a closer is still
+ * waiting" never depends on a wall clock.
+ */
+function holdCloserLock(paths: LifecyclePaths): Database | null {
+	try {
+		const database = new Database(paths.closerLockFile);
+		try {
+			setLockDatabaseMode(paths.closerLockFile);
+			if (!verifyOwnerOnlyPathSecurity(paths.closerLockFile, "file").ok) throw new Error("closer_lock_unsafe");
+			configureLockDatabase(database, 0);
+			database.exec("BEGIN IMMEDIATE");
+			return database;
+		} catch {
+			database.close();
+			return null;
+		}
+	} catch {
+		return null;
+	}
+}
+
+function releaseCloserLock(database: Database): void {
+	try {
+		database.exec("ROLLBACK");
+	} catch {
+	} finally {
+		database.close();
+	}
+}
+
+/** Darwin: whether the closer that published this generation's intent is still waiting. */
+function closerWaiting(paths: LifecyclePaths): boolean {
+	if (!verifyOwnerOnlyPathSecurity(paths.closerLockFile, "file").ok) return false;
+	let database: Database;
+	try {
+		database = new Database(paths.closerLockFile, { readwrite: true, create: false });
+	} catch {
+		return false;
+	}
+	try {
+		configureLockDatabase(database, 0);
+		database.exec("BEGIN IMMEDIATE");
+		database.exec("ROLLBACK");
+		return false;
+	} catch (error) {
+		return (error as { code?: unknown }).code === "SQLITE_BUSY";
+	} finally {
+		database.close();
+	}
+}
+
 function acquireSqliteLockSync(paths: LifecyclePaths, waitMs: number, existingOnly = false): Database | null {
 	try {
 		if (existingOnly) {
@@ -1816,6 +1872,35 @@ function isExpectedOwnerTerminal(
 		observedAt >= Date.parse(relay.relayed_at) &&
 		isValidOwnerIntent(intent, { ...request, observed_at: relay.relayed_at })
 	);
+}
+
+/**
+ * Whether the supervisor has already published a pending or confirmed relay record
+ * for this exact intent. Where a supervisor relays (Darwin, or any generation with a
+ * supervisor index) it publishes the pending record durably before signaling, so a
+ * terminal captured while neither record exists cannot be that relay's signal,
+ * whatever the wall clock says. A Linux generation without an index has no relay:
+ * its closer signals directly.
+ */
+export function cooperativeRelayVisible(paths: LifecyclePaths, intent: OwnerIntent): boolean {
+	try {
+		fsSync.lstatSync(paths.supervisorIndexFile);
+	} catch (error) {
+		return isCode(error, "ENOENT") && process.platform !== "darwin";
+	}
+	// The supervisor publishes the confirmed record before removing the pending one.
+	for (const file of [paths.relayPendingFile, paths.relayFile])
+		try {
+			const record = readSecureOwnerJson(file);
+			if (
+				isRecord(record) &&
+				record.intent_id === intent.intent_id &&
+				record.dispatch_id === intent.dispatch_id &&
+				record.generation === intent.generation
+			)
+				return true;
+		} catch {}
+	return false;
 }
 
 /**
@@ -2203,7 +2288,9 @@ export function consumeCooperativeOwnerIntent(input: {
 			Date.now() >= Date.parse(intent.expires_at)
 		)
 			return;
-		if (!input.canRelay()) return;
+		// An intent whose closer stopped waiting (gave up, exited or crashed) is never
+		// relayed, whatever the wall clock says.
+		if (!input.canRelay() || !closerWaiting(paths)) return;
 		const relayRecord: ManagedOwnerRelayRecord = {
 			schema_version: 1,
 			intent_id: intent.intent_id,
@@ -2233,6 +2320,7 @@ export function consumeCooperativeOwnerIntent(input: {
 			!!recorded.data &&
 			bytes.equals(Buffer.from(recorded.data)) &&
 			signaledAt.getTime() < Date.parse(intent.expires_at) &&
+			closerWaiting(paths) &&
 			input.relay(intent, signaledAt.toISOString());
 		if (delivered) {
 			input.publishNoReplace(
@@ -2285,6 +2373,17 @@ export async function closeExactTmuxOwner(
 		if (process.platform !== "darwin") throw new Error("cooperative_owner_platform_unsupported");
 		const db = acquireSqliteLockSync(paths, 250, true);
 		if (!db) throw new Error("generation_lock_contended");
+		// Held before the intent is visible; a concurrent closer of this generation
+		// cannot take it.
+		const closer = holdCloserLock(paths);
+		if (!closer) {
+			try {
+				db.exec("COMMIT");
+			} finally {
+				db.close();
+			}
+			throw new Error("generation_lock_contended");
+		}
 		const intent = ownerIntentRecord(intentInput());
 		const shutdown = deps.shutdown;
 		const assertOwned = () => {
@@ -2304,49 +2403,55 @@ export async function closeExactTmuxOwner(
 			if (Date.now() >= Date.parse(intent.expires_at)) throw new Error("owner_term_verdict_timeout");
 		};
 		try {
-			assertSecureGeneration(paths, request.sessionId);
-			retireUndeliveredCooperativeIntent(paths, request.sessionId, request.serverKey);
-			assertOwned();
-			await shutdown.publishNoReplace(
-				paths.root,
-				paths.intentFile,
-				Buffer.from(`${JSON.stringify(intent)}\n`),
-				assertOwned,
-			);
-			if (JSON.stringify(readSecureOwnerJson(paths.intentFile)) !== JSON.stringify(intent))
-				throw new Error("owner_intent_publication_uncertain");
-		} finally {
-			// Namespace publication cannot be undone by a SQLite rollback or error.
 			try {
-				db.exec("COMMIT");
+				assertSecureGeneration(paths, request.sessionId);
+				retireUndeliveredCooperativeIntent(paths, request.sessionId, request.serverKey);
+				assertOwned();
+				await shutdown.publishNoReplace(
+					paths.root,
+					paths.intentFile,
+					Buffer.from(`${JSON.stringify(intent)}\n`),
+					assertOwned,
+				);
+				if (JSON.stringify(readSecureOwnerJson(paths.intentFile)) !== JSON.stringify(intent))
+					throw new Error("owner_intent_publication_uncertain");
 			} finally {
-				db.close();
+				// Namespace publication cannot be undone by a SQLite rollback or error.
+				try {
+					db.exec("COMMIT");
+				} finally {
+					db.close();
+				}
 			}
+			const giveUp = (): never => {
+				retireAbandonedCooperativeIntent(paths, request.sessionId, request.serverKey, intent);
+				throw new Error("owner_term_verdict_timeout");
+			};
+			let verdict: OwnerVerdict | null;
+			try {
+				verdict = await deps.waitForVerdict(intent);
+			} catch {
+				return giveUp();
+			}
+			if (
+				Date.now() >= Date.parse(intent.expires_at) ||
+				!isValidOwnerVerdict(verdict) ||
+				verdict.intent_id !== intent.intent_id ||
+				verdict.generation !== request.generation ||
+				verdict.session_id !== request.sessionId ||
+				verdict.server_key !== request.serverKey ||
+				verdict.classification !== "expected_operator_shutdown"
+			)
+				return giveUp();
+			// Only the exact supervisor's relay of this intent makes the shutdown expected.
+			if (!readCooperativeRelayRecord(paths, intent)) return giveUp();
+			await deps.cleanupSession();
+			return verdict;
+		} finally {
+			// The supervisor relays only while this lock is held: once the closer stops
+			// waiting, even an intent it could not retire is never delivered.
+			releaseCloserLock(closer);
 		}
-		const giveUp = (): never => {
-			retireAbandonedCooperativeIntent(paths, request.sessionId, request.serverKey, intent);
-			throw new Error("owner_term_verdict_timeout");
-		};
-		let verdict: OwnerVerdict | null;
-		try {
-			verdict = await deps.waitForVerdict(intent);
-		} catch {
-			return giveUp();
-		}
-		if (
-			Date.now() >= Date.parse(intent.expires_at) ||
-			!isValidOwnerVerdict(verdict) ||
-			verdict.intent_id !== intent.intent_id ||
-			verdict.generation !== request.generation ||
-			verdict.session_id !== request.sessionId ||
-			verdict.server_key !== request.serverKey ||
-			verdict.classification !== "expected_operator_shutdown"
-		)
-			return giveUp();
-		// Only the exact supervisor's relay of this intent makes the shutdown expected.
-		if (!readCooperativeRelayRecord(paths, intent)) return giveUp();
-		await deps.cleanupSession();
-		return verdict;
 	}
 	const generationLockToken = await acquireOwnerGenerationLock(paths, request.sessionId);
 	if (!generationLockToken) throw new Error("generation_lock_contended");

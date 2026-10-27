@@ -2247,8 +2247,9 @@ describe("coordinator runtime state sidecar", () => {
 		["waits for an in-flight relay", "pending"],
 		["waits for the final flush after a confirmed relay", "confirmed"],
 		["fails on plain contention", "none"],
+		["never adopts a relay published after the signal was captured", "after_capture"],
 	] as const)("finalizes a signaled child whose supervisor still holds the relay lock: %s", async (_case, phase) => {
-		const inFlight = phase !== "none";
+		const inFlight = phase === "pending" || phase === "confirmed";
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");
 		const sessionId = "relay-lock-session";
@@ -2277,7 +2278,9 @@ describe("coordinator runtime state sidecar", () => {
 			session_id: sessionId,
 			server_key: "opaque-owner",
 			...supervisor,
-			relayed_at: new Date().toISOString(),
+			// After capture the relay is stamped earlier than the observation, as after a
+			// backward wall-clock step; only capture-time evidence can exclude it.
+			relayed_at: new Date(Date.now() - (phase === "after_capture" ? 500 : 0)).toISOString(),
 		};
 		if (phase === "pending")
 			await fs.writeFile(paths.relayPendingFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
@@ -2306,15 +2309,18 @@ describe("coordinator runtime state sidecar", () => {
 const env = process.env; const db = new Database(env.LOCK_DB); db.exec("BEGIN IMMEDIATE");
 process.stdout.write("locked\\n");
 setTimeout(() => {
-	if (env.RELAY_FILE) { fs.writeFileSync(env.RELAY_FILE, env.RELAY_BYTES, { mode: 0o600, flag: "wx" }); fs.unlinkSync(env.PENDING_FILE); }
+	if (env.RELAY_FILE) { fs.writeFileSync(env.RELAY_FILE, env.RELAY_BYTES, { mode: 0o600, flag: "wx" }); fs.rmSync(env.PENDING_FILE, { force: true }); }
 	db.exec("COMMIT"); db.close(); process.exit(0);
-}, 700);`,
+}, Number(env.HOLD_MS));`,
 			],
 			env: {
 				...process.env,
 				LOCK_DB: paths.lockDatabaseFile,
 				PENDING_FILE: paths.relayPendingFile,
-				...(phase === "pending" ? { RELAY_FILE: paths.relayFile, RELAY_BYTES: `${JSON.stringify(record)}\n` } : {}),
+				HOLD_MS: phase === "after_capture" ? "100" : "700",
+				...(phase === "pending" || phase === "after_capture"
+					? { RELAY_FILE: paths.relayFile, RELAY_BYTES: `${JSON.stringify(record)}\n` }
+					: {}),
 			},
 			stdout: "pipe",
 			stderr: "pipe",
@@ -2339,6 +2345,9 @@ setTimeout(() => {
 		if (inFlight) {
 			expect(payload).toMatchObject({ state: "completed" });
 			expect(await readJson(paths.verdictFile)).toMatchObject({ classification: "expected_operator_shutdown" });
+		} else if (phase === "after_capture") {
+			expect(payload).toMatchObject({ state: "errored" });
+			expect(await readJson(paths.verdictFile)).toMatchObject({ classification: "unexpected_owner_loss" });
 		} else {
 			expect(payload).toMatchObject({ state: "errored", error: { code: "owner_verdict_unavailable" } });
 			expect(fsSync.existsSync(paths.verdictFile)).toBeFalse();

@@ -1380,7 +1380,13 @@ still completes. A child observer that finds the generation lock held while a
 relay is pending or its confirmed record is being flushed waits up to 3 seconds
 for it instead of ending with `owner_verdict_unavailable`. A pinned relaunch is
 refused with `managed_owner_predecessor_live` while the current generation's
-supervisor is still live.
+supervisor is still live. The closer holds a per-generation closer lock
+(`closer-<generation>.sqlite`) from before its intent is visible until it stops
+waiting, and the supervisor relays only while that lock is held, so an intent
+whose closer gave up, exited or crashed is never delivered, whatever the wall
+clock says. The child sidecar also captures the intent's dispatch only when the
+relay record for it is already visible, so a SIGTERM handled before the relay
+is never attributed to it.
 
 A supervisor that is stopped or stalled past the intent's deadline, before or
 during publication, refuses the expired intent and never relays it. A close

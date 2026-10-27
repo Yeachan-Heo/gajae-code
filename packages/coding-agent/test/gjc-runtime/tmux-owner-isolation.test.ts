@@ -60,6 +60,19 @@ const publishRelayForTest = (file: string, bytes: Uint8Array): void => {
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
 
+/** Holds a generation's closer lock the way a waiting closer does; returns the release. */
+const holdCloser = (paths: { closerLockFile: string }): (() => void) => {
+	const closer = new Database(paths.closerLockFile);
+	fsSync.chmodSync(paths.closerLockFile, 0o600);
+	closer.exec("BEGIN IMMEDIATE");
+	let held = true;
+	return () => {
+		if (!held) return;
+		held = false;
+		closer.exec("ROLLBACK");
+		closer.close();
+	};
+};
 const itKernelSignalClose = it.skipIf(process.platform === "darwin");
 const itOwnerOnlyReads = it.skipIf(process.platform === "win32");
 
@@ -609,6 +622,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 
 	it("consumes only exact timely evidence while holding the same generation lock", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-consumer-"));
+		let releaseCloser = () => {};
 		try {
 			await replaceOwnerGeneration(state, "session", "prior-generation");
 			await observeOwnerTerminal({
@@ -657,6 +671,8 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 			const write = (file: string, value: unknown) =>
 				fsSync.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
 			write(path.join(paths.root, "child-token.binding.json"), binding);
+			// A closer is waiting, so every refusal below comes from the evidence under test.
+			releaseCloser = holdCloser(paths);
 			let relays = 0;
 			let relayable = true;
 			let signaledAt: string | undefined;
@@ -783,6 +799,14 @@ await Bun.stdin.text(); db.exec("COMMIT"); db.close(); clearTimeout(timer);`,
 			expect(relays).toBe(0);
 			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
 			relayable = true;
+			// Without a waiting closer (it gave up, exited or crashed) nothing is relayed,
+			// independent of the intent's wall-clock window.
+			releaseCloser();
+			poll();
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+			expect(fsSync.existsSync(`${paths.relayPendingFile}.intent.unsent`)).toBe(false);
+			releaseCloser = holdCloser(paths);
 			poll();
 			expect(relays).toBe(1);
 			expect(readSecureOwnerJson(paths.intentFile)).toEqual(intent);
@@ -808,6 +832,67 @@ await Bun.stdin.text(); db.exec("COMMIT"); db.close(); clearTimeout(timer);`,
 			poll();
 			expect(relays).toBe(1);
 		} finally {
+			releaseCloser();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("never delivers once the closer stops waiting during relay publication", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-closer-gone-"));
+		let releaseCloser = () => {};
+		try {
+			await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", "generation");
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation: "generation",
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "provenance",
+				created_at: new Date().toISOString(),
+			};
+			const intent: OwnerIntent = {
+				schema_version: 1,
+				intent_id: "intent",
+				state: "pending",
+				generation: "generation",
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(Date.now() - 100).toISOString(),
+				expires_at: new Date(Date.now() + 10_000).toISOString(),
+			};
+			fsSync.writeFileSync(path.join(paths.root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, {
+				mode: 0o600,
+			});
+			fsSync.writeFileSync(paths.intentFile, `${JSON.stringify(intent)}\n`, { mode: 0o600 });
+			releaseCloser = holdCloser(paths);
+			let relays = 0;
+			consumeCooperativeOwnerIntent({
+				stateDir: state,
+				binding,
+				serverKey: "socket",
+				canRelay: () => true,
+				relay: () => {
+					relays += 1;
+					return true;
+				},
+				// The closer gives up after the pending record is durable, before delivery.
+				publishNoReplace: (file, bytes) => {
+					publishRelayForTest(file, bytes);
+					if (file === paths.relayPendingFile) releaseCloser();
+				},
+			});
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			expect(fsSync.existsSync(`${paths.relayPendingFile}.intent.unsent`)).toBe(true);
+		} finally {
+			releaseCloser();
 			await fs.rm(state, { recursive: true, force: true });
 		}
 	});
@@ -2552,6 +2637,80 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 		}
 	});
 
+	it("never relays an intent its closer abandoned without being able to retire it", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-abandoned-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation,
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "start",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+			};
+			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const closerBusy = () => {
+				const probe = new Database(paths.closerLockFile);
+				try {
+					probe.exec("PRAGMA busy_timeout = 0");
+					probe.exec("BEGIN IMMEDIATE");
+					probe.exec("ROLLBACK");
+					return false;
+				} catch {
+					return true;
+				} finally {
+					probe.close();
+				}
+			};
+			// A stalled supervisor holds the generation lock while the closer gives up, so
+			// the closer cannot retire its intent.
+			const stalled = new Database(paths.lockDatabaseFile);
+			let waitedWhileHeld = false;
+			try {
+				await expect(
+					close(state, generation, "dispatch", async () => {
+						waitedWhileHeld = closerBusy();
+						stalled.exec("BEGIN IMMEDIATE");
+						return null;
+					}),
+				).rejects.toThrow("owner_term_verdict_timeout");
+			} finally {
+				stalled.exec("COMMIT");
+				stalled.close();
+			}
+			expect(waitedWhileHeld).toBeTrue();
+			expect(closerBusy()).toBeFalse();
+			const intent = readSecureOwnerJson(paths.intentFile) as OwnerIntent;
+			// Resumed within the intent's wall-clock window, the supervisor still refuses it.
+			setSystemTime(new Date(Date.parse(intent.created_at) + 1));
+			let relays = 0;
+			consumeCooperativeOwnerIntent({
+				stateDir: state,
+				publishNoReplace: publishRelayForTest,
+				binding,
+				serverKey: "socket",
+				canRelay: () => true,
+				relay: () => {
+					relays += 1;
+					return true;
+				},
+			});
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+		} finally {
+			setSystemTime();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("retires an expired intent the supervisor never relayed so a later close can rearm", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-rearm-"));
 		try {
@@ -2738,6 +2897,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-unsent-"));
 		const realRead = natives.readOwnerOnlyFile;
 		const nativeRead = spyOn(natives, "readOwnerOnlyFile");
+		let releaseCloser = () => {};
 		try {
 			const generation = await replaceOwnerGeneration(state, "session", "generation");
 			const paths = lifecyclePaths(state, "session", generation);
@@ -2775,6 +2935,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 						while (Date.now() <= Date.parse(intent.expires_at)) Bun.sleepSync(10);
 					return realRead(file, limit);
 				});
+			releaseCloser = holdCloser(paths);
 			let relays = 0;
 			consumeCooperativeOwnerIntent({
 				stateDir: state,
@@ -2810,6 +2971,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 			});
 			expect(verdict.classification).toBe("unexpected_owner_loss");
 		} finally {
+			releaseCloser();
 			nativeRead.mockRestore();
 			await fs.rm(state, { recursive: true, force: true });
 		}

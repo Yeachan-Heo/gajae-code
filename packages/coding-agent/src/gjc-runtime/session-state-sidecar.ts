@@ -24,6 +24,7 @@ import { sessionRoot, sessionRuntimeDir, sessionRuntimeStatePath } from "./sessi
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
 import {
+	cooperativeRelayVisible,
 	isValidOwnerIntent,
 	lifecyclePaths,
 	type ObserveTerminalRequest,
@@ -2949,23 +2950,25 @@ async function persistInvalidOwnerTerminalMetadata(
 	});
 }
 
-async function operatorDispatchIdForOwner(
-	owner: OwnerTerminalContext,
-	request: Omit<ObserveTerminalRequest, "operator_dispatch_id">,
-): Promise<string | undefined> {
+/**
+ * Captured before the observation is stamped. Where a supervisor relays, the intent
+ * explains this terminal only if the relay record for it is already visible: an
+ * unrelated signal handled before the relay never gains its dispatch id, independent
+ * of wall-clock ordering. Timing is otherwise judged by the verdict, which still
+ * accepts a timely relay that a stopped child handled late.
+ */
+async function operatorDispatchIdForOwner(owner: OwnerTerminalContext, sessionId: string): Promise<string | undefined> {
 	try {
-		const intent = JSON.parse(
-			await Bun.file(lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile).text(),
-		) as unknown;
+		const paths = lifecyclePaths(owner.stateDir, sessionId, owner.generation);
+		const intent = JSON.parse(await Bun.file(paths.intentFile).text()) as unknown;
 		if (
 			!isValidOwnerIntent(intent) ||
-			intent.generation !== request.owner_generation ||
-			intent.session_id !== request.session_id ||
-			intent.server_key !== request.socket_key
+			intent.generation !== owner.generation ||
+			intent.session_id !== sessionId ||
+			intent.server_key !== owner.socketKey ||
+			!cooperativeRelayVisible(paths, intent)
 		)
 			return undefined;
-		// Timing is not judged here: the verdict decides whether this intent explains
-		// the observation, including a timely relay that a stopped child handled late.
 		return owner.operatorDispatchId ?? intent.dispatch_id;
 	} catch {
 		return undefined;
@@ -2978,6 +2981,7 @@ async function observeOwnerTerminalPostmortem(
 	sessionId: string,
 ): Promise<OwnerVerdict | null> {
 	try {
+		const operatorDispatchId = await operatorDispatchIdForOwner(owner, sessionId);
 		const now = new Date().toISOString();
 		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id"> = {
 			schema_version: 1,
@@ -2993,7 +2997,6 @@ async function observeOwnerTerminalPostmortem(
 			exit_kind: String(reason),
 			reason: "process_postmortem",
 		};
-		const operatorDispatchId = await operatorDispatchIdForOwner(owner, observation);
 		return await observeOwnerTerminal({
 			...observation,
 			...(operatorDispatchId ? { operator_dispatch_id: operatorDispatchId } : {}),
