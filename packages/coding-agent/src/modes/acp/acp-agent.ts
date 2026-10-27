@@ -285,6 +285,8 @@ type SessionRecord = {
 	inboundSequence: number;
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
 	busy: boolean;
+	/** Cached names from the last published skill list; prompt dispatch must not await discovery before claiming ownership. */
+	inlineSkillCommands?: Map<string, { name: string }>;
 	/** Last SDK activity state; ACP prompt settlement can precede the SDK's idle publication. */
 	sdkIdle: boolean;
 	backgroundBusy: boolean;
@@ -2537,18 +2539,7 @@ export class AcpAgent implements Agent {
 			);
 
 		const payload = acpPromptPayload(params.prompt);
-		let skillInvocation = acpSkillInvocation(params.prompt);
-		const textBlock = params.prompt.length === 1 && params.prompt[0]?.type === "text" ? params.prompt[0] : undefined;
-		if (!skillInvocation && textBlock?.text.toLowerCase().includes("/skill:")) {
-			try {
-				skillInvocation = acpSkillInvocation(
-					params.prompt,
-					acpSkillCommandMap(await record.adapter.query("skill.list/state")),
-				);
-			} catch {
-				// Keep the complete user text on the ordinary prompt path if skill discovery is unavailable.
-			}
-		}
+		const skillInvocation = acpSkillInvocation(params.prompt, record.inlineSkillCommands);
 		const clientRef = randomUUID();
 		if (!skillInvocation) {
 			const promptError = validateRequiredPromptText("turn.prompt", {
@@ -5652,6 +5643,8 @@ export class AcpAgent implements Agent {
 		} catch {
 			// Builtins remain useful when an older SDK host cannot expose skill state.
 		}
+		const record = this.#sessions.get(id);
+		if (record?.adapter === adapter) record.inlineSkillCommands = acpSkillCommandMap(skills);
 		await this.#publishSessionUpdate(
 			id,
 			{
