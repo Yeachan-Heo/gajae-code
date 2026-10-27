@@ -29,7 +29,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@gajae-code/tui";
-import { logger, prompt, untilAborted } from "@gajae-code/utils";
+import { logger, untilAborted } from "@gajae-code/utils";
 import {
 	formatDeepInterviewSelectorPrompt,
 	isDeepInterviewAskQuestion,
@@ -64,8 +64,8 @@ import {
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
-import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
+import { askToolDescriptionForSession } from "./session-descriptions";
 import type {
 	AskAnswerRequest,
 	AskRemoteControl,
@@ -808,7 +808,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
 	get description(): string {
-		return prompt.render(askDescription, { answerChannelAvailable: this.#hasAnswerChannel() });
+		return askToolDescriptionForSession(this.session);
 	}
 	get parameters(): AskParametersSchema {
 		return selectAskParameters(this.session.getDeepInterviewAskStage?.());
@@ -831,12 +831,6 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
 			? new AskTool(session)
 			: null;
-	}
-
-	#hasAnswerChannel(): boolean {
-		if (this.session.hasUI || this.session.getAskAnswerSource?.()) return true;
-		const gateEmitter = this.session.getWorkflowGateEmitter?.();
-		return this.#hasWorkflowGateAnswerChannel(gateEmitter);
 	}
 
 	#hasWorkflowGateAnswerChannel(gateEmitter: WorkflowGateEmitter | undefined): boolean {

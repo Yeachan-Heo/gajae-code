@@ -142,6 +142,22 @@ function singleDeepInterviewQuestion() {
 }
 
 describe("AskTool execution integrity", () => {
+	it("reports the current UI state instead of the session startup snapshot", () => {
+		let uiAttached = true;
+		const tool = new AskTool(
+			createSession({
+				hasUI: true,
+				getToolUIContext: () => ({ hasUI: uiAttached, ui: uiAttached ? {} : undefined }),
+			}),
+		);
+
+		expect(tool.description).toContain("An interactive or remote answer channel is available");
+		uiAttached = false;
+		expect(tool.description).toContain("No interactive or remote answer channel is available");
+		uiAttached = true;
+		expect(tool.description).toContain("An interactive or remote answer channel is available");
+	});
+
 	it("reports and enforces whether a headless answer channel is available", async () => {
 		const gateEmitter = new BrokerWorkflowGateEmitter("ask-answer-channel-test", new MemoryGateStore());
 		const tool = new AskTool(

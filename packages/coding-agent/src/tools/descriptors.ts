@@ -12,6 +12,7 @@ import {
 	validateDeferredTodoArguments,
 } from "./descriptor-validation";
 import {
+	askToolDescriptionForSession,
 	evalToolDescriptionForSession,
 	renderTaskDescription,
 	searchToolDescriptionForSession,
@@ -528,6 +529,7 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 	];
 
 const sessionDescriptions: Readonly<Record<string, ToolDescriptorMetadata["descriptionForSession"]>> = {
+	ask: askToolDescriptionForSession,
 	eval: evalToolDescriptionForSession,
 	search: searchToolDescriptionForSession,
 	task: renderTaskDescription,
