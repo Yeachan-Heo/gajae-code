@@ -234,7 +234,8 @@ test("property: status line strips arbitrary terminal controls, fc.property seed
 });
 
 test("linear scan prevents quadratic blowup on repeated unterminated control introducers", () => {
-	const repeated = `cmd${"\x1b]".repeat(5000)}arg`;
+	const count = 5000;
+	const repeated = `cmd${"\x1b]".repeat(count)}arg`;
 	const rendered = renderStatusLine(
 		{
 			title: "SSH",
@@ -244,5 +245,7 @@ test("linear scan prevents quadratic blowup on repeated unterminated control int
 	);
 	expect(rendered).toContain("ssh user@host cmd");
 	expect(rendered).toContain("arg");
-	expect(rendered).not.toContain("\x1b");
+	expect(rendered).not.toContain("\x1b]");
+	expect(rendered).toContain("]".repeat(count));
+	expect(Bun.stripANSI(rendered)).toContain(`ssh user@host cmd${"]".repeat(count)}arg`);
 });
