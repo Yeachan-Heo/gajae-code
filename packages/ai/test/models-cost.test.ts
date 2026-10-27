@@ -655,4 +655,88 @@ describe("calculateCost", () => {
 		expect(output.usage.input).toBe(10);
 		expect(output.usage.cacheWrite).toBe(0);
 	});
+
+	it("switches OpenRouter GPT-6 Sol pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openrouter", "openai/gpt-6-sol");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		// 200K input @ $2 + 1K output @ $10 + 72K cacheRead @ $0.20
+		expect(threshold.cost.total).toBeCloseTo(0.4244, 8);
+		// same request one cache-write token past the threshold, at 2x/1.5x rates
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.843805, 8);
+	});
+
+	it("switches OpenRouter GPT-6 Astra pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openrouter", "openai/gpt-6-astra");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(threshold.cost.total).toBeCloseTo(2.122, 8);
+		expect(aboveThreshold.cost.total).toBeCloseTo(4.219025, 8);
+	});
+
+	it("switches OpenRouter GPT-6 Luna pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openrouter", "openai/gpt-6-luna");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		expect(threshold.cost.total).toBeCloseTo(0.02122, 8);
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.04219025, 8);
+	});
+
+	it("switches OpenRouter GPT-5.6 Sol pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openrouter", "openai/gpt-5.6-sol");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		// 200K input @ $4 + 1K output @ $20 + 72K cacheRead @ $0.40
+		expect(threshold.cost.total).toBeCloseTo(0.8488, 8);
+		// same request one cache-write token past the threshold, at 2x/1.5x rates
+		expect(aboveThreshold.cost.total).toBeCloseTo(1.68761, 8);
+	});
 });

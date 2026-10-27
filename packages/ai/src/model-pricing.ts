@@ -96,14 +96,22 @@ const OPENAI_GPT_5_6_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
 ]);
 
 export function getOpenAIModelCost<TApi extends Api>(model: Model<TApi>, inputTokens: number): ModelCost | undefined {
-	if (model.provider !== "openai" && model.provider !== "openai-codex") {
+	if (model.provider !== "openai" && model.provider !== "openai-codex" && model.provider !== "openrouter") {
 		return undefined;
 	}
-	const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
-	if (!pricing) {
+	// For direct OpenAI/openai-codex, use the bundled pricing table.
+	if (model.provider !== "openrouter") {
+		const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
+		if (!pricing) {
+			return undefined;
+		}
+		return inputTokens > pricing.longContextPricing.threshold ? pricing.longContextPricing.cost : pricing.cost;
+	}
+	// For OpenRouter, check if the model has bundled long-context pricing.
+	if (!model.longContextPricing) {
 		return undefined;
 	}
-	return inputTokens > pricing.longContextPricing.threshold ? pricing.longContextPricing.cost : pricing.cost;
+	return inputTokens > model.longContextPricing.threshold ? model.longContextPricing.cost : model.cost;
 }
 
 const BEDROCK_HAIKU_5_5_ID = /^(?:(?:au|eu|global|jp|us).)?anthropic.claude-haiku-5-5$/;
@@ -183,16 +191,21 @@ export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>)
 }
 
 export function applyOpenAIModelPricing<TApi extends Api>(model: Model<TApi>): void {
-	if (model.provider !== "openai" && model.provider !== "openai-codex") {
+	if (model.provider !== "openai" && model.provider !== "openai-codex" && model.provider !== "openrouter") {
 		return;
 	}
-	const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
-	if (!pricing) {
-		return;
+	// For direct OpenAI/openai-codex, use the bundled pricing table.
+	if (model.provider !== "openrouter") {
+		const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
+		if (!pricing) {
+			return;
+		}
+		model.cost = { ...pricing.cost };
+		model.longContextPricing = {
+			threshold: pricing.longContextPricing.threshold,
+			cost: { ...pricing.longContextPricing.cost },
+		};
 	}
-	model.cost = { ...pricing.cost };
-	model.longContextPricing = {
-		threshold: pricing.longContextPricing.threshold,
-		cost: { ...pricing.longContextPricing.cost },
-	};
+	// For OpenRouter models with openai/* IDs, long-context pricing should already
+	// be set in models.json. This function is a no-op for OpenRouter in that case.
 }
