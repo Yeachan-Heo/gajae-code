@@ -166,6 +166,61 @@ describe("parseSkillInvocations", () => {
 		expect(fencedBlockTest[0]?.commandName).toBe("skill:alpha");
 		expect(fencedBlockTest[1]?.commandName).toBe("skill:gamma");
 	});
+
+	it("CommonMark span permutations: single backticks at line start and elsewhere", () => {
+		// Table-driven test for line-start backtick spans and various CommonMark cases
+		const testCases: Array<{
+			description: string;
+			text: string;
+			expectedCommandCount: number;
+			expectedCommands?: string[];
+		}> = [
+			// Single backtick at line start should be treated as inline code span opener
+			{
+				description: "Single backtick at line start opens inline code span",
+				text: "Notes:\n`npm test` is the cmd, literal: `run /skill:alpha here`",
+				expectedCommandCount: 0,
+			},
+			{
+				description: "Single backtick at line start with skill outside",
+				text: "`example` use /skill:alpha now",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+			// Multiple inline code spans with skills
+			{
+				description: "Multiple single-backtick spans with skill outside",
+				text: "`code1` and /skill:alpha and `code2`",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+			// Mixed fences and inline spans
+			{
+				description: "Fence with inline spans and skills outside",
+				text: "`inline` /skill:alpha\n```\n/skill:beta\n```\n/skill:gamma",
+				expectedCommandCount: 2,
+				expectedCommands: ["skill:alpha", "skill:gamma"],
+			},
+			// CommonMark: only 3+ backticks at line start are fence delimiters
+			{
+				description: "Two backticks at line start are inline, not fence",
+				text: "Start\n``code`` with /skill:alpha",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+		];
+
+		for (const testCase of testCases) {
+			const result = parseSkillInvocations(testCase.text, skillsByCommandName);
+			// Test case: ${testCase.description}
+			expect(result.length).toBe(testCase.expectedCommandCount);
+			if (testCase.expectedCommands) {
+				for (let i = 0; i < testCase.expectedCommands.length; i++) {
+					expect(result[i]?.commandName).toBe(testCase.expectedCommands[i]);
+				}
+			}
+		}
+	});
 });
 
 describe("skills", () => {
