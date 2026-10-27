@@ -10,7 +10,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { CRASH_ISSUE_MARKER_PREFIX, normalizeCrashFrames, VERSION } from "@gajae-code/utils";
+import { CRASH_ISSUE_MARKER_PREFIX, normalizeCrashFrames, sanitizeDisplayLine, VERSION } from "@gajae-code/utils";
 import type { RunGh } from "../utils/gh";
 import {
 	type CrashSignatureView,
@@ -268,13 +268,15 @@ export async function checkForDuplicateIssue(runGh: RunGh, fingerprint: string):
 	const first = parsed[0] as { url?: unknown; title?: unknown; author?: unknown };
 	if (typeof first.url !== "string" || !isCanonicalIssueUrl(first.url))
 		return { status: "uncertain", reason: "duplicate search returned a non-canonical URL" };
-	const title = typeof first.title === "string" ? first.title : "(untitled)";
-	const author =
+	// Remote titles and logins are display text. Flatten controls and line breaks before stdout.
+	const title = sanitizeDisplayLine(typeof first.title === "string" ? first.title : "(untitled)");
+	const author = sanitizeDisplayLine(
 		first.author &&
-		typeof first.author === "object" &&
-		typeof (first.author as { login?: unknown }).login === "string"
-			? ((first.author as { login: string }).login satisfies string)
-			: "unknown";
+			typeof first.author === "object" &&
+			typeof (first.author as { login?: unknown }).login === "string"
+			? (first.author as { login: string }).login
+			: "unknown",
+	);
 	// A marker in a body is forgeable, so this is a candidate only: the default
 	// action prints the URL and stops.
 	return { status: "candidate", candidate: { url: first.url, title, author } };

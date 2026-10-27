@@ -211,8 +211,8 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
-	Snowflake,
 	safeErrorDescription,
+	Snowflake,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
@@ -2120,14 +2120,81 @@ function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; pat
 	return undefined;
 }
 
+const PERMISSION_TITLE_PREVIEW = 80;
+const APPROVAL_FORMAT_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+/** One visible token per control byte. This string is display-only. */
+function encodeApprovalControl(code: number): string {
+	if (code <= 0x1f) return `^${String.fromCharCode(code + 0x40)}`;
+	if (code === 0x7f) return "^?";
+	return `<${code.toString(16)}>`;
+}
+
+/**
+ * Encode control bytes and keep every printable byte in order.
+ * An OSC payload is shell text, so deleting it would hide a command that still runs.
+ */
+function visibleApprovalText(value: string, flattenNewlines: boolean): string {
+	let out = "";
+	for (let index = 0; index < value.length; ) {
+		const code = value.codePointAt(index) ?? 0;
+		const width = code > 0xffff ? 2 : 1;
+		if (code >= 0xd800 && code <= 0xdfff) {
+			out += `<${code.toString(16)}>`;
+			index += 1;
+			continue;
+		}
+		if (flattenNewlines && (code === 0x0a || code === 0x0d)) {
+			out += " ";
+			index += width;
+			while (index < value.length) {
+				const next = value.codePointAt(index) ?? 0;
+				if (next !== 0x0a && next !== 0x0d) break;
+				index += next > 0xffff ? 2 : 1;
+			}
+			continue;
+		}
+		if (code === 0x0a) {
+			out += "\n";
+			index += width;
+			continue;
+		}
+		if (code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+			out += encodeApprovalControl(code);
+			index += width;
+			continue;
+		}
+		if (APPROVAL_FORMAT_RE.test(String.fromCodePoint(code))) {
+			index += width;
+			continue;
+		}
+		out += String.fromCodePoint(code);
+		index += width;
+	}
+	return out;
+}
+
+/** Encode controls before the title is cut, so an escape cannot hide the approved text. */
+function permissionPromptTitle(value: string, max?: number): string {
+	const visible = visibleApprovalText(value, true);
+	if (max === undefined || visible.length <= max) return visible;
+	return visible.slice(0, max);
+}
+
+/** Encode controls on the whole command. Line breaks stay. */
+function permissionPromptBody(value: string): string {
+	return visibleApprovalText(value, false);
+}
+
 function getPermissionIntent(
 	toolName: string,
 	args: unknown,
 ): { toolName: string; title: string; paths?: string[]; cacheKey: string } | undefined {
 	const a = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
 	if (isShellExecutionPermissionTool(toolName)) {
-		const cmd = getStringProperty(a, "command")?.slice(0, 80);
-		return { toolName, title: cmd || toolName, cacheKey: toolName };
+		const cmd = getStringProperty(a, "command");
+		const title = cmd ? permissionPromptTitle(cmd, PERMISSION_TITLE_PREVIEW) : "";
+		return { toolName, title: title || toolName, cacheKey: toolName };
 	}
 	if (toolName === "eval") {
 		const cells = Array.isArray(a.cells) ? a.cells : [];
@@ -2135,37 +2202,46 @@ function getPermissionIntent(
 		const cell = firstCell as Record<string, unknown> | undefined;
 		const title = cell ? getStringProperty(cell, "title") : undefined;
 		const language = cell ? getStringProperty(cell, "language") : undefined;
+		const cleaned = title ? permissionPromptTitle(title) : "";
 		return {
 			toolName,
-			title: title ?? (language ? `Eval ${language}` : "eval"),
+			title: cleaned || (language ? permissionPromptTitle(`Eval ${language}`) : "") || "eval",
 			cacheKey: toolName,
 		};
 	}
 	if (toolName === "python") {
 		const action = getStringProperty(a, "action");
 		if (action === "clear") return { toolName, title: "python clear", cacheKey: toolName };
-		const code = getStringProperty(a, "code")?.slice(0, 80);
-		return { toolName, title: code && code.length > 0 ? code : "python", cacheKey: toolName };
+		const code = getStringProperty(a, "code");
+		const title = code ? permissionPromptTitle(code, PERMISSION_TITLE_PREVIEW) : "";
+		return { toolName, title: title.length > 0 ? title : "python", cacheKey: toolName };
 	}
 	if (toolName === "recipe") {
-		const op = getStringProperty(a, "op")?.slice(0, 80);
-		return { toolName, title: op && op.length > 0 ? op : "recipe", cacheKey: toolName };
+		const op = getStringProperty(a, "op");
+		const title = op ? permissionPromptTitle(op, PERMISSION_TITLE_PREVIEW) : "";
+		return { toolName, title: title.length > 0 ? title : "recipe", cacheKey: toolName };
 	}
 	if (toolName === "bisect") {
-		const run = getStringProperty(a, "run")?.slice(0, 80);
-		return { toolName, title: run && run.length > 0 ? run : "bisect", cacheKey: toolName };
+		const run = getStringProperty(a, "run");
+		const title = run ? permissionPromptTitle(run, PERMISSION_TITLE_PREVIEW) : "";
+		return { toolName, title: title.length > 0 ? title : "bisect", cacheKey: toolName };
 	}
 	if (toolName === "delete") {
 		const p = getStringProperty(a, "path");
-		return { toolName, title: p ? `Delete ${p}` : toolName, paths: p ? [p] : undefined, cacheKey: toolName };
+		const title = p ? permissionPromptTitle(`Delete ${p}`) : "";
+		return { toolName, title: title || toolName, paths: p ? [p] : undefined, cacheKey: toolName };
 	}
 	if (toolName === "move") {
 		const from = getStringProperty(a, "oldPath") ?? getStringProperty(a, "path") ?? getStringProperty(a, "from");
 		const to = getStringProperty(a, "newPath") ?? getStringProperty(a, "to") ?? getStringProperty(a, "destination");
-		if (from && to) return { toolName, title: `Move ${from} to ${to}`, paths: [from, to], cacheKey: toolName };
+		if (from && to) {
+			const title = permissionPromptTitle(`Move ${from} to ${to}`);
+			return { toolName, title: title || toolName, paths: [from, to], cacheKey: toolName };
+		}
+		const title = from ? permissionPromptTitle(`Move ${from}`) : "";
 		return {
 			toolName,
-			title: from ? `Move ${from}` : toolName,
+			title: title || toolName,
 			paths: from ? [from] : undefined,
 			cacheKey: toolName,
 		};
@@ -2174,34 +2250,43 @@ function getPermissionIntent(
 		const intent = getEditDestructiveIntent(args);
 		if (!intent) return undefined;
 		if (intent.kind === "delete") {
+			const title = permissionPromptTitle(`Delete ${intent.paths[0] ?? "edit target"}`);
 			return {
 				toolName,
-				title: `Delete ${intent.paths[0] ?? "edit target"}`,
+				title: title || "edit",
 				paths: intent.paths,
 				cacheKey: "edit:delete",
 			};
 		}
 		const from = intent.paths[0];
 		const to = intent.paths[1];
+		const title = permissionPromptTitle(
+			from && to ? `Move ${from} to ${to}` : `Move ${from ?? to ?? "edit target"}`,
+		);
 		return {
 			toolName,
-			title: from && to ? `Move ${from} to ${to}` : `Move ${from ?? to ?? "edit target"}`,
+			title: title || "edit",
 			paths: intent.paths,
 			cacheKey: "edit:move",
 		};
 	}
-	if (toolName === "github") return githubPermissionIntent(args);
+	if (toolName === "github") {
+		const intent = githubPermissionIntent(args);
+		if (!intent) return undefined;
+		return { ...intent, title: permissionPromptTitle(intent.title) || "github" };
+	}
 	if (toolName === "computer") {
 		const action = getStringProperty(a, "action");
-		return { toolName, title: action ? `Computer ${action}` : toolName, cacheKey: toolName };
+		const title = action ? permissionPromptTitle(`Computer ${action}`) : "";
+		return { toolName, title: title || toolName, cacheKey: toolName };
 	}
 	if (toolName === "debug") {
 		const action = getStringProperty(a, "action");
 		if (action !== "launch" && action !== "attach") return undefined;
 		if (action === "attach") return { toolName, title: "debug attach", cacheKey: "debug" };
 		const program = getStringProperty(a, "program");
-		const title = program ? `debug launch ${program}` : "debug launch";
-		return { toolName, title: title.slice(0, 80), cacheKey: "debug" };
+		const title = permissionPromptTitle(program ? `debug launch ${program}` : "debug launch", PERMISSION_TITLE_PREVIEW);
+		return { toolName, title: title || "debug launch", cacheKey: "debug" };
 	}
 	return undefined;
 }
@@ -12695,7 +12780,12 @@ export class AgentSession {
 							? getStringProperty(args as Record<string, unknown>, "command")
 							: undefined;
 					const commandContent = command
-						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
+						? [
+								{
+									type: "content" as const,
+									content: { type: "text" as const, text: `$ ${permissionPromptBody(command)}` },
+								},
+							]
 						: target.name === "github"
 							? [{ type: "content" as const, content: { type: "text" as const, text: permissionIntent.title } }]
 							: undefined;

@@ -388,6 +388,27 @@ not settle earlier effects.
   `accepted`, `effect_started`, `awaiting_ready`, and `terminal_uncertain` legacy
   history stays fenced even for an apparently unrelated empty session. Recovery
   after restart marking a row `terminal_uncertain` is not proof of no effect.
+- `session.spawn` claim mirrors are not legacy requests. Current brokers mark
+  each mirror with `spawnAnchor: true` in its row, and a marked mirror never
+  fences, even after its claim leaves `sdk/spawn-authority.jsonl`. Mirrors
+  written by brokers that predate the marker have no durable field, position, or
+  timestamp that proves they are mirrors (in-place legacy migration rewrites
+  row timestamps), so the broker never infers them: they stay fenced like any
+  other unkeyed row.
+- Operator release of a pre-marker mirror: with the broker stopped, write
+  `sdk/lifecycle-ledger.spawn-anchor-attestation.json` as
+  `{"version":1,"identities":["<identity>", ...]}` and start the broker. List
+  only identities you can match to a `claim.lifecycleIdentity` in a preserved
+  copy of `sdk/spawn-authority.jsonl` or other first-hand evidence; listing a
+  genuine legacy request removes its fence. The broker never writes or derives
+  this file. It honors a listed identity only while that identity's entire
+  history is a single unkeyed, unmarked `accepted` row with no session target
+  and no quarantined or corruption-uncertain history; other entries, and the
+  whole file when it is malformed or cannot be read (for example a directory or
+  a file without read permission), are ignored and stay fenced. An unreadable
+  file is logged as a broker warning and never stops the broker from starting. A still-fenced
+  identity keeps returning `legacy_lifecycle_ambiguous`. Removing an identity
+  restores its fence at the next broker start.
 
 This diagnostic identifies the actual admission guard without exposing ledger
 identities, request hashes, filesystem paths, credentials, or broker free text.
@@ -415,6 +436,19 @@ requests cannot mint operator authority: copying `operator:true` and
 omitting the key, or supplying `operator:false` fails closed without invoking
 the terminal-abort surface. Non-operator terminal abort retains its existing
 connection-ownership semantics.
+
+The route reaches every session host on the current gjc, including a TUI or a
+direct CLI session the Broker did not launch. A Broker-launched host is bound by
+its lifecycle request id; any other host publishes a process-local random marker
+in its own endpoint registration in the Broker-owned session index, and the
+Broker echoes exactly that marker. The marker never appears in endpoint
+discovery, `session list`, or any SDK response, so an endpoint-token holder
+cannot forge it. When the operator abort stops a turn, the host's terminal shows
+`Turn stopped by a remote operator.` A host that published no marker (a gjc that
+predates the operator route) is refused before dispatch with
+`authorization_denied`, `outcomeCertainty: "not-applied"`, and diagnostic
+`sdk_operator_control_unsupported`; unlike `endpoint_stale`, retrying the same
+request cannot succeed until the session restarts on a current gjc.
 
 `session.get_endpoint` is refused unconditionally: endpoint credentials remain
 an SDK-core implementation detail. The raw hatch validates operation names and

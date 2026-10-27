@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -23,6 +24,16 @@ import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/s
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
+
+/** Darwin and Windows broker startup shells out for a machine id. Linux reads a file. */
+function hardwareIdToolOnPath(): boolean {
+	const name = process.platform === "win32" ? "reg.exe" : process.platform === "darwin" ? "ioreg" : "";
+	if (!name) return true;
+	return (process.env.PATH ?? "")
+		.split(path.delimiter)
+		.filter(Boolean)
+		.some(dir => existsSync(path.join(dir, name)));
+}
 
 async function withStageTimeout<T>(label: string, promise: Promise<T>, timeoutMs = 15_000): Promise<T> {
 	const timeout = Promise.withResolvers<T>();
@@ -355,7 +366,7 @@ async function deliverLeanFinalThroughProductionHost(
 	return count();
 }
 
-describe("chat daemon worker", () => {
+describe.skipIf(!hardwareIdToolOnPath())("chat daemon worker", () => {
 	let root = "";
 	afterEach(async () => {
 		if (root) await fs.rm(root, { recursive: true, force: true });
@@ -485,6 +496,11 @@ describe("chat daemon worker", () => {
 			},
 		);
 
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			'notifications:\n  discord:\n    authorizedUserId: "human"\n',
+		);
 		const replayedThread = provider.waitForThreadCount(1);
 		await runtime.start();
 		await client.waitForRequest(frame => frame.type === "event_replay");
@@ -1614,6 +1630,11 @@ describe("chat daemon worker", () => {
 						clearInterval: (() => {}) as typeof clearInterval,
 					},
 				},
+			);
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(
+				path.join(agentDir, "config.yml"),
+				'notifications:\n  discord:\n    authorizedUserId: "human"\n',
 			);
 			const replayedThread = provider.waitForThreadCount(1);
 			await runtime.start();

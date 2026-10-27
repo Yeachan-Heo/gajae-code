@@ -1,0 +1,3 @@
+### Fixed
+
+- The helpers GJC runs on its own while starting a session -- the `ps` process-identity probe behind file locks, launch-worktree reservations, the resident blob cache and `gjc harness`, the `tmux -V` multiplexer detection, the tmux window rename and its `git symbolic-ref` branch lookup, and the `lspci`/`wmic` GPU probe -- now start from the same filtered environment as the bash tool. Previously a repository `.env` declaring `LD_PRELOAD` (or another loader hook such as `LD_AUDIT` or `DYLD_INSERT_LIBRARIES`) made those helpers load a repository library as soon as `gjc` was launched in the checkout, before any prompt, including in the compiled binary.

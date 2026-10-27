@@ -15,6 +15,7 @@ import { repo } from "../../utils/git";
 import { endpointIncarnation } from "./endpoint-authority";
 import { brokerLockHostIdentity } from "./lock-host-identity";
 import { processIncarnation } from "./process-incarnation";
+import { publishableRuntimeAbortCapability } from "./runtime-abort-capability";
 import {
 	assertSupportedSessionIndexEventVersion,
 	assertSupportedSnapshotVersion,
@@ -152,6 +153,12 @@ export interface SessionIndexEvent {
 	/** Immutable endpoint file identity captured by the broker at registration. */
 	endpointFileId?: string;
 	lifecycleRequestId?: string;
+	/**
+	 * Operator-abort marker a host without a lifecycle request publishes in its own
+	 * endpoint registration (`runtime-abort-capability.ts`). Broker-private: never
+	 * returned by session list or any SDK response.
+	 */
+	abortCapability?: string;
 	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/**
@@ -182,6 +189,8 @@ export interface IndexedSession {
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
+	/** Broker-private operator-abort marker of a host without a lifecycle request. */
+	abortCapability?: string;
 	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/** True only for a terminal-uncertain claim written by a forced stale-worktree release. */
@@ -626,6 +635,7 @@ function projectIdentity(
 		endpointMtimeMs: latest.endpointMtimeMs,
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
+		...(latest.abortCapability === undefined ? {} : { abortCapability: latest.abortCapability }),
 		...(hostUnregisteredReason === undefined ? {} : { hostUnregisteredReason }),
 		terminalUncertain,
 		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
@@ -1846,6 +1856,21 @@ export class SessionIndex {
 				// persisted binding instead.
 				if (ownIncarnation !== undefined && unsigned.hostIncarnation === undefined)
 					unsigned.hostIncarnation = ownIncarnation;
+				// A host registering its own endpoint without a lifecycle request publishes
+				// its operator-abort marker, so the Broker can route an operator terminal
+				// abort to a TUI or direct CLI session (a lifecycle host proves the same
+				// routing with its lifecycle request id). Generation 0 is the transcript-only
+				// direct registration, which has no endpoint to route to.
+				if (
+					unsigned.type === "host_registered" &&
+					unsigned.pid === process.pid &&
+					unsigned.endpointGeneration > 0 &&
+					unsigned.lifecycleRequestId === undefined &&
+					unsigned.abortCapability === undefined
+				) {
+					const abortCapability = publishableRuntimeAbortCapability();
+					if (abortCapability !== undefined) unsigned.abortCapability = abortCapability;
+				}
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				const serialized = JSON.stringify(event);
 				// Publish to memory only after the complete append and fsync succeed.

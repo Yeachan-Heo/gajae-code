@@ -1,0 +1,3 @@
+### Fixed
+
+- Skills chained with the `skill` tool now reach the model in the same turn. The tool sent the callee prompt as a plain custom message, which a busy session queues as a follow-up; follow-ups are only delivered once the agent stops, so the prompt arrived after the final answer and started an extra turn that re-ran the chained workflow. For example, an autoresearch mission that had already reached a verdict and been cleared was re-activated at `intake`, and its research-only guard then blocked every write for the rest of the session. The prompt is now steered in right after the tool result, and a prompt whose preparation finishes after the run was aborted is dropped instead of restarting the stopped run.

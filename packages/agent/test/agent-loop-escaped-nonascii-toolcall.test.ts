@@ -204,7 +204,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [askTool(executed)] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				onAssistantMessageEvent: (_message, event) => {
 					if (!terminalSent) {
@@ -259,14 +259,14 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 
 		const mock = createMockModel({ responses: [{ content: [call] }, { content: ["done"] }] });
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [mutatingTool(executed)] };
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const stream = agentLoop([createUserMessage("write it")], context, config, undefined, mock.stream);
 		for await (const _event of stream) {
 			// drain
 		}
 
 		expect(executed).toEqual([{ question: QUESTION }]);
-		expect(mock.model.calls).toHaveLength(2);
+		expect(mock.calls).toHaveLength(2);
 	});
 
 	it("logs only bounded shape for in-loop discards and terminal rejection", async () => {
@@ -298,7 +298,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			const stream = agentLoop(
 				[createUserMessage("ask me")],
 				context,
-				{ model: mock.model, convertToLlm: identityConverter },
+				{ model: mock, convertToLlm: identityConverter },
 				undefined,
 				terminalOnlyStream(mock.stream),
 			);
@@ -381,7 +381,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				[createUserMessage("ask me")],
 				context,
 				{
-					model: mock.model,
+					model: mock,
 					convertToLlm: identityConverter,
 					fallbackManaged: true,
 					transientRecoveryMessage: {
@@ -440,7 +440,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			const stream = agentLoop(
 				[createUserMessage("ask me")],
 				context,
-				{ model: mock.model, convertToLlm: identityConverter },
+				{ model: mock, convertToLlm: identityConverter },
 				undefined,
 				terminalOnlyStream(mock.stream),
 			);
@@ -464,7 +464,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({
 			responses: [thinkingToolTurn("tc-1", true), literalTurn("tc-2"), { content: ["done"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const publishedAssistants: AssistantMessage[] = [];
@@ -489,7 +489,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(toolResults[0].isError).toBeFalsy();
 		// The resample must not replay the escaped arguments back to the model as
 		// its own prior output: the retried request carries no assistant turn.
-		const resampleRequest = mock.model.calls[1];
+		const resampleRequest = mock.calls[1];
 		expect(resampleRequest).toBeDefined();
 		expect(resampleRequest.context.messages.some(message => message.role === "assistant")).toBe(false);
 		expect(publishedAssistants).toHaveLength(2);
@@ -509,7 +509,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({
 			responses: [escapedTurn("tc-1"), literalTurn("tc-2"), { content: ["done"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
@@ -525,7 +525,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		// The resample request names the defect: a deterministic escaper
 		// reproduces the identical `\uXXXX` spelling on a blind re-request, so
 		// the retry must carry the steering instruction.
-		const resampleRequest = mock.model.calls[1];
+		const resampleRequest = mock.calls[1];
 		expect(resampleRequest).toBeDefined();
 		const steering = resampleRequest.context.messages.filter(
 			message =>
@@ -547,7 +547,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 					message.content.includes("literal UTF-8"),
 			),
 		).toBe(false);
-		const followUpRequest = mock.model.calls[2];
+		const followUpRequest = mock.calls[2];
 		expect(followUpRequest).toBeDefined();
 		expect(
 			followUpRequest.context.messages.filter(
@@ -567,7 +567,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const agent = new Agent({
 			initialState: {
 				systemPrompt: [""],
-				model: mock.model,
+				model: mock,
 				tools: [askTool(executed)],
 				messages: [],
 			},
@@ -616,7 +616,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			responses: [thinkingToolTurn("tc-accepted"), { content: ["done"] }],
 		});
 		const agent = new Agent({
-			initialState: { systemPrompt: [""], model: mock.model, tools: [askTool(executed)], messages: [] },
+			initialState: { systemPrompt: [""], model: mock, tools: [askTool(executed)], messages: [] },
 			convertToLlm: identityConverter,
 			streamFn: mock.stream,
 		});
@@ -674,7 +674,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			tools: [askTool(executed)],
 		};
 		const mock = createMockModel({ responses: [escapedTurn("tc-1"), literalTurn("tc-2"), { content: ["done"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
@@ -704,7 +704,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			const executed: Array<Record<string, unknown>> = [];
 			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
 			const mock = createMockModel({ responses: [escapedTurn(`tc-${stopReason}`, stopReason)] });
-			const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+			const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 			const events: AgentEvent[] = [];
 
 			const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
@@ -726,7 +726,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
 		const mock = createMockModel({ responses: [escapedTurnWithText("tc-visible"), { content: ["done"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const toolEnds: AgentEvent[] = [];
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
@@ -744,7 +744,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({ responses: [escapedTurnWithText("tc-visible"), { content: ["done"] }] });
 		const callbackTypes: string[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onAssistantMessageEvent: (_message, event) => callbackTypes.push(event.type),
 		};
@@ -782,7 +782,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const toolEvents: AgentEvent[] = [];
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
@@ -832,7 +832,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			[createUserMessage("ask me")],
 			context,
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 			},
 			undefined,
@@ -851,7 +851,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({
 			responses: [escapedTurn("tc-1"), escapedTurn("tc-2"), literalTurn("tc-3"), { content: ["done"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const toolEnds: AgentEvent[] = [];
 
 		const stream = agentLoop(
@@ -883,7 +883,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop(
 			[createUserMessage("ask twice")],
@@ -909,7 +909,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			responses: [escapedTurn("tc-1"), literalTurn("tc-2"), { content: ["done"] }],
 		});
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			getToolChoice: () => {
 				getterCalls += 1;
@@ -944,7 +944,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		};
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
 		const mock = createMockModel({ responses: [literalTurn("tc-live"), { content: ["done"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
 
 		for await (const event of stream) {
@@ -970,7 +970,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const controller = new AbortController();
 		const events: AgentEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onAssistantMessageEvent: (_message, event) => {
 				if (event.type === "toolcall_end") controller.abort();
@@ -1013,7 +1013,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const callbackTypes: string[] = [];
 		const events: AgentEvent[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			onAssistantMessageEvent: (_message, event) => {
 				callbackTypes.push(event.type);
@@ -1062,7 +1062,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({ responses: [literalTurnWithText("tc-consumer-abort")] });
 		const controller = new AbortController();
 		const events: AgentEvent[] = [];
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
 		for await (const event of stream) {
@@ -1095,9 +1095,9 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const providerOwned: AssistantMessage = {
 			role: "assistant",
 			content: thinkingToolTurn("tc-detached").content,
-			api: mock.model.api,
-			provider: mock.model.provider,
-			model: mock.model.id,
+			api: mock.api,
+			provider: mock.provider,
+			model: mock.id,
 			usage: structuredClone(PROVIDER_USAGE),
 			stopReason: "toolUse",
 			responseId: "provider-response-id",
@@ -1107,7 +1107,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		};
 		let calls = 0;
 		const streamFn: typeof mock.stream = (_model, llmContext, options) => {
-			if (calls++ > 0) return mock.stream(mock.model, llmContext, options);
+			if (calls++ > 0) return mock.stream(mock, llmContext, options);
 			const providerStream = new AssistantMessageEventStream();
 			queueMicrotask(() => {
 				providerStream.push({ type: "start", partial: providerOwned });
@@ -1139,7 +1139,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			return providerStream;
 		};
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, streamFn);
 		for await (const _event of stream) {
@@ -1179,9 +1179,9 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				const failure: AssistantMessage = {
 					role: "assistant",
 					content: [],
-					api: mock.model.api,
-					provider: mock.model.provider,
-					model: mock.model.id,
+					api: mock.api,
+					provider: mock.provider,
+					model: mock.id,
 					usage: structuredClone(PROVIDER_USAGE),
 					stopReason: "error",
 					errorMessage: "rate limited",
@@ -1198,7 +1198,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			return providerStream;
 		};
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, streamFn);
 		for await (const _event of stream) {
@@ -1221,7 +1221,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({
 			responses: [escapedTurn("tc-1"), escapedTurn("tc-2"), escapedTurn("tc-3"), { content: ["recovered"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop(
@@ -1257,7 +1257,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				return escapedTurn(`tc-${calls}`);
 			},
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
 		for await (const _event of stream) {
@@ -1280,7 +1280,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({ responses: [escapedTurn("tc-managed"), { content: ["done"] }] });
 		const outcomes: ManagedAttemptOutcome[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			fallbackManaged: true,
 			onManagedAttemptOutcome: outcome => {
@@ -1308,7 +1308,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		}
 		expect(executed).toHaveLength(0);
 		expect(toolResults).toHaveLength(0);
-		const replayRequest = mock.model.calls.at(-1)?.context.messages;
+		const replayRequest = mock.calls.at(-1)?.context.messages;
 		expect(replayRequest?.some(message => message.role === "assistant")).toBe(false);
 	});
 
@@ -1336,7 +1336,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool([])] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				fallbackManaged: true,
 				onManagedAttemptOutcome: outcome => {
@@ -1382,7 +1382,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool([])] },
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				fallbackManaged: true,
 			},
@@ -1440,7 +1440,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			[createUserMessage("ask me")],
 			context,
 			{
-				model: mock.model,
+				model: mock,
 				convertToLlm: identityConverter,
 				fallbackManaged: true,
 				onManagedAttemptOutcome: outcome => {
@@ -1475,7 +1475,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({ responses: [escapedTurn("tc-managed-1"), literalTurn("tc-managed-2")] });
 		const outcomes: ManagedAttemptOutcome[] = [];
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			fallbackManaged: true,
 			onManagedAttemptOutcome: outcome => {
@@ -1497,7 +1497,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(outcomes).toHaveLength(1);
 		expect(outcomes[0].type).toBe("escaped_arguments_discarded");
 		expect(executed).toEqual([]);
-		expect(mock.model.calls).toHaveLength(1);
+		expect(mock.calls).toHaveLength(1);
 	});
 
 	it("stops resampling in managed fallback once the budget is spent", async () => {
@@ -1509,7 +1509,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const outcomes: ManagedAttemptOutcome[] = [];
 		let continuations = 0;
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: mock,
 			convertToLlm: identityConverter,
 			fallbackManaged: true,
 			onManagedAttemptOutcome: outcome => {
@@ -1555,7 +1555,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				return escapedTurn(`tc-${calls}`);
 			},
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
@@ -1594,7 +1594,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({
 			responses: [emDashEscapedTurn("tc-1"), { content: ["done"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 		const warnings: Array<{ message: string; context?: Record<string, unknown> }> = [];
 		const warn = vi.spyOn(logger, "warn").mockImplementation((message, logContext) => {
 			warnings.push({ message, context: logContext });
@@ -1662,7 +1662,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
 			context,
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			mock.stream,
 		);
@@ -1725,7 +1725,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [tool] },
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			mock.stream,
 		);
@@ -1759,7 +1759,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] },
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			mock.stream,
 		);
@@ -1802,7 +1802,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] },
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			mock.stream,
 		);
@@ -1842,7 +1842,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			const stream = agentLoop(
 				[createUserMessage("ask me")],
 				context,
-				{ model: mock.model, convertToLlm: identityConverter },
+				{ model: mock, convertToLlm: identityConverter },
 				undefined,
 				mock.stream,
 			);
@@ -1888,7 +1888,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				[createUserMessage("ask me")],
 				context,
 				{
-					model: mock.model,
+					model: mock,
 					convertToLlm: identityConverter,
 					fallbackManaged: true,
 					onManagedAttemptOutcome: outcome => {
@@ -1948,7 +1948,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			const stream = agentLoop(
 				[createUserMessage("ask me")],
 				context,
-				{ model: mock.model, convertToLlm: identityConverter },
+				{ model: mock, convertToLlm: identityConverter },
 				undefined,
 				mock.stream,
 			);
@@ -1979,7 +1979,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] },
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			mock.stream,
 		);
@@ -2023,7 +2023,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
 			{ systemPrompt: [""], messages: [], tools: [tool] },
-			{ model: mock.model, convertToLlm: identityConverter },
+			{ model: mock, convertToLlm: identityConverter },
 			undefined,
 			mock.stream,
 		);
@@ -2056,7 +2056,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({
 			responses: [metaTurn("tc-1"), metaTurn("tc-2"), metaTurn("tc-3"), { content: ["done"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
@@ -2088,7 +2088,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				{ content: ["done"] },
 			],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
@@ -2129,7 +2129,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const mock = createMockModel({
 			responses: [enDashTurn("tc-1"), enDashTurn("tc-2"), enDashTurn("tc-3"), { content: ["done"] }],
 		});
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
@@ -2178,7 +2178,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			const mock = createMockModel({
 				responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
 			});
-			const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+			const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 			const toolResults: Array<{ isError?: boolean; text: string }> = [];
 			const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
@@ -2207,7 +2207,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
 		const mock = createMockModel({ responses: [literalTurn("tc-1"), { content: ["done"] }] });
-		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const config: AgentLoopConfig = { model: mock, convertToLlm: identityConverter };
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
 		for await (const _ of stream) {

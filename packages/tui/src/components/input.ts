@@ -37,6 +37,7 @@ export class Input implements Component, Focusable {
 	#cursor: number = 0; // Cursor position in the value
 	onSubmit?: (value: string) => void;
 	onEscape?: () => void;
+	onEdit?: () => void;
 
 	/** Focusable interface - set by TUI when focus changes */
 	focused: boolean = false;
@@ -50,6 +51,9 @@ export class Input implements Component, Focusable {
 
 	// Undo support
 	#undoStack: InputState[] = [];
+	// The stack only appends during a yank chain; undo and resets end the chain.
+	// Keep an index to the existing snapshot without retaining another value copy.
+	#yankUndoIndex = -1;
 
 	getValue(): string {
 		return this.#value;
@@ -60,6 +64,12 @@ export class Input implements Component, Focusable {
 		this.#value = normalized;
 		this.#cursor = normalized.length;
 		this.#lastAction = null;
+	}
+
+	#put(value: string, cursor: number): void {
+		if (value !== this.#value) this.onEdit?.();
+		this.#value = value;
+		this.#cursor = cursor;
 	}
 
 	handleInput(data: string): void {
@@ -200,8 +210,7 @@ export class Input implements Component, Focusable {
 		this.#lastAction = "type-word";
 
 		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
+		this.#put(inserted.value, inserted.cursor);
 	}
 
 	#handleBackspace(): void {
@@ -217,8 +226,8 @@ export class Input implements Component, Focusable {
 		const lastGrapheme = graphemes[graphemes.length - 1];
 		const graphemeLength = lastGrapheme ? lastGrapheme.segment.length : 1;
 
-		this.#value = this.#value.slice(0, this.#cursor - graphemeLength) + this.#value.slice(this.#cursor);
-		this.#cursor -= graphemeLength;
+		const next = this.#value.slice(0, this.#cursor - graphemeLength) + this.#value.slice(this.#cursor);
+		this.#put(next, this.#cursor - graphemeLength);
 	}
 
 	#handleForwardDelete(): void {
@@ -233,7 +242,7 @@ export class Input implements Component, Focusable {
 		const firstGrapheme = segmenter.segment(afterCursor)[Symbol.iterator]().next().value;
 		const graphemeLength = firstGrapheme ? firstGrapheme.segment.length : 1;
 
-		this.#value = this.#value.slice(0, this.#cursor) + this.#value.slice(this.#cursor + graphemeLength);
+		this.#put(this.#value.slice(0, this.#cursor) + this.#value.slice(this.#cursor + graphemeLength), this.#cursor);
 	}
 
 	#deleteToLineStart(): void {
@@ -246,8 +255,7 @@ export class Input implements Component, Focusable {
 		this.#killRing.push(deletedText, { prepend: true, accumulate: this.#lastAction === "kill" });
 		this.#lastAction = "kill";
 
-		this.#value = this.#value.slice(this.#cursor);
-		this.#cursor = 0;
+		this.#put(this.#value.slice(this.#cursor), 0);
 	}
 
 	#deleteToLineEnd(): void {
@@ -260,7 +268,7 @@ export class Input implements Component, Focusable {
 		this.#killRing.push(deletedText, { prepend: false, accumulate: this.#lastAction === "kill" });
 		this.#lastAction = "kill";
 
-		this.#value = this.#value.slice(0, this.#cursor);
+		this.#put(this.#value.slice(0, this.#cursor), this.#cursor);
 	}
 
 	#deleteWordBackwards(): void {
@@ -281,8 +289,7 @@ export class Input implements Component, Focusable {
 		this.#killRing.push(deletedText, { prepend: true, accumulate: wasKill });
 		this.#lastAction = "kill";
 
-		this.#value = this.#value.slice(0, deleteFrom) + this.#value.slice(this.#cursor);
-		this.#cursor = deleteFrom;
+		this.#put(this.#value.slice(0, deleteFrom) + this.#value.slice(this.#cursor), deleteFrom);
 	}
 
 	#deleteWordForward(): void {
@@ -303,7 +310,7 @@ export class Input implements Component, Focusable {
 		this.#killRing.push(deletedText, { prepend: false, accumulate: wasKill });
 		this.#lastAction = "kill";
 
-		this.#value = this.#value.slice(0, this.#cursor) + this.#value.slice(deleteTo);
+		this.#put(this.#value.slice(0, this.#cursor) + this.#value.slice(deleteTo), this.#cursor);
 	}
 
 	#yank(): void {
@@ -313,9 +320,9 @@ export class Input implements Component, Focusable {
 		}
 
 		this.#pushUndo();
+		this.#yankUndoIndex = this.#undoStack.length - 1;
 		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
+		this.#put(inserted.value, inserted.cursor);
 		this.#lastAction = "yank";
 	}
 
@@ -324,17 +331,16 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
+		const beforeYank = this.#undoStack[this.#yankUndoIndex];
+		if (!beforeYank) return;
 		this.#pushUndo();
 
-		const prevText = this.#killRing.peek() ?? "";
-		this.#value = this.#value.slice(0, this.#cursor - prevText.length) + this.#value.slice(this.#cursor);
-		this.#cursor -= prevText.length;
+		this.#put(beforeYank.value, beforeYank.cursor);
 
 		this.#killRing.rotate();
 		const text = this.#killRing.peek() ?? "";
 		const inserted = insertTextNfcAt(this.#value, this.#cursor, text);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
+		this.#put(inserted.value, inserted.cursor);
 		this.#lastAction = "yank";
 	}
 
@@ -347,8 +353,7 @@ export class Input implements Component, Focusable {
 		if (!snapshot) {
 			return;
 		}
-		this.#value = snapshot.value;
-		this.#cursor = snapshot.cursor;
+		this.#put(snapshot.value, snapshot.cursor);
 		this.#lastAction = null;
 	}
 
@@ -390,8 +395,7 @@ export class Input implements Component, Focusable {
 
 		// Insert at cursor position
 		const inserted = insertTextNfcAt(this.#value, this.#cursor, cleanText);
-		this.#value = inserted.value;
-		this.#cursor = inserted.cursor;
+		this.#put(inserted.value, inserted.cursor);
 	}
 
 	invalidate(): void {

@@ -1071,6 +1071,8 @@ type BrokerSessionControlRequest = {
 
 type BrokerSessionControlAuthority = {
 	record: IndexedSession;
+	/** Value the session runtime's operator-abort gate expects; see `sessionAbortCapability`. */
+	abortCapability: string;
 	endpoint: Record<string, unknown>;
 	endpointIdentity: {
 		dev: bigint;
@@ -1121,6 +1123,24 @@ function brokerControlResponse(value: unknown): BrokerResponse {
 	return { ok: false, error: { code, message } };
 }
 
+/**
+ * The operator-abort marker the session's runtime expects from the Broker.
+ *
+ * A Broker-launched host expects its lifecycle request id. A TUI or direct CLI host
+ * has none and expects the marker it published in its own endpoint registration.
+ * Either way the value is read only from broker-owned index state; a session that
+ * published neither cannot be reached by the operator route.
+ */
+function sessionAbortCapability(record: IndexedSession): string | undefined {
+	const capability = record.lifecycleRequestId ?? record.abortCapability;
+	return typeof capability === "string" &&
+		capability.length > 0 &&
+		capability.length <= 128 &&
+		/^[A-Za-z0-9._-]+$/u.test(capability)
+		? capability
+		: undefined;
+}
+
 function sameSessionControlAuthority(
 	left: BrokerSessionControlAuthority,
 	right: BrokerSessionControlAuthority,
@@ -1130,6 +1150,7 @@ function sameSessionControlAuthority(
 		left.record.processIncarnation === right.record.processIncarnation &&
 		left.record.hostIncarnation === right.record.hostIncarnation &&
 		left.record.lifecycleRequestId === right.record.lifecycleRequestId &&
+		left.abortCapability === right.abortCapability &&
 		endpointIncarnation(left.record, left.record.sessionId) ===
 			endpointIncarnation(right.record, right.record.sessionId) &&
 		left.endpoint.sessionId === right.endpoint.sessionId &&
@@ -1985,7 +2006,7 @@ export class Broker {
 		setOwner(true);
 		inFlight.claimId = decision.claim.claimId;
 		inFlight.phase = decision.claim.state;
-		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
+		await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac, { spawnAnchor: true });
 		return await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery);
 	}
 
@@ -4335,7 +4356,7 @@ export class Broker {
 			await this.#spawnAuthority.open();
 			for (const claim of this.#spawnAuthority.claims()) {
 				const mirror = this.ledger.get(claim.lifecycleIdentity);
-				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac);
+				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac, { spawnAnchor: true });
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
@@ -5057,13 +5078,15 @@ export class Broker {
 			indexed.endpointMtimeMs === undefined ||
 			!Number.isFinite(indexed.endpointMtimeMs) ||
 			indexed.endpointMtimeMs <= 0 ||
-			typeof indexed.lifecycleRequestId !== "string" ||
-			indexed.lifecycleRequestId.length === 0 ||
-			indexed.lifecycleRequestId.length > 128 ||
-			!/^[A-Za-z0-9._-]+$/u.test(indexed.lifecycleRequestId) ||
 			endpointIncarnation(indexed, indexed.sessionId) === undefined
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const abortCapability = sessionAbortCapability(indexed);
+		// The endpoint itself is current; only its host never published operator
+		// authority (a gjc that predates the operator route). Retrying cannot help, so
+		// this must not read as a stale endpoint.
+		if (abortCapability === undefined)
+			return error("operator_control_unsupported", "session host does not publish operator control authority");
 		let endpointResponse: BrokerResponse;
 		try {
 			endpointResponse = await this.#readEndpoint(indexed, {});
@@ -5090,6 +5113,7 @@ export class Broker {
 			if (!endpointIdentity.isFile()) return error("endpoint_stale", "session endpoint is not a regular file");
 			return {
 				record: indexed,
+				abortCapability,
 				endpoint,
 				endpointIdentity: {
 					dev: endpointIdentity.dev,
@@ -5145,7 +5169,7 @@ export class Broker {
 					"turn.abort",
 					{
 						...request.abortInput,
-						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.record.lifecycleRequestId,
+						[BROKER_RUNTIME_ABORT_CAPABILITY_FIELD]: authority.abortCapability,
 					},
 					{
 						confirm: true,
@@ -5247,7 +5271,11 @@ export class Broker {
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
-			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			const {
+				lifecycleRequestId: _lifecycleRequestId,
+				abortCapability: _abortCapability,
+				...publicSession
+			} = session;
 			const incarnation = endpointIncarnation(session, session.sessionId);
 			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
 		});

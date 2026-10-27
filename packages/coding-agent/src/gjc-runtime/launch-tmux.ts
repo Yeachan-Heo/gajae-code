@@ -6,6 +6,7 @@ import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import type { Args } from "../cli/args";
 import { prepareManagedDirectoryRoot } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
@@ -853,7 +854,7 @@ function renameExistingTmuxWindowIfNeeded(context: TmuxLaunchContext): void {
 	const spawnSync = context.spawnSync ?? defaultSpawnSync;
 	renameExistingTmuxWindow(tmuxCommand, paneId, title, spawnSync, {
 		cwd,
-		env,
+		env: context.env ?? projectSafeSpawnEnv(),
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -865,6 +866,7 @@ function readCurrentBranch(cwd: string): string | null {
 	try {
 		const result = Bun.spawnSync(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
 			cwd,
+			env: projectSafeSpawnEnv(),
 			stdout: "pipe",
 			stderr: "ignore",
 		});
