@@ -27,7 +27,6 @@ export function sanitizeStatusLineText(text: string): string {
 	return text
 		.replace(/[\r\n\t]+/gu, " ")
 		.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "")
-		// Strip OSC sequences EXCEPT well-formed OSC 8 hyperlinks (\x1b]8;...ST)
 		.replace(/\x1b\](?!8;)[^\x1b\x07]*(?:\x07|\x1b\\)/gu, "")
 		.replace(/\u009d(?!8;)[^\u009c\x07]*(?:\u009c|\x07)/gu, "")
 		.replace(/\x1bP[\s\S]*?(?:\x1b\\|\x07)/gu, "")
@@ -35,7 +34,6 @@ export function sanitizeStatusLineText(text: string): string {
 		.replace(/\x1b\[[0-?]*[ -/]*[@-ln-~]/gu, "")
 		.replace(/\u009b[0-?]*[ -/]*[@-ln-~]/gu, "")
 		.replace(/[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]/gu, "")
-		// Preserve SGR (ESC[...m), OSC 8 (ESC]8;...), and ST (ESC\)
 		.replace(/\x1b(?!\[[\d;:]*m|\]8;|\\)/gu, "")
 		.replace(/[\x80-\x9c\x9e-\x9f]/gu, "")
 		.replace(/\u009d(?!8;)/gu, "");
