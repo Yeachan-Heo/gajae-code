@@ -57,3 +57,7 @@ summary { cursor:pointer; padding:8px 0; overflow-wrap:anywhere; }
 .showcase { max-width:900px; margin:0 auto; padding:32px 24px; }.showcase>section { margin:24px 0; padding:24px; border:1px solid var(--border); border-radius:14px; }.showcase .composer { margin:16px 0; }.showcase .session-row { max-width:360px; }
 @media(max-width:759px) { .desktop-sidebar { display:none; }.mobile-only { display:inline-flex; }.toolbar { padding:8px 12px; }.conversation { padding:8px 16px; }.composer-area { padding:8px 12px 16px; }.sidebar-drawer nav { max-height:60dvh; overflow:auto; }.showcase { padding:16px 8px; }.showcase>section { padding:16px; } }
 @media(prefers-reduced-motion:reduce) { *,*::before,*::after { transition:none !important; scroll-behavior:auto !important; } }
+.history-list { display:flex; flex-direction:column; gap:12px; max-height:60dvh; overflow:auto; }
+.command-run { display:flex; flex-wrap:wrap; gap:8px; align-items:end; }
+.command-run input { flex:1 1 240px; min-width:0; }
+.command-list small { color:var(--muted); }

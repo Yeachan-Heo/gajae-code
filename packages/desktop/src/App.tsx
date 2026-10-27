@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+	DesktopCommand,
+	DesktopCommandResult,
 	DesktopDiff,
 	DesktopFrame,
+	DesktopHistory,
 	DesktopMethod,
 	DesktopSession,
 	DesktopSetting,
@@ -12,7 +15,7 @@ import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow
 import { OAuthSettings } from "./OAuthSettings";
 import "./styles.css";
 
-type Dialog = "settings" | "commands" | "rename" | "delete" | "tools" | "goal" | "result" | null;
+type Dialog = "settings" | "commands" | "history" | "rename" | "delete" | "tools" | "goal" | "result" | null;
 const textOf = (value: unknown) =>
 	typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "결과 없음");
 
@@ -56,6 +59,12 @@ export default function App() {
 	const [activeTools, setActiveTools] = useState<string[]>([]);
 	const [filter, setFilter] = useState("");
 	const [historyLimit, setHistoryLimit] = useState(100);
+	const [commandList, setCommandList] = useState<DesktopCommand[]>([]);
+	const [commandInput, setCommandInput] = useState("");
+	const [commandOutput, setCommandOutput] = useState("");
+	const [history, setHistory] = useState<DesktopHistory | null>(null);
+	const [deliverAs, setDeliverAs] = useState<"steer" | "followUp">("steer");
+	const commandInputRef = useRef<HTMLInputElement>(null);
 	const conversation = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const session = snapshot?.sessions.find(item => item.id === selected);
@@ -160,7 +169,7 @@ export default function App() {
 			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
 				event.preventDefault();
 				if (dialog) closeDialog();
-				else setDialog("commands");
+				else openCommands();
 			}
 			if (event.key === "Escape") {
 				setSidebar(false);
@@ -247,13 +256,79 @@ export default function App() {
 		});
 	};
 	const send = () => {
-		if (!session || !connected || session.status === "running" || session.status === "waiting") return;
+		if (!session || !connected) return;
 		const sessionId = session.id;
 		const text = drafts[sessionId] || "";
 		if (!text.trim()) return;
+		const queued = session.status === "running" || session.status === "waiting";
 		void run(sessionId, async () => {
-			await request("prompt", { sessionId, text });
+			const result = await request<{ queued?: boolean }>("prompt", {
+				sessionId,
+				text,
+				...(queued ? { deliverAs } : {}),
+			});
 			setDrafts(previous => (previous[sessionId] === text ? { ...previous, [sessionId]: "" } : previous));
+			if (result?.queued) setNotice("실행 중인 작업에 대기열로 추가했습니다.");
+		});
+	};
+	const openCommands = () => {
+		const generation = setDialog("commands");
+		setFilter("");
+		setCommandInput("");
+		setCommandOutput("");
+		void run("commands", async () => {
+			const value = await request<DesktopCommand[]>("command.list");
+			if (dialogGeneration.current === generation) setCommandList(value);
+		});
+	};
+	const runCommand = (text: string) => {
+		const sessionId = dialogOwner || selected;
+		if (!sessionId || !text.trim()) return;
+		const generation = dialogGeneration.current;
+		void run(`command:${sessionId}`, async () => {
+			const result = await request<DesktopCommandResult>("command.run", { sessionId, text });
+			if (dialogGeneration.current !== generation) return;
+			setCommandOutput(
+				[
+					result.output,
+					result.prompt
+						? `모델로 전달한 입력: ${result.prompt}`
+						: result.consumed
+							? "명령을 실행했습니다."
+							: "내장 명령이 아니므로 모델에 메시지로 전달했습니다.",
+					result.outputTruncated ? "출력이 길어 일부만 표시했습니다." : "",
+				]
+					.filter(Boolean)
+					.join("\n\n"),
+			);
+		});
+	};
+	const openHistory = () => {
+		const sessionId = selected;
+		const generation = setDialog("history");
+		setHistory(null);
+		void run(`history:${sessionId}`, async () => {
+			const value = await request<DesktopHistory>("history.get", { sessionId, offset: 0, limit: 500 });
+			if (dialogGeneration.current === generation) setHistory(value);
+		});
+	};
+	const loadMoreHistory = () => {
+		const sessionId = dialogOwner;
+		if (!history) return;
+		const generation = dialogGeneration.current;
+		const offset = history.offset + history.messages.length;
+		void run(`history:${sessionId}`, async () => {
+			const value = await request<DesktopHistory>("history.get", {
+				sessionId,
+				offset,
+				limit: 500,
+			});
+			if (dialogGeneration.current !== generation) return;
+			setHistory(previous =>
+				previous
+					? { ...value, offset: previous.offset, messages: [...previous.messages, ...value.messages] }
+					: value,
+			);
 		});
 	};
 	useEffect(() => {
@@ -484,9 +559,14 @@ export default function App() {
 							<Button aria-pressed={review} disabled={!connected} onClick={() => setReview(!review)}>
 								변경 검토
 							</Button>
+							<Button disabled={!connected} onClick={openHistory}>
+								전체 기록
+							</Button>
 						</>
 					)}
-					<Button onClick={() => setDialog("commands")}>명령</Button>
+					<Button disabled={!connected} onClick={openCommands}>
+						명령
+					</Button>
 				</header>
 				{connection &&
 					(fatal ? (
@@ -519,9 +599,7 @@ export default function App() {
 							}}
 						>
 							{session.historyTruncated && (
-								<p className="muted">
-									최근 기록만 표시합니다. 전체 기록은 명령 메뉴의 대화 내보내기에서 확인하세요.
-								</p>
+								<p className="muted">최근 기록만 표시합니다. 위의 ‘전체 기록’에서 모두 확인할 수 있습니다.</p>
 							)}
 							{session.messages.length > historyLimit && (
 								<Button onClick={() => setHistoryLimit(value => value + 100)}>이전 메시지 100개 더 보기</Button>
@@ -572,7 +650,9 @@ export default function App() {
 								onChange={value => setDrafts(previous => ({ ...previous, [selected]: value }))}
 								onSend={send}
 								onStop={() => void call("abort", { sessionId: selected }, `abort:${selected}`)}
-								busy={!!pending[selected] || session.status === "running" || session.status === "waiting"}
+								busy={session.status === "running" || session.status === "waiting"}
+								deliverAs={deliverAs}
+								onDeliverAs={setDeliverAs}
 								disabled={!connected}
 							/>
 						</div>
@@ -603,6 +683,7 @@ export default function App() {
 						{
 							settings: "설정",
 							commands: "명령",
+							history: "전체 기록",
 							rename: "대화 이름 변경",
 							delete: "대화 삭제",
 							tools: "활성 도구",
@@ -716,8 +797,36 @@ export default function App() {
 					)}
 					{dialog === "commands" && (
 						<>
+							<p className="muted">
+								TUI와 같은 내장 슬래시 명령을 그대로 실행합니다. 내장 명령이 아니면 메시지로 모델에 전달됩니다.
+							</p>
 							<label htmlFor="command-search">명령 검색</label>
 							<input id="command-search" value={filter} onChange={event => setFilter(event.target.value)} />
+							<form
+								className="command-run"
+								onSubmit={event => {
+									event.preventDefault();
+									runCommand(commandInput);
+								}}
+							>
+								<label htmlFor="command-input">명령 실행</label>
+								<input
+									id="command-input"
+									ref={commandInputRef}
+									value={commandInput}
+									placeholder="/help"
+									onChange={event => setCommandInput(event.target.value)}
+								/>
+								<Button
+									type="submit"
+									disabled={
+										!connected || !selected || !commandInput.trim() || !!pending[`command:${dialogOwner}`]
+									}
+								>
+									실행
+								</Button>
+							</form>
+							{commandOutput && <pre className="bounded-output">{commandOutput}</pre>}
 							<div className="command-list">
 								{commands
 									.filter(command => command.label.toLowerCase().includes(filter.toLowerCase()))
@@ -734,18 +843,54 @@ export default function App() {
 											{command.label}
 										</Button>
 									))}
-								{snapshot?.capabilities
-									.filter(
-										capability =>
-											!capability.available && capability.label.toLowerCase().includes(filter.toLowerCase()),
+							</div>
+							<h3>GJC 슬래시 명령 {commandList.length > 0 && `(${commandList.length})`}</h3>
+							<div className="command-list">
+								{commandList
+									.filter(command =>
+										`${command.name} ${command.description}`.toLowerCase().includes(filter.toLowerCase()),
 									)
-									.map(capability => (
-										<div className="capability" key={capability.id}>
-											<strong>{capability.label} · 사용 불가</strong>
-											<small>{capability.reason || "공개 SDK 지원 대기 · #7322"}</small>
-										</div>
+									.map(command => (
+										<Button
+											key={command.name}
+											title={command.description}
+											disabled={!connected || !selected}
+											onClick={() => {
+												const text = command.hint ? `/${command.name} ` : `/${command.name}`;
+												setCommandInput(text);
+												commandInputRef.current?.focus();
+											}}
+										>
+											<code>/{command.name}</code> <small>{command.description}</small>
+										</Button>
 									))}
 							</div>
+							{snapshot?.capabilities
+								.filter(capability => !capability.available)
+								.map(capability => (
+									<div className="capability" key={capability.id}>
+										<strong>{capability.label} · 사용 불가</strong>
+										<small>{capability.reason || "공개 SDK 지원 대기 · #7322"}</small>
+									</div>
+								))}
+						</>
+					)}
+					{dialog === "history" && history === null && <p>전체 기록 불러오는 중…</p>}
+					{dialog === "history" && history !== null && (
+						<>
+							<p className="muted">
+								전체 {history.total}개 중 {history.messages.length}개를 표시합니다.
+							</p>
+							<div className="history-list">
+								{history.messages.map(message => (
+									<Message key={message.id} message={message} />
+								))}
+							</div>
+							{history.truncated && (
+								<Button disabled={pending[`history:${dialogOwner}`]} onClick={loadMoreHistory}>
+									다음 500개 불러오기
+								</Button>
+							)}
 						</>
 					)}
 					{dialog === "rename" && (

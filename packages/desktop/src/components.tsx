@@ -73,6 +73,8 @@ export function Composer({
 	onStop,
 	busy,
 	disabled,
+	deliverAs,
+	onDeliverAs,
 }: {
 	value: string;
 	onChange: (value: string) => void;
@@ -80,8 +82,11 @@ export function Composer({
 	onStop: () => void;
 	busy: boolean;
 	disabled?: boolean;
+	deliverAs?: "steer" | "followUp";
+	onDeliverAs?: (value: "steer" | "followUp") => void;
 }) {
 	const id = useId();
+	const deliverId = useId();
 	return (
 		<form
 			className="composer"
@@ -105,7 +110,6 @@ export function Composer({
 						event.key === "Enter" &&
 						(event.metaKey || event.ctrlKey) &&
 						!event.nativeEvent.isComposing &&
-						!busy &&
 						!disabled &&
 						value.trim()
 					) {
@@ -116,15 +120,27 @@ export function Composer({
 			/>
 			<div className="composer-actions">
 				<small>⌘ / Ctrl + Enter로 보내기</small>
-				{busy ? (
+				{busy && onDeliverAs && (
+					<>
+						<label htmlFor={deliverId}>실행 중 입력</label>
+						<select
+							id={deliverId}
+							value={deliverAs ?? "steer"}
+							onChange={event => onDeliverAs(event.target.value === "followUp" ? "followUp" : "steer")}
+						>
+							<option value="steer">작업에 개입</option>
+							<option value="followUp">끝난 뒤 후속</option>
+						</select>
+					</>
+				)}
+				{busy && (
 					<Button onClick={onStop} disabled={disabled}>
 						작업 중지
 					</Button>
-				) : (
-					<Button type="submit" className="primary" disabled={disabled || !value.trim()}>
-						보내기
-					</Button>
 				)}
+				<Button type="submit" className="primary" disabled={disabled || !value.trim()}>
+					{busy ? "대기열에 추가" : "보내기"}
+				</Button>
 			</div>
 		</form>
 	);
