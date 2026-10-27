@@ -514,7 +514,13 @@ function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
 		const resolvedEntrypoint = pathModule.isAbsolute(entrypoint)
 			? entrypoint
 			: pathModule.resolve(context.cwd, entrypoint);
-		return [executable, resolvedEntrypoint];
+		// A macOS managed pane process must stay the pinned supervisor PID. Bun's cwd
+		// `.env` autoload could reintroduce the malloc variables the pane scrubs and
+		// make the CLI malloc guard re-exec below the pane PID, so source launches
+		// disable it like a compiled binary does.
+		return context.managedOwnerSupervisor && context.platform === "darwin"
+			? [executable, "--no-env-file", resolvedEntrypoint]
+			: [executable, resolvedEntrypoint];
 	}
 
 	const executable =

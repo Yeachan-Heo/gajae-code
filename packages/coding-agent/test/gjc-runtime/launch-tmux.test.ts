@@ -3764,8 +3764,10 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).not.toContain("tmux-exit.json");
 			// `exec` keeps the pane PID equal to the supervisor PID that managed close pins.
 			const entry = path.join(root, "cli.ts");
+			// A macOS source launch also refuses Bun's cwd `.env` autoload in both processes.
+			const bun = platform === "darwin" ? `'/bin/bun' '--no-env-file'` : `'/bin/bun'`;
 			expect(innerCommand).toEndWith(
-				` '/bin/bun' '${entry}' '--internal-managed-owner-supervisor' '--' '/bin/bun' '${entry}' 'hello'`,
+				` ${bun} '${entry}' '--internal-managed-owner-supervisor' '--' ${bun} '${entry}' 'hello'`,
 			);
 			expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_COMMAND_JSON");
 			expect(

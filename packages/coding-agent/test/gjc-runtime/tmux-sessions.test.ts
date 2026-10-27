@@ -2406,6 +2406,11 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 			childEnv.MallocStackLogging = "0";
 			delete childEnv.GJC_MALLOC_ENV_REEXEC;
 			expect(paneCommand).toStartWith("exec env -u MallocStackLogging -u MallocStackLoggingNoCompact ");
+			// A source launch must not reload them from the pane cwd's `.env` either.
+			await fs.writeFile(path.join(stateDir, ".env"), "MallocStackLogging=1\nMallocStackLoggingNoCompact=1\n", {
+				mode: 0o600,
+			});
+			expect(paneCommand).toContain(` '--no-env-file' '${entry}' '--internal-managed-owner-supervisor' '--' `);
 			// tmux runs the pane command through `sh -c`; `exec` keeps this PID as the supervisor.
 			const owner = Bun.spawn(["/bin/sh", "-c", paneCommand], {
 				cwd: stateDir,
