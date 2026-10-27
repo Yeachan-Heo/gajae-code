@@ -464,11 +464,15 @@ function buildInlineSkillInvocationArgs<TSkill extends Pick<Skill, "name">>(
 }
 
 /**
- * Check if a given position in text is inside an inline code span (backtick-delimited).
- * Handles escaped backticks correctly.
+ * Check if a given position in text is inside an inline code span (backtick-delimited)
+ * or a fenced code block (triple-backtick-delimited). Handles escaped backticks correctly.
+ * Per CommonMark:
+ * - An inline code span opens with a backtick run and closes with a backtick run of equal length
+ * - A fenced code block starts with a backtick run (3+) at the start of a line
  */
 function isPositionInsideInlineCode(text: string, position: number): boolean {
-	let openDelimiterPosition: number | null = null;
+	// Stack to track nested code spans/blocks: [length, isAtLineStart]
+	const delimiterStack: Array<[length: number, isAtLineStart: boolean]> = [];
 
 	for (let i = 0; i < position && i < text.length; ) {
 		if (text[i] !== "`") {
@@ -476,20 +480,61 @@ function isPositionInsideInlineCode(text: string, position: number): boolean {
 			continue;
 		}
 
+		// Count the backtick run
 		let runEnd = i + 1;
 		while (text[runEnd] === "`") runEnd += 1;
-		if (runEnd - i !== 1) {
+		const runLength = runEnd - i;
+
+		// Check if this backtick run is escaped
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		const isEscaped = backslashCount % 2 === 1;
+
+		if (isEscaped) {
 			i = runEnd;
 			continue;
 		}
 
-		let backslashCount = 0;
-		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
-		if (backslashCount % 2 === 0) openDelimiterPosition = openDelimiterPosition === null ? i : null;
+		// Check if this backtick run is at the start of a line
+		const isAtLineStart = i === 0 || text[i - 1] === "\n";
+
+		// Handle fenced code blocks (3+ backticks at line start)
+		if (isAtLineStart && runLength >= 3) {
+			if (
+				delimiterStack.length > 0 &&
+				delimiterStack[delimiterStack.length - 1]?.[0] === runLength &&
+				delimiterStack[delimiterStack.length - 1]?.[1]
+			) {
+				// Closing fence with matching length
+				delimiterStack.pop();
+			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
+				// Opening fence (only if not already inside another fence)
+				delimiterStack.push([runLength, true]);
+			}
+			i = runEnd;
+			continue;
+		}
+
+		// Handle inline code spans (backticks not at line start)
+		if (!isAtLineStart) {
+			if (delimiterStack.length > 0) {
+				const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
+				if (!openIsAtLineStart && openLength === runLength) {
+					// Closing inline code span with matching length
+					delimiterStack.pop();
+					i = runEnd;
+					continue;
+				}
+			}
+
+			// Opening inline code span
+			delimiterStack.push([runLength, false]);
+		}
+
 		i = runEnd;
 	}
 
-	return openDelimiterPosition !== null;
+	return delimiterStack.length > 0;
 }
 
 export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
