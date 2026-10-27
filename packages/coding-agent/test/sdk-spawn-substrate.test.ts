@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { __setBinaryResolverForTests, __setExecutableIdentityResolverForTests } from "../src/gjc-runtime/psmux-detect";
 import type { ManagedTmuxLaunchProof } from "../src/gjc-runtime/tmux-sessions";
 import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
 import {
@@ -122,32 +123,83 @@ describe("Broker spawn substrate provider", () => {
 		expect(drops).toEqual([["FOO-BAR", "TOO_LARGE"]]);
 	});
 
-	it("uses the psmux substrate kind only for the Windows multiplexer selection", async () => {
-		const psmux = managedProof({
-			providerIdentity: '["windows-psmux","C:\\\\psmux.exe","namespace","volume:42"]',
-			psmuxIncarnation: "psmux-incarnation",
-		});
+	it("selects headless on Windows before any multiplexer probe or managed launch", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-windows-"));
+		temporaryDirectories.push(cwd);
+		let selections = 0;
+		let managedLaunches = 0;
+		let terminated = false;
 		const provider = createSpawnSubstrateProvider({
 			platform: "win32",
-			selectMultiplexer: () => "psmux",
-			launchManaged: () => psmux,
-			verifyManaged: () => "verified",
-			closeManaged: async () => {},
-			processIncarnation: () => "windows:701",
-		});
-		const result = await provider.launch(launchSpec("C:\\repo"));
-		expect(result).toEqual({
-			ok: true,
-			proof: {
-				...substrateProof(psmux),
-				substrateKind: "psmux",
-				processIncarnation: "windows:701",
-				stateFileProof: {
-					...substrateProof(psmux).stateFileProof,
-					psmuxIncarnation: "psmux-incarnation",
-				},
+			selectMultiplexer: () => {
+				selections += 1;
+				return "tmux";
 			},
+			launchManaged: () => {
+				managedLaunches += 1;
+				throw new Error("managed launch must not be attempted on Windows");
+			},
+			startHeadless: () => ({ pid: 701, terminate: () => (terminated = true) }),
+			processIncarnation: () => "windows:701",
+			isProcessGone: () => false,
 		});
+		const result = await provider.launch({ ...launchSpec(cwd), argv: ["custom-trusted-host", "--serve"] });
+		if (!result.ok) throw new Error(`headless launch failed: ${result.message}`);
+		expect(result.proof).toMatchObject({ substrateKind: "headless", pid: 701, processIncarnation: "windows:701" });
+		expect({ selections, managedLaunches, terminated }).toEqual({
+			selections: 0,
+			managedLaunches: 0,
+			terminated: false,
+		});
+		expect(await provider.verify(result.proof)).toBe("verified");
+	});
+
+	it("never probes a configured psmux through the default Windows selector", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-windows-default-"));
+		temporaryDirectories.push(cwd);
+		let managedLaunches = 0;
+		// An installed, identifiable psmux that the pre-admission selector would pick.
+		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "C:\\psmux\\psmux.exe" : null));
+		__setExecutableIdentityResolverForTests(() => "volume:42");
+		const which = spyOn(Bun, "which").mockImplementation(command => command);
+		const provider = createSpawnSubstrateProvider({
+			platform: "win32",
+			env: { GJC_TMUX_COMMAND: "psmux" },
+			launchManaged: () => {
+				managedLaunches += 1;
+				throw new Error("managed launch must not be attempted on Windows");
+			},
+			startHeadless: () => ({ pid: 702, terminate() {} }),
+			processIncarnation: () => "windows:702",
+		});
+		let result: Awaited<ReturnType<typeof provider.launch>>;
+		try {
+			result = await provider.launch(launchSpec(cwd));
+		} finally {
+			which.mockRestore();
+			__setBinaryResolverForTests(null);
+			__setExecutableIdentityResolverForTests(null);
+		}
+		expect(result).toMatchObject({ ok: true, proof: { substrateKind: "headless", pid: 702 } });
+		expect(managedLaunches).toBe(0);
+	});
+
+	it("terminates the Windows headless child when its proof cannot be published", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-windows-unpublished-"));
+		temporaryDirectories.push(cwd);
+		await Bun.write(path.join(cwd, ".gjc"), "not a directory");
+		let terminated = false;
+		const provider = createSpawnSubstrateProvider({
+			platform: "win32",
+			startHeadless: () => ({ pid: 703, terminate: () => (terminated = true) }),
+			processIncarnation: () => "windows:703",
+		});
+		await expect(provider.launch(launchSpec(cwd))).resolves.toEqual({
+			ok: false,
+			code: "substrate_proof_failed",
+			message: "The selected spawn substrate could not be proven exactly.",
+		});
+		expect(terminated).toBeTrue();
 	});
 
 	it("does not fall back after a managed proof failure without cleanup evidence", async () => {
