@@ -154,14 +154,16 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 }
 
 /**
- * An intent its supervisor confirmed relaying: the delivery evidence that makes a
- * later SIGTERM an operator shutdown on every platform (Darwin requires it).
+ * An intent whose later SIGTERM is an operator shutdown. Elsewhere the closer
+ * delivers that signal itself; a Darwin closer never does, so there the intent
+ * also needs its supervisor's confirmed relay record.
  */
 async function createRelayedOwnerIntent(
 	stateDir: string,
 	input: Parameters<typeof createOwnerIntent>[1],
 ): Promise<Awaited<ReturnType<typeof createOwnerIntent>>> {
 	const intent = await createOwnerIntent(stateDir, input);
+	if (process.platform !== "darwin") return intent;
 	const paths = lifecyclePaths(stateDir, intent.session_id, intent.generation);
 	const supervisor = { child_token: "token", supervisor_pid: 10, supervisor_start_time: "start" };
 	const ownerOnly = (file: string, value: unknown) =>
