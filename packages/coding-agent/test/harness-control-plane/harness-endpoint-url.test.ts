@@ -35,6 +35,9 @@ describe("harness discovery url", () => {
 			"ws://user:pw@127.0.0.1:9",
 			"http://127.0.0.1:9",
 			"ws://127.0.0.1:9#frag",
+			"ws://127.0.0.1:9/#",
+			"ws://127.0.0.1:9/?",
+			"ws://127.0.0.1:9/?#",
 			"ws://example.com:9",
 			"ws://0.0.0.0:9",
 			"",
@@ -55,6 +58,8 @@ describe("harness discovery url", () => {
 				expect(isHarnessLoopbackEndpointUrl(url)).toBe(true);
 				expect(isHarnessLoopbackEndpointUrl(`${url}/steal`)).toBe(false);
 				expect(isHarnessLoopbackEndpointUrl(`${url}?token=x`)).toBe(false);
+				expect(isHarnessLoopbackEndpointUrl(`${url}#`)).toBe(false);
+				expect(isHarnessLoopbackEndpointUrl(`${url}?`)).toBe(false);
 				expect(isHarnessLoopbackEndpointUrl(`${chosenScheme}://user@${chosenHost}:${chosenPort}`)).toBe(false);
 			}),
 			{ seed: SEED, numRuns: RUNS },
@@ -82,6 +87,8 @@ describe("harness discovery url", () => {
 				expect(url.password).toBe("");
 				expect(url.search).toBe("");
 				expect(url.hash).toBe("");
+				expect(url.href.includes("?")).toBe(false);
+				expect(url.href.includes("#")).toBe(false);
 				expect(url.pathname === "/" || url.pathname === "").toBe(true);
 			}),
 			{ seed: SEED, numRuns: RUNS },

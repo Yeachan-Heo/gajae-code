@@ -23,6 +23,8 @@ export function isHarnessLoopbackEndpointUrl(raw: string): boolean {
 	if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") return false;
 	if (url.username !== "" || url.password !== "") return false;
 	if (url.search !== "" || url.hash !== "") return false;
+	// An empty "?" or "#" is dropped from search/hash but still makes the WebSocket URL invalid.
+	if (url.href.includes("?") || url.href.includes("#")) return false;
 	if (url.pathname !== "/" && url.pathname !== "") return false;
 	if (url.port !== "") {
 		const port = Number(url.port);

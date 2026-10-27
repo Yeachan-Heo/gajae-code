@@ -118,6 +118,22 @@ describe("harness owner discovery trust", () => {
 		expect(stale.spawnCalls).toBe(1);
 		expect(stale.token).toBe("spawned-token");
 
+		const emptyHash = await dial(
+			{ version: 1, sessionId: "session-a", url: "ws://127.0.0.1:9/#", token: "hash-token", pid: process.pid },
+			true,
+		);
+		expect(emptyHash.spawnCalls).toBe(1);
+		expect(emptyHash.url).toBe("ws://127.0.0.1:9");
+		expect(emptyHash.token).toBe("spawned-token");
+
+		const emptyQuery = await dial(
+			{ version: 1, sessionId: "session-a", url: "ws://127.0.0.1:9/?", token: "query-token", pid: process.pid },
+			true,
+		);
+		expect(emptyQuery.spawnCalls).toBe(1);
+		expect(emptyQuery.url).toBe("ws://127.0.0.1:9");
+		expect(emptyQuery.token).toBe("spawned-token");
+
 		const missingPid = await dial(
 			{ version: 1, sessionId: "session-a", url: "ws://127.0.0.1:9", token: "no-pid-token" },
 			true,
