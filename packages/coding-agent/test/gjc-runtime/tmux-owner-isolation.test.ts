@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -2375,6 +2375,69 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 		return null;
 	};
 
+	it("keeps a genuine predecessor provable after the wall clock moves backward between launches", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-clock-"));
+		try {
+			await replaceOwnerGeneration(state, "session", "prior-generation");
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: "prior-generation",
+				state_dir: state,
+				socket_key: "socket",
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: "EXIT",
+				exit_code: 0,
+				exit_kind: "exit",
+				reason: "test",
+			});
+			// An NTP correction moves the clock ten minutes back before the relaunch.
+			const skew = 10 * 60_000;
+			setSystemTime(new Date(Date.now() - skew));
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			setSystemTime();
+			const paths = lifecyclePaths(state, "session", generation);
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation,
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "start",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+			};
+			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			// The closer publishes past the predecessor check, and the supervisor relays it.
+			let relays = 0;
+			await expect(
+				close(state, generation, "dispatch", async () => {
+					consumeCooperativeOwnerIntent({
+						stateDir: state,
+						binding,
+						serverKey: "socket",
+						canRelay: () => true,
+						relay: () => {
+							relays += 1;
+							return true;
+						},
+					});
+					return null;
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			expect(relays).toBe(1);
+			expect(readSecureOwnerJson(paths.relayFile)).toMatchObject({ generation, dispatch_id: "dispatch" });
+		} finally {
+			setSystemTime();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("retires an expired intent the supervisor never relayed so a later close can rearm", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-rearm-"));
 		try {
@@ -2627,6 +2690,25 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 				"owner_term_verdict_timeout",
 			);
 		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("owner generation publication time", () => {
+	it("never publishes a successor earlier than its predecessor after a backward clock correction", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-monotonic-"));
+		try {
+			replaceOwnerGenerationSync(state, "session", "first", captureOwnerGenerationBaselineSync(state, "session"));
+			const first = captureOwnerGenerationBaselineSync(state, "session");
+			if (first.state !== "current") throw new Error("first generation missing");
+			setSystemTime(new Date(Date.now() - 10 * 60_000));
+			replaceOwnerGenerationSync(state, "session", "second", first);
+			const second = captureOwnerGenerationBaselineSync(state, "session");
+			if (second.state !== "current") throw new Error("second generation missing");
+			expect(Date.parse(second.published_at)).toBeGreaterThan(Date.parse(first.published_at));
+		} finally {
+			setSystemTime();
 			await fs.rm(state, { recursive: true, force: true });
 		}
 	});

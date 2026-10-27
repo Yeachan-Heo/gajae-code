@@ -1027,6 +1027,25 @@ export function memoryGuardClaimPaths(stateDir: string, sessionId: string): Memo
 	};
 }
 
+/**
+ * A new generation's publication time, never earlier than the evidence it succeeds.
+ * Predecessor proof compares the prior generation and its terminal against this
+ * immutable timestamp, so a backward wall-clock correction between launches must
+ * not make a genuine predecessor look newer. Runs under the generation lock.
+ */
+function monotonicGenerationPublishedAt(paths: LifecyclePaths, previous: OwnerGenerationBaseline): string {
+	let floor = previous.state === "current" ? Date.parse(previous.published_at) : Number.NaN;
+	try {
+		const alias = JSON.parse(fsSync.readFileSync(paths.verdictAliasFile, "utf8")) as { observed_at?: unknown };
+		if (typeof alias.observed_at === "string" && isCanonicalUtcTimestamp(alias.observed_at))
+			floor = Number.isNaN(floor) ? Date.parse(alias.observed_at) : Math.max(floor, Date.parse(alias.observed_at));
+	} catch {
+		// Missing or unreadable history imposes no floor; predecessor proof still fails closed.
+	}
+	const now = Date.now();
+	return new Date(Number.isNaN(floor) || now > floor ? now : floor + 1).toISOString();
+}
+
 export async function replaceOwnerGeneration(
 	stateDir: string,
 	sessionId: string,
@@ -1044,7 +1063,7 @@ export async function replaceOwnerGeneration(
 			schema_version: 1 as const,
 			generation,
 			session_id: sessionId,
-			published_at: new Date().toISOString(),
+			published_at: monotonicGenerationPublishedAt(paths, previous),
 		};
 		await publishImmutableGenerationMarker(paths.generationMarkerFile, published);
 		if (previous.state === "current" && previous.generation !== generation)
@@ -1293,7 +1312,7 @@ export function replaceOwnerGenerationSync(
 			schema_version: 1 as const,
 			generation,
 			session_id: sessionId,
-			published_at: new Date().toISOString(),
+			published_at: monotonicGenerationPublishedAt(paths, previous),
 		};
 		publishImmutableGenerationMarkerSync(paths.generationMarkerFile, published);
 		if (previous.state === "current" && previous.generation !== generation)
