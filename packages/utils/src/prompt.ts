@@ -133,7 +133,7 @@ export function format(content: string, options: PromptFormatOptions = {}): stri
 	const isPreRender = renderPhase === "pre-render";
 	const lines = content.split("\n");
 	const result: string[] = [];
-	let inCodeBlock = false;
+	let codeFence: { marker: string; length: number } | undefined;
 
 	const htmlCommentState: HtmlCommentState = { inHtmlComment: false };
 	const topLevelTags: string[] = [];
@@ -141,13 +141,15 @@ export function format(content: string, options: PromptFormatOptions = {}): stri
 	for (let i = 0; i < lines.length; i++) {
 		let line = lines[i].trimEnd();
 		let trimmedStart = line.trimStart();
-		if (trimmedStart.startsWith("```") || trimmedStart.startsWith("~~~")) {
-			inCodeBlock = !inCodeBlock;
+		const fence = /^(`{3,}|~{3,})(.*)$/.exec(trimmedStart);
+		if (codeFence) {
+			if (fence && fence[1][0] === codeFence.marker && fence[1].length >= codeFence.length && fence[2].trim() === "")
+				codeFence = undefined;
 			result.push(line);
 			continue;
 		}
-
-		if (inCodeBlock) {
+		if (fence && (fence[1][0] !== "`" || !fence[2].includes("`"))) {
+			codeFence = { marker: fence[1][0], length: fence[1].length };
 			result.push(line);
 			continue;
 		}

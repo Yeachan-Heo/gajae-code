@@ -35,7 +35,11 @@ export function untilAborted<T>(
 	pr: Promise<T> | (() => Promise<T>),
 ): Promise<T> {
 	if (!signal) return typeof pr === "function" ? pr() : pr;
-	if (signal.aborted) return Promise.reject(new AbortError(signal));
+	if (signal.aborted) {
+		// Already-started work still owns a rejection even when cancellation wins.
+		if (typeof pr !== "function") void pr.catch(() => {});
+		return Promise.reject(new AbortError(signal));
+	}
 
 	const { promise, resolve, reject } = Promise.withResolvers<T>();
 	const onAbort = () => reject(new AbortError(signal));
