@@ -19,6 +19,14 @@ Cell fields:
 - Put workflow explanations in the assistant message or `title` — never inside cell code.
 {{#if py}}- Python cells run inside an IPython kernel with a live event loop. Use top-level `await` directly (e.g. `await main()`); `asyncio.run(…)` raises "cannot be called from a running event loop".{{/if}}
 **On failure:** errors identify the failing cell (e.g., "Cell 3 failed"). Resubmit only the fixed cell (or fixed cell + remaining cells).
+
+**Chaining tools within eval:**
+
+Tools called via `tool.<name>(args)` from eval go through the same permission and approval gates as direct calls. Chain tool calls in eval to save round-trips only when both:
+- The operation benefits from batch execution (multiple reads, searches, loops over files, filter/aggregate results)
+- The tools don't require human review (e.g., `read`, `find`, `search`, `bash` with `grep`)
+
+Avoid chaining when a single tool call suffices or when the result needs human review before proceeding (e.g., `edit` preview requiring approval). Split such operations into direct tool calls instead.
 </instruction>
 
 <prelude>
