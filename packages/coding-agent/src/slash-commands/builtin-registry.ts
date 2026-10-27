@@ -14,7 +14,6 @@ import {
 	type GjcModelAssignmentTargetId,
 	requiresExplicitThinkingChoice,
 } from "../config/model-registry";
-
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -22,6 +21,7 @@ import {
 	parseModelString,
 	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
+import type { ModelSelectorValue } from "../config/model-selector-value";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getAvailableThemes, getDetectedThemeSettingsPath, setTheme, theme } from "../modes/theme/theme";
@@ -332,6 +332,13 @@ function renderExactMcpStatus(snapshot: ExactMcpStatusSnapshot): string {
 	return lines.join("\n");
 }
 
+/** One status row. Arrays keep the historical comma join; controls never reach the terminal. */
+function formatModelSelectorForStatus(value: ModelSelectorValue | undefined): string {
+	if (value == null) return "(unset)";
+	const raw = typeof value === "string" ? value : value.join(",");
+	return sanitizeDisplayLine(raw);
+}
+
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 	const agentModelOverrides = runtime.settings.get("task.agentModelOverrides");
 	const lines = ["Model assignments:"];
@@ -339,7 +346,9 @@ function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 		const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
 		const modelSelector =
 			target.settingsPath === "modelRoles" ? runtime.settings.getModelRole(targetId) : agentModelOverrides[targetId];
-		lines.push(`  ${target.tag ?? target.id.toUpperCase()} (${target.name}): ${modelSelector ?? "(unset)"}`);
+		lines.push(
+			`  ${target.tag ?? target.id.toUpperCase()} (${target.name}): ${formatModelSelectorForStatus(modelSelector)}`,
+		);
 	}
 	return lines.join("\n");
 }

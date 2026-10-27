@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { exactUnlink } from "@gajae-code/natives";
 import { isEnoent, logger, postmortem } from "@gajae-code/utils";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 
 const BLOB_PREFIX = "blob:sha256:";
@@ -299,7 +300,7 @@ function residentCacheUtcProcessStart(pid: number): ResidentCacheProcessStart {
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "ignore",
-			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+			env: { ...projectSafeSpawnEnv(), LC_ALL: "C", LANG: "C", TZ: "UTC" },
 		});
 		if (result.exitCode === 0) {
 			const rendered = new TextDecoder().decode(result.stdout).trim();

@@ -1930,7 +1930,11 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 			},
 		});
-		const ctx = extensionContext(transport.sessionId, cwd);
+		const notices: Array<{ message: string; type?: string }> = [];
+		const ctx = {
+			...extensionContext(transport.sessionId, cwd),
+			ui: { notify: (message: string, type?: string) => notices.push({ message, type }) },
+		} as unknown as ExtensionContext;
 		try {
 			await handlers.get("session_start")?.({}, ctx);
 			const waitForFrame = async (id: string) => {
@@ -2056,6 +2060,9 @@ describe("SessionSdkSessionRuntime", () => {
 				if (Date.now() > deliveryDeadline) throw new Error("Timed out waiting for operator delivery receipt");
 				await Bun.sleep(20);
 			}
+			// Only the operator abort is attributed at the terminal; the session's own
+			// client stopping its turn is not announced as someone else's action.
+			expect(notices).toEqual([{ message: "Turn stopped by a remote operator.", type: "warning" }]);
 		} finally {
 			setBrokerRuntimeAbortCapabilityForTest(undefined);
 			await handlers.get("session_shutdown")?.({}, ctx);

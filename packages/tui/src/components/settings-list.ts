@@ -1,7 +1,12 @@
+import { sanitizeDisplayLine } from "@gajae-code/utils";
 import { getKeybindings } from "../keybindings";
 import { extractPrintableText, matchesKey } from "../keys";
 import type { Component } from "../tui";
 import { Ellipsis, getSegmenter, padding, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils";
+
+function settingDisplayText(value: unknown): string {
+	return typeof value === "string" ? value : String(value ?? "");
+}
 
 export interface SettingItem {
 	/** Unique identifier for this setting */
@@ -14,8 +19,12 @@ export interface SettingItem {
 	currentValue: string;
 	/** If provided, Enter/Space cycles through these values */
 	values?: string[];
-	/** If provided, Enter opens this submenu. Receives current value and done callback. */
-	submenu?: (currentValue: string, done: (selectedValue?: string) => void) => Component;
+	/** If provided, Enter opens this submenu. The first argument is the display-safe line; the third is the stored value. `edited: false` keeps that stored value. */
+	submenu?: (
+		currentValue: string,
+		done: (selectedValue?: string, edited?: boolean) => void,
+		storedValue?: string,
+	) => Component;
 }
 
 export interface SettingsListTheme {
@@ -176,10 +185,9 @@ export class SettingsList implements Component {
 			const usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator);
 			const valueMaxWidth = Math.max(0, width - usedWidth - 2);
 
-			const valueText = this.#theme.value(
-				truncateToWidth(item.currentValue, valueMaxWidth, Ellipsis.Omit),
-				isSelected,
-			);
+			// Strip the full value before the width clip so a partial escape cannot remain.
+			const safeValue = sanitizeDisplayLine(settingDisplayText(item.currentValue));
+			const valueText = this.#theme.value(truncateToWidth(safeValue, valueMaxWidth, Ellipsis.Omit), isSelected);
 
 			lines.push(truncateToWidth(prefix + labelText + separator + valueText, width));
 		}
@@ -274,15 +282,22 @@ export class SettingsList implements Component {
 		if (!item) return;
 
 		if (item.submenu) {
-			// Open submenu, passing current value so it can pre-select correctly
+			// Display line and stored value stay separate. Only an explicit untouched confirm keeps the stored value.
 			this.#submenuItemIndex = this.#selectedIndex;
-			this.#submenuComponent = item.submenu(item.currentValue, (selectedValue?: string) => {
-				if (selectedValue !== undefined) {
-					item.currentValue = selectedValue;
-					this.#onChange(item.id, selectedValue);
-				}
-				this.#closeSubmenu();
-			});
+			const storedValue = item.currentValue;
+			const displayValue = sanitizeDisplayLine(settingDisplayText(storedValue));
+			this.#submenuComponent = item.submenu(
+				displayValue,
+				(selectedValue?: string, edited?: boolean) => {
+					if (selectedValue !== undefined) {
+						const committed = edited === false ? storedValue : selectedValue;
+						item.currentValue = committed;
+						this.#onChange(item.id, committed);
+					}
+					this.#closeSubmenu();
+				},
+				storedValue,
+			);
 		} else if (item.values && item.values.length > 0) {
 			// Cycle through values
 			const currentIndex = item.values.indexOf(item.currentValue);

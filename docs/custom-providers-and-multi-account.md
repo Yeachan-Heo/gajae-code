@@ -14,12 +14,11 @@ The canonical runtime behavior is described here; the field-by-field model refer
 ```yaml
 providers:
   my-local:
-    name: My Local Runtime
     baseUrl: http://127.0.0.1:8000/v1
     api: openai-completions
     auth: none
     models:
-      my-model:
+      - id: my-model
         name: My Model
         contextWindow: 128000
         maxTokens: 32000
@@ -32,7 +31,6 @@ Ollama, llama.cpp, LM Studio, oMLX, vLLM, and SGLang are discovered implicitly w
 ```yaml
 providers:
   hosted:
-    name: Hosted Proxy
     baseUrl: https://proxy.example.com/v1
     api: openai-completions
     apiKey: MY_PROXY_KEY        # env-name-or-literal semantics

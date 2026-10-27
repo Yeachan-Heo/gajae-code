@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
 import type { SessionAttachment } from "../src/sdk/router";
-import { SessionRouterError } from "../src/sdk/router";
+import { SessionRouter, SessionRouterError } from "../src/sdk/router";
 
 type RouterHarness = {
 	router: unknown;
@@ -74,21 +77,34 @@ test("4356 SessionRouterError is not wrapped as reconnect_exhausted transport lo
 	await adapter.close();
 });
 
-test("4356 no SessionRouterError throw site uses the bare default message", async () => {
-	const files = [
-		"packages/coding-agent/src/sdk/router/session-router.ts",
-		"packages/coding-agent/src/sdk/acp/adapter.ts",
-	];
-	for (const file of files) {
-		const text = await Bun.file(file).text();
-		const bare = [...text.matchAll(/throw new SessionRouterError\("pre_send"\)/g)];
-		expect(bare.length).toBe(0);
+test("4356 router distinguishes unpublished and expired requests before dispatch", async () => {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-router-diagnostics-"));
+	const router = new SessionRouter({ agentDir });
+	try {
+		await router.start();
+		expect(router.isReady()).toBe(true);
+		let dispatches = 0;
+		for (const { deadline, reason } of [
+			{ deadline: undefined, reason: "session not published" },
+			{ deadline: Date.now() - 1, reason: "deadline elapsed during router preparation" },
+		]) {
+			const request = router.request("session-4356", { type: "get_state" }, undefined, undefined, {
+				deadline,
+				beforeDispatch: () => {
+					dispatches++;
+				},
+			});
+			await expect(request).rejects.toBeInstanceOf(SessionRouterError);
+			await expect(request).rejects.toMatchObject({ phase: "pre_send", message: expect.stringContaining(reason) });
+			expect(dispatches).toBe(0);
+		}
+	} finally {
+		try {
+			await router.stop();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
 	}
-	const adapterText = await Bun.file("packages/coding-agent/src/sdk/acp/adapter.ts").text();
-	expect(adapterText).not.toContain('throw new SessionRouterError("pre_send")');
-	const routerText = await Bun.file("packages/coding-agent/src/sdk/router/session-router.ts").text();
-	// Every throw must carry a site-specific message.
-	expect(routerText).not.toContain('throw new SessionRouterError("pre_send");');
 });
 
 test("4356 AcpAgent recovery preserves mcpServers and makes failure observable", async () => {

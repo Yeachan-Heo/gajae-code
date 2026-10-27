@@ -2,6 +2,7 @@
  * Render a code or markdown cell with optional output section.
  */
 import { Markdown } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import { getMarkdownTheme, highlightCode, type Theme } from "../modes/theme/theme";
 import {
 	formatDuration,
@@ -92,13 +93,20 @@ function collapseCarriageReturns(line: string): string {
 	const idx = line.lastIndexOf("\r");
 	return idx < 0 ? line : line.slice(idx + 1);
 }
+
+// Source bytes are untrusted. Collapse CR first: sanitizeText drops CR, which
+// would concatenate both sides of a progress-bar overwrite. Strip before the
+// line cap and the highlighter so a clipped line cannot keep a control.
+function sanitizeCodeLines(text: string): string[] {
+	return sanitizeTerminalLines(text).map(line => sanitizeText(line));
+}
 export function renderCodeCell(options: CodeCellOptions, theme: Theme): string[] {
 	const { code, language, output, expanded = false, outputMaxLines = 6, codeMaxLines = 12, width } = options;
 	const { title, meta } = formatHeader(options, theme);
 	const state = getState(options.status);
 
 	const normalizedCode = replaceTabs(code ?? "");
-	const rawCodeLines = sanitizeTerminalLines(normalizedCode);
+	const rawCodeLines = sanitizeCodeLines(normalizedCode);
 	const maxCodeLines = expanded ? rawCodeLines.length : Math.min(rawCodeLines.length, codeMaxLines);
 	const visibleCode = rawCodeLines.slice(0, maxCodeLines).join("\n");
 	const codeLines = highlightCode(visibleCode, language);
@@ -166,7 +174,13 @@ export function renderMarkdownCell(options: MarkdownCellOptions, theme: Theme): 
 	// Markdown component manages its own wrapping at the inner content width.
 	// `renderOutputBlock` adds a `│ ` prefix + `│` suffix → 3 visible columns.
 	const innerWidth = Math.max(20, width - 3);
-	const allLines = content.trim() ? new Markdown(content, 0, 0, getMarkdownTheme()).render(innerWidth) : [];
+	// Repository markdown is untrusted. Turn CR/CRLF into LF before sanitizeText,
+	// which drops CR: a lone CR is a markdown break on the previous renderer and
+	// must not be written raw. Then strip other controls before Markdown.
+	const markdownSource = sanitizeText(content.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+	const allLines = markdownSource.trim()
+		? new Markdown(markdownSource, 0, 0, getMarkdownTheme()).render(innerWidth)
+		: [];
 	const maxContentLines = expanded ? allLines.length : Math.min(allLines.length, contentMaxLines);
 	const contentLines = allLines.slice(0, maxContentLines);
 	const hiddenContentLines = allLines.length - maxContentLines;

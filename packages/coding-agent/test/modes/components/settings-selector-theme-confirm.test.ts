@@ -136,6 +136,93 @@ describe("SettingsSelectorComponent theme selection", () => {
 		expect(component.render(120).join("\n")).toContain("red-claw");
 	});
 
+	it("keeps a stored dark theme whose name contains a line break or a control", () => {
+		for (const name of ["evil\nname", "alpha\u001b]0;x\u0007"]) {
+			settings.set("theme.dark", name);
+			settings.set("theme.light", "blue-crab");
+			const committed: string[] = [];
+			const component = new SettingsSelectorComponent(
+				{
+					availableThinkingLevels: [],
+					thinkingLevel: undefined,
+					availableThemes: ["blue-crab", name],
+					availableModelProfiles: [],
+					cwd: process.cwd(),
+				},
+				{
+					onChange: () => {},
+					onThemeCommit: async (path, themeName) => {
+						committed.push(themeName);
+						settings.set(path, themeName);
+						return true;
+					},
+					onCancel: () => {},
+				},
+			);
+			component.handleInput("\n");
+			component.handleInput("\n");
+			expect(committed).toEqual([name]);
+			expect(settings.get("theme.dark")).toBe(name);
+		}
+	});
+
+	it("renders a dark theme name with a line break as one row", () => {
+		settings.set("theme.dark", "evil\nname");
+		const row = Bun.stripANSI(createSelector().component.render(120).join("\n"));
+		expect(row).toContain("evil name");
+		expect(row.includes("\u001b]0;")).toBe(false);
+	});
+
+	it("keeps a stored model profile whose name contains a line break", () => {
+		settings.set("modelProfile.default", "line\nbreak");
+		const changed: Array<{ path: SettingPath; value: unknown }> = [];
+		const component = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: THEMES,
+				availableModelProfiles: ["alpha", "line\nbreak"],
+				cwd: process.cwd(),
+			},
+			{
+				onChange: (path, value) => {
+					changed.push({ path, value });
+				},
+				onCancel: () => {},
+			},
+		);
+		component.handleInput("\x1b[C");
+		for (const character of "default model") component.handleInput(character);
+		component.handleInput("\n");
+		component.handleInput("\n");
+		expect(changed.at(-1)).toEqual({ path: "modelProfile.default", value: "line\nbreak" });
+	});
+
+	it("keeps an ordinary stored model profile name", () => {
+		settings.set("modelProfile.default", "Line-Break");
+		const changed: Array<{ path: SettingPath; value: unknown }> = [];
+		const component = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: THEMES,
+				availableModelProfiles: ["line-break", "Line-Break"],
+				cwd: process.cwd(),
+			},
+			{
+				onChange: (path, value) => {
+					changed.push({ path, value });
+				},
+				onCancel: () => {},
+			},
+		);
+		component.handleInput("\x1b[C");
+		for (const character of "default model") component.handleInput(character);
+		component.handleInput("\n");
+		component.handleInput("\n");
+		expect(changed.at(-1)).toEqual({ path: "modelProfile.default", value: "Line-Break" });
+	});
+
 	it("persists and displays the selected dark theme only after confirmation", () => {
 		const { component, previewedThemes, restoredThemes, changedSettings } = createSelector();
 

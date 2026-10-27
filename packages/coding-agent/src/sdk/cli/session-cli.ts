@@ -186,6 +186,7 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		master_context_required: "authorization_denied",
 		adapter_operation_prohibited: "authorization_denied",
 		endpoint_credential_forbidden: "authorization_denied",
+		operator_control_unsupported: "authorization_denied",
 	};
 	const references: EvidenceReference[] = [];
 	const source = object(details);
@@ -202,7 +203,9 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 	}
 	return new PublicCommandFailure({
 		kind: Object.hasOwn(kinds, code) ? kinds[code]! : "operation_failed",
-		proof: code === "wait_timeout" ? "accepted" : proof,
+		// The broker refuses an operator abort for a host without operator authority
+		// before it opens the session endpoint, so nothing was sent to the session.
+		proof: code === "wait_timeout" ? "accepted" : code === "operator_control_unsupported" ? "pre-send" : proof,
 		references,
 		// A typed `resource_gone` keeps its public classification; the fixed
 		// diagnostic only separates absent resource state from an empty result.
@@ -214,7 +217,9 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 				? { diagnostics: ["sdk_unknown_operation" as const] }
 				: code === "not_a_repository"
 					? { diagnostics: ["sdk_scope_requires_repository" as const] }
-					: {}),
+					: code === "operator_control_unsupported"
+						? { diagnostics: ["sdk_operator_control_unsupported" as const] }
+						: {}),
 	});
 }
 

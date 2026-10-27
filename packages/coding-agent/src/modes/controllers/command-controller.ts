@@ -5,7 +5,7 @@ import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/ag
 import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { canonicalEnvKey, projectEnvSnapshot } from "@gajae-code/utils/env-file";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
@@ -776,7 +776,8 @@ export class CommandController {
 			const provider = this.ctx.session.model?.provider;
 			const mode = resolveAppendOnlyMode(setting, provider ?? "");
 			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
-			const settingLabel = setting === "auto" ? `${setting} (${provider ?? "?"})` : setting;
+			const settingLabel =
+				setting === "auto" ? `${setting} (${provider ?? "?"})` : sanitizeDisplayLine(String(setting));
 			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
 		}
 		if (stats.sessionMemory) {
@@ -865,8 +866,12 @@ export class CommandController {
 			for (const server of this.ctx.lspServers) {
 				const statusColor = server.status === "ready" ? "success" : server.status === "error" ? "error" : "warning";
 				const statusText =
-					server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
-				info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
+					server.status === "error" && server.error
+						? `${server.status}: ${sanitizeDisplayLine(server.error)}`
+						: server.status;
+				const fileTypes = server.fileTypes.map(fileType => sanitizeDisplayLine(fileType)).join(", ");
+				const serverLabel = sanitizeDisplayLine(server.name);
+				info += `${theme.fg("dim", `${serverLabel}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${fileTypes})`)}\n`;
 			}
 		}
 
@@ -879,7 +884,7 @@ export class CommandController {
 				for (const name of mcpServers) {
 					const conn = this.ctx.mcpManager.getConnection(name);
 					const toolCount = conn?.tools?.length ?? 0;
-					info += `${theme.fg("dim", `${name}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
+					info += `${theme.fg("dim", `${sanitizeDisplayLine(name)}:`)} ${theme.fg("success", "connected")} ${theme.fg("dim", `(${toolCount} tools)`)}\n`;
 				}
 			}
 		}

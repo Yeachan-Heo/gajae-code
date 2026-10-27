@@ -15,6 +15,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { $credentialEnv } from "@gajae-code/utils/env";
+import { projectSafeSpawnEnv } from "@gajae-code/utils/shell-config";
 import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
@@ -609,7 +610,7 @@ function portableProcessStartTime(pid: number): string | null {
 	const result = Bun.spawnSync([...command, String(pid)], {
 		stdout: "pipe",
 		stderr: "ignore",
-		env: { ...process.env, LC_ALL: "C", LANG: "C" },
+		env: { ...projectSafeSpawnEnv(), LC_ALL: "C", LANG: "C" },
 	});
 	if (result.exitCode !== 0) return null;
 	const value = result.stdout.toString();

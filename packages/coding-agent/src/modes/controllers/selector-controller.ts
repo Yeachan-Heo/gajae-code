@@ -3982,6 +3982,23 @@ export class SelectorController {
 									done();
 									await this.#handleOAuthLogin(selectedProviderId, options);
 								},
+								onReloginAccount: async (credentialId: number) => {
+									const authStorage = this.ctx.session.modelRegistry.authStorage;
+									const removalTargets = authStorage.listCredentialRemovalTargets(selectedProviderId);
+									const targetToRemove = removalTargets.find(target => target.id === credentialId);
+									if (targetToRemove) {
+										const result = authStorage.removeAuthCredentialsHard(selectedProviderId, [
+											targetToRemove,
+										]);
+										if (result.kind !== "removed") {
+											this.ctx.showError("Failed to clear disabled credential. Retry or re-login manually.");
+											return;
+										}
+									}
+									selector.stopValidation();
+									done();
+									await this.#handleOAuthLogin(selectedProviderId, options);
+								},
 								onAccountRemove: async targets => {
 									await this.#handleLogout(selectedProviderId, targets);
 									selector.stopValidation();

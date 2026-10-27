@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import { parseLifecycleJson } from "./lifecycle-codec";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
@@ -76,6 +77,8 @@ export interface LifecycleLedgerEntry {
 	fingerprint?: string;
 	/** True only when a session.close request supplied immutable generation authority. */
 	closeAuthorityBound?: boolean;
+	/** Set only on unkeyed rows that mirror a spawn-authority claim; see `hasLegacyIdentity`. */
+	spawnAnchor?: true;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -199,6 +202,7 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 		typeof entry.ts === "number" &&
 		Number.isSafeInteger(entry.ts) &&
 		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
+		(entry.spawnAnchor === undefined || entry.spawnAnchor === true) &&
 		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
 	);
 }
@@ -288,8 +292,10 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 export class LifecycleLedger {
 	#file: string;
 	#corruptFile: string;
+	#spawnAnchorAttestationFile: string;
 	#entries: LifecycleLedgerEntry[] = [];
 	#byIdentity = new Map<string, LifecycleLedgerEntry>();
+	#attestedSpawnAnchors: ReadonlySet<string> = new Set();
 	#limits: Required<LifecycleLedgerLimits>;
 	#rowCount = 0;
 	#byteCount = 0;
@@ -311,6 +317,7 @@ export class LifecycleLedger {
 	constructor(agentDir: string, limits: LifecycleLedgerLimits = {}) {
 		this.#file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
 		this.#corruptFile = `${this.#file}.corrupt`;
+		this.#spawnAnchorAttestationFile = path.join(agentDir, "sdk", "lifecycle-ledger.spawn-anchor-attestation.json");
 		this.#limits = {
 			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
 			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
@@ -326,6 +333,7 @@ export class LifecycleLedger {
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
 		this.#byIdentity.clear();
+		this.#attestedSpawnAnchors = new Set();
 		this.#warnings = [];
 		this.#rowCount = 0;
 		this.#byteCount = 0;
@@ -399,6 +407,7 @@ export class LifecycleLedger {
 			}
 		}
 		if (tornTail) await this.#sealTornTail();
+		await this.#loadAttestedSpawnAnchors(new Set([...invalidIdentities, ...uncertainAfterCorruption]));
 		for (const [identity, uncertain] of syntheticUncertain) {
 			this.#byIdentity.set(identity, uncertain);
 			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
@@ -671,6 +680,9 @@ export class LifecycleLedger {
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
 	async #syncDirectory(): Promise<void> {
+		// Windows does not support fsync on directory handles; the temporary file is
+		// still synced before its atomic rename. Same rule as lifecycle.ts syncDirectory.
+		if (process.platform === "win32") return;
 		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
 		try {
 			await directory.sync();
@@ -813,9 +825,11 @@ export class LifecycleLedger {
 	/**
 	 * Live legacy rows predate the operation/key index. Their opaque identities
 	 * cannot establish that a different target is safe, so callers must reject
-	 * rather than create a second admission. A fresh session.create may ignore
-	 * final legacy rows: exact legacy identities are still resolved before this
-	 * check, and uncertain rows retain their session-scoped fences.
+	 * rather than create a second admission. Spawn-claim anchors are unkeyed but
+	 * are not legacy requests and never fence (see #isSpawnAnchor). A fresh
+	 * session.create may ignore final legacy rows: exact legacy identities are
+	 * still resolved before this check, and uncertain rows retain their
+	 * session-scoped fences.
 	 *
 	 * A session-targeted request passes `sessionTarget` to ignore terminal legacy
 	 * rows that record only other sessions, unless the row is the caller's key
@@ -839,6 +853,7 @@ export class LifecycleLedger {
 		return [...this.#byIdentity.values()].some(
 			entry =>
 				entry.operationKey === undefined &&
+				!this.#isSpawnAnchor(entry) &&
 				!(options.ignoreFinalRows && final(entry.state)) &&
 				!unrelatedTerminal(entry) &&
 				!excludedIdentities?.has(entry.identity),
@@ -918,6 +933,83 @@ export class LifecycleLedger {
 		this.#byteCount += line.length;
 		return entry;
 	}
+	/**
+	 * Spawn-claim anchors are unkeyed rows that only mirror a spawn-authority claim;
+	 * they are never target-inclusive lifecycle requests, so they never fence a
+	 * different admission, even after their claim leaves the spawn-authority
+	 * journal. Current writers mark them with `spawnAnchor: true` in the row, which
+	 * survives migration, compaction, eviction and restarts.
+	 *
+	 * Mirrors written before that marker carry no durable field that tells them
+	 * apart from a pre-index legacy request: file position and `ts` are not
+	 * provenance, because `migrateIdentity` rewrites accepted legacy rows in place
+	 * with the current wall clock. Such rows therefore stay fenced unless an
+	 * operator lists them in {@link #spawnAnchorAttestationFile}; see
+	 * {@link #loadAttestedSpawnAnchors}.
+	 */
+	#isSpawnAnchor(entry: LifecycleLedgerEntry): boolean {
+		return entry.spawnAnchor === true || this.#attestedSpawnAnchors.has(entry.identity);
+	}
+	/**
+	 * Loads the operator-written spawn-anchor attestation. The broker never writes
+	 * or derives this file. A listed identity is exempt only while its whole
+	 * history is the single unkeyed, unmarked `accepted` row a spawn mirror writes,
+	 * with no session target and no quarantined or corruption-uncertain history; any
+	 * other listed identity, and every identity of an unreadable file, stays fenced.
+	 * The file is optional and only ever lifts fences, so failing to read it leaves
+	 * the attested set empty instead of failing the ledger open.
+	 */
+	async #loadAttestedSpawnAnchors(quarantined: ReadonlySet<string>): Promise<void> {
+		let text: string;
+		try {
+			text = await fs.readFile(this.#spawnAnchorAttestationFile, "utf8");
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT") return;
+			this.#warnings.push("Unreadable spawn-anchor attestation ignored");
+			logger.warn("sdk broker: spawn-anchor attestation is unreadable; pre-marker mirrors stay fenced", {
+				code: code ?? "unknown",
+			});
+			return;
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch {
+			value = undefined;
+		}
+		const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+		if (
+			record?.version !== 1 ||
+			!Array.isArray(record.identities) ||
+			!record.identities.every(identity => typeof identity === "string")
+		) {
+			this.#warnings.push("Malformed spawn-anchor attestation ignored");
+			return;
+		}
+		const rowCounts = new Map<string, number>();
+		for (const entry of this.#entries) rowCounts.set(entry.identity, (rowCounts.get(entry.identity) ?? 0) + 1);
+		const attested = new Set<string>();
+		let rejected = 0;
+		for (const identity of new Set(record.identities as string[])) {
+			const entry = this.#byIdentity.get(identity);
+			if (
+				entry !== undefined &&
+				rowCounts.get(identity) === 1 &&
+				!quarantined.has(identity) &&
+				entry.state === "accepted" &&
+				entry.operationKey === undefined &&
+				entry.spawnAnchor === undefined &&
+				entry.fingerprint === undefined &&
+				entry.intendedSessionId === undefined &&
+				entry.closeAuthorityBound === undefined
+			)
+				attested.add(identity);
+			else rejected += 1;
+		}
+		if (rejected > 0) this.#warnings.push("Spawn-anchor attestation entries that are not spawn-mirror rows ignored");
+		this.#attestedSpawnAnchors = attested;
+	}
 	async begin(
 		identity: string,
 		requestHash: string,
@@ -926,6 +1018,7 @@ export class LifecycleLedger {
 			fingerprint?: string;
 			intendedSessionId?: string;
 			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
 		} = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
@@ -939,6 +1032,7 @@ export class LifecycleLedger {
 			fingerprint?: string;
 			intendedSessionId?: string;
 			closeAuthorityBound?: boolean;
+			spawnAnchor?: true;
 		},
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
@@ -953,6 +1047,7 @@ export class LifecycleLedger {
 					fingerprint: metadata.fingerprint,
 					intendedSessionId: metadata.intendedSessionId,
 					closeAuthorityBound: metadata.closeAuthorityBound,
+					spawnAnchor: metadata.spawnAnchor,
 					state: "accepted",
 					ts: Date.now(),
 				}),

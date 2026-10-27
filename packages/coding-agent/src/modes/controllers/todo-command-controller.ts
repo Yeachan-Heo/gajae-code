@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { sanitizeText } from "@gajae-code/utils";
 import { resolveToCwd } from "../../tools/path-utils";
 import {
 	applyOpsToPhases,
@@ -26,6 +27,11 @@ const USAGE = [
 	"  /todo drop   [<task|phase>]        Mark task/phase/all abandoned",
 	"  /todo rm     [<task|phase>]        Remove task/phase/all",
 ].join("\n");
+
+// Session todo text is drawn with showStatus, which does not strip terminal controls.
+function todoStatusText(text: string): string {
+	return sanitizeText(text);
+}
 
 // =============================================================================
 // Argument tokenizer (respects double-quoted strings)
@@ -196,7 +202,7 @@ export class TodoCommandController {
 			this.ctx.showStatus("No todos. Use /todo append <task> to start one.");
 			return;
 		}
-		this.ctx.showStatus(phasesToMarkdown(phases).trimEnd());
+		this.ctx.showStatus(todoStatusText(phasesToMarkdown(phases).trimEnd()));
 	}
 
 	#copyMarkdown(): void {
@@ -294,7 +300,7 @@ export class TodoCommandController {
 		});
 
 		this.#commit(next, `/todo append → ${targetPhase.name}`);
-		this.ctx.showStatus(`Appended to ${targetPhase.name}: ${finalContent}`);
+		this.ctx.showStatus(todoStatusText(`Appended to ${targetPhase.name}: ${finalContent}`));
 	}
 
 	// ------------------------------------------------------------- start / done / drop / rm
@@ -316,7 +322,7 @@ export class TodoCommandController {
 			return;
 		}
 		this.#commit(phases, `/todo start ${hit.task.content}`);
-		this.ctx.showStatus(`Started: ${hit.task.content}`);
+		this.ctx.showStatus(todoStatusText(`Started: ${hit.task.content}`));
 	}
 
 	#mutateStatus(rest: string, target: "completed" | "abandoned"): void {
@@ -343,7 +349,7 @@ export class TodoCommandController {
 				return;
 			}
 			this.#commit(phases, `/todo ${op} ${taskHit.task.content}`);
-			this.ctx.showStatus(`Marked ${target}: ${taskHit.task.content}`);
+			this.ctx.showStatus(todoStatusText(`Marked ${target}: ${taskHit.task.content}`));
 			return;
 		}
 
@@ -355,7 +361,7 @@ export class TodoCommandController {
 				return;
 			}
 			this.#commit(phases, `/todo ${op} ${phaseHit.name}`);
-			this.ctx.showStatus(`Marked phase ${phaseHit.name} ${target}.`);
+			this.ctx.showStatus(todoStatusText(`Marked phase ${phaseHit.name} ${target}.`));
 			return;
 		}
 
@@ -378,7 +384,7 @@ export class TodoCommandController {
 				return;
 			}
 			this.#commit(phases, `/todo rm ${taskHit.task.content}`);
-			this.ctx.showStatus(`Removed: ${taskHit.task.content}`);
+			this.ctx.showStatus(todoStatusText(`Removed: ${taskHit.task.content}`));
 			return;
 		}
 		const phaseHit = findPhaseFuzzy(current, trimmed);
@@ -389,7 +395,7 @@ export class TodoCommandController {
 				return;
 			}
 			this.#commit(phases, `/todo rm ${phaseHit.name}`);
-			this.ctx.showStatus(`Removed phase: ${phaseHit.name}`);
+			this.ctx.showStatus(todoStatusText(`Removed phase: ${phaseHit.name}`));
 			return;
 		}
 		this.ctx.showError(`No task or phase matched "${trimmed}".`);
