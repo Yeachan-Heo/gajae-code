@@ -101,6 +101,8 @@ Lifecycle:
 
 The runtime does not make these transitions transactional: canonical skill handoff does not complete an inline goal for the agent; the `skill` tool retires a conclusive mission only after its callee prompt dispatch succeeds. User cancellation can preserve an active or paused goal. After cancellation or a failed handoff, re-enter, inspect `goal({"op":"get"})`, and clean up only a matching nonterminal goal. An unrelated or unreadable Ultragoal state can also reject generic goal operations; do not bypass that guard or clear mission state early.
 
+If the `skill` tool returns `autoresearchMissionRetirementFailed`, the callee prompt was already dispatched; do not retry the handoff. Run `gjc autoresearch clear` and verify its receipt before starting a successor mission.
+
 Goal mode never authorizes implementation: the mission remains research-only (findings, evidence, run records, verdict), and the nudge loop must never be used to start product-code changes.
 
 ## Evidence sources interleave

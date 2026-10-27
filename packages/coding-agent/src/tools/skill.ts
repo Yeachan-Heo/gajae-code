@@ -22,7 +22,7 @@
  */
 
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
-import { prompt, untilAborted } from "@gajae-code/utils";
+import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { resolveGlobalUserSkillLinkTrust } from "../config/skill-settings-defaults";
 import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gjc-plugins";
@@ -282,9 +282,20 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				// the callee in an extra turn.
 				{ triggerTurn: false, deliverAs: "steer" },
 			);
+			let autoresearchMissionRetirementFailed = false;
 			if (activeSkill === "autoresearch" && isCanonicalGjcWorkflowSkill(skill.name)) {
 				const sessionId = activeState?.session_id?.trim() || this.#session.getSessionId?.()?.trim();
-				if (sessionId) await autoresearchRetireConclusiveMissionAfterHandoff(this.#session.cwd, sessionId);
+				if (sessionId) {
+					try {
+						await autoresearchRetireConclusiveMissionAfterHandoff(this.#session.cwd, sessionId);
+					} catch (error) {
+						autoresearchMissionRetirementFailed = true;
+						logger.warn("Autoresearch mission retirement failed after handoff dispatch", {
+							sessionId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
 			}
 
 			const summary = JSON.stringify({
@@ -292,6 +303,13 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				path: skill.filePath,
 				args: activationResult.cleanedArgs || undefined,
 				lineCount: built.details.lineCount,
+				...(autoresearchMissionRetirementFailed
+					? {
+							autoresearchMissionRetirementFailed: true,
+							warning:
+								"The handoff was dispatched, but autoresearch mission cleanup failed. Do not retry the handoff; run `gjc autoresearch clear` before starting another autoresearch mission.",
+						}
+					: {}),
 			});
 			return {
 				content: [{ type: "text", text: summary }],
@@ -300,6 +318,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					path: skill.filePath,
 					args: activationResult.cleanedArgs || undefined,
 					lineCount: built.details.lineCount,
+					...(autoresearchMissionRetirementFailed ? { autoresearchMissionRetirementFailed: true } : {}),
 				},
 			};
 		});

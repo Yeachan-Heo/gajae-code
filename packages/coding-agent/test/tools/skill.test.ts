@@ -8,6 +8,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { clearPluginRootsAndCaches } from "@gajae-code/coding-agent/discovery/helpers";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { loadSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import * as autoresearchRuntime from "@gajae-code/coding-agent/gjc-runtime/autoresearch-runtime";
 import {
 	autoresearchIntake,
 	autoresearchIssueVerdict,
@@ -935,6 +936,41 @@ describe("SkillTool", () => {
 			expect((await readModeState(cwd, "autoresearch", sessionId))?.current_phase).toBe("handoff");
 			expect((await readModeState(cwd, "autoresearch", sessionId))?.active).toBe(false);
 			expect((await readModeState(cwd, "ralplan", sessionId))?.active).toBe(true);
+		} finally {
+			if (autoresearch) await safeRm(autoresearch.baseDir, { recursive: true, force: true });
+			if (ralplan) await safeRm(ralplan.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not fail or invite a duplicate handoff when mission retirement fails after dispatch", async () => {
+		const cwd = await makeTempCwd();
+		const sessionId = "s1";
+		let autoresearch: Skill | undefined;
+		let ralplan: Skill | undefined;
+		try {
+			await writeCallerModeState(cwd, "autoresearch", "verdict", sessionId);
+			autoresearch = await makeSkill("autoresearch", "---\nname: autoresearch\n---\nResearch");
+			ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+			const retire = spyOn(autoresearchRuntime, "autoresearchRetireConclusiveMissionAfterHandoff").mockRejectedValue(
+				new Error("disk full"),
+			);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [autoresearch, ralplan], captured, {
+				getActiveSkillState: () => ({ skill: "autoresearch", session_id: sessionId }),
+				getActiveSkillPhase: () => "verdict",
+			});
+			const tool = SkillTool.createIf(session);
+			if (!tool) throw new Error("Expected skill tool");
+
+			const result = await tool.execute("handoff-cleanup-failure", { name: "ralplan" });
+
+			expect(captured).toHaveLength(1);
+			expect(retire).toHaveBeenCalledTimes(1);
+			expect(result.details).toMatchObject({ name: "ralplan", autoresearchMissionRetirementFailed: true });
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).toContain("Do not retry the handoff");
+			expect(text).toContain("gjc autoresearch clear");
 		} finally {
 			if (autoresearch) await safeRm(autoresearch.baseDir, { recursive: true, force: true });
 			if (ralplan) await safeRm(ralplan.baseDir, { recursive: true, force: true });
