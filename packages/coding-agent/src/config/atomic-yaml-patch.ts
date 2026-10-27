@@ -311,8 +311,10 @@ function assertPatch(patch: AtomicYamlPatch): void {
 		throw new Error("Atomic YAML patches require a non-empty, safe dotted path.");
 	}
 	if (
-		patch.expected &&
-		(typeof patch.expected.path !== "string" ||
+		patch.expected !== undefined &&
+		(patch.expected === null ||
+			typeof patch.expected !== "object" ||
+			typeof patch.expected.path !== "string" ||
 			patch.expected.path.length === 0 ||
 			!isSafeAtomicYamlPath(patch.expected.path.split(".")) ||
 			typeof patch.expected.hash !== "string" ||

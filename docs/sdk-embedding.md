@@ -105,7 +105,10 @@ same exact path retain ordered last-write semantics.
 Ordinary saves also publish effective changes adopted from another scoped owner's
 on-disk edits. Overlapping writes through the shared in-process YAML writer fence
 older receipts, including same-value and ABA writes and canonical-path aliases.
-Unrelated model-role writes do not invalidate a default-role receipt. These
+Per-role writes track unrelated roles independently when the role is a safe
+single path segment. A literal role name that cannot be represented as one safe
+segment uses whole-record ownership in `setGlobalModelRoleAndFlush` and can
+invalidate a default-role receipt even when it updates a different role. These
 ownership generations are process-local: unknown or cross-process writers retain
 the existing hash/exact-file checks, which do not prove same-value or ABA ownership.
 

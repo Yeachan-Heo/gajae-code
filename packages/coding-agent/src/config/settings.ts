@@ -342,15 +342,18 @@ function isAtomicSettingsPath(path: string): boolean {
 
 function stageAtomicSettingsPatches(patches: readonly SettingsAtomicPatch[]): SettingsAtomicPatch[] {
 	return patches.map(patch => {
-		if (!isAtomicSettingsPath(patch.path)) {
-			throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
+		const path = patch.path;
+		const op = patch.op;
+		if (!isAtomicSettingsPath(path)) {
+			throw new Error(`Unknown setting path for atomic batch: ${path}`);
 		}
-		if (patch.op === "unset") return { path: patch.path, op: "unset" };
-		if (patch.op !== "set") throw new TypeError("Unknown settings atomic patch operation.");
-		if (patch.value === undefined) {
-			throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
+		if (op === "unset") return { path, op };
+		if (op !== "set") throw new TypeError("Unknown settings atomic patch operation.");
+		const value = (patch as Extract<SettingsAtomicPatch, { op: "set" }>).value;
+		if (value === undefined) {
+			throw new TypeError(`Settings set patch for ${path} cannot carry undefined; use unset instead.`);
 		}
-		return { path: patch.path, op: "set", value: structuredClone(patch.value) };
+		return { path, op, value: structuredClone(value) };
 	});
 }
 
@@ -663,6 +666,7 @@ export class Settings implements NotificationSettingsReader {
 	/** Latest dirty patch for each path, owned by its generation. */
 	#modified = new Map<string, SettingsPatch>();
 	#nextGeneration = 0;
+	#runtimeGeneration = 0;
 	#pathRevisions = new Map<string, number>();
 	#nextRevision = 0;
 	/** Pending debounced ordinary save; its queue slot is reserved immediately. */
@@ -1341,131 +1345,134 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
 		this.#assertDurableConfigWritable();
-		assertNonOverlappingAtomicYamlPatches(patches);
+		const admissionRevision = this.#nextRevision;
+		const admissionRuntimeGeneration = this.#runtimeGeneration;
+		const stagedPatches = stageAtomicSettingsPatches(patches);
+		if (this.#nextRevision !== admissionRevision || this.#runtimeGeneration !== admissionRuntimeGeneration) {
+			throw new Error("Settings changed while the atomic batch was preparing; build it again.");
+		}
+		assertNonOverlappingAtomicYamlPatches(stagedPatches);
 		if (!this.#persist || !this.#configPath) {
-			const stagedPatches = stageAtomicSettingsPatches(patches);
-			const notificationValidationGuard = this.#notificationValidationRestoreGuard();
-			const changes = new Map<
-				string,
-				{ before: unknown; beforeEffective: unknown; beforeHash: string; afterHash: string; revision: number }
-			>();
-			for (const patch of stagedPatches) {
-				if (!changes.has(patch.path)) {
-					changes.set(patch.path, {
-						before: structuredClone(getByPath(this.#global, patch.path.split("."))),
-						beforeEffective: Object.hasOwn(SETTINGS_SCHEMA, patch.path)
-							? this.get(patch.path as SettingPath)
-							: undefined,
-						beforeHash: atomicYamlPathHash(this.#global, patch.path),
-						afterHash: "",
-						revision: 0,
-					});
-				}
-			}
-			const candidateGlobal = structuredClone(this.#global);
-			const hasNotificationMutation = stagedPatches.some(patch => isNotificationSettingsPath(patch.path));
-			const candidateRawNotifications = hasNotificationMutation
-				? structuredClone(this.#rawNotificationConfig ?? {})
-				: this.#rawNotificationConfig;
-			for (const patch of stagedPatches) {
-				const segments = patch.path.split(".");
-				if (patch.op === "set") setByPath(candidateGlobal, segments, patch.value);
-				else deleteByPath(candidateGlobal, segments);
-				if (isNotificationSettingsPath(patch.path)) {
-					if (patch.op === "set") setByPath(candidateRawNotifications!, segments, structuredClone(patch.value));
-					else deleteByPath(candidateRawNotifications!, segments);
-				}
-			}
-			for (const [patchPath, change] of changes) {
-				change.afterHash = atomicYamlPathHash(candidateGlobal, patchPath);
-			}
-			const candidateMerged = this.#mergeSettingsLayers(candidateGlobal, this.#project, this.#overrides);
-			const candidateDiagnostic = this.#computeAutoroutingDiagnostic(candidateGlobal, candidateMerged);
-			let candidateMalformedRoot = this.#hasMalformedConfigRoot;
-			let candidateInvalidNotifications = this.#hasInvalidNotificationGlobal;
-			if (hasNotificationMutation) {
-				try {
-					parseNotificationSettingsSnapshot(candidateRawNotifications);
-					candidateMalformedRoot = false;
-					candidateInvalidNotifications = false;
-				} catch (error) {
-					if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration")
-						throw error;
-					candidateInvalidNotifications = true;
-				}
-			}
-			this.#global = candidateGlobal;
-			this.#rawNotificationConfig = candidateRawNotifications;
-			this.#merged = candidateMerged;
-			this.#autoroutingLocalIssues = candidateDiagnostic.localIssues;
-			this.#autoroutingEffective = candidateDiagnostic.effective;
-			this.#hasMalformedConfigRoot = candidateMalformedRoot;
-			this.#hasInvalidNotificationGlobal = candidateInvalidNotifications;
-			if (hasNotificationMutation) this.#notificationValidationGeneration++;
-			for (const [settingPath, change] of changes) {
-				change.revision = ++this.#nextRevision;
-				this.#pathRevisions.set(settingPath, change.revision);
-			}
-			this.#recordNotificationValidationBatchApply(
-				notificationValidationGuard,
-				patches.map(patch => patch.path),
-			);
-			this.#publishSettingsChanges(
-				new Map([...changes].map(([settingPath, change]) => [settingPath, change.beforeEffective])),
-			);
-			let discarded = false;
-			let receipt: CasReceipt;
-			receipt = {
-				revisions: [],
-				discard: () => {
-					discarded = true;
-				},
-				restore: async () => {
-					if (discarded) return { status: "discarded" } as const;
-					const conflicts = [...changes].flatMap(([patchPath, change]) =>
-						this.#pathRevisions.get(patchPath) === change.revision &&
-						!this.#hasNewerOverlappingRevision(patchPath, change.revision) &&
-						atomicYamlPathHash(this.#global, patchPath) === change.afterHash
-							? []
-							: [patchPath],
-					);
-					if (conflicts.length > 0) return { status: "conflict", paths: conflicts } as const;
-					const previous = new Map(
-						[...changes.keys()].map(settingPath => [
-							settingPath,
-							Object.hasOwn(SETTINGS_SCHEMA, settingPath) ? this.get(settingPath as SettingPath) : undefined,
-						]),
-					);
-					const restoreNotificationValidationState = this.#canRestoreNotificationValidationState(
-						notificationValidationGuard,
-						changes.keys(),
-					);
-					for (const [patchPath, change] of changes) {
-						if (change.beforeHash === atomicYamlPathHash({}, patchPath)) {
-							deleteByPath(this.#global, patchPath.split("."));
-							this.#applyNotificationMutationToRaw(patchPath, undefined);
-						} else {
-							setByPath(this.#global, patchPath.split("."), structuredClone(change.before));
-							this.#applyNotificationMutationToRaw(patchPath, change.before);
-						}
+			const applyMemoryBatch = (
+				stagedPatches: readonly SettingsAtomicPatch[],
+				restoreGuard?: NotificationValidationRestoreGuard,
+			): CasReceipt => {
+				const notificationValidationGuard = this.#notificationValidationRestoreGuard();
+				const changes = new Map<
+					string,
+					{ before: unknown; beforeEffective: unknown; beforeHash: string; afterHash: string; revision: number }
+				>();
+				for (const patch of stagedPatches) {
+					if (!changes.has(patch.path)) {
+						changes.set(patch.path, {
+							before: structuredClone(getByPath(this.#global, patch.path.split("."))),
+							beforeEffective: Object.hasOwn(SETTINGS_SCHEMA, patch.path)
+								? this.get(patch.path as SettingPath)
+								: undefined,
+							beforeHash: atomicYamlPathHash(this.#global, patch.path),
+							afterHash: "",
+							revision: 0,
+						});
 					}
-					const modelRoles = rawSettingsRecord(this.#global.modelRoles);
-					if (changes.has("modelRoles.default") && modelRoles && Object.keys(modelRoles).length === 0) {
-						delete this.#global.modelRoles;
+				}
+				const candidateGlobal = structuredClone(this.#global);
+				const hasNotificationMutation = stagedPatches.some(patch => isNotificationSettingsPath(patch.path));
+				const candidateRawNotifications = hasNotificationMutation
+					? structuredClone(this.#rawNotificationConfig ?? {})
+					: this.#rawNotificationConfig;
+				for (const patch of stagedPatches) {
+					const segments = patch.path.split(".");
+					if (patch.op === "set") setByPath(candidateGlobal, segments, patch.value);
+					else deleteByPath(candidateGlobal, segments);
+					if (isNotificationSettingsPath(patch.path)) {
+						if (patch.op === "set") setByPath(candidateRawNotifications!, segments, structuredClone(patch.value));
+						else deleteByPath(candidateRawNotifications!, segments);
 					}
-					this.#rebuildMerged();
-					this.#revalidateNotificationSettingsAfterMutation(changes.keys());
-					if (restoreNotificationValidationState) {
-						this.#restoreNotificationValidationState(notificationValidationGuard.state);
+				}
+				const candidateModelRoles = rawSettingsRecord(candidateGlobal.modelRoles);
+				if (
+					stagedPatches.some(patch => patch.path === "modelRoles.default" && patch.op === "unset") &&
+					candidateModelRoles &&
+					Object.keys(candidateModelRoles).length === 0
+				) {
+					delete candidateGlobal.modelRoles;
+				}
+				for (const [patchPath, change] of changes) {
+					change.afterHash = atomicYamlPathHash(candidateGlobal, patchPath);
+				}
+				const candidateMerged = this.#mergeSettingsLayers(candidateGlobal, this.#project, this.#overrides);
+				const candidateDiagnostic = this.#computeAutoroutingDiagnostic(candidateGlobal, candidateMerged);
+				let candidateMalformedRoot = this.#hasMalformedConfigRoot;
+				let candidateInvalidNotifications = this.#hasInvalidNotificationGlobal;
+				if (hasNotificationMutation) {
+					try {
+						parseNotificationSettingsSnapshot(candidateRawNotifications);
+						candidateMalformedRoot = false;
+						candidateInvalidNotifications = false;
+					} catch (error) {
+						if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration")
+							throw error;
+						candidateInvalidNotifications = true;
 					}
-					this.#publishSettingsChanges(previous);
-					return { status: "restored", receipt } as const;
-				},
+				}
+				if (restoreGuard && this.#canRestoreNotificationValidationState(restoreGuard, changes.keys())) {
+					candidateMalformedRoot = restoreGuard.state.malformedConfigRoot;
+					candidateInvalidNotifications = restoreGuard.state.invalidNotificationGlobal;
+				}
+				this.#global = candidateGlobal;
+				this.#rawNotificationConfig = candidateRawNotifications;
+				this.#merged = candidateMerged;
+				this.#autoroutingLocalIssues = candidateDiagnostic.localIssues;
+				this.#autoroutingEffective = candidateDiagnostic.effective;
+				this.#hasMalformedConfigRoot = candidateMalformedRoot;
+				this.#hasInvalidNotificationGlobal = candidateInvalidNotifications;
+				if (hasNotificationMutation) this.#notificationValidationGeneration++;
+				for (const [settingPath, change] of changes) {
+					change.revision = ++this.#nextRevision;
+					this.#pathRevisions.set(settingPath, change.revision);
+				}
+				this.#recordNotificationValidationBatchApply(
+					notificationValidationGuard,
+					stagedPatches.map(patch => patch.path),
+				);
+				this.#publishSettingsChanges(
+					new Map([...changes].map(([settingPath, change]) => [settingPath, change.beforeEffective])),
+				);
+				let discarded = false;
+				const receipt: CasReceipt = {
+					revisions: [],
+					discard: () => {
+						discarded = true;
+					},
+					restore: async () => {
+						if (discarded) return { status: "discarded" } as const;
+						const conflicts = [...changes].flatMap(([patchPath, change]) =>
+							this.#pathRevisions.get(patchPath) === change.revision &&
+							!this.#hasNewerOverlappingRevision(patchPath, change.revision) &&
+							atomicYamlPathHash(this.#global, patchPath) === change.afterHash
+								? []
+								: [patchPath],
+						);
+						if (conflicts.length > 0) return { status: "conflict", paths: conflicts } as const;
+						const restorePatches: SettingsAtomicPatch[] = [...changes].map(([path, change]) =>
+							change.beforeHash === atomicYamlPathHash({}, path)
+								? { path: path as SettingsAtomicPatch["path"], op: "unset" }
+								: {
+										path: path as SettingsAtomicPatch["path"],
+										op: "set",
+										value: structuredClone(change.before),
+									},
+						);
+						const inverse = applyMemoryBatch(restorePatches, notificationValidationGuard);
+						return { status: "restored", receipt: inverse } as const;
+					},
+				};
+				return receipt;
 			};
-			return receipt;
+			return applyMemoryBatch(stagedPatches);
 		}
 
-		const durablePatches: AtomicYamlPatch[] = stageAtomicSettingsPatches(patches);
+		const durablePatches: AtomicYamlPatch[] = stagedPatches;
 
 		// A durable batch is a causal barrier: close the earlier ordinary debounce
 		// inside its already-reserved slot before queueing this batch.
@@ -1524,9 +1531,9 @@ export class Settings implements NotificationSettingsReader {
 		const commit = applyAtomicYamlPatchesWithCurrent(
 			this.#configPath,
 			async current => {
-				const patches = await buildPatches(structuredClone(current));
+				const patches = stageAtomicSettingsPatches(await buildPatches(structuredClone(current)));
 				assertNonOverlappingAtomicYamlPatches(patches);
-				const durablePatches: AtomicYamlPatch[] = stageAtomicSettingsPatches(patches);
+				const durablePatches: AtomicYamlPatch[] = patches;
 				revisions = durablePatches.map(patch => ({
 					patch,
 					revision: ++this.#nextRevision,
@@ -1570,6 +1577,7 @@ export class Settings implements NotificationSettingsReader {
 		if (isNotificationSettingsPath(path)) throw new NotificationSettingsOverrideError(path);
 		const previous = this.get(path);
 		const clonedValue = structuredClone(value);
+		this.#runtimeGeneration++;
 		setByPath(this.#overrides, path.split("."), clonedValue);
 		this.#rebuildMerged();
 		this.#publishSettingsChanges(new Map([[path, previous]]));
@@ -1586,6 +1594,7 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	clearOverride(path: SettingPath): void {
 		const previous = this.get(path);
+		this.#runtimeGeneration++;
 		const segments = path.split(".");
 		let current: unknown = this.#overrides;
 		for (const segment of segments) {
@@ -1878,10 +1887,18 @@ export class Settings implements NotificationSettingsReader {
 		modelId: ModelSelectorValue | undefined,
 	): Promise<CasReceipt> {
 		return this.commitAtomicBatchWithCurrent(current => {
+			// Dots in role names are literal keys, not path separators. Unsafe or
+			// unrepresentable names retain whole-map ownership instead of being
+			// reinterpreted as a different role.
+			if (!role.includes(".") && isSafeAtomicYamlPath(["modelRoles", role])) {
+				const path: SettingsAtomicPath = `modelRoles.${role}`;
+				return modelId === undefined ? [{ path, op: "unset" }] : [{ path, op: "set", value: modelId }];
+			}
 			const roles = rawSettingsRecord(current.modelRoles) ?? {};
 			const next = { ...roles };
 			if (modelId === undefined) delete next[role];
-			else next[role] = modelId;
+			else
+				Object.defineProperty(next, role, { value: modelId, writable: true, enumerable: true, configurable: true });
 			return [{ path: "modelRoles", op: "set", value: next }];
 		});
 	}
@@ -6351,15 +6368,19 @@ export class Settings implements NotificationSettingsReader {
 			notificationValidationGuard,
 			restoredPatches.map(patch => patch.path),
 		);
-		if (this.#applyDurablePatches(revisions, restoredPatches, false) && restoreNotificationValidationState) {
-			this.#restoreNotificationValidationState(notificationValidationGuard.state);
-		}
+		this.#applyDurablePatches(
+			revisions,
+			restoredPatches,
+			false,
+			restoreNotificationValidationState ? notificationValidationGuard.state : undefined,
+		);
 	}
 
 	#applyDurablePatches(
 		revisions: readonly DurableBatchRevision[],
 		patches: readonly AtomicYamlPatch[],
 		clearStagedMutations: boolean,
+		restoreNotificationState?: NotificationValidationState,
 	): boolean {
 		const revisionsByPath = new Map<string, DurableBatchRevision>();
 		for (const entry of revisions) revisionsByPath.set(entry.patch.path, entry);
@@ -6409,6 +6430,7 @@ export class Settings implements NotificationSettingsReader {
 		}
 		this.#rebuildMerged();
 		this.#revalidateNotificationSettingsAfterMutation(applicable.map(patch => patch.path));
+		if (restoreNotificationState) this.#restoreNotificationValidationState(restoreNotificationState);
 		this.#publishSettingsChanges(previous);
 		return applicable.some(patch => isNotificationSettingsPath(patch.path));
 	}

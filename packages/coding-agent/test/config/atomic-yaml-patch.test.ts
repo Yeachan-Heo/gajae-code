@@ -38,6 +38,44 @@ afterEach(async () => {
 });
 
 describe("atomic YAML patches", () => {
+	test("rejects malformed present preconditions before any batch write", async () => {
+		const configPath = await configPathForTest();
+		const before = "feature:\n  keep: true\n";
+		await Bun.write(configPath, before);
+		for (const expected of [false, 0, "", null, {}, { path: "feature.keep", hash: "" }]) {
+			const invalid = {
+				path: "feature.keep",
+				op: "set",
+				value: "private-payload",
+				expected,
+			} as unknown as AtomicYamlPatch;
+			try {
+				applyAtomicYamlPatches(configPath, [{ path: "other", op: "set", value: 1 }, invalid]);
+				throw new Error("Expected invalid precondition rejection");
+			} catch (error) {
+				expect(String(error)).toContain("preconditions");
+				expect(String(error)).not.toContain("private-payload");
+			}
+			expect(await Bun.file(configPath).text()).toBe(before);
+		}
+		await applyAtomicYamlPatches(configPath, [
+			{
+				path: "feature.keep",
+				op: "set",
+				value: false,
+				expected: { path: "feature.keep", hash: atomicYamlPathHash({ feature: { keep: true } }, "feature.keep") },
+			},
+		]);
+		expect(await readYaml(configPath)).toEqual({ feature: { keep: false } });
+		await expect(
+			applyAtomicYamlPatches(configPath, [
+				{ path: "feature.keep", op: "set", value: true, expected: { path: "feature.keep", hash: "wrong" } },
+			]),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await readYaml(configPath)).toEqual({ feature: { keep: false } });
+		await applyAtomicYamlPatches(configPath, [{ path: "feature.keep", op: "set", value: true, expected: undefined }]);
+		expect(await readYaml(configPath)).toEqual({ feature: { keep: true } });
+	});
 	test("rejects unsafe patch and precondition segments before writing any sibling", async () => {
 		const configPath = await configPathForTest();
 		const before = "feature:\n  keep: true\n";
