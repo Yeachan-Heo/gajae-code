@@ -21,13 +21,14 @@ import {
 	__setBinaryResolverForTests,
 	__setExecutableIdentityResolverForTests,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
-import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { sessionRuntimeDir, tmuxRuntimeSessionPath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import { buildGjcTmuxSessionSlug } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
@@ -3976,6 +3977,47 @@ describe("tmux owner isolation launch gate", () => {
 			}
 		},
 	);
+
+	it.skipIf(process.platform === "win32")("refuses a root launch whose private state tail is a symlink", () => {
+		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-tail-link-")));
+		try {
+			const cwd = path.join(root, "workspace");
+			const outside = path.join(root, "outside");
+			fs.mkdirSync(outside, { mode: 0o700 });
+			const stateFile = tmuxRuntimeSessionPath(cwd, "tail-gjc-session", buildGjcTmuxSessionSlug("gjc_tail"));
+			fs.mkdirSync(path.dirname(path.dirname(stateFile)), { recursive: true, mode: 0o700 });
+			fs.symlinkSync(outside, path.dirname(stateFile));
+			const calls: string[][] = [];
+			const diagnostics: string[] = [];
+			launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd,
+				env: {
+					GJC_TMUX_SESSION: "gjc_tail",
+					GJC_COORDINATOR_SESSION_ID: "tail-session",
+					GJC_SESSION_ID: "tail-gjc-session",
+					GJC_COORDINATOR_SESSION_STATE_FILE: "",
+				},
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				diagnosticWriter: message => diagnostics.push(message),
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+			expect(calls.some(call => call[0] === "new-session")).toBe(false);
+			expect(diagnostics.join("\n")).toContain("managed_owner_storage_unsafe");
+			expect(fs.readdirSync(outside)).toEqual([]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 
 	it("exact-rolls back a spawned owner when generation publication loses its baseline", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-owner-generation-race-"));

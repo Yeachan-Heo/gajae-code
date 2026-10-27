@@ -977,6 +977,39 @@ describe("GJC tmux session management", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"refuses a Broker launch whose private state tail is a symlink",
+		async () => {
+			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-tail-link-")));
+			fixtureDirectories.push(root);
+			const cwd = path.join(root, "workspace");
+			const outside = path.join(root, "outside");
+			await fs.mkdir(outside, { mode: 0o700 });
+			const stateFile = tmuxRuntimeSessionPath(cwd, "broker-child", buildGjcTmuxSessionSlug("broker-child"));
+			await fs.mkdir(path.dirname(path.dirname(stateFile)), { recursive: true, mode: 0o700 });
+			// Link the private tail itself to a separate owner-only directory.
+			await fs.symlink(outside, path.dirname(stateFile));
+			let reachedIsolation = false;
+			__setCreateOwnerIsolationForTests({
+				execute: () => {
+					reachedIsolation = true;
+					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+				},
+			});
+			expect(() =>
+				createGjcTmuxSession(
+					{ GJC_TMUX_COMMAND: "tmux" },
+					{
+						platform: process.platform === "linux" ? "linux" : "darwin",
+						launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] },
+					},
+				),
+			).toThrow("gjc_tmux_managed_storage_unsafe");
+			expect(reachedIsolation).toBe(false);
+			expect(fsSync.readdirSync(outside)).toEqual([]);
+		},
+	);
+
 	it("cleans the exact created session when managed proof rejects multiple pane PIDs", () => {
 		const cwd = path.join(os.tmpdir(), `gjc-managed-proof-cleanup-${crypto.randomUUID()}`);
 		const sessionName = "broker-child";
