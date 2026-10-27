@@ -17029,7 +17029,7 @@ export class AgentSession {
 					this.#settleDeliveredOwnedRegistrations([appMessage]);
 					return;
 				}
-				await this.#queueFollowUpAfterReservation(
+				const queuedFollowUp = await this.#queueFollowUpAfterReservation(
 					appMessage,
 					this.#getCustomMessageTextContent(appMessage),
 					{
@@ -17040,6 +17040,7 @@ export class AgentSession {
 					},
 					options?.preflightSignal,
 				);
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp);
 				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity
 				// aligned with where the executable message actually landed.
@@ -17070,7 +17071,7 @@ export class AgentSession {
 			}
 
 			const independentOfTurn = appMessage.attribution === "user" || options?.origin === "external";
-			await this.#queueFollowUpAfterReservation(
+			const queuedFollowUp = await this.#queueFollowUpAfterReservation(
 				appMessage,
 				this.#getCustomMessageTextContent(appMessage),
 				{
@@ -17081,6 +17082,7 @@ export class AgentSession {
 				},
 				options?.preflightSignal,
 			);
+			this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp);
 			this.#bindCustomDisplayEntry(appMessage, "followUp");
 			if (independentOfTurn) {
 				this.#externalFollowUps.add(appMessage);
