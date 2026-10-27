@@ -181,6 +181,43 @@ describe("Settings", () => {
 		}
 	});
 
+	it("transfers in-memory receipt ownership on restoration, including same-value writes", async () => {
+		const settings = Settings.isolated({ temperature: 0.2 });
+		try {
+			const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.8 }]);
+			const restored = await receipt.restore();
+			expect(restored.status).toBe("restored");
+			if (restored.status !== "restored") throw new Error("Expected a restorable receipt");
+			expect(settings.get("temperature")).toBe(0.2);
+			expect((await restored.receipt.restore()).status).toBe("restored");
+			expect(settings.get("temperature")).toBe(0.8);
+			expect((await receipt.restore()).status).toBe("conflict");
+			const same = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.8 }]);
+			expect((await same.restore()).status).toBe("restored");
+			expect((await same.restore()).status).toBe("conflict");
+		} finally {
+			await settings.close();
+		}
+	});
+
+	for (const durable of [false, true]) {
+		it(`keeps unrelated safe model-role receipts independent (${durable ? "disk" : "memory"})`, async () => {
+			const settings = durable ? await Settings.loadForScope({ cwd: projectDir, agentDir }) : Settings.isolated();
+			try {
+				const receipt = await settings.commitAtomicBatch([
+					{ path: "modelRoles.default", op: "set", value: "test/a" },
+				]);
+				await settings.setGlobalModelRoleAndFlush("custom", "test/b");
+				expect((await receipt.restore()).status).toBe("restored");
+				expect(settings.getGlobal("modelRoles")?.custom).toBe("test/b");
+				await settings.setGlobalModelRoleAndFlush("literal.role", "test/c");
+				expect(settings.getGlobal("modelRoles")?.["literal.role"]).toBe("test/c");
+			} finally {
+				await settings.close();
+			}
+		});
+	}
+
 	it("does not log setting override values when initialization options differ", async () => {
 		const initialSecret = "initial-settings-secret";
 		const requestedSecret = "requested-settings-secret";
