@@ -30,7 +30,7 @@ export function sanitizeStatusLineText(text: string): string {
 	return text
 		.replace(/[\r\n\t]+/gu, " ")
 		.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, "")
-		.replace(/\x1b\][\s\S]*?(?:\x1b\\|\x07)/gu, (match) => {
+		.replace(/\x1b\][\s\S]*?(?:\x1b\\|\x07)/gu, match => {
 			if (WELL_FORMED_FILE_OSC8_RE.test(match) || WELL_FORMED_OSC8_CLOSURE_RE.test(match)) {
 				return match;
 			}
