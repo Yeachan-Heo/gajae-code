@@ -132,8 +132,9 @@ describe("Settings.snapshotForCwd", () => {
 			const parent = await Settings.loadReadonly({ cwd: parentCwd, agentDir });
 			expect(parent.getGlobal("ask.timeout")).toBe(30);
 			expect(parent.get("ask.timeout")).toBe(15);
-			expect(getDefaultTabWidth()).toBe(parentTabWidth);
-			observedTabWidths.length = 0;
+			expect(parent.get("display.tabWidth")).toBe(parentTabWidth);
+			expect(getDefaultTabWidth()).toBe(originalTabWidth);
+			expect(observedTabWidths).toEqual([]);
 			const changedPaths: string[] = [];
 			const unsubscribe = parent.onChanged(settingPath => changedPaths.push(settingPath));
 			try {
@@ -145,7 +146,7 @@ describe("Settings.snapshotForCwd", () => {
 				expect(parent.getCwd()).toBe(parentCwd);
 				expect(parent.get("ask.timeout")).toBe(15);
 				expect(observedTabWidths).toEqual([]);
-				expect(getDefaultTabWidth()).toBe(parentTabWidth);
+				expect(getDefaultTabWidth()).toBe(originalTabWidth);
 				expect(changedPaths).toEqual([]);
 
 				parent.override("ask.timeout", 45);
@@ -159,7 +160,7 @@ describe("Settings.snapshotForCwd", () => {
 				expect(parent.getCwd()).toBe(parentCwd);
 				expect(changedPaths).toHaveLength(changeCount);
 				expect(observedTabWidths).toEqual([]);
-				expect(getDefaultTabWidth()).toBe(parentTabWidth);
+				expect(getDefaultTabWidth()).toBe(originalTabWidth);
 			} finally {
 				unsubscribe();
 			}
