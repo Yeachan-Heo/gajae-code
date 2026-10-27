@@ -57,6 +57,44 @@ const ownerIsolationFlag = "--internal-tmux-owner-isolation";
 const publishRelayForTest = (file: string, bytes: Uint8Array): void => {
 	publishManagedFileNoReplaceSync(file, bytes, managedDirectoryRoot(path.dirname(file)));
 };
+/** The supervised child's pid the consumer tests relay to. */
+const COOPERATIVE_CHILD_PID = 4242;
+/** What an admitted Darwin child publishes once its cooperative handler is installed. */
+const publishCooperativeReadyForTest = (
+	paths: { cooperativeReadyFile: string },
+	generation: string,
+	overrides: Record<string, unknown> = {},
+): void =>
+	fsSync.writeFileSync(
+		paths.cooperativeReadyFile,
+		`${JSON.stringify({ schema_version: 1, generation, session_id: "session", child_token: "token", child_pid: COOPERATIVE_CHILD_PID, signal: "SIGUSR2", ...overrides })}\n`,
+		{ mode: 0o600 },
+	);
+/** The supervisor's index and its reconciliation of the relayed child's own exit. */
+const publishChildExitForTest = (
+	paths: { supervisorIndexFile: string; childExitFile: string },
+	intent: OwnerIntent,
+	overrides: Record<string, unknown> = {},
+): void => {
+	if (!fsSync.existsSync(paths.supervisorIndexFile))
+		fsSync.writeFileSync(
+			paths.supervisorIndexFile,
+			`${JSON.stringify({ schema_version: 1, generation: intent.generation, session_id: intent.session_id, child_token: "token", supervisor_pid: 10, supervisor_start_time: "start" })}\n`,
+			{ mode: 0o600 },
+		);
+	fsSync.writeFileSync(
+		paths.childExitFile,
+		`${JSON.stringify({ schema_version: 1, generation: intent.generation, session_id: intent.session_id, child_token: "token", child_pid: COOPERATIVE_CHILD_PID, intent_id: intent.intent_id, dispatch_id: intent.dispatch_id, signal: null, exit_code: 143, explained: true, observed_at: new Date().toISOString(), ...overrides })}\n`,
+		{ mode: 0o600 },
+	);
+};
+const waitForPath = async (file: string, timeoutMs = 3_000): Promise<void> => {
+	const deadline = Date.now() + timeoutMs;
+	while (!fsSync.existsSync(file)) {
+		if (Date.now() >= deadline) throw new Error(`timed out waiting for ${file}`);
+		await Bun.sleep(10);
+	}
+};
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
 
@@ -279,6 +317,7 @@ describe("owner intent construction", () => {
 									})}\n`,
 									{ mode: 0o600 },
 								);
+							if (mode === "cooperative_intent") publishChildExitForTest(paths, intent);
 							return {
 								schema_version: 1,
 								generation,
@@ -671,6 +710,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 			const write = (file: string, value: unknown) =>
 				fsSync.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
 			write(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
 			// A closer is waiting, so every refusal below comes from the evidence under test.
 			releaseCloser = holdCloser(paths);
 			let relays = 0;
@@ -678,6 +718,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 			let signaledAt: string | undefined;
 			const poll = () =>
 				consumeCooperativeOwnerIntent({
+					childPid: COOPERATIVE_CHILD_PID,
 					stateDir: state,
 					publishNoReplace: publishRelayForTest,
 					binding,
@@ -807,6 +848,25 @@ await Bun.stdin.text(); db.exec("COMMIT"); db.close(); clearTimeout(timer);`,
 			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
 			expect(fsSync.existsSync(`${paths.relayPendingFile}.intent.unsent`)).toBe(false);
 			releaseCloser = holdCloser(paths);
+			// Only the exact child that installed its cooperative handler is relayed to:
+			// the signal's default action would otherwise kill it without attribution.
+			for (const overrides of [
+				null,
+				{ child_pid: COOPERATIVE_CHILD_PID + 1 },
+				{ child_token: "other" },
+				{ generation: "other" },
+				{ signal: "SIGTERM" },
+				{ extra: true },
+			]) {
+				fsSync.rmSync(paths.cooperativeReadyFile, { force: true });
+				if (overrides) publishCooperativeReadyForTest(paths, binding.generation, overrides);
+				poll();
+				expect(relays).toBe(0);
+				expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+				expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			}
+			fsSync.rmSync(paths.cooperativeReadyFile, { force: true });
+			publishCooperativeReadyForTest(paths, binding.generation);
 			poll();
 			expect(relays).toBe(1);
 			expect(readSecureOwnerJson(paths.intentFile)).toEqual(intent);
@@ -870,10 +930,12 @@ await Bun.stdin.text(); db.exec("COMMIT"); db.close(); clearTimeout(timer);`,
 			fsSync.writeFileSync(path.join(paths.root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, {
 				mode: 0o600,
 			});
+			publishCooperativeReadyForTest(paths, binding.generation);
 			fsSync.writeFileSync(paths.intentFile, `${JSON.stringify(intent)}\n`, { mode: 0o600 });
 			releaseCloser = holdCloser(paths);
 			let relays = 0;
 			consumeCooperativeOwnerIntent({
+				childPid: COOPERATIVE_CHILD_PID,
 				stateDir: state,
 				binding,
 				serverKey: "socket",
@@ -2539,6 +2601,22 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 		supervisor_pid: 10,
 		supervisor_start_time: "start",
 	});
+	/** The child's exclusive record of the first termination cause it handled. */
+	const shutdownCause = (
+		generation: string,
+		cause: "cooperative" | "signal",
+		overrides: Record<string, unknown> = {},
+	) => ({
+		schema_version: 1,
+		generation,
+		session_id: "session",
+		child_token: "token",
+		child_pid: COOPERATIVE_CHILD_PID,
+		cause,
+		signal: cause === "cooperative" ? "SIGUSR2" : "SIGTERM",
+		recorded_at: new Date().toISOString(),
+		...overrides,
+	});
 	const close = (
 		state: string,
 		generation: string,
@@ -2610,12 +2688,14 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 				created_at: new Date(Date.now() - 1_000).toISOString(),
 			};
 			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
 			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
 			// The closer publishes past the predecessor check, and the supervisor relays it.
 			let relays = 0;
 			await expect(
 				close(state, generation, "dispatch", async () => {
 					consumeCooperativeOwnerIntent({
+						childPid: COOPERATIVE_CHILD_PID,
 						stateDir: state,
 						publishNoReplace: publishRelayForTest,
 						binding,
@@ -2680,6 +2760,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 				created_at: new Date(Date.now() - 1_000).toISOString(),
 			};
 			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
 			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
 			const closerBusy = () => {
 				const probe = new Database(paths.closerLockFile);
@@ -2717,6 +2798,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 			setSystemTime(new Date(Date.parse(intent.created_at) + 1));
 			let relays = 0;
 			consumeCooperativeOwnerIntent({
+				childPid: COOPERATIVE_CHILD_PID,
 				stateDir: state,
 				publishNoReplace: publishRelayForTest,
 				binding,
@@ -2827,8 +2909,139 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 		}
 	});
 
-	it("classifies a SIGTERM as operator shutdown only with the supervisor's relay of that intent", async () => {
-		for (const relayed of [false, true]) {
+	/** A real admitted child: postmortem first, then the cooperative installer. */
+	const startCooperativeChild = (state: string, generation: string, cleanupFile: string) =>
+		Bun.spawn({
+			cmd: [
+				process.execPath,
+				"-e",
+				`import * as postmortem from ${JSON.stringify(path.join(repoRoot, "packages", "utils", "src", "postmortem.ts"))};
+import { appendFileSync } from "node:fs";
+import { installManagedOwnerCooperativeShutdown } from ${JSON.stringify(path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"))};
+postmortem.register("fixture", async reason => { appendFileSync(process.env.CLEANUP_FILE, reason + "\\n"); await Bun.sleep(200); });
+setTimeout(() => process.exit(91), 8_000);
+const ready = installManagedOwnerCooperativeShutdown({ stateDir: process.env.STATE, sessionId: "session", generation: process.env.GENERATION, childToken: "token" });
+process.stdout.write(ready ? "ready\\n" : "unready\\n");
+setInterval(() => {}, 1_000);`,
+			],
+			cwd: repoRoot,
+			env: { ...process.env, STATE: state, GENERATION: generation, CLEANUP_FILE: cleanupFile },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+	const firstLine = async (child: Bun.Subprocess<"ignore", "pipe", "pipe">) => {
+		const reader = child.stdout.getReader();
+		try {
+			return new TextDecoder().decode((await reader.read()).value);
+		} finally {
+			reader.releaseLock();
+		}
+	};
+
+	it.each([
+		["the relay alone", ["SIGUSR2"], { cause: "cooperative", signal: "SIGUSR2" }, 143],
+		[
+			"an unrelated SIGTERM handled before the relay",
+			["SIGTERM", "SIGUSR2"],
+			{ cause: "signal", signal: "SIGTERM" },
+			143,
+		],
+		["a SIGHUP handled before the relay", ["SIGHUP", "SIGUSR2"], { cause: "signal", signal: "SIGHUP" }, 129],
+	] as const)("records the first termination cause an admitted child handles: %s", async (_case, signals, cause, exitCode) => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-cause-"));
+		const cleanupFile = path.join(state, "cleanup");
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			child = startCooperativeChild(state, generation, cleanupFile);
+			expect(await firstLine(child)).toBe("ready\n");
+			// Readiness is published only after the handlers exist, and names this child.
+			expect(readSecureOwnerJson(paths.cooperativeReadyFile)).toEqual({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				child_token: "token",
+				child_pid: child.pid,
+				signal: "SIGUSR2",
+			});
+			for (const signal of signals) {
+				// `Subprocess.kill` would map SIGUSR2 to Darwin's SIGSYS.
+				process.kill(child.pid, signal);
+				// The earlier signal is handled before the next one is sent.
+				if (signal !== "SIGUSR2") await waitForPath(paths.shutdownCauseFile);
+			}
+			expect(await child.exited).toBe(exitCode);
+			expect(readSecureOwnerJson(paths.shutdownCauseFile)).toMatchObject({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				child_token: "token",
+				child_pid: child.pid,
+				...cause,
+			});
+			// One shutdown: a relay after another cause starts no second one.
+			expect((await fs.readFile(cleanupFile, "utf8")).trim().split("\n")).toHaveLength(1);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores the relay when the child cannot record it as its first cause", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-cause-taken-"));
+		const cleanupFile = path.join(state, "cleanup");
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			const taken = shutdownCause(generation, "signal", { child_pid: 1 });
+			ownerOnly(paths.shutdownCauseFile, taken);
+			child = startCooperativeChild(state, generation, cleanupFile);
+			expect(await firstLine(child)).toBe("ready\n");
+			process.kill(child.pid, "SIGUSR2");
+			await Bun.sleep(300);
+			// No cooperative shutdown started, and the existing record is untouched.
+			expect(child.exitCode).toBeNull();
+			expect(fsSync.existsSync(cleanupFile)).toBe(false);
+			expect(readSecureOwnerJson(paths.shutdownCauseFile)).toEqual(taken);
+			child.kill("SIGTERM");
+			expect(await child.exited).toBe(143);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes no readiness from an unsafe lifecycle root", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-unsafe-"));
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			fsSync.chmodSync(paths.root, 0o755);
+			child = startCooperativeChild(state, generation, path.join(state, "cleanup"));
+			expect(await firstLine(child)).toBe("unready\n");
+			expect(fsSync.existsSync(paths.cooperativeReadyFile)).toBe(false);
+			child.kill("SIGTERM");
+			expect(await child.exited).toBe(143);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["no relay", false, "cooperative", {}],
+		["no shutdown cause", true, null, {}],
+		// An unrelated SIGTERM the child handled before the relay arrived.
+		["a SIGTERM handled before the relay", true, "signal", {}],
+		["another child's cooperative cause", true, "cooperative", { child_token: "other" }],
+		["another generation's cooperative cause", true, "cooperative", { generation: "other" }],
+		["a malformed cause", true, "cooperative", { extra: true }],
+		["the relay handled first", true, "cooperative", {}],
+	] as const)("classifies a SIGTERM as operator shutdown only when the child handled the relay first: %s", async (_case, relayed, cause, overrides) => {
+		{
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-classify-"));
 			try {
 				const generation = await replaceOwnerGeneration(state, "session", "generation");
@@ -2844,8 +3057,9 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 					expires_at: new Date(Date.now() + 10_000).toISOString(),
 				});
 				if (relayed) ownerOnly(paths.relayFile, relayRecord(intent, generation));
-				// The child sidecar copies the pending intent's dispatch id after an
-				// unrelated SIGTERM; without relay evidence that is not an operator close.
+				if (cause) ownerOnly(paths.shutdownCauseFile, shutdownCause(generation, cause, overrides));
+				// The child sidecar copies the relay's dispatch id at postmortem start; only
+				// delivery the child handled as its first cause makes that an operator close.
 				const verdict = await observeOwnerTerminal({
 					schema_version: 1,
 					op: "observe_terminal",
@@ -2861,10 +3075,84 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 					reason: "process_postmortem",
 					operator_dispatch_id: intent.dispatch_id,
 				});
-				expect(verdict.classification).toBe(relayed ? "expected_operator_shutdown" : "unexpected_owner_loss");
+				expect(verdict.classification).toBe(
+					_case === "the relay handled first" ? "expected_operator_shutdown" : "unexpected_owner_loss",
+				);
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
 			}
+		}
+	});
+
+	it.each([
+		["no reconciliation", null],
+		["a fatal exit after the child's verdict", { signal: "SIGABRT", exit_code: null, explained: false }],
+		["another intent's exit", { intent_id: "other" }],
+		["another dispatch's exit", { dispatch_id: "other" }],
+		["another child's exit", { child_token: "other" }],
+		["a malformed record", { extra: true }],
+		["an explained exit", {}],
+	] as const)("completes a cooperative close only after the supervisor explained the child's exit: %s", async (_case, exit) => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-exit-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			let cleanups = 0;
+			const closing = closeExactTmuxOwner(
+				{
+					stateDir: state,
+					sessionId: "session",
+					generation,
+					serverKey: "socket",
+					pid: 10,
+					startTime: "start",
+					dispatchId: "dispatch",
+					createdAt: new Date(Date.now() - 10).toISOString(),
+					expiresAt: new Date(Date.now() + 5_000).toISOString(),
+				},
+				{
+					readStartTime: async () => "start",
+					shutdown: {
+						kind: "cooperative_intent",
+						publishNoReplace: publishOwnerIntentNoReplace,
+						assertCooperativeOwner: () => {},
+					},
+					// The child published its expected verdict for the relayed intent, then
+					// its supervisor reconciled the actual exit.
+					waitForVerdict: async intent => {
+						ownerOnly(paths.relayFile, relayRecord(intent, generation));
+						if (exit) publishChildExitForTest(paths, intent, exit);
+						return {
+							schema_version: 1,
+							generation,
+							session_id: "session",
+							server_key: "socket",
+							observed_at: new Date().toISOString(),
+							signal: "SIGTERM",
+							exit_code: null,
+							result: "owner_term_then_session_cleanup",
+							observer: "sidecar",
+							classification: "expected_operator_shutdown",
+							reason: "process_postmortem",
+							intent_id: intent.intent_id,
+							dedupe_key: `owner-loss:session:${generation}`,
+						};
+					},
+					cleanupSession: async () => {
+						cleanups += 1;
+					},
+				},
+			);
+			if (_case === "an explained exit") {
+				await expect(closing).resolves.toMatchObject({ classification: "expected_operator_shutdown" });
+				expect(cleanups).toBe(1);
+			} else {
+				await expect(closing).rejects.toThrow("owner_term_child_exit_unexplained");
+				expect(cleanups).toBe(0);
+			}
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
 		}
 	});
 
@@ -2893,6 +3181,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 				...relayRecord(intent, generation),
 				relayed_at: new Date(relayedAt).toISOString(),
 			});
+			ownerOnly(paths.shutdownCauseFile, shutdownCause(generation, "cooperative"));
 			const verdict = await observeOwnerTerminal({
 				schema_version: 1,
 				op: "observe_terminal",
@@ -2939,6 +3228,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 				created_at: new Date(Date.now() - 1_000).toISOString(),
 			};
 			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
 			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
 			const intent = await createOwnerIntent(state, {
 				generation,
@@ -2963,6 +3253,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 			releaseCloser = holdCloser(paths);
 			let relays = 0;
 			consumeCooperativeOwnerIntent({
+				childPid: COOPERATIVE_CHILD_PID,
 				stateDir: state,
 				publishNoReplace: publishRelayForTest,
 				binding,

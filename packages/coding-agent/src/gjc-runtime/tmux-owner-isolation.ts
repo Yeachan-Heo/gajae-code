@@ -24,10 +24,18 @@ import { observeProcessIncarnation, type ProcessIncarnationObservation } from ".
 import { parseLinuxProcStartTime } from "./linux-proc";
 import {
 	isManagedOwnerBinding,
+	isManagedOwnerChildExit,
+	isManagedOwnerCooperativeReady,
 	isManagedOwnerRelayRecord,
+	isManagedOwnerShutdownCause,
 	isManagedOwnerSigabrtReceipt,
+	isManagedOwnerSupervisorIndex,
+	MANAGED_OWNER_COOPERATIVE_SIGNAL,
 	type ManagedOwnerBinding,
+	type ManagedOwnerChildExit,
+	type ManagedOwnerCooperativeReady,
 	type ManagedOwnerRelayRecord,
+	type ManagedOwnerShutdownCause,
 } from "./managed-owner-binding";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
@@ -984,12 +992,18 @@ export interface LifecyclePaths {
 	journalFile: string;
 	/** Darwin: names the one supervisor binding of this generation (no directory scan). */
 	supervisorIndexFile: string;
-	/** Darwin: durable proof that the exact supervisor delivered SIGTERM for one intent. */
+	/** Darwin: durable proof that the exact supervisor delivered its cooperative signal for one intent. */
 	relayFile: string;
 	/** Darwin: published before delivery; removed once a confirmed delivery publishes `relayFile`. */
 	relayPendingFile: string;
 	/** Darwin: SQLite lock its closer holds for as long as it waits on the intent. */
 	closerLockFile: string;
+	/** Darwin: the admitted child installed its cooperative signal handler. */
+	cooperativeReadyFile: string;
+	/** Darwin: the child's first handled termination cause, created exclusively. */
+	shutdownCauseFile: string;
+	/** Darwin: the supervisor's reconciliation of the relayed child's actual exit. */
+	childExitFile: string;
 }
 export function lifecyclePaths(stateDir: string, sessionId: string, generation: string): LifecyclePaths {
 	const root = path.join(stateDir, sessionId, "owner-lifecycle");
@@ -1009,6 +1023,10 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		relayFile: path.join(root, `relay-${generation}.json`),
 		relayPendingFile: path.join(root, `relay-${generation}.pending.json`),
 		closerLockFile: path.join(root, `closer-${generation}.sqlite`),
+		cooperativeReadyFile: path.join(root, `cooperative-ready-${generation}.json`),
+		shutdownCauseFile: path.join(root, `shutdown-cause-${generation}.json`),
+		// Not `child-*`: that prefix is reserved for bindings in predecessor resolution.
+		childExitFile: path.join(root, `supervised-exit-${generation}.json`),
 	};
 }
 
@@ -1854,6 +1872,10 @@ export function isValidOwnerIntent(intent: unknown, request?: ObserveTerminalReq
  * is never attributed to a later relay. A timely relay still explains an observation
  * made after expiry, for example by a child that was stopped and handled the signal
  * late. A Darwin closer never signals, so a missing index is never evidence there.
+ * Delivery and timestamps still do not prove causation: an unrelated SIGTERM can
+ * start the child's shutdown between `relayed_at` and delivery. The index's exact
+ * child must also have recorded the cooperative signal as the first termination
+ * cause it handled, which an earlier SIGTERM, SIGHUP or SIGINT always preempts.
  */
 function isExpectedOwnerTerminal(
 	paths: LifecyclePaths,
@@ -1874,6 +1896,9 @@ function isExpectedOwnerTerminal(
 		return false;
 	}
 	if (!relay || !isCanonicalUtcTimestamp(relay.relayed_at)) return false;
+	// Delivery alone is not causation: the child must have handled the relay first.
+	const index = readSupervisorIndex(paths, intent);
+	if (!index || relay.child_token !== index.child_token || !managedOwnerCooperativeCause(paths, index)) return false;
 	const observedAt = Date.parse(request.observed_at);
 	return (
 		Number.isFinite(observedAt) &&
@@ -2112,6 +2137,190 @@ function assertNoIntentHistory(paths: LifecyclePaths, includeCanonical: boolean)
 }
 
 /**
+ * Exclusive, owner-only creation inside the verified private lifecycle root. A
+ * failure, including an existing record, publishes nothing new.
+ */
+function createOwnerOnlyRecordSync(root: string, file: string, value: unknown): boolean {
+	if (!verifyOwnerOnlyPathSecurity(root, "directory").ok) return false;
+	const { O_CREAT, O_EXCL, O_NOFOLLOW, O_WRONLY } = fsSync.constants;
+	let descriptor: number;
+	try {
+		descriptor = fsSync.openSync(file, O_CREAT | O_EXCL | O_NOFOLLOW | O_WRONLY, 0o600);
+	} catch {
+		return false;
+	}
+	try {
+		fsSync.writeSync(descriptor, `${JSON.stringify(value)}\n`);
+		fsSync.fsyncSync(descriptor);
+	} catch {
+		// A partial record never validates, so readers fail closed on it.
+		return false;
+	} finally {
+		fsSync.closeSync(descriptor);
+	}
+	try {
+		const directory = fsSync.openSync(root, "r");
+		try {
+			fsSync.fsyncSync(directory);
+		} finally {
+			fsSync.closeSync(directory);
+		}
+	} catch {}
+	return true;
+}
+
+/**
+ * Darwin, in an admitted managed child, before the CLI starts: record the first
+ * termination cause this process handles, and accept the supervisor's cooperative
+ * signal only as that first cause. The cooperative signal then starts the ordinary
+ * SIGTERM shutdown. Signals carry no sender identity, so this ordering, not a
+ * timestamp, is what lets a verdict attribute the shutdown to the relay: a SIGTERM,
+ * SIGHUP or SIGINT handled first wins the exclusive record, and the relay is ignored.
+ * The readiness record is published only after the handlers are installed; without
+ * it the supervisor never relays. Returns whether readiness was published.
+ */
+export function installManagedOwnerCooperativeShutdown(input: {
+	stateDir: string;
+	sessionId: string;
+	generation: string;
+	childToken: string;
+}): boolean {
+	if (process.platform !== "darwin") return false;
+	const paths = lifecyclePaths(input.stateDir, input.sessionId, input.generation);
+	const identity = {
+		schema_version: 1 as const,
+		generation: input.generation,
+		session_id: input.sessionId,
+		child_token: input.childToken,
+		child_pid: process.pid,
+	};
+	const recordCause = (cause: ManagedOwnerShutdownCause["cause"], signal: string): boolean =>
+		createOwnerOnlyRecordSync(paths.root, paths.shutdownCauseFile, {
+			...identity,
+			cause,
+			signal,
+			recorded_at: new Date().toISOString(),
+		} satisfies ManagedOwnerShutdownCause);
+	process.on(MANAGED_OWNER_COOPERATIVE_SIGNAL, () => {
+		if (recordCause("cooperative", MANAGED_OWNER_COOPERATIVE_SIGNAL)) process.kill(process.pid, "SIGTERM");
+	});
+	for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const)
+		process.on(signal, () => {
+			recordCause("signal", signal);
+		});
+	return createOwnerOnlyRecordSync(paths.root, paths.cooperativeReadyFile, {
+		...identity,
+		signal: MANAGED_OWNER_COOPERATIVE_SIGNAL,
+	} satisfies ManagedOwnerCooperativeReady);
+}
+
+/** Darwin: whether this exact child published readiness for the cooperative signal. */
+export function managedOwnerCooperativeReady(
+	paths: LifecyclePaths,
+	binding: Pick<ManagedOwnerBinding, "session_id" | "generation" | "child_token">,
+	childPid: number,
+): boolean {
+	try {
+		const ready = readSecureOwnerJson(paths.cooperativeReadyFile);
+		return (
+			isManagedOwnerCooperativeReady(ready) &&
+			ready.session_id === binding.session_id &&
+			ready.generation === binding.generation &&
+			ready.child_token === binding.child_token &&
+			ready.child_pid === childPid
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** Darwin: the generation's exact child recorded the cooperative signal as its first cause. */
+export function managedOwnerCooperativeCause(
+	paths: LifecyclePaths,
+	binding: Pick<ManagedOwnerBinding, "session_id" | "generation" | "child_token">,
+	childPid?: number,
+): boolean {
+	try {
+		const cause = readSecureOwnerJson(paths.shutdownCauseFile);
+		return (
+			isManagedOwnerShutdownCause(cause) &&
+			cause.cause === "cooperative" &&
+			cause.session_id === binding.session_id &&
+			cause.generation === binding.generation &&
+			cause.child_token === binding.child_token &&
+			(childPid === undefined || cause.child_pid === childPid)
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** Darwin: the generation's one supervisor index, or null when it is unusable. */
+function readSupervisorIndex(paths: LifecyclePaths, intent: OwnerIntent) {
+	try {
+		const index = readSecureOwnerJson(paths.supervisorIndexFile);
+		return isManagedOwnerSupervisorIndex(index) &&
+			index.generation === intent.generation &&
+			index.session_id === intent.session_id
+			? index
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Darwin: the supervisor's reconciliation of the relayed child's exit, recorded
+ * after its own terminal observation. Written exclusively; an unexplained exit also
+ * publishes the generation's owner-loss incident, because an expected verdict the
+ * child published before it died stays history and never makes the close successful.
+ */
+export async function recordManagedOwnerChildExit(stateDir: string, record: ManagedOwnerChildExit): Promise<void> {
+	if (!isManagedOwnerChildExit(record)) throw new Error("managed_owner_child_exit_invalid");
+	const paths = lifecyclePaths(stateDir, record.session_id, record.generation);
+	if (!createOwnerOnlyRecordSync(paths.root, paths.childExitFile, record))
+		throw new Error("managed_owner_child_exit_unrecorded");
+	if (record.explained) return;
+	// An unexpected verdict already published this exact incident; an expected one did
+	// not. Without a verdict, whichever observer publishes it records the incident.
+	const verdict = await readJson<OwnerVerdict>(paths.verdictFile);
+	if (
+		!isValidOwnerVerdict(verdict) ||
+		verdict.generation !== record.generation ||
+		verdict.session_id !== record.session_id
+	)
+		return;
+	await publishImmutableIncident(paths.incidentFile, {
+		schema_version: 1,
+		generation: record.generation,
+		session_id: record.session_id,
+		dedupe_key: verdict.dedupe_key,
+		created_at: verdict.observed_at,
+		classification: "unexpected_owner_loss",
+	});
+}
+
+/** Darwin: only an explained child exit for this exact intent completes a cooperative close. */
+function managedOwnerChildExitExplained(paths: LifecyclePaths, intent: OwnerIntent): boolean {
+	const index = readSupervisorIndex(paths, intent);
+	if (!index) return false;
+	try {
+		const exit = readSecureOwnerJson(paths.childExitFile);
+		return (
+			isManagedOwnerChildExit(exit) &&
+			exit.explained &&
+			exit.intent_id === intent.intent_id &&
+			exit.dispatch_id === intent.dispatch_id &&
+			exit.generation === intent.generation &&
+			exit.session_id === intent.session_id &&
+			exit.child_token === index.child_token
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Darwin relay evidence for exactly this intent, or null when none exists.
  * An unreadable or mismatched record is never treated as absent.
  */
@@ -2261,9 +2470,11 @@ export function consumeCooperativeOwnerIntent(input: {
 	stateDir: string;
 	binding: ManagedOwnerBinding;
 	serverKey: string;
+	/** The supervisor's direct child; it must have published cooperative readiness. */
+	childPid: number;
 	/** Whether the exact child can still receive a relay right now. */
 	canRelay(): boolean;
-	/** Delivers SIGTERM; returns true only when the signal was actually sent. */
+	/** Delivers the cooperative signal; returns true only when it was actually sent. */
 	relay(intent: OwnerIntent, observedAt: string): boolean;
 	/**
 	 * Durable no-replace publication inside the private lifecycle root. Injected by
@@ -2299,6 +2510,9 @@ export function consumeCooperativeOwnerIntent(input: {
 		// An intent whose closer stopped waiting (gave up, exited or crashed) is never
 		// relayed, whatever the wall clock says.
 		if (!input.canRelay() || !closerWaiting(paths)) return;
+		// A child that never installed its cooperative handler would die from the
+		// signal's default action, which no verdict could attribute.
+		if (!managedOwnerCooperativeReady(paths, binding, input.childPid)) return;
 		const relayRecord: ManagedOwnerRelayRecord = {
 			schema_version: 1,
 			intent_id: intent.intent_id,
@@ -2431,9 +2645,9 @@ export async function closeExactTmuxOwner(
 					db.close();
 				}
 			}
-			const giveUp = (): never => {
+			const giveUp = (code = "owner_term_verdict_timeout"): never => {
 				retireAbandonedCooperativeIntent(paths, request.sessionId, request.serverKey, intent);
-				throw new Error("owner_term_verdict_timeout");
+				throw new Error(code);
 			};
 			let verdict: OwnerVerdict | null;
 			try {
@@ -2451,8 +2665,10 @@ export async function closeExactTmuxOwner(
 				verdict.classification !== "expected_operator_shutdown"
 			)
 				return giveUp();
-			// Only the exact supervisor's relay of this intent makes the shutdown expected.
+			// Only the exact supervisor's relay of this intent makes the shutdown expected,
+			// and only an explained child exit makes it a successful close.
 			if (!readCooperativeRelayRecord(paths, intent)) return giveUp();
+			if (!managedOwnerChildExitExplained(paths, intent)) return giveUp("owner_term_child_exit_unexplained");
 			await deps.cleanupSession();
 			return verdict;
 		} finally {

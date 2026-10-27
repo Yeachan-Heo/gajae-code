@@ -39,6 +39,25 @@ const admissionModule = path.join(
 	"managed-owner-admission.ts",
 );
 
+const postmortemModule = path.join(repoRoot, "packages", "utils", "src", "postmortem.ts");
+/**
+ * A Darwin child admitted through the production pre-CLI barrier, which installs its
+ * cooperative shutdown handler and publishes readiness. `cleanup` runs as its
+ * postmortem callback, as the CLI's own cleanup would.
+ */
+function admittedChildScript(cleanup: string, prelude = ""): string {
+	return `import * as postmortem from ${JSON.stringify(postmortemModule)};
+import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)};
+import { writeFile } from "node:fs/promises";
+${prelude}
+// Final test containment, never a successful relay outcome.
+setTimeout(() => process.exit(91), 6_000);
+postmortem.register("fixture", async () => { ${cleanup} });
+if ((await admitManagedOwnerBeforeCli()).kind !== "supervised") process.exit(92);
+await writeFile(process.env.READY_FILE!, JSON.stringify({ pid: process.pid, ppid: process.ppid }));
+setInterval(() => {}, 1_000);`;
+}
+
 function cleanManagedEnvironment(): NodeJS.ProcessEnv {
 	const env = { ...process.env };
 	for (const key of Object.keys(env)) {
@@ -561,7 +580,11 @@ try { await runManagedOwnerSupervisor(${supervisorArgs}); process.exitCode = 22;
 		const failures: unknown[] = [];
 		try {
 			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
-			const childScript = `import { writeFile } from "node:fs/promises";
+			// A cooperative relay reaches the child through its admitted handler, which
+			// ends it through the postmortem SIGTERM shutdown (exit 143).
+			const childScript =
+				mode === "os-signal"
+					? `import { writeFile } from "node:fs/promises";
 let signals = 0;
 // Final test containment, never a successful relay outcome.
 setTimeout(() => process.exit(91), 6_000);
@@ -572,7 +595,12 @@ process.on("SIGTERM", () => {
 	});
 });
 await writeFile(process.env.READY_FILE!, JSON.stringify({ pid: process.pid, ppid: process.ppid }));
-setInterval(() => {}, 1_000);`;
+setInterval(() => {}, 1_000);`
+					: admittedChildScript(
+							"signals += 1; await writeFile(process.env.CLEANUP_FILE!, JSON.stringify({ signals })); await Bun.sleep(300);",
+							"let signals = 0;",
+						);
+			const childExit = mode === "os-signal" ? 0 : 143;
 			supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
 				READY_FILE: readyFile,
 				CLEANUP_FILE: cleanupFile,
@@ -619,7 +647,19 @@ setInterval(() => {}, 1_000);`;
 						},
 						waitForVerdict: async intent => {
 							const exit = await Promise.race([ownedSupervisor.exited, Bun.sleep(3_000).then(() => null)]);
-							expect(exit).toBe(0);
+							expect(exit).toBe(childExit);
+							// The supervisor reconciled the child's own exit after the relay.
+							expect(readSecureOwnerJson(paths.childExitFile)).toMatchObject({
+								intent_id: intent.intent_id,
+								child_pid: ready.pid,
+								signal: null,
+								exit_code: 143,
+								explained: true,
+							});
+							expect(readSecureOwnerJson(paths.shutdownCauseFile)).toMatchObject({
+								cause: "cooperative",
+								child_pid: ready.pid,
+							});
 							const verdict = readSecureOwnerJson(paths.verdictFile);
 							if (!isValidOwnerVerdict(verdict) || verdict.intent_id !== intent.intent_id) return null;
 							expect(readSecureOwnerJson(paths.verdictAliasFile)).toEqual({
@@ -644,7 +684,7 @@ setInterval(() => {}, 1_000);`;
 			expect(() => process.kill(supervisorPid, 0)).not.toThrow();
 			supervisor.kill("SIGTERM");
 			const exit = await Promise.race([supervisor.exited, Bun.sleep(2_000).then(() => null)]);
-			expect(exit).toBe(0);
+			expect(exit).toBe(childExit);
 			if (closing) await closing;
 			expect(await childReference?.waitForExit({ timeoutMs: 1_000 })).toBe(true);
 			expect(JSON.parse(await fs.readFile(cleanupFile, "utf8"))).toEqual({ signals: 1 });
@@ -691,22 +731,123 @@ setInterval(() => {}, 1_000);`;
 		if (failures.length > 0) throw new AggregateError(failures, "Managed supervisor verification or teardown failed");
 	}, 20_000);
 	it.skipIf(process.platform !== "darwin")(
-		"preserves a fatal child signal after a cooperative relay as owner loss",
+		"never attributes a shutdown an unrelated SIGTERM began to a later cooperative relay",
 		async () => {
 			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 			const readyFile = path.join(stateDir, "child-ready");
+			const cleanupFile = path.join(stateDir, "child-cleanup");
 			let supervisor: Bun.Subprocess | undefined;
 			try {
 				await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
-				// The relayed SIGTERM arrives, then the child dies of an unrelated fault
-				// before any sidecar of its own could publish a verdict.
-				const childScript = `import { writeFile } from "node:fs/promises";
-setTimeout(() => process.exit(91), 6_000);
-process.on("SIGTERM", () => process.kill(process.pid, "SIGABRT"));
-await writeFile(process.env.READY_FILE!, JSON.stringify({ pid: process.pid }));
-setInterval(() => {}, 1_000);`;
+				// A slow cleanup keeps the child running and relayable after the SIGTERM.
+				const childScript = admittedChildScript(
+					`await writeFile(process.env.CLEANUP_FILE!, "started"); await Bun.sleep(1_500);`,
+				);
 				supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
 					READY_FILE: readyFile,
+					CLEANUP_FILE: cleanupFile,
+					GJC_TMUX_OWNER_SERVER_KEY: "fixture-socket",
+				});
+				const ownedSupervisor = supervisor;
+				await waitForFile(readyFile);
+				const ready = JSON.parse(await fs.readFile(readyFile, "utf8")) as { pid: number };
+				process.kill(ready.pid, "SIGTERM");
+				await waitForFile(cleanupFile);
+				const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+				const bindingFile = (await fs.readdir(paths.root)).find(file => file.endsWith(".binding.json"))!;
+				const binding = readSecureOwnerJson(path.join(paths.root, bindingFile));
+				if (!isManagedOwnerBinding(binding)) throw new Error("fixture_binding_invalid");
+				const nativeSupervisor = nativeProcessBindings().Process.fromPid(supervisor.pid);
+				let published: unknown = null;
+				const closing = closeExactTmuxOwner(
+					{
+						stateDir,
+						sessionId: binding.session_id,
+						generation: binding.generation,
+						serverKey: "fixture-socket",
+						pid: binding.supervisor_pid,
+						startTime: binding.supervisor_start_time,
+						dispatchId: "fixture-dispatch",
+						createdAt: new Date().toISOString(),
+						expiresAt: new Date(Date.now() + 4_000).toISOString(),
+					},
+					{
+						readStartTime: async () => nativeSupervisor?.incarnation ?? null,
+						shutdown: {
+							kind: "cooperative_intent",
+							publishNoReplace: publishOwnerIntentNoReplace,
+							assertCooperativeOwner: () => {},
+						},
+						waitForVerdict: async () => {
+							await Promise.race([ownedSupervisor.exited, Bun.sleep(4_000)]);
+							published = readSecureOwnerJson(paths.verdictFile);
+							return isValidOwnerVerdict(published) ? published : null;
+						},
+						cleanupSession: async () => {},
+					},
+				);
+				await expect(closing).rejects.toThrow("owner_term_verdict_timeout");
+				expect(await ownedSupervisor.exited).toBe(143);
+				// The relay was delivered while the child was still shutting down ...
+				expect(readSecureOwnerJson(paths.relayFile)).toMatchObject({ dispatch_id: "fixture-dispatch" });
+				// ... but the child had already handled the unrelated SIGTERM first.
+				expect(readSecureOwnerJson(paths.shutdownCauseFile)).toMatchObject({
+					child_pid: ready.pid,
+					cause: "signal",
+					signal: "SIGTERM",
+				});
+				expect(readSecureOwnerJson(paths.childExitFile)).toMatchObject({
+					child_pid: ready.pid,
+					signal: null,
+					exit_code: 143,
+					explained: false,
+				});
+				expect(published).toMatchObject({ classification: "unexpected_owner_loss" });
+				expect(published).not.toHaveProperty("intent_id");
+			} finally {
+				if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null)
+					supervisor.kill("SIGTERM");
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+	it.skipIf(process.platform !== "darwin").each([
+		["SIGABRT before any verdict of its own", false, "abort"],
+		["SIGABRT after its own expected verdict", true, "abort"],
+		["a failure exit after its own expected verdict", true, "exit-1"],
+	] as const)(
+		"preserves an unexplained child exit after a cooperative relay as owner loss: %s",
+		async (_case, publishVerdict, fault) => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+			const readyFile = path.join(stateDir, "child-ready");
+			const childVerdictFile = path.join(stateDir, "child-verdict.json");
+			let supervisor: Bun.Subprocess | undefined;
+			try {
+				await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
+				// The relay starts the child's shutdown; it optionally publishes the expected
+				// verdict its sidecar would, then dies of an unrelated fault mid-cleanup.
+				const childScript = admittedChildScript(
+					`if (process.env.PUBLISH_VERDICT === "1") {
+	const env = process.env;
+	const paths = lifecyclePaths(env.GJC_TMUX_OWNER_STATE_DIR!, env.GJC_COORDINATOR_SESSION_ID!, env.GJC_TMUX_OWNER_GENERATION!);
+	// The sidecar's capture saw this relay; wait out its confirmation under the lock.
+	let relay: { dispatch_id: string } | null = null;
+	for (let attempt = 0; !relay && attempt < 200; attempt += 1) {
+		try { relay = readSecureOwnerJson(paths.relayFile) as { dispatch_id: string }; } catch { await Bun.sleep(5); }
+	}
+	const verdict = await observeOwnerTerminal({ schema_version: 1, op: "observe_terminal", session_id: env.GJC_COORDINATOR_SESSION_ID!, owner_generation: env.GJC_TMUX_OWNER_GENERATION!, state_dir: env.GJC_TMUX_OWNER_STATE_DIR!, socket_key: env.GJC_TMUX_OWNER_SERVER_KEY!, observer: "sidecar", observed_at: new Date().toISOString(), signal: "SIGTERM", exit_code: null, exit_kind: "SIGTERM", reason: "process_postmortem", operator_dispatch_id: relay?.dispatch_id });
+	await writeFile(env.CHILD_VERDICT_FILE!, JSON.stringify(verdict));
+}
+if (process.env.FAULT === "exit-1") process.exit(1);
+process.kill(process.pid, "SIGABRT");`,
+					`import { lifecyclePaths, observeOwnerTerminal, readSecureOwnerJson } from ${JSON.stringify(path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"))};`,
+				);
+				supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+					READY_FILE: readyFile,
+					CHILD_VERDICT_FILE: childVerdictFile,
+					PUBLISH_VERDICT: publishVerdict ? "1" : "0",
+					FAULT: fault,
 					GJC_TMUX_OWNER_SERVER_KEY: "fixture-socket",
 				});
 				const ownedSupervisor = supervisor;
@@ -717,6 +858,7 @@ setInterval(() => {}, 1_000);`;
 				if (!isManagedOwnerBinding(binding)) throw new Error("fixture_binding_invalid");
 				const nativeSupervisor = nativeProcessBindings().Process.fromPid(supervisor.pid);
 				let published: unknown = null;
+				let cleanups = 0;
 				const closing = closeExactTmuxOwner(
 					{
 						stateDir,
@@ -741,17 +883,43 @@ setInterval(() => {}, 1_000);`;
 							published = readSecureOwnerJson(paths.verdictFile);
 							return isValidOwnerVerdict(published) ? published : null;
 						},
-						cleanupSession: async () => {},
+						cleanupSession: async () => {
+							cleanups += 1;
+						},
 					},
 				);
-				await expect(closing).rejects.toThrow("owner_term_verdict_timeout");
-				expect(await ownedSupervisor.exited).toBe(134);
-				expect(published).toMatchObject({
-					classification: "unexpected_owner_loss",
-					signal: "UNKNOWN",
-					exit_code: 134,
+				await expect(closing).rejects.toThrow(
+					publishVerdict ? "owner_term_child_exit_unexplained" : "owner_term_verdict_timeout",
+				);
+				expect(cleanups).toBe(0);
+				expect(await ownedSupervisor.exited).toBe(fault === "abort" ? 134 : 1);
+				const ready = JSON.parse(await fs.readFile(readyFile, "utf8")) as { pid: number };
+				// The supervisor's reconciliation of the actual exit outranks any verdict.
+				expect(readSecureOwnerJson(paths.childExitFile)).toMatchObject({
+					child_pid: ready.pid,
+					dispatch_id: "fixture-dispatch",
+					signal: fault === "abort" ? "SIGABRT" : null,
+					exit_code: fault === "abort" ? null : 1,
+					explained: false,
 				});
-				expect(published).not.toHaveProperty("intent_id");
+				expect(readSecureOwnerJson(paths.incidentFile)).toMatchObject({
+					classification: "unexpected_owner_loss",
+					dedupe_key: "owner-loss:session-2681:generation-2681",
+				});
+				if (publishVerdict) {
+					// The child's own verdict was expected and remains immutable history.
+					expect(JSON.parse(await fs.readFile(childVerdictFile, "utf8"))).toMatchObject({
+						classification: "expected_operator_shutdown",
+					});
+					expect(published).toMatchObject({ classification: "expected_operator_shutdown" });
+				} else {
+					expect(published).toMatchObject({
+						classification: "unexpected_owner_loss",
+						signal: "UNKNOWN",
+						exit_code: 134,
+					});
+					expect(published).not.toHaveProperty("intent_id");
+				}
 			} finally {
 				if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null)
 					supervisor.kill("SIGTERM");

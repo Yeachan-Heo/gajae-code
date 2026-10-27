@@ -2953,9 +2953,11 @@ async function persistInvalidOwnerTerminalMetadata(
 /**
  * Synchronous and first in the postmortem: where a supervisor relays, the intent
  * explains this terminal only if the relay record for it was already visible when the
- * postmortem began. An unrelated signal handled before the relay never gains its
- * dispatch id, independent of wall-clock ordering. Timing is otherwise judged by the
- * verdict, which still accepts a timely relay that a stopped child handled late.
+ * postmortem began. That visibility is necessary, not sufficient: the supervisor
+ * publishes its pending record before delivery, so an unrelated signal can still
+ * arrive in between. The verdict therefore also requires the child's exclusive
+ * record that the relay was the first termination cause it handled, and still
+ * accepts a timely relay that a stopped child handled late.
  */
 function operatorDispatchIdForOwner(owner: OwnerTerminalContext, sessionId: string): string | undefined {
 	try {

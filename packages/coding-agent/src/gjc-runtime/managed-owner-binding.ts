@@ -184,7 +184,7 @@ export function isManagedOwnerSupervisorIndex(value: unknown): value is ManagedO
 
 /**
  * Darwin: published no-replace by the exact supervisor, under the generation lock,
- * as `relay-<generation>.pending.json` before it relays SIGTERM for one cooperative
+ * as `relay-<generation>.pending.json` before it relays its cooperative signal for one
  * intent. Only after the signal was sent does it publish `relay-<generation>.json`,
  * whose `relayed_at` was sampled immediately before delivery, and remove the
  * pending record. Only the confirmed record proves delivery: an operator-shutdown
@@ -228,5 +228,126 @@ export function isManagedOwnerRelayRecord(value: unknown): value is ManagedOwner
 		positivePid(value.supervisor_pid) &&
 		nonempty(value.supervisor_start_time) &&
 		timestamp(value.relayed_at)
+	);
+}
+
+/** Darwin: the signal only the exact supervisor sends to relay a cooperative intent. */
+export const MANAGED_OWNER_COOPERATIVE_SIGNAL = "SIGUSR2";
+
+/**
+ * Darwin: published no-replace by an admitted child as
+ * `cooperative-ready-<generation>.json` only after it installed its cooperative
+ * signal handler, so its supervisor never relays to a child whose default action
+ * for that signal would kill it.
+ */
+export interface ManagedOwnerCooperativeReady {
+	schema_version: 1;
+	generation: string;
+	session_id: string;
+	child_token: string;
+	child_pid: number;
+	signal: typeof MANAGED_OWNER_COOPERATIVE_SIGNAL;
+}
+export function isManagedOwnerCooperativeReady(value: unknown): value is ManagedOwnerCooperativeReady {
+	return (
+		record(value) &&
+		exactKeys(value, ["schema_version", "generation", "session_id", "child_token", "child_pid", "signal"]) &&
+		value.schema_version === 1 &&
+		nonempty(value.generation) &&
+		nonempty(value.session_id) &&
+		nonempty(value.child_token) &&
+		positivePid(value.child_pid) &&
+		value.signal === MANAGED_OWNER_COOPERATIVE_SIGNAL
+	);
+}
+
+/**
+ * Darwin: created exclusively by an admitted child as `shutdown-cause-<generation>.json`
+ * from the first termination signal it handles. `cooperative` means the supervisor's
+ * cooperative signal came first; any SIGTERM, SIGHUP or SIGINT handled before it
+ * records `signal`. Exclusive creation linearizes the two, so an unrelated signal the
+ * child began handling before the relay can never be attributed to that relay.
+ */
+export interface ManagedOwnerShutdownCause {
+	schema_version: 1;
+	generation: string;
+	session_id: string;
+	child_token: string;
+	child_pid: number;
+	cause: "cooperative" | "signal";
+	signal: string;
+	recorded_at: string;
+}
+export function isManagedOwnerShutdownCause(value: unknown): value is ManagedOwnerShutdownCause {
+	return (
+		record(value) &&
+		exactKeys(value, [
+			"schema_version",
+			"generation",
+			"session_id",
+			"child_token",
+			"child_pid",
+			"cause",
+			"signal",
+			"recorded_at",
+		]) &&
+		value.schema_version === 1 &&
+		nonempty(value.generation) &&
+		nonempty(value.session_id) &&
+		nonempty(value.child_token) &&
+		positivePid(value.child_pid) &&
+		(value.cause === "cooperative" || value.cause === "signal") &&
+		nonempty(value.signal) &&
+		timestamp(value.recorded_at)
+	);
+}
+
+/**
+ * Darwin: published no-replace by the exact supervisor as `supervised-exit-<generation>.json`
+ * after the child it relayed a cooperative intent to has exited. `explained` is true
+ * only when the child's first handled cause was that relay and it then ended through
+ * its own exit (code 0 or the handled-SIGTERM 143), not a fatal signal. A cooperative
+ * close succeeds only with an explained record for its exact intent.
+ */
+export interface ManagedOwnerChildExit {
+	schema_version: 1;
+	generation: string;
+	session_id: string;
+	child_token: string;
+	child_pid: number;
+	intent_id: string;
+	dispatch_id: string;
+	signal: string | null;
+	exit_code: number | null;
+	explained: boolean;
+	observed_at: string;
+}
+export function isManagedOwnerChildExit(value: unknown): value is ManagedOwnerChildExit {
+	return (
+		record(value) &&
+		exactKeys(value, [
+			"schema_version",
+			"generation",
+			"session_id",
+			"child_token",
+			"child_pid",
+			"intent_id",
+			"dispatch_id",
+			"signal",
+			"exit_code",
+			"explained",
+			"observed_at",
+		]) &&
+		value.schema_version === 1 &&
+		nonempty(value.generation) &&
+		nonempty(value.session_id) &&
+		nonempty(value.child_token) &&
+		positivePid(value.child_pid) &&
+		nonempty(value.intent_id) &&
+		nonempty(value.dispatch_id) &&
+		(value.signal === null || nonempty(value.signal)) &&
+		(value.exit_code === null || (typeof value.exit_code === "number" && Number.isSafeInteger(value.exit_code))) &&
+		typeof value.explained === "boolean" &&
+		timestamp(value.observed_at)
 	);
 }

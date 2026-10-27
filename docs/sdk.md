@@ -1366,24 +1366,41 @@ exact supervisor stays live; an untrusted, ambiguous, or still-unavailable
 binding fails closed. A binding's `created_at` is never compared with the
 current wall clock, so a backward clock step does not block a close, and the
 close deadline itself runs on monotonic time.
+Before its CLI starts, an admitted Darwin child installs a handler for the
+cooperative signal (SIGUSR2) and recorders for SIGTERM, SIGHUP and SIGINT, then
+publishes `cooperative-ready-<generation>.json` naming its pid and child token.
+Whichever of these signals the child handles first creates
+`shutdown-cause-<generation>.json` exclusively: `cooperative` for SIGUSR2, which
+then starts the ordinary SIGTERM shutdown, or `signal` for any other. A
+cooperative signal that arrives after another cause records nothing and starts
+no second shutdown.
 The supervisor polls for that intent,
-validates it against its own binding, generation and server key, and relays in
+validates it against its own binding, generation and server key, relays only to
+a child whose readiness record names that exact child, and relays in
 two durable phases under that lock: it publishes a pending record for that
 exact intent (`relay-<generation>.pending.json`), samples the relay instant,
-rechecks the intent's deadline on that instant, relays SIGTERM exactly once
-through its original child spawn handle, and only after the signal was actually
+rechecks the intent's deadline on that instant, relays SIGUSR2 exactly once
+through its original child spawn handle (by signal number: Bun's
+`Subprocess.kill` resolves signal names with Linux numbers), and only after the signal was actually
 sent publishes the confirmed relay record (`relay-<generation>.json`, stamped
 with that instant) and removes the pending record. A declined, expired or
 unverifiable attempt renames the pending record to an `.unsent` name instead. A
-close succeeds only when both the pinned supervisor has exited and the terminal
-verdict matching the published intent exists; publication alone, a timeout, an
-exit without a verdict, or a verdict while the supervisor is still alive is not
-success, and guarded session cleanup is skipped. A plain OS SIGTERM to the
+close succeeds only when the pinned supervisor has exited, the terminal verdict
+matching the published intent exists, and the supervisor's reconciliation of
+the child's exit (`supervised-exit-<generation>.json`) explains it: the child
+recorded the relay as its first cause and ended through its own exit with 0 or
+143, or through SIGTERM. Publication alone, a timeout, an exit without a
+verdict, a verdict while the supervisor is still alive, or an unexplained child
+exit (`owner_term_child_exit_unexplained`, which also publishes the generation's
+`unexpected_owner_loss` incident) is not success, and guarded session cleanup is
+skipped. A verdict the child published before such an exit stays immutable
+history but never completes the close. A plain OS SIGTERM to the
 supervisor still stops its child but never claims an operator verdict: on
 Darwin, and on any generation with a supervisor index, a terminal is classified
 as an operator shutdown only when the confirmed relay record names the pending
-intent, the intent was still valid at the relay instant, and the terminal was
-observed at or after that instant. An unrelated signal observed before the
+intent, the intent was still valid at the relay instant, the terminal was
+observed at or after that instant, and the indexed child recorded the relay as
+its first termination cause. An unrelated signal observed before the
 relay is therefore recorded as owner loss, whichever observer (supervisor or
 child sidecar) publishes first, while a child that handles a timely relay late
 still completes. A child observer that finds the generation lock held while a
@@ -1403,17 +1420,17 @@ that had already passed that final check when the supervisor was suspended can
 still complete; its pending record then marks the delivery as uncertain. The
 child sidecar captures the intent's dispatch synchronously when its postmortem
 begins, and only if a relay record for that intent is already visible, so a
-SIGTERM whose postmortem began before the relay is never attributed to it. The
+SIGTERM whose postmortem began before the relay is never attributed to it. A
+SIGTERM that arrives after the pending record is published but before delivery
+wins the exclusive cause record, so it is not attributed either. The
 supervisor never relays to a child the OS already reports terminated but not
 yet reaped. When the child publishes no verdict of its own, the supervisor's
 fallback observation claims the relayed intent only if the child ended through
 its own exit or the default SIGTERM action; any other fatal signal, such as
 SIGABRT, is published with its actual termination as `unexpected_owner_loss`.
-The
-remaining limits are an unrelated signal that arrives after the pending record
-is durable but before delivery combined with a backward wall-clock step, and
-the latency between signal arrival and the start of the postmortem, which no
-userspace evidence can order.
+Signals carry no sender identity, so the remaining limit is the order in which
+the runtime dispatches two signals that are pending at the same time: the one
+handled first is the cause.
 
 A supervisor that is stopped or stalled past the intent's deadline, before or
 during publication, refuses the expired intent and never relays it. A close

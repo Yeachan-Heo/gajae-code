@@ -156,7 +156,8 @@ async function readJson(file: string): Promise<Record<string, unknown>> {
 /**
  * An intent whose later SIGTERM is an operator shutdown. Elsewhere the closer
  * delivers that signal itself; a Darwin closer never does, so there the intent
- * also needs its supervisor's confirmed relay record.
+ * also needs its supervisor's confirmed relay record, and the child's record that
+ * the relay was the first termination cause it handled.
  */
 async function createRelayedOwnerIntent(
 	stateDir: string,
@@ -183,6 +184,16 @@ async function createRelayedOwnerIntent(
 		server_key: intent.server_key,
 		...supervisor,
 		relayed_at: intent.created_at,
+	});
+	await ownerOnly(paths.shutdownCauseFile, {
+		schema_version: 1,
+		generation: intent.generation,
+		session_id: intent.session_id,
+		child_token: supervisor.child_token,
+		child_pid: process.pid,
+		cause: "cooperative",
+		signal: "SIGUSR2",
+		recorded_at: intent.created_at,
 	});
 	return intent;
 }
@@ -2284,6 +2295,12 @@ describe("coordinator runtime state sidecar", () => {
 		};
 		if (phase === "pending")
 			await fs.writeFile(paths.relayPendingFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+		// The child handled the relay as its first cause; only capture order is under test.
+		await fs.writeFile(
+			paths.shutdownCauseFile,
+			`${JSON.stringify({ schema_version: 1, generation, session_id: sessionId, child_token: "token", child_pid: process.pid, cause: "cooperative", signal: "SIGUSR2", recorded_at: new Date().toISOString() })}\n`,
+			{ mode: 0o600 },
+		);
 		// The confirmed record is published; the supervisor still holds the lock for its final flush.
 		if (phase === "confirmed") await fs.writeFile(paths.relayFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
