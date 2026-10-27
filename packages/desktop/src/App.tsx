@@ -51,6 +51,7 @@ export default function App() {
 	const [diffLoading, setDiffLoading] = useState(false);
 	const [settings, setSettings] = useState<DesktopSetting[] | null>(null);
 	const [settingFilter, setSettingFilter] = useState("");
+	const [sessionFilter, setSessionFilter] = useState("");
 	const [provider, setProvider] = useState("");
 	const [key, setKey] = useState("");
 	const [notice, setNotice] = useState("");
@@ -454,6 +455,16 @@ export default function App() {
 			<Button disabled={!connected || pending.global} onClick={() => void openProject()}>
 				프로젝트 열기 / 추가
 			</Button>
+			<label className="sr-only" htmlFor="session-search">
+				대화 검색
+			</label>
+			<input
+				id="session-search"
+				className="session-search"
+				value={sessionFilter}
+				placeholder="대화 검색"
+				onChange={event => setSessionFilter(event.target.value)}
+			/>
 			<nav aria-label="프로젝트와 대화">
 				{snapshot?.projects.map(item => (
 					<section className="project-group" key={item.id}>
@@ -478,7 +489,11 @@ export default function App() {
 						<small className="path">{item.path}</small>
 						{errors[`project:${item.id}`] && <ErrorBanner>{errors[`project:${item.id}`]}</ErrorBanner>}
 						{snapshot.sessions
-							.filter(chat => chat.projectId === item.id)
+							.filter(
+								chat =>
+									chat.projectId === item.id &&
+									chat.title.toLowerCase().includes(sessionFilter.trim().toLowerCase()),
+							)
 							.sort((a, b) => Number(b.starred) - Number(a.starred))
 							.map(chat => (
 								<SessionRow
