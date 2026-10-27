@@ -3615,26 +3615,32 @@ export class Broker {
 	/**
 	 * A headless host closes through its own endpoint first so it removes its endpoint
 	 * and disposes its session; on Windows a substrate signal is `TerminateProcess`,
-	 * which skips both. True only once the exact substrate is proven gone.
+	 * which skips both. Returns the substrate verdict after the attempt; only an
+	 * acknowledged close earns the host's cleanup grace, measured on monotonic time.
 	 */
 	async #closeSpawnHostGracefully(
 		authority: SpawnAuthorityV1,
 		proof: SpawnSubstrateProof,
 		provider: SpawnSubstrateProvider,
-	): Promise<boolean> {
+	): Promise<"verified" | "mismatch" | "gone"> {
 		const pinned = spawnPinFromAuthority(authority);
-		if (!pinned) return false;
+		if (!pinned) return "verified";
+		let accepted = false;
 		try {
-			if ((await this.#spawnHostClose({ sessionId: pinned.sessionId, pinned })) !== "accepted") return false;
+			accepted = (await this.#spawnHostClose({ sessionId: pinned.sessionId, pinned })) === "accepted";
 		} catch {
-			return false;
+			accepted = false;
 		}
-		const deadline = Date.now() + this.settings.spawnHostCloseGraceMs;
+		// Without an acknowledgement the escalation's own re-verification settles it.
+		if (!accepted) return "verified";
+		const graceMs = this.settings.spawnHostCloseGraceMs;
+		const started = performance.now();
 		for (;;) {
 			const verdict = await provider.verify(proof);
-			if (verdict !== "verified") return verdict === "gone";
-			if (Date.now() >= deadline) return false;
-			await Bun.sleep(Math.min(50, Math.max(0, deadline - Date.now())));
+			if (verdict !== "verified") return verdict;
+			const remaining = graceMs - (performance.now() - started);
+			if (remaining <= 0) return "verified";
+			await Bun.sleep(Math.min(50, remaining));
 		}
 	}
 
@@ -3742,15 +3748,20 @@ export class Broker {
 				).authority!;
 			}
 			if (verdict === "verified" || verdict === "gone") {
-				const closedByHost =
-					verdict === "verified" &&
-					proof.substrateKind === "headless" &&
-					(await this.#closeSpawnHostGracefully(authority, proof, provider));
-				if (!closedByHost) {
+				// Absence of the exact substrate is the close proof. A host that exits on its
+				// own (after a lost acknowledgement, at the grace boundary, or before an
+				// earlier retained attempt) is closed without any signal; the substrate close
+				// re-verifies and refuses an already-gone identity, so it is never asked to.
+				let current =
+					verdict === "verified" && proof.substrateKind === "headless"
+						? await this.#closeSpawnHostGracefully(authority, proof, provider)
+						: verdict;
+				if (current === "verified") {
 					const closedSubstrate = await provider.close(proof);
-					if (!closedSubstrate.ok) return "retained";
+					current = await provider.verify(proof);
+					if (!closedSubstrate.ok && current !== "gone") return "retained";
 				}
-				if ((await provider.verify(proof)) !== "gone") return "retained";
+				if (current !== "gone") return "retained";
 			} else return "retained";
 			const at = Math.max(Date.now(), authority.updatedAt + 1);
 			const closedAuthority: SpawnAuthorityV1 = { ...authority, closeState: "closed", closedAt: at, updatedAt: at };

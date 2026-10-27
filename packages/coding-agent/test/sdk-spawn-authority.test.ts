@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash, createHmac } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -1831,7 +1831,6 @@ describe("Broker spawn close and orphan reaper", () => {
 
 	it.each([
 		"accepted-stays",
-		"accepted-mismatch",
 		"unavailable",
 		"throws",
 	] as const)("escalates through the exact substrate close when the host close is %s", async outcome => {
@@ -1856,6 +1855,220 @@ describe("Broker spawn close and orphan reaper", () => {
 			// Only an acknowledged close earns the exit grace before escalation.
 			if (outcome === "accepted-stays") expect(Date.now() - started).toBeGreaterThanOrEqual(150);
 		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("retains a host whose identity stops re-proving after it acknowledged close, without any signal", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, "accepted-mismatch", calls),
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "accepted-mismatch-key");
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: false, error: { code: "close_refused" } });
+			expect(calls).toHaveLength(1);
+			// A reused pid is not this host: it is neither proven gone nor signaled.
+			expect(probe.closes).toBe(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	type HeadlessHost = { alive: boolean; signals: string[]; dieAfterReads?: number };
+	function exactHeadlessProvider(host: HeadlessHost) {
+		return createSpawnSubstrateProvider({
+			platform: "darwin",
+			selectMultiplexer: () => "none",
+			startHeadless: () => ({ pid: 996, terminate() {} }),
+			processIncarnation: pid => {
+				if (pid !== 996) return undefined;
+				if (host.dieAfterReads !== undefined && --host.dieAfterReads < 0) host.alive = false;
+				return host.alive ? "inc-996" : undefined;
+			},
+			isProcessGone: pid => pid === 996 && !host.alive,
+			signalHeadless: (_pid, _incarnation, _platform, signal) => {
+				host.signals.push(signal);
+				host.alive = false;
+				return true;
+			},
+			sleep: async () => {},
+		});
+	}
+	async function closeExactHeadless(
+		key: string,
+		host: HeadlessHost,
+		close: (host: HeadlessHost) => Promise<"accepted" | "unavailable">,
+		graceMs = 5_000,
+	): Promise<{ first: unknown; second?: unknown }> {
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: exactHeadlessProvider(host),
+			spawnPromptLayer: { ...promptLayer, close: async () => await close(host) },
+			spawnHostCloseGraceMs: graceMs,
+		});
+		setLifecycleCommandResolverForTest(broker, () => ({
+			kind: "compiled",
+			file: "child-command",
+			args: [],
+			env: {},
+		}));
+		await broker.start();
+		try {
+			const response = (await broker.handleRequest("session.spawn", { ...spawnInput(), cwd: agentDir }, key)) as {
+				ok: boolean;
+				result?: { sessionId?: string };
+			};
+			expect(response.ok).toBe(true);
+			const childId = response.result!.sessionId!;
+			const first = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			const second = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			return { first, second };
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	}
+
+	it.each([
+		"unavailable",
+		"throws",
+	] as const)("closes a host that exits although its close acknowledgement was %s, without any signal", async outcome => {
+		const host: HeadlessHost = { alive: true, signals: [] };
+		const { first, second } = await closeExactHeadless(`lost-ack-${outcome}`, host, async current => {
+			// The host ran session.close, but the acknowledgement never arrived.
+			current.alive = false;
+			if (outcome === "throws") throw new Error("socket closed before the response");
+			return "unavailable";
+		});
+		expect(first).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+		expect(second).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+		expect(host.signals).toEqual([]);
+	});
+
+	it("closes a host that exits right after the grace expired, without any signal", async () => {
+		const host: HeadlessHost = { alive: true, signals: [] };
+		const { first } = await closeExactHeadless(
+			"grace-boundary",
+			host,
+			async current => {
+				// Still alive for the grace check, gone when the escalation re-verifies.
+				current.dieAfterReads = 1;
+				return "accepted";
+			},
+			0,
+		);
+		expect(first).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+		expect(host.signals).toEqual([]);
+	});
+
+	it("closes a host that already exited before close was requested, without any signal", async () => {
+		const host: HeadlessHost = { alive: true, signals: [] };
+		const closeCalls: string[] = [];
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: exactHeadlessProvider(host),
+			spawnPromptLayer: {
+				...promptLayer,
+				close: async () => {
+					closeCalls.push("close");
+					return "accepted" as const;
+				},
+			},
+		});
+		setLifecycleCommandResolverForTest(broker, () => ({
+			kind: "compiled",
+			file: "child-command",
+			args: [],
+			env: {},
+		}));
+		await broker.start();
+		try {
+			const response = (await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				"already-gone-key",
+			)) as { ok: boolean; result?: { sessionId?: string } };
+			expect(response.ok).toBe(true);
+			host.alive = false;
+			const closed = await broker.handleRequest(
+				"session.close",
+				{ sessionId: response.result!.sessionId! },
+				undefined,
+			);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+			expect(closeCalls).toEqual([]);
+			expect(host.signals).toEqual([]);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["forward", 3_600_000],
+		["backward", -3_600_000],
+	] as const)("measures the close grace on monotonic time when the wall clock steps %s", async (_direction, step) => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		let armed = false;
+		let stepped = false;
+		const exact = provider(probe);
+		// The wall clock steps once the grace has started: at the first re-verification.
+		const base = {
+			...exact,
+			verify: async () => {
+				if (armed) stepped = true;
+				return await exact.verify();
+			},
+		};
+		const wallNow = Date.now.bind(Date);
+		const clock = spyOn(Date, "now");
+		clock.mockImplementation(() => wallNow() + (stepped ? step : 0));
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: base,
+			spawnPromptLayer: {
+				...promptLayer,
+				close: async () => {
+					armed = true;
+					if (step > 0) setTimeout(() => (probe.verdict = "gone"), 200);
+					return "accepted" as const;
+				},
+			},
+			spawnHostCloseGraceMs: step > 0 ? 2_000 : 300,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `clock-${step}`);
+			const started = performance.now();
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			const elapsed = performance.now() - started;
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+			if (step > 0) {
+				// A forward step must not cut the host's cleanup short.
+				expect(probe.closes).toBe(0);
+			} else {
+				// A backward step must not stretch the grace beyond its bound.
+				expect(probe.closes).toBe(1);
+				expect(elapsed).toBeLessThan(2_000);
+			}
+		} finally {
+			clock.mockRestore();
 			await broker.stop();
 		}
 	});
