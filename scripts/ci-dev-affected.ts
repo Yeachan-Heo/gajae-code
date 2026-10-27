@@ -1124,7 +1124,7 @@ export function planTargetedTasks(
 	validateTestPaths = false,
 ): Task[] {
 	const tasks = new Map<string, Task>();
-	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
+	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath) || isRuntimeMarkdownPath(changedPath));
 	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
 	// index is generated from, so shipping the edit without regenerating that index is
 	// the one drift class a docs-only PR can introduce. Select just its gate.
@@ -1221,12 +1221,12 @@ export function planTargetedTasks(
 			add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
 		}
 
-		if (mappedTests.length > 0) {
+		if (mappedTests.length > 0 || (changedPath.endsWith(".md") && behavioralTestsFor(changedPath).length > 0)) {
 			continue;
 		}
 
 		if (owner) {
-			if (isCodingAgentRuntimePath(changedPath)) {
+			if (isCodingAgentRuntimePath(changedPath) || isRuntimeMarkdownPath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
 			if (isUnscopedWrapperPath(changedPath)) {
@@ -1398,10 +1398,15 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 	return matches.length === 1 ? matches : [];
 }
 
-// Resolve explicit behavioral-owner tests. Unlike mappedTestsFor(), these tests
-// are additive because an entrypoint's package-level check and smoke coverage
-// remain necessary even when it owns a dedicated contract test.
+// Resolve explicit behavioral-owner tests. These supplement package checks and
+// smoke coverage for code entrypoints. Bundled Markdown uses its mapped consumer
+// tests instead of CLI smoke; its owning-package check is still required.
 function behavioralTestsFor(changedPath: string): readonly string[] {
+	if (changedPath.endsWith(".md") && (
+		changedPath.startsWith("packages/coding-agent/src/prompts/agents/") ||
+		changedPath.startsWith("packages/coding-agent/src/prompts/agent-fragments/") ||
+		changedPath.startsWith("packages/coding-agent/src/defaults/gjc/")
+	)) return ["packages/coding-agent/test/default-gjc-definitions.test.ts"];
 	return BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
 }
 
@@ -1423,6 +1428,12 @@ function ensureNativeBuild(tasks: Map<string, Task>): void {
 	if (keys.some(taskNeedsNative) && !keys.some(isNativeBuildKey)) {
 		addNativeBuild(tasks);
 	}
+}
+
+// PR targeting must keep bundled source input. Push planning already discovers
+// its owning package and deliberately retains its broader validation policy.
+function isRuntimeMarkdownPath(changedPath: string): boolean {
+	return changedPath.endsWith(".md") && ["packages/coding-agent/src/", "packages/agent/src/", "packages/ai/src/"].some(prefix => changedPath.startsWith(prefix));
 }
 
 export function isDocOrChangelogPath(changedPath: string): boolean {
@@ -2377,4 +2388,4 @@ function assertTaskKeys(value: Record<string, unknown>): void {
 
 if (import.meta.main) {
 	await main();
-}
+	}
