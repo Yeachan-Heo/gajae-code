@@ -277,13 +277,21 @@ export class ExtensionInteractionService {
 		const { promise, resolve, reject } = Promise.withResolvers<ExtensionInteractionResult>();
 		const abort = () => this.#finish(requestId, { status: "cancelled", reason: "aborted" });
 		let timer: Timer | undefined;
+		const removeAbortListener = () => {
+			if (!signal) return;
+			try {
+				EventTarget.prototype.removeEventListener.call(signal, "abort", abort);
+			} catch {
+				// A host wrapper must not replace the request's settlement or admission error.
+			}
+		};
 		const item: PendingInteraction = {
 			request: { sessionId: this.#sessionId, requestId, purpose, payload: detachedPayload },
 			resolve,
 			reject,
 			cleanup: () => {
 				if (timer !== undefined) clearTimeout(timer);
-				if (signal) EventTarget.prototype.removeEventListener.call(signal, "abort", abort);
+				removeAbortListener();
 			},
 		};
 		this.#pending.set(requestId, item);
@@ -293,13 +301,14 @@ export class ExtensionInteractionService {
 				EventTarget.prototype.addEventListener.call(signal, "abort", abort, { once: true });
 			} catch {
 				const removed = this.#pending.delete(requestId);
-				EventTarget.prototype.removeEventListener.call(signal, "abort", abort);
-				if (removed) this.#changed();
+				removeAbortListener();
+				if (!removed) return promise;
+				this.#changed();
 				throw new ExtensionInteractionError("invalid-request", "Invalid interaction signal");
 			}
 			if (!this.#pending.has(requestId)) {
 				// Settlement can reenter while a host wraps registration, before it actually attaches.
-				EventTarget.prototype.removeEventListener.call(signal, "abort", abort);
+				removeAbortListener();
 				return promise;
 			}
 			if (abortedGetter.call(signal)) {

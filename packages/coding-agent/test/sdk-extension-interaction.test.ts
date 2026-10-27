@@ -693,6 +693,63 @@ describe("portable extension interactions", () => {
 		}
 	});
 
+	it("preserves settlement when signal registration attaches, reenters and throws", async () => {
+		for (const action of ["abort", "dispose", "pending"] as const) {
+			for (const throwOnRemove of [false, true]) {
+				const { service } = fixture();
+				const controller = new AbortController();
+				const nativeAdd = EventTarget.prototype.addEventListener;
+				const nativeRemove = EventTarget.prototype.removeEventListener;
+				let attached: unknown;
+				let removed = false;
+				const remove = spyOn(EventTarget.prototype, "removeEventListener").mockImplementation(function (
+					this: EventTarget,
+					type,
+					listener,
+					options,
+				) {
+					nativeRemove.call(this, type, listener, options);
+					if (this === controller.signal && type === "abort" && listener === attached) {
+						removed = true;
+						if (throwOnRemove) throw new Error("private cleanup error");
+					}
+				});
+				const register = spyOn(EventTarget.prototype, "addEventListener").mockImplementation(function (
+					this: EventTarget,
+					type,
+					listener,
+					options,
+				) {
+					nativeAdd.call(this, type, listener, options);
+					if (this === controller.signal && type === "abort") {
+						attached = listener;
+						if (action === "abort") controller.abort();
+						if (action === "dispose") service.dispose();
+						throw new Error("private registration error");
+					}
+				});
+				try {
+					const request = () => service.request({ kind: "input", title: action }, { signal: controller.signal });
+					if (action === "pending") {
+						errorCode(request, "invalid-request");
+					} else {
+						expect(await request()).toEqual({
+							status: "cancelled",
+							reason: action === "abort" ? "aborted" : "disposed",
+						});
+					}
+					expect(attached).not.toBeNull();
+					expect(removed).toBe(true);
+					expect(service.snapshot().pending).toEqual([]);
+				} finally {
+					register.mockRestore();
+					remove.mockRestore();
+					service.dispose();
+				}
+			}
+		}
+	});
+
 	it("validates malformed payloads and timeout boundaries before creating pending work", () => {
 		const { service } = fixture();
 		for (const payload of [
