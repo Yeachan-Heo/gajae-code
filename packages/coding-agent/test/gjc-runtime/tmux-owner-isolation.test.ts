@@ -3228,6 +3228,70 @@ setInterval(() => {}, 1_000);`,
 		}
 	});
 
+	it("completes a timely cooperative close after the wall clock steps past the intent expiry", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-clock-"));
+		const realNow = Date.now;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			let cleanups = 0;
+			const closing = closeExactTmuxOwner(
+				{
+					stateDir: state,
+					sessionId: "session",
+					generation,
+					serverKey: "socket",
+					pid: 10,
+					startTime: "start",
+					dispatchId: "dispatch",
+					createdAt: new Date(Date.now() - 10).toISOString(),
+					expiresAt: new Date(Date.now() + 5_000).toISOString(),
+				},
+				{
+					readStartTime: async () => "start",
+					shutdown: {
+						kind: "cooperative_intent",
+						publishNoReplace: publishOwnerIntentNoReplace,
+						assertCooperativeOwner: () => {},
+					},
+					// The relay and verdict are timely; the wall clock then steps forward an
+					// hour while the child cleans up, before the caller's wait returns.
+					waitForVerdict: async intent => {
+						ownerOnly(paths.relayFile, relayRecord(intent, generation));
+						publishChildExitForTest(paths, intent, {});
+						const verdict = {
+							schema_version: 1 as const,
+							generation,
+							session_id: "session",
+							server_key: "socket",
+							observed_at: new Date().toISOString(),
+							signal: "SIGTERM" as const,
+							exit_code: null,
+							result: "owner_term_then_session_cleanup" as const,
+							observer: "sidecar" as const,
+							classification: "expected_operator_shutdown" as const,
+							reason: "process_postmortem",
+							intent_id: intent.intent_id,
+							dedupe_key: `owner-loss:session:${generation}`,
+						};
+						const stepped = realNow() + 3_600_000;
+						Date.now = () => stepped;
+						return verdict;
+					},
+					cleanupSession: async () => {
+						cleanups += 1;
+					},
+				},
+			);
+			await expect(closing).resolves.toMatchObject({ classification: "expected_operator_shutdown" });
+			expect(cleanups).toBe(1);
+		} finally {
+			Date.now = realNow;
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		["no reconciliation", null],
 		["a fatal exit after the child's verdict", { signal: "SIGABRT", exit_code: null, explained: false }],

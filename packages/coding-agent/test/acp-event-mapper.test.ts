@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import path from "node:path";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
 import acpProtocolSchema from "@agentclientprotocol/sdk/schema/schema.json" with { type: "json" };
+import fc from "fast-check";
 import { fromJSONSchema } from "zod/v4";
 import type * as z from "zod/v4/core";
 import {
@@ -1081,5 +1082,475 @@ describe("ACP event mapper", () => {
 			update: { ...notification!.update, sessionUpdate: "tool_call_updates" },
 		});
 		expectAcpStructureRejects(zSessionNotification, { ...notification, sessionId: 42 });
+	});
+
+	const terminalControl = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
+
+	function stringsIn(value: unknown, out: string[] = [], seen = new WeakSet<object>()): string[] {
+		if (typeof value === "string") {
+			out.push(value);
+			return out;
+		}
+		if (typeof value !== "object" || value === null || seen.has(value)) return out;
+		seen.add(value);
+		if (Array.isArray(value)) {
+			for (const item of value) stringsIn(item, out, seen);
+			return out;
+		}
+		for (const item of Object.values(value)) stringsIn(item, out, seen);
+		return out;
+	}
+
+	it("does not send a tool argument terminal control sequence raw in the session update", () => {
+		const args = {
+			command: "echo \u001b[31mred\u001b[0m",
+			note: "\u001b]0;title\u0007hidden",
+			extra: ["\u001b[31mx"],
+			meta: { q: "\u0007z" },
+		};
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_hostile_cmd",
+				toolName: "bash",
+				args,
+				intent: "run \u001b[31mtests",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		for (const text of stringsIn(updates)) expect(text).not.toMatch(terminalControl);
+		expect(JSON.stringify(updates)).not.toContain("\\u001b");
+		const update = updates[0]!.update as {
+			title?: string;
+			rawInput?: { command?: string; note?: string; extra?: string[]; meta?: { q?: string } };
+			content?: Array<{ content?: { text?: string } }>;
+		};
+		expect(update.title).toBe("run tests");
+		expect(update.rawInput).toEqual({ command: "echo red", note: "hidden", extra: ["x"], meta: { q: "z" } });
+		expect(update.content?.[0]?.content?.text).toBe("$ echo red");
+		expect(update.rawInput).not.toBe(args);
+
+		const readUpdates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_hostile_path",
+				toolName: "read",
+				args: { path: "src/\u001b[2Jevil.ts" },
+			} as AgentSessionEvent,
+			"session-1",
+			{ cwd: "/repo" },
+		);
+		expectAcpNotifications(readUpdates);
+		const readUpdate = readUpdates[0]!.update as {
+			title?: string;
+			rawInput?: { path?: string };
+			locations?: { path: string }[];
+		};
+		expect(readUpdate.title).toBe("read: src/evil.ts");
+		expect(readUpdate.rawInput).toEqual({ path: "src/evil.ts" });
+		expect(readUpdate.locations).toEqual([{ path: path.resolve("/repo", "src/\u001b[2Jevil.ts") }]);
+
+		const progress = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "toolu_hostile_cmd",
+				toolName: "bash",
+				args: { command: "echo \u001b[31mred\u001b[0m" },
+				partialResult: { content: [{ type: "text", text: "ok" }] },
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		expect(stringsIn(progress).join("\n")).toContain("$ echo red");
+		for (const text of stringsIn(progress)) expect(text).not.toMatch(terminalControl);
+
+		const failed = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "toolu_hostile_end",
+				toolName: "bash",
+				isError: true,
+				result: { content: [{ type: "text", text: "failed" }] },
+			} as AgentSessionEvent,
+			"session-1",
+			{ getToolArgs: () => ({ command: "echo \u001b[31mred\u001b[0m" }) },
+		);
+		expect((failed[0]!.update as { title?: string }).title).toBe("Failed: bash: echo red");
+		for (const text of stringsIn((failed[0]!.update as { title?: string; content?: unknown }).title)) {
+			expect(text).not.toMatch(terminalControl);
+		}
+	});
+
+	it("preserves an own __proto__ key on sanitized rawInput", () => {
+		// sanitizeClientValue copies own keys with defineProperty.
+		const args = JSON.parse('{"command":"echo \\u001b[31mred","__proto__":{"x":1}}') as {
+			command: string;
+		};
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_proto",
+				toolName: "bash",
+				args,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const rawInput = (updates[0]!.update as { rawInput: { command: string } }).rawInput;
+		expect(rawInput.command).toBe("echo red");
+		expect(Object.hasOwn(rawInput, "__proto__")).toBe(true);
+		expect(Object.getPrototypeOf(rawInput)).toBe(Object.prototype);
+		expect(JSON.parse(JSON.stringify(rawInput))).toEqual(JSON.parse('{"command":"echo red","__proto__":{"x":1}}'));
+	});
+
+	it("still sends an ordinary tool command, path, pattern, and intent unchanged", () => {
+		const args = { command: "npm run check", cwd: "/repo" };
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_ok",
+				toolName: "bash",
+				args,
+				intent: "run the package check",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const update = updates[0]!.update as {
+			title?: string;
+			rawInput?: unknown;
+			content?: Array<{ content?: { text?: string } }>;
+		};
+		expect(update.title).toBe("run the package check");
+		expect(update.rawInput).toBe(args);
+		expect(update.content?.[0]?.content?.text).toBe("$ npm run check");
+
+		const multiline = "echo hi\necho there";
+		const multiArgs = { command: multiline };
+		const multi = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_multi",
+				toolName: "bash",
+				args: multiArgs,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const multiUpdate = multi[0]!.update as {
+			title?: string;
+			rawInput?: { command?: string };
+			content?: Array<{ content?: { text?: string } }>;
+		};
+		expect(multiUpdate.title).toBe(`bash: ${multiline}`);
+		expect(multiUpdate.rawInput).toBe(multiArgs);
+		expect(multiUpdate.content?.[0]?.content?.text).toBe(`$ ${multiline}`);
+
+		const readArgs = { path: "src/file.ts" };
+		const read = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_read_ok",
+				toolName: "read",
+				args: readArgs,
+			} as AgentSessionEvent,
+			"session-1",
+			{ cwd: "/repo" },
+		);
+		const readUpdate = read[0]!.update as {
+			title?: string;
+			rawInput?: unknown;
+			locations?: { path: string }[];
+		};
+		expect(readUpdate.title).toBe("read: src/file.ts");
+		expect(readUpdate.rawInput).toBe(readArgs);
+		expect(readUpdate.locations).toEqual([{ path: path.resolve("/repo", "src/file.ts") }]);
+
+		const patternArgs = { pattern: "function\\s+name" };
+		const queryArgs = { query: "where is main" };
+		const pattern = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_pattern",
+				toolName: "search",
+				args: patternArgs,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const query = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_query",
+				toolName: "search",
+				args: queryArgs,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		expect((pattern[0]!.update as { title?: string }).title).toBe("search: function\\s+name");
+		expect((pattern[0]!.update as { rawInput?: unknown }).rawInput).toBe(patternArgs);
+		expect((query[0]!.update as { title?: string }).title).toBe("search: where is main");
+		expect((query[0]!.update as { rawInput?: unknown }).rawInput).toBe(queryArgs);
+	});
+
+	it("property: tool argument controls stay out of the session update, seed 6722026, 64 inputs", () => {
+		const controlPrefix = fc.constantFrom("\u001b[31m", "\u001b]0;title\u0007", "\u0000", "\u007f", "\u001bc");
+		fc.assert(
+			fc.property(
+				controlPrefix,
+				fc.string({ maxLength: 40 }),
+				fc.string({ maxLength: 20 }),
+				(prefix, body, note) => {
+					const command = `${prefix}${body}`;
+					const updates = mapAgentSessionEventToAcpSessionUpdates(
+						{
+							type: "tool_execution_start",
+							toolCallId: "toolu_prop",
+							toolName: "bash",
+							args: { command, note },
+						} as AgentSessionEvent,
+						"session-1",
+					);
+					for (const text of stringsIn(updates)) expect(text).not.toMatch(terminalControl);
+					const update = updates[0]!.update as {
+						title: string;
+						rawInput: { command: string; note: string };
+					};
+					const again = mapAgentSessionEventToAcpSessionUpdates(
+						{
+							type: "tool_execution_start",
+							toolCallId: "toolu_prop",
+							toolName: "bash",
+							args: { command: update.rawInput.command, note: update.rawInput.note },
+						} as AgentSessionEvent,
+						"session-1",
+					);
+					const againUpdate = again[0]!.update as { title: string; rawInput: { command: string; note: string } };
+					expect(againUpdate.title).toBe(update.title);
+					expect(againUpdate.rawInput).toEqual(update.rawInput);
+				},
+			),
+			{ seed: 6722026, numRuns: 64 },
+		);
+	});
+
+	it("property: plain tool commands stay in the session update, seed 6722026, 64 inputs", () => {
+		fc.assert(
+			fc.property(fc.stringMatching(/^[A-Za-z0-9 ._/:-]{0,40}$/), command => {
+				const args = { command };
+				const updates = mapAgentSessionEventToAcpSessionUpdates(
+					{
+						type: "tool_execution_start",
+						toolCallId: "toolu_plain",
+						toolName: "bash",
+						args,
+					} as AgentSessionEvent,
+					"session-1",
+				);
+				const update = updates[0]!.update as {
+					title?: string;
+					rawInput?: { command?: string };
+					content?: Array<{ content?: { text?: string } }>;
+				};
+				expect(update.rawInput).toBe(args);
+				if (command.length === 0) {
+					expect(update.title).toBe("bash");
+					expect(update.content).toBeUndefined();
+				} else {
+					expect(update.title).toBe(`bash: ${command}`);
+					expect(update.content?.[0]?.content?.text).toBe(`$ ${command}`);
+				}
+			}),
+			{ seed: 6722026, numRuns: 64 },
+		);
+	});
+
+	it("does not throw on a deep or cyclic tool argument", () => {
+		let nested: unknown = { note: "\u001b[31mdeep" };
+		for (let depth = 0; depth < 128; depth++) nested = { child: nested };
+		const started = performance.now();
+		const deep = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_deep",
+				toolName: "bash",
+				args: { command: "echo \u001b[31mred", note: "\u001b[31mx", nested },
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		expect(performance.now() - started).toBeLessThan(1000);
+		expect(deep).toHaveLength(1);
+		const deepRaw = (deep[0]!.update as { rawInput: { command: string; note: string; nested: unknown } }).rawInput;
+		expect(deepRaw.command).toBe("echo red");
+		expect(deepRaw.note).toBe("x");
+		let deepCursor: unknown = deepRaw.nested;
+		for (let depth = 0; depth < 128; depth++) deepCursor = (deepCursor as { child: unknown }).child;
+		expect((deepCursor as { note: string }).note).toBe("deep");
+		for (const text of stringsIn(deepRaw)) expect(text).not.toMatch(terminalControl);
+
+		const cyclic: Record<string, unknown> = { command: "echo \u001b[31mred" };
+		cyclic.self = cyclic;
+		const cycle = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_cycle",
+				toolName: "bash",
+				args: cyclic,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		expect(cycle).toHaveLength(1);
+		const cycleRaw = (cycle[0]!.update as { rawInput: { command: string; self: unknown } }).rawInput;
+		expect(cycleRaw.command).toBe("echo red");
+		expect(cycleRaw.self).toBe(cycleRaw);
+	});
+
+	it("property: nested tool arguments drop controls and keep shape, seed 6722026, 64 inputs", () => {
+		const leaf = fc.string({ maxLength: 24 });
+		fc.assert(
+			fc.property(
+				fc.array(leaf, { maxLength: 3 }),
+				fc.dictionary(fc.stringMatching(/^[a-z]{1,8}$/), leaf, { maxKeys: 3 }),
+				(extra, meta) => {
+					const updates = mapAgentSessionEventToAcpSessionUpdates(
+						{
+							type: "tool_execution_start",
+							toolCallId: "toolu_nested",
+							toolName: "bash",
+							args: { command: "echo ok", extra, meta },
+						} as AgentSessionEvent,
+						"session-1",
+					);
+					const raw = (
+						updates[0]!.update as {
+							rawInput: { command: string; extra: string[]; meta: Record<string, string> };
+						}
+					).rawInput;
+					expect(raw.command).toBe("echo ok");
+					expect(raw.extra).toHaveLength(extra.length);
+					expect(Object.keys(raw.meta).sort()).toEqual(Object.keys(meta).sort());
+					for (const text of stringsIn(raw)) expect(text).not.toMatch(terminalControl);
+				},
+			),
+			{ seed: 6722026, numRuns: 64 },
+		);
+	});
+
+	function nestChild(leaf: unknown, levels: number): unknown {
+		let nested = leaf;
+		for (let depth = 0; depth < levels; depth++) nested = { child: nested };
+		return nested;
+	}
+
+	it("strips a terminal control nested past 64 object levels in rawInput", () => {
+		const args = {
+			command: "echo \u001b[31mred",
+			nested: nestChild({ note: "\u001b[31mdeep", extra: ["\u0007x", "ok"] }, 64),
+		};
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_deep_control",
+				toolName: "bash",
+				args,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const raw = (updates[0]!.update as { rawInput: { command: string; nested: unknown } }).rawInput;
+		expect(raw).not.toBe(args);
+		expect(raw.command).toBe("echo red");
+		let cursor: unknown = raw.nested;
+		for (let depth = 0; depth < 64; depth++) cursor = (cursor as { child: unknown }).child;
+		const leaf = cursor as { note: string; extra: string[] };
+		expect(leaf.note).toBe("deep");
+		expect(leaf.extra).toEqual(["x", "ok"]);
+		for (const text of stringsIn(updates)) expect(text).not.toMatch(terminalControl);
+	});
+
+	it("still sends a plain tool argument nested past 64 object levels", () => {
+		const args = {
+			command: "npm test",
+			nested: nestChild({ note: "plain deep", extra: ["ok", "still"] }, 64),
+		};
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_deep_plain",
+				toolName: "bash",
+				args,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const update = updates[0]!.update as {
+			title?: string;
+			rawInput?: { command?: string; nested?: unknown };
+			content?: Array<{ content?: { text?: string } }>;
+		};
+		expect(update.rawInput).toBe(args);
+		expect(update.title).toBe("bash: npm test");
+		expect(update.content?.[0]?.content?.text).toBe("$ npm test");
+		let cursor: unknown = args.nested;
+		for (let depth = 0; depth < 64; depth++) cursor = (cursor as { child: unknown }).child;
+		expect(cursor).toEqual({ note: "plain deep", extra: ["ok", "still"] });
+	});
+
+	it("strips a control in a cycle nested past 64 object levels", () => {
+		const cycle: Record<string, unknown> = { note: "\u001b[31mdeep" };
+		cycle.self = cycle;
+		const args = { command: "echo ok", nested: nestChild(cycle, 64) };
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_start",
+				toolCallId: "toolu_deep_cycle",
+				toolName: "bash",
+				args,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		let cursor: unknown = (updates[0]!.update as { rawInput: { nested: unknown } }).rawInput.nested;
+		for (let depth = 0; depth < 64; depth++) cursor = (cursor as { child: unknown }).child;
+		const leaf = cursor as { note: string; self: unknown };
+		expect(leaf.note).toBe("deep");
+		expect(leaf.self).toBe(leaf);
+		for (const text of stringsIn(updates)) expect(text).not.toMatch(terminalControl);
+	});
+
+	it("property: a control nested past 64 object levels stays out of rawInput, seed 7264026, 64 inputs", () => {
+		fc.assert(
+			fc.property(
+				fc.integer({ min: 65, max: 96 }),
+				fc.constantFrom("\u001b[31m", "\u001b]0;title\u0007", "\u0000"),
+				fc.stringMatching(/^[A-Za-z0-9 .]{0,12}$/),
+				(levels, prefix, body) => {
+					const args = { command: "echo ok", nested: nestChild({ note: `${prefix}${body}` }, levels) };
+					const updates = mapAgentSessionEventToAcpSessionUpdates(
+						{
+							type: "tool_execution_start",
+							toolCallId: "toolu_deep_prop",
+							toolName: "bash",
+							args,
+						} as AgentSessionEvent,
+						"session-1",
+					);
+					for (const text of stringsIn(updates)) expect(text).not.toMatch(terminalControl);
+					let cursor: unknown = (updates[0]!.update as { rawInput: { nested: unknown } }).rawInput.nested;
+					for (let depth = 0; depth < levels; depth++) cursor = (cursor as { child: unknown }).child;
+					expect((cursor as { note: string }).note).toBe(body);
+					const again = mapAgentSessionEventToAcpSessionUpdates(
+						{
+							type: "tool_execution_start",
+							toolCallId: "toolu_deep_prop",
+							toolName: "bash",
+							args: (updates[0]!.update as { rawInput: unknown }).rawInput,
+						} as AgentSessionEvent,
+						"session-1",
+					);
+					expect((again[0]!.update as { rawInput: unknown }).rawInput).toEqual(
+						(updates[0]!.update as { rawInput: unknown }).rawInput,
+					);
+				},
+			),
+			{ seed: 7264026, numRuns: 64 },
+		);
 	});
 });

@@ -139,9 +139,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * pre-upgrade owner cannot retain the queue race fixed by #5120.
  * Slack generation 80 persists and fences the inbound SDK dispatch boundary so
  * crashes, recovery, and attachment retirement cannot replay ambiguous work.
+ * Discord generation 87 rejects inbound commands and actions whose author is
+ * not in the configured actor allowlist, so a pre-upgrade owner cannot keep
+ * accepting every non-bot guild member.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 86,
+	discord: 87,
 	slack: 94,
 };
 

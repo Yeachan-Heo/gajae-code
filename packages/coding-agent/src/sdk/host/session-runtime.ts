@@ -7692,6 +7692,31 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				return true;
 			},
 		);
+		// The person at this terminal did not stop the turn, so say who did. Only a
+		// Broker-routed operator terminal abort that actually stopped a turn is
+		// attributed; an idempotent replay of the same request is not announced twice.
+		const attributedOperatorAborts = new Set<string>();
+		const attributeOperatorTerminalAbort = (request: SdkFrame, response: SdkFrame | undefined): void => {
+			if (request.operation !== "turn.abort" || !response || response.ok !== true) return;
+			const input = request.input;
+			if (typeof input !== "object" || input === null || (input as { mode?: unknown }).mode !== "terminal") return;
+			if (!hasBrokerRuntimeAbortCapability(input)) return;
+			const result = response.result;
+			if (typeof result !== "object" || result === null || (result as { turn?: unknown }).turn !== "stopped") return;
+			const key = typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined;
+			if (key !== undefined) {
+				if (attributedOperatorAborts.has(key)) return;
+				if (attributedOperatorAborts.size >= 256) attributedOperatorAborts.clear();
+				attributedOperatorAborts.add(key);
+			}
+			try {
+				ctx.ui.notify("Turn stopped by a remote operator.", "warning");
+			} catch (error) {
+				logger.warn("sdk: operator abort attribution failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		};
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
@@ -7804,6 +7829,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			onRequest: options.onSdkRequest,
 			onControlResponseDelivery: async (_connectionId, request, response, outcome) => {
+				attributeOperatorTerminalAbort(request, response);
 				// Strict key validation: a malformed retry (e.g. numeric
 				// idempotencyKey) rejected by dispatch must NEVER hash to the same
 				// key as a legitimate stored string and advance its response state
