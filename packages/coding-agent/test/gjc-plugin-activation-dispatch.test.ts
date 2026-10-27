@@ -243,4 +243,20 @@ describe("GJC sub-skill activation dispatch", () => {
 		const cleared = await readActiveSubskillsForParent({ cwd, sessionId, parent: "ralplan", phase: "planner" });
 		expect(cleared).toHaveLength(0);
 	});
+
+	test("escapes regex special chars in activation flag (issue #7314)", async () => {
+		const cwd = await tempProjectWithFixture("valid-skill-plugin");
+
+		// Test that flags with dots don't match unrelated tokens containing those chars
+		const result = await resolveSubskillActivationForSkillInvocation({
+			cwd,
+			skillName: "ralplan",
+			args: "keep --reviewXv1 and --design and --review.v1 more",
+		});
+
+		// Should only remove --design, not --reviewXv1 or any other unrelated tokens
+		expect(result.cleanedArgs).toBe("keep --reviewXv1 and and --review.v1 more");
+		expect(result.activation).toBeDefined();
+		expect(result.activation?.activationArg).toBe("design");
+	});
 });
