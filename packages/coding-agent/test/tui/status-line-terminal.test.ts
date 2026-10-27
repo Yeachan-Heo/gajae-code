@@ -1,10 +1,16 @@
-import { beforeAll, expect, test } from "bun:test";
+import { afterEach, beforeAll, expect, test } from "bun:test";
 import fc from "fast-check";
+import { settings } from "../../src/config/settings";
 import { initTheme, theme } from "../../src/modes/theme/theme";
+import { fileHyperlink } from "../../src/tui/hyperlink";
 import { renderStatusLine } from "../../src/tui/status-line";
 
 beforeAll(async () => {
 	await initTheme();
+});
+
+afterEach(() => {
+	settings.clearOverride("tui.hyperlinks");
 });
 
 test("status line strips terminal controls from title, description, badge, and meta", () => {
@@ -110,6 +116,45 @@ test("strips injected controls embedded inside caller-styled text", () => {
 	expect(rendered).not.toContain("\x1b[2J");
 	expect(rendered).toContain("src/evilfile.ts");
 	expect(rendered).toContain(theme.fg("accent", "src/evilfile.ts"));
+});
+
+test("preserves OSC 8 fileHyperlink markup in description when hyperlinks are enabled", () => {
+	settings.override("tui.hyperlinks", "always");
+	const linkedPath = fileHyperlink("/repo/src/tools/read.ts", theme.fg("accent", "src/tools/read.ts"));
+
+	const rendered = renderStatusLine(
+		{
+			title: "Read",
+			description: linkedPath,
+		},
+		theme,
+	);
+
+	expect(rendered).toContain("\x1b]8;");
+	expect(rendered).toContain("\x1b]8;;\x1b\\");
+	expect(rendered).toContain("file:///repo/src/tools/read.ts");
+	expect(rendered).toContain("src/tools/read.ts");
+});
+
+test("strips injected terminal controls while preserving OSC 8 file hyperlinks", () => {
+	settings.override("tui.hyperlinks", "always");
+	const evilAnchor = `src/\x1b]52;c;payload\x07\x1b[2Jread.ts`;
+	const linkedPath = fileHyperlink("/repo/src/tools/read.ts", evilAnchor);
+
+	const rendered = renderStatusLine(
+		{
+			title: "Read",
+			description: linkedPath,
+		},
+		theme,
+	);
+
+	expect(rendered).toContain("\x1b]8;");
+	expect(rendered).toContain("file:///repo/src/tools/read.ts");
+	expect(rendered).not.toContain("\x1b]52;");
+	expect(rendered).not.toContain("payload");
+	expect(rendered).not.toContain("\x1b[2J");
+	expect(rendered).toContain("src/read.ts");
 });
 
 test("property: status line strips arbitrary terminal controls, fc.property seed 71291, numRuns 64", () => {
