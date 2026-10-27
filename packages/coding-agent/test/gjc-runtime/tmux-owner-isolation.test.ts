@@ -60,6 +60,9 @@ const publishRelayForTest = (file: string, bytes: Uint8Array): void => {
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
 
+const itKernelSignalClose = it.skipIf(process.platform === "darwin");
+const itOwnerOnlyReads = it.skipIf(process.platform === "win32");
+
 describe("exact owner JSON framing", () => {
 	const specimens: [string, Uint8Array, "value" | "framing" | "json", unknown?][] = [
 		["object LF", Buffer.from("{}\n"), "value", {}],
@@ -897,8 +900,6 @@ function holdSqliteWriteLock(databaseFile: string): Database {
  * Kernel-signal close: the closer delivers SIGTERM itself after publishing the
  * intent. Only Linux closes that way; a Darwin closer needs a supervisor relay.
  */
-const itKernelSignalClose = it.skipIf(process.platform === "darwin");
-const itOwnerOnlyReads = it.skipIf(process.platform === "win32");
 
 describe("tmux owner isolation", () => {
 	it("recognizes only the exact owner-isolation argv", () => {
