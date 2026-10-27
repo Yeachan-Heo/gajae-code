@@ -1294,6 +1294,13 @@ read whose metadata changed mid-window (`metadata_changed`) is re-acquired from
 scratch a bounded number of times; identity, link-count, ownership and ACL
 failures are never retried. There is no pathname fallback.
 
+The 64 KiB bound is not a new prompt limit. A recoverable binding is its fixed
+fields (about 540 bytes) plus the same command JSON the tmux pane command
+already carries, and tmux rejects any pane command over about 16 KiB
+(`command too long`) before a supervisor exists, as it did before supervision.
+An inline prompt too large for that limit already fails at tmux session
+creation, supervised or not; pass it through a file instead.
+
 Opaque bindings never grant crash-recovery authority. Recoverable predecessor
 bindings and SIGABRT receipts remain a separate Linux-only capability backed by
 recovery-fs; stale binding schemas are rejected rather than migrated.
