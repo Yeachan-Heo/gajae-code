@@ -507,12 +507,22 @@ function buildCodeSpanChecker(text: string): (position: number) => boolean {
 			const top = delimiterStack[delimiterStack.length - 1];
 			if (top && top[1] && runLength >= top[0]) {
 				// Closing fence: length must be >= opener (per CommonMark)
-				const [, , openPos] = top;
-				// Mark all positions from opener to closer as inside code
-				for (let pos = openPos; pos < runEnd; pos++) {
-					insideCodePositions.add(pos);
+				// and only whitespace may follow on the line
+				let closingFenceValid = true;
+				for (let j = runEnd; j < text.length && text[j] !== "\n"; j++) {
+					if (text[j] !== " " && text[j] !== "\t") {
+						closingFenceValid = false;
+						break;
+					}
 				}
-				delimiterStack.pop();
+				if (closingFenceValid) {
+					const [, , openPos] = top;
+					// Mark all positions from opener to closer as inside code
+					for (let pos = openPos; pos < runEnd; pos++) {
+						insideCodePositions.add(pos);
+					}
+					delimiterStack.pop();
+				}
 			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
 				// Opening fence (only if not already inside another fence)
 				delimiterStack.push([runLength, true, i]);

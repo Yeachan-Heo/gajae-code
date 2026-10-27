@@ -229,6 +229,20 @@ describe("parseSkillInvocations", () => {
 				expectedCommandCount: 1,
 				expectedCommands: ["skill:beta"],
 			},
+			// Closing fence with text after is not a valid fence (per CommonMark)
+			// /skill:alpha is inside code block and should NOT be invoked
+			{
+				description: "Backticks with text after do not close fence (issue #7321)",
+				text: "Explain:\n```text\n``` not a closing fence\n/skill:alpha run\n```",
+				expectedCommandCount: 0,
+			},
+			// Closing fence with trailing whitespace is valid, so /skill:alpha is outside
+			{
+				description: "Closing fence with trailing whitespace is valid",
+				text: "Explain:\n```text\n```   \n/skill:alpha run",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
 		];
 
 		for (const testCase of testCases) {
