@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it, setSystemTime, spyOn } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -21,6 +21,7 @@ import {
 	isValidOwnerVerdict,
 	lifecyclePaths,
 	type OwnerIntent,
+	type OwnerVerdict,
 	observeOwnerTerminal,
 	ownerProcessStartTime,
 	type PlanRequest,
@@ -29,6 +30,7 @@ import {
 	planTmuxOwnerIsolation,
 	planTmuxOwnerIsolationSync,
 	readSecureOwnerJson,
+	recordManagedOwnerChildExit,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
@@ -41,14 +43,77 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
 import { publishOwnerIntentNoReplace } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import * as natives from "@gajae-code/natives";
+import type { ProcessIncarnationObservation } from "../../src/sdk/broker/process-incarnation";
+import {
+	managedDirectoryRoot,
+	publishManagedFileNoReplaceSync,
+} from "../../src/session/internal/managed-session-storage";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const ownerIsolationCliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 const packagedGjcEntry = path.join(repoRoot, "packages", "coding-agent", "bin", "gjc.js");
 const mainEntry = path.join(repoRoot, "packages", "coding-agent", "src", "main.ts");
 const ownerIsolationFlag = "--internal-tmux-owner-isolation";
+// The supervisor's production publisher for the relay record.
+const publishRelayForTest = (file: string, bytes: Uint8Array): void => {
+	publishManagedFileNoReplaceSync(file, bytes, managedDirectoryRoot(path.dirname(file)));
+};
+/** The supervised child's pid the consumer tests relay to. */
+const COOPERATIVE_CHILD_PID = 4242;
+/** What an admitted Darwin child publishes once its cooperative handler is installed. */
+const publishCooperativeReadyForTest = (
+	paths: { cooperativeReadyFile: string },
+	generation: string,
+	overrides: Record<string, unknown> = {},
+): void =>
+	fsSync.writeFileSync(
+		paths.cooperativeReadyFile,
+		`${JSON.stringify({ schema_version: 1, generation, session_id: "session", child_token: "token", child_pid: COOPERATIVE_CHILD_PID, signal: "SIGUSR2", ...overrides })}\n`,
+		{ mode: 0o600 },
+	);
+/** The supervisor's index and its reconciliation of the relayed child's own exit. */
+const publishChildExitForTest = (
+	paths: { supervisorIndexFile: string; childExitFile: string },
+	intent: OwnerIntent,
+	overrides: Record<string, unknown> = {},
+): void => {
+	if (!fsSync.existsSync(paths.supervisorIndexFile))
+		fsSync.writeFileSync(
+			paths.supervisorIndexFile,
+			`${JSON.stringify({ schema_version: 1, generation: intent.generation, session_id: intent.session_id, child_token: "token", supervisor_pid: 10, supervisor_start_time: "start" })}\n`,
+			{ mode: 0o600 },
+		);
+	fsSync.writeFileSync(
+		paths.childExitFile,
+		`${JSON.stringify({ schema_version: 1, generation: intent.generation, session_id: intent.session_id, child_token: "token", child_pid: COOPERATIVE_CHILD_PID, intent_id: intent.intent_id, dispatch_id: intent.dispatch_id, signal: null, exit_code: 143, explained: true, observed_at: new Date().toISOString(), ...overrides })}\n`,
+		{ mode: 0o600 },
+	);
+};
+const waitForPath = async (file: string, timeoutMs = 3_000): Promise<void> => {
+	const deadline = Date.now() + timeoutMs;
+	while (!fsSync.existsSync(file)) {
+		if (Date.now() >= deadline) throw new Error(`timed out waiting for ${file}`);
+		await Bun.sleep(10);
+	}
+};
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
+
+/** Holds a generation's closer lock the way a waiting closer does; returns the release. */
+const holdCloser = (paths: { closerLockFile: string }): (() => void) => {
+	const closer = new Database(paths.closerLockFile);
+	fsSync.chmodSync(paths.closerLockFile, 0o600);
+	closer.exec("BEGIN IMMEDIATE");
+	let held = true;
+	return () => {
+		if (!held) return;
+		held = false;
+		closer.exec("ROLLBACK");
+		closer.close();
+	};
+};
+const itKernelSignalClose = it.skipIf(process.platform === "darwin");
+const itOwnerOnlyReads = it.skipIf(process.platform === "win32");
 
 describe("exact owner JSON framing", () => {
 	const specimens: [string, Uint8Array, "value" | "framing" | "json", unknown?][] = [
@@ -71,29 +136,48 @@ describe("exact owner JSON framing", () => {
 		["trailing token", Buffer.from("{} true\n"), "json"],
 		["duplicate keys", Buffer.from('{"key":1,"key":2}\n'), "value", { key: 2 }],
 	];
-	it.each(
-		specimens.map(([name, bytes, kind, value]) => [name, bytes, kind, value] as const),
-	)("preserves native-reader and retained-byte semantics: %s", async (_name, bytes, kind, value) => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-framing-"));
-		try {
-			const file = path.join(root, "evidence.json");
-			await fs.writeFile(file, bytes, { mode: 0o600 });
-			const secure = () => readSecureOwnerJson(file);
-			const retained = () => parseExactOwnerJson(bytes, "managed_owner_json_framing_invalid");
-			if (kind === "value") {
-				expect(secure()).toEqual(value);
-				expect(retained()).toEqual(value);
-			} else if (kind === "framing") {
-				expect(secure).toThrow(bytes.length ? "owner_evidence_framing_invalid" : "owner_evidence_unavailable");
-				expect(retained).toThrow("managed_owner_json_framing_invalid");
-			} else {
-				expect(secure).toThrow(SyntaxError);
-				expect(retained).toThrow(SyntaxError);
+	// The native owner-only reader exists only on macOS and Linux.
+	it
+		.skipIf(process.platform === "win32")
+		.each(specimens.map(([name, bytes, kind, value]) => [name, bytes, kind, value] as const))(
+		"preserves native-reader and retained-byte semantics: %s",
+		async (_name, bytes, kind, value) => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-framing-"));
+			try {
+				const file = path.join(root, "evidence.json");
+				await fs.writeFile(file, bytes, { mode: 0o600 });
+				const secure = () => readSecureOwnerJson(file);
+				const retained = () => parseExactOwnerJson(bytes, "managed_owner_json_framing_invalid");
+				if (kind === "value") {
+					expect(secure()).toEqual(value);
+					expect(retained()).toEqual(value);
+				} else if (kind === "framing") {
+					expect(secure).toThrow(bytes.length ? "owner_evidence_framing_invalid" : "owner_evidence_unavailable");
+					expect(retained).toThrow("managed_owner_json_framing_invalid");
+				} else {
+					expect(secure).toThrow(SyntaxError);
+					expect(retained).toThrow(SyntaxError);
+				}
+			} finally {
+				await fs.rm(root, { recursive: true, force: true });
 			}
-		} finally {
-			await fs.rm(root, { recursive: true, force: true });
-		}
-	});
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"fails closed on Windows, where the owner-only reader is unsupported",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-framing-"));
+			try {
+				const file = path.join(root, "evidence.json");
+				await fs.writeFile(file, "{}\n");
+				expect(natives.readOwnerOnlyFile(file, 65536)).toEqual({ ok: false, code: "unsupported_platform" });
+				expect(() => readSecureOwnerJson(file)).toThrow("owner_evidence_unavailable");
+			} finally {
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("keeps native failure classification and the 65536-byte bound", () => {
 		const read = spyOn(natives, "readOwnerOnlyFile").mockReturnValue({ ok: false, code: "read_failed" });
@@ -216,6 +300,25 @@ describe("owner intent construction", () => {
 							};
 							expect(JSON.stringify(intent)).toBe(JSON.stringify(expected));
 							expect(await fs.readFile(paths.intentFile, "utf8")).toBe(`${JSON.stringify(expected)}\n`);
+							// The exact supervisor's delivery evidence for this intent.
+							if (mode === "cooperative_intent")
+								fsSync.writeFileSync(
+									paths.relayFile,
+									`${JSON.stringify({
+										schema_version: 1,
+										intent_id: intent.intent_id,
+										dispatch_id: intent.dispatch_id,
+										generation,
+										session_id: "session",
+										server_key: "socket",
+										child_token: "token",
+										supervisor_pid: 10,
+										supervisor_start_time: "start",
+										relayed_at: new Date().toISOString(),
+									})}\n`,
+									{ mode: 0o600 },
+								);
+							if (mode === "cooperative_intent") publishChildExitForTest(paths, intent);
 							return {
 								schema_version: 1,
 								generation,
@@ -361,30 +464,91 @@ describe("closed managed predecessor evidence", () => {
 		},
 	);
 
-	it("treats a receipt-less prior binding as history only where SIGABRT receipts cannot exist", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-history-"));
-		try {
-			const baseline = {
-				state: "current",
-				schema_version: 1,
-				generation: "generation",
-				session_id: "session",
-				published_at: "2026-09-08T00:00:00.000Z",
-			} as const;
-			const root = lifecyclePaths(stateDir, "session", "generation").root;
-			await fs.mkdir(root, { recursive: true, mode: 0o700 });
-			// A supervised owner that exited normally leaves only its child binding.
-			await fs.writeFile(path.join(root, "child-token.binding.json"), "{}\n", { mode: 0o600 });
-			const resolve = () => resolveManagedOwnerPredecessorSync(stateDir, "session", baseline);
-			if (process.platform === "linux") expect(resolve).toThrow("managed_owner_replacement_evidence_ambiguous");
-			else expect(resolve()).toBeUndefined();
-			// A receipt still fails closed off Linux; it is never trusted as recovery evidence.
-			await fs.writeFile(path.join(root, "sigabrt-token.receipt.json"), "{}\n", { mode: 0o600 });
-			if (process.platform !== "linux") expect(resolve).toThrow("managed_owner_replacement_evidence_unavailable");
-		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
-		}
-	});
+	// Owner-only evidence reads do not exist on Windows, where managed launches are refused.
+	itOwnerOnlyReads(
+		"treats a receipt-less prior binding as history only where SIGABRT receipts cannot exist",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-history-"));
+			try {
+				const baseline = {
+					state: "current",
+					schema_version: 1,
+					generation: "generation",
+					session_id: "session",
+					published_at: "2026-09-08T00:00:00.000Z",
+				} as const;
+				const root = lifecyclePaths(stateDir, "session", "generation").root;
+				await fs.mkdir(root, { recursive: true, mode: 0o700 });
+				// A supervised owner that exited normally leaves only its child binding.
+				const binding = {
+					schema_version: 3,
+					binding_kind: "opaque",
+					generation: "generation",
+					session_id: "session",
+					run_id: "run",
+					endpoint_incarnation: "incarnation",
+					child_token: "token",
+					supervisor_pid: 4242,
+					supervisor_start_time: "supervisor-start",
+					created_at: baseline.published_at,
+				};
+				await fs.writeFile(path.join(root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, {
+					mode: 0o600,
+				});
+				const resolve = (observation: ProcessIncarnationObservation = { status: "absent" }) =>
+					resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid => {
+						expect(pid).toBe(4242);
+						return observation;
+					});
+				if (process.platform === "linux")
+					expect(() => resolve()).toThrow("managed_owner_replacement_evidence_ambiguous");
+				else {
+					expect(resolve()).toBeUndefined();
+					// A reused pid is a different process; the exact supervisor has exited.
+					expect(resolve({ status: "present", incarnation: "another-start" })).toBeUndefined();
+					// The exact supervisor is still live: its generation must not be replaced.
+					expect(() => resolve({ status: "present", incarnation: "supervisor-start" })).toThrow(
+						"managed_owner_predecessor_live",
+					);
+					expect(() => resolve({ status: "unknown", reasonCode: "lookup_failed" })).toThrow(
+						"managed_owner_replacement_evidence_unavailable",
+					);
+					// Bindings of earlier generations share the pinned root and stay history, even
+					// when their pid now names a live process with the recorded start time.
+					await fs.writeFile(
+						path.join(root, "child-older.binding.json"),
+						`${JSON.stringify({ ...binding, generation: "older-generation", child_token: "older", supervisor_pid: 5151 })}\n`,
+						{ mode: 0o600 },
+					);
+					expect(
+						resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid =>
+							pid === 5151 ? { status: "present", incarnation: "supervisor-start" } : { status: "absent" },
+						),
+					).toBeUndefined();
+					expect(() =>
+						resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid =>
+							pid === 4242 ? { status: "present", incarnation: "supervisor-start" } : { status: "absent" },
+						),
+					).toThrow("managed_owner_predecessor_live");
+					await fs.rm(path.join(root, "child-older.binding.json"));
+					for (const patch of [{ session_id: "other" }, { supervisor_pid: 0 }]) {
+						await fs.writeFile(
+							path.join(root, "child-token.binding.json"),
+							`${JSON.stringify({ ...binding, ...patch })}\n`,
+							{ mode: 0o600 },
+						);
+						expect(() => resolve()).toThrow("managed_owner_replacement_evidence_untrusted");
+					}
+				}
+				// A receipt still fails closed off Linux; it is never trusted as recovery evidence.
+				await fs.writeFile(path.join(root, "sigabrt-token.receipt.json"), "{}\n", { mode: 0o600 });
+				if (process.platform !== "linux")
+					expect(() => resolve()).toThrow("managed_owner_replacement_evidence_unavailable");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commit", () => {
@@ -481,8 +645,10 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 					}),
 				).rejects.toThrow();
 				expect(cleanups).toBe(0);
-				expect(fsSync.existsSync(paths.intentFile)).toBe(
-					["after-rename", "readback", "release", "mismatched-verdict"].includes(fault),
+				expect(fsSync.existsSync(paths.intentFile)).toBe(["after-rename", "readback", "release"].includes(fault));
+				// A closer that gave up retires its own provably undelivered intent at once.
+				expect(fsSync.readdirSync(paths.root).filter(entry => entry.endsWith(".undelivered"))).toHaveLength(
+					fault === "mismatched-verdict" ? 1 : 0,
 				);
 				for (const suffix of [".cancelled", ".expired", ".consumed"])
 					expect(fsSync.existsSync(`${paths.intentFile}${suffix}`)).toBe(false);
@@ -496,6 +662,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 
 	it("consumes only exact timely evidence while holding the same generation lock", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-consumer-"));
+		let releaseCloser = () => {};
 		try {
 			await replaceOwnerGeneration(state, "session", "prior-generation");
 			await observeOwnerTerminal({
@@ -525,7 +692,9 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 				child_token: "token",
 				supervisor_pid: 10,
 				supervisor_start_time: "provenance",
-				created_at: new Date(Date.now() - 1_000).toISOString(),
+				// Recorded before a wall-clock rollback: later than every intent below. The
+				// binding's creation time is not a gate, so the live owner stays closable.
+				created_at: new Date(Date.now() + 60_000).toISOString(),
 			};
 			const intent: OwnerIntent = {
 				schema_version: 1,
@@ -542,13 +711,24 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 			const write = (file: string, value: unknown) =>
 				fsSync.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
 			write(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
+			// A closer is waiting, so every refusal below comes from the evidence under test.
+			releaseCloser = holdCloser(paths);
 			let relays = 0;
+			let relayable = true;
+			let signaledAt: string | undefined;
 			const poll = () =>
 				consumeCooperativeOwnerIntent({
+					childPid: COOPERATIVE_CHILD_PID,
 					stateDir: state,
+					publishNoReplace: publishRelayForTest,
 					binding,
 					serverKey: "socket",
-					relay: () => {
+					canRelay: () => relayable,
+					relay: (_intent, observedAt) => {
+						// The pending record is durable before delivery.
+						expect(fsSync.existsSync(paths.relayPendingFile)).toBe(true);
+						signaledAt = observedAt;
 						const contender = new Database(paths.lockDatabaseFile);
 						try {
 							contender.exec("PRAGMA busy_timeout = 0");
@@ -557,6 +737,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 							contender.close();
 						}
 						relays += 1;
+						return true;
 					},
 				});
 			write(`${paths.intentFile}.staging`, intent);
@@ -569,7 +750,6 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 				{ dispatch_id: "" },
 				{ extra: true },
 				{ created_at: new Date(Date.now() + 1_000).toISOString() },
-				{ created_at: new Date(Date.now() - 2_000).toISOString() },
 				{ expires_at: new Date(Date.now() - 1).toISOString() },
 			]) {
 				write(paths.intentFile, { ...intent, ...patch });
@@ -655,13 +835,127 @@ await Bun.stdin.text(); db.exec("COMMIT"); db.close(); clearTimeout(timer);`,
 				}
 				expect(exited).toBe(0);
 			}
+			// A child that can no longer receive the relay leaves no delivery evidence.
+			relayable = false;
+			poll();
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			relayable = true;
+			// Without a waiting closer (it gave up, exited or crashed) nothing is relayed,
+			// independent of the intent's wall-clock window.
+			releaseCloser();
+			poll();
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+			expect(fsSync.existsSync(`${paths.relayPendingFile}.intent.unsent`)).toBe(false);
+			releaseCloser = holdCloser(paths);
+			// Only the exact child that installed its cooperative handler is relayed to:
+			// the signal's default action would otherwise kill it without attribution.
+			for (const overrides of [
+				null,
+				{ child_pid: COOPERATIVE_CHILD_PID + 1 },
+				{ child_token: "other" },
+				{ generation: "other" },
+				{ signal: "SIGTERM" },
+				{ extra: true },
+			]) {
+				fsSync.rmSync(paths.cooperativeReadyFile, { force: true });
+				if (overrides) publishCooperativeReadyForTest(paths, binding.generation, overrides);
+				poll();
+				expect(relays).toBe(0);
+				expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+				expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			}
+			fsSync.rmSync(paths.cooperativeReadyFile, { force: true });
+			publishCooperativeReadyForTest(paths, binding.generation);
 			poll();
 			expect(relays).toBe(1);
 			expect(readSecureOwnerJson(paths.intentFile)).toEqual(intent);
+			// Delivery evidence is durable before the relay and names the exact intent and supervisor.
+			expect(readSecureOwnerJson(paths.relayFile)).toMatchObject({
+				schema_version: 1,
+				intent_id: "intent",
+				dispatch_id: "dispatch",
+				generation: "generation",
+				session_id: "session",
+				server_key: "socket",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "provenance",
+				// Sampled after the pending record was durable, immediately before delivery.
+				relayed_at: signaledAt,
+			});
+			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+			// A relay record is permanent history: no second delivery for this generation.
+			poll();
+			expect(relays).toBe(1);
 			await replaceOwnerGeneration(state, "session", "replacement");
 			poll();
 			expect(relays).toBe(1);
 		} finally {
+			releaseCloser();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("never delivers once the closer stops waiting during relay publication", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-closer-gone-"));
+		let releaseCloser = () => {};
+		try {
+			await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", "generation");
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation: "generation",
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "provenance",
+				created_at: new Date().toISOString(),
+			};
+			const intent: OwnerIntent = {
+				schema_version: 1,
+				intent_id: "intent",
+				state: "pending",
+				generation: "generation",
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(Date.now() - 100).toISOString(),
+				expires_at: new Date(Date.now() + 10_000).toISOString(),
+			};
+			fsSync.writeFileSync(path.join(paths.root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, {
+				mode: 0o600,
+			});
+			publishCooperativeReadyForTest(paths, binding.generation);
+			fsSync.writeFileSync(paths.intentFile, `${JSON.stringify(intent)}\n`, { mode: 0o600 });
+			releaseCloser = holdCloser(paths);
+			let relays = 0;
+			consumeCooperativeOwnerIntent({
+				childPid: COOPERATIVE_CHILD_PID,
+				stateDir: state,
+				binding,
+				serverKey: "socket",
+				canRelay: () => true,
+				relay: () => {
+					relays += 1;
+					return true;
+				},
+				// The closer gives up after the pending record is durable, before delivery.
+				publishNoReplace: (file, bytes) => {
+					publishRelayForTest(file, bytes);
+					if (file === paths.relayPendingFile) releaseCloser();
+				},
+			});
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			expect(fsSync.existsSync(`${paths.relayPendingFile}.intent.unsent`)).toBe(true);
+		} finally {
+			releaseCloser();
 			await fs.rm(state, { recursive: true, force: true });
 		}
 	});
@@ -749,6 +1043,11 @@ function holdSqliteWriteLock(databaseFile: string): Database {
 	database.exec("BEGIN IMMEDIATE");
 	return database;
 }
+
+/**
+ * Kernel-signal close: the closer delivers SIGTERM itself after publishing the
+ * intent. Only Linux closes that way; a Darwin closer needs a supervisor relay.
+ */
 
 describe("tmux owner isolation", () => {
 	it("recognizes only the exact owner-isolation argv", () => {
@@ -1763,53 +2062,58 @@ describe("tmux owner isolation", () => {
 		await fs.rm(state, { recursive: true, force: true });
 	});
 
-	it("writes verdict before consuming a matching attempt intent and converges observers", async () => {
-		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
-		const generation = await replaceOwnerGeneration(state, "session", "generation");
-		await createOwnerIntent(state, {
-			generation,
-			session_id: "session",
-			server_key: "socket",
-			expected_terminal: {
-				signal: "SIGTERM",
-				result: "owner_term_then_session_cleanup",
-			},
-			dispatch_id: "dispatch",
-			created_at: "2026-01-01T00:00:00.000Z",
-			expires_at: "2026-01-01T00:01:00.000Z",
-		});
-		const observed = {
-			schema_version: 1 as const,
-			op: "observe_terminal" as const,
-			session_id: "session",
-			owner_generation: generation,
-			state_dir: state,
-			socket_key: "socket",
-			observer: "sidecar" as const,
-			observed_at: "2026-01-01T00:00:01.000Z",
-			signal: "SIGTERM" as const,
-			exit_code: 0,
-			exit_kind: "exit",
-			reason: "owner_exit",
-			operator_dispatch_id: "dispatch",
-		};
-		const first = await observeOwnerTerminal(observed);
-		const second = await observeOwnerTerminal({
-			...observed,
-			observer: "raw_monitor",
-			reason: "different",
-		});
-		expect(first.classification).toBe("expected_operator_shutdown");
-		expect(second).toEqual(first);
-		await expect(
-			fs.access(path.join(state, "session", "owner-lifecycle", "intent-generation.json.consumed")),
-		).resolves.toBeNull();
-		await expect(Bun.file(path.join(state, "session", "owner-lifecycle", "verdict.json")).json()).resolves.toEqual({
-			...first,
-			owner_generation: generation,
-		});
-		await fs.rm(state, { recursive: true, force: true });
-	});
+	itKernelSignalClose(
+		"writes verdict before consuming a matching attempt intent and converges observers",
+		async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: {
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+				},
+				dispatch_id: "dispatch",
+				created_at: "2026-01-01T00:00:00.000Z",
+				expires_at: "2026-01-01T00:01:00.000Z",
+			});
+			const observed = {
+				schema_version: 1 as const,
+				op: "observe_terminal" as const,
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar" as const,
+				observed_at: "2026-01-01T00:00:01.000Z",
+				signal: "SIGTERM" as const,
+				exit_code: 0,
+				exit_kind: "exit",
+				reason: "owner_exit",
+				operator_dispatch_id: "dispatch",
+			};
+			const first = await observeOwnerTerminal(observed);
+			const second = await observeOwnerTerminal({
+				...observed,
+				observer: "raw_monitor",
+				reason: "different",
+			});
+			expect(first.classification).toBe("expected_operator_shutdown");
+			expect(second).toEqual(first);
+			await expect(
+				fs.access(path.join(state, "session", "owner-lifecycle", "intent-generation.json.consumed")),
+			).resolves.toBeNull();
+			await expect(Bun.file(path.join(state, "session", "owner-lifecycle", "verdict.json")).json()).resolves.toEqual(
+				{
+					...first,
+					owner_generation: generation,
+				},
+			);
+			await fs.rm(state, { recursive: true, force: true });
+		},
+	);
 
 	it("rejects a foreign generation while using the shared SQLite lock database", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
@@ -2270,6 +2574,989 @@ describe("tmux owner isolation", () => {
 				}),
 			).rejects.toThrow("owner_intent_invalid");
 		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+});
+
+describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evidence", () => {
+	const ownerOnly = (file: string, value: unknown) =>
+		fsSync.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+	const relayRecord = (intent: OwnerIntent, generation: string) => ({
+		schema_version: 1,
+		intent_id: intent.intent_id,
+		dispatch_id: intent.dispatch_id,
+		generation,
+		session_id: "session",
+		server_key: "socket",
+		child_token: "token",
+		supervisor_pid: 10,
+		supervisor_start_time: "start",
+		relayed_at: new Date().toISOString(),
+	});
+	const supervisorIndex = (generation: string) => ({
+		schema_version: 1,
+		generation,
+		session_id: "session",
+		child_token: "token",
+		supervisor_pid: 10,
+		supervisor_start_time: "start",
+	});
+	/** The child's exclusive record of the first termination cause it handled. */
+	const shutdownCause = (
+		generation: string,
+		cause: "cooperative" | "signal",
+		overrides: Record<string, unknown> = {},
+	) => ({
+		schema_version: 1,
+		generation,
+		session_id: "session",
+		child_token: "token",
+		child_pid: COOPERATIVE_CHILD_PID,
+		cause,
+		signal: cause === "cooperative" ? "SIGUSR2" : "SIGTERM",
+		recorded_at: new Date().toISOString(),
+		...overrides,
+	});
+	const close = (
+		state: string,
+		generation: string,
+		dispatchId: string,
+		waitForVerdict: (intent: OwnerIntent) => Promise<OwnerVerdict | null>,
+	) =>
+		closeExactTmuxOwner(
+			{
+				stateDir: state,
+				sessionId: "session",
+				generation,
+				serverKey: "socket",
+				pid: 10,
+				startTime: "start",
+				dispatchId,
+				createdAt: new Date(Date.now() - 10).toISOString(),
+				expiresAt: new Date(Date.now() + 150).toISOString(),
+			},
+			{
+				readStartTime: async () => "start",
+				shutdown: {
+					kind: "cooperative_intent",
+					publishNoReplace: publishOwnerIntentNoReplace,
+					assertCooperativeOwner: () => {},
+				},
+				waitForVerdict,
+				cleanupSession: async () => {},
+			},
+		);
+	const expiredWait = async () => {
+		await Bun.sleep(200);
+		return null;
+	};
+
+	it("keeps a genuine predecessor provable after the wall clock moves backward between launches", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-clock-"));
+		try {
+			await replaceOwnerGeneration(state, "session", "prior-generation");
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: "prior-generation",
+				state_dir: state,
+				socket_key: "socket",
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: "EXIT",
+				exit_code: 0,
+				exit_kind: "exit",
+				reason: "test",
+			});
+			// An NTP correction moves the clock ten minutes back before the relaunch.
+			const skew = 10 * 60_000;
+			setSystemTime(new Date(Date.now() - skew));
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			setSystemTime();
+			const paths = lifecyclePaths(state, "session", generation);
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation,
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "start",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+			};
+			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			// The closer publishes past the predecessor check, and the supervisor relays it.
+			let relays = 0;
+			await expect(
+				close(state, generation, "dispatch", async () => {
+					consumeCooperativeOwnerIntent({
+						childPid: COOPERATIVE_CHILD_PID,
+						stateDir: state,
+						publishNoReplace: publishRelayForTest,
+						binding,
+						serverKey: "socket",
+						canRelay: () => true,
+						relay: () => {
+							relays += 1;
+							return true;
+						},
+					});
+					return null;
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			expect(relays).toBe(1);
+			expect(readSecureOwnerJson(paths.relayFile)).toMatchObject({ generation, dispatch_id: "dispatch" });
+		} finally {
+			setSystemTime();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it.each(["symlink", "hardlink"] as const)("refuses a %s closer lock without touching its target", async kind => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-closer-link-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-closer-target-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const target = path.join(outside, "external.sqlite");
+			const external = new Database(target);
+			external.exec("CREATE TABLE kept (value TEXT)");
+			external.close();
+			await fs.chmod(target, 0o644);
+			const before = await fs.readFile(target);
+			if (kind === "symlink") await fs.symlink(target, paths.closerLockFile);
+			else await fs.link(target, paths.closerLockFile);
+			await expect(close(state, generation, "dispatch", expiredWait)).rejects.toThrow("generation_lock_contended");
+			expect((await fs.stat(target)).mode & 0o777).toBe(0o644);
+			expect(await fs.readFile(target)).toEqual(before);
+			expect(fsSync.existsSync(paths.intentFile)).toBe(false);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("never relays an intent its closer abandoned without being able to retire it", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-abandoned-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation,
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "start",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+			};
+			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const closerBusy = () => {
+				const probe = new Database(paths.closerLockFile);
+				try {
+					probe.exec("PRAGMA busy_timeout = 0");
+					probe.exec("BEGIN IMMEDIATE");
+					probe.exec("ROLLBACK");
+					return false;
+				} catch {
+					return true;
+				} finally {
+					probe.close();
+				}
+			};
+			// A stalled supervisor holds the generation lock while the closer gives up, so
+			// the closer cannot retire its intent.
+			const stalled = new Database(paths.lockDatabaseFile);
+			let waitedWhileHeld = false;
+			try {
+				await expect(
+					close(state, generation, "dispatch", async () => {
+						waitedWhileHeld = closerBusy();
+						stalled.exec("BEGIN IMMEDIATE");
+						return null;
+					}),
+				).rejects.toThrow("owner_term_verdict_timeout");
+			} finally {
+				stalled.exec("COMMIT");
+				stalled.close();
+			}
+			expect(waitedWhileHeld).toBeTrue();
+			expect(closerBusy()).toBeFalse();
+			const intent = readSecureOwnerJson(paths.intentFile) as OwnerIntent;
+			// Resumed within the intent's wall-clock window, the supervisor still refuses it.
+			setSystemTime(new Date(Date.parse(intent.created_at) + 1));
+			let relays = 0;
+			consumeCooperativeOwnerIntent({
+				childPid: COOPERATIVE_CHILD_PID,
+				stateDir: state,
+				publishNoReplace: publishRelayForTest,
+				binding,
+				serverKey: "socket",
+				canRelay: () => true,
+				relay: () => {
+					relays += 1;
+					return true;
+				},
+			});
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+		} finally {
+			setSystemTime();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("retires an expired intent the supervisor never relayed so a later close can rearm", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-rearm-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			const retired = (intent: OwnerIntent) =>
+				fsSync.existsSync(path.join(paths.root, `intent-${generation}.${intent.intent_id}.undelivered`));
+			// A stopped supervisor never consumes the first intent. The closer that gives up
+			// retires it at once, so a resumed supervisor finds nothing to relay even if the
+			// wall clock was rolled back meanwhile.
+			let stale: OwnerIntent | undefined;
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					stale = intent;
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			expect(fsSync.existsSync(paths.intentFile)).toBe(false);
+			expect(retired(stale!)).toBeTrue();
+			// The retry rearms instead of failing forever with owner_intent_replay.
+			let rearmed: OwnerIntent | undefined;
+			await expect(
+				close(state, generation, "dispatch-2", async intent => {
+					rearmed = intent;
+					return null;
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			expect(rearmed?.dispatch_id).toBe("dispatch-2");
+			expect(rearmed?.intent_id).not.toBe(stale!.intent_id);
+			expect(retired(rearmed!)).toBeTrue();
+			// A closer that crashed before giving up leaves its intent; the next close
+			// retires it once it has expired, and rearms.
+			const crashed = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch-crashed",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() - 1).toISOString(),
+			});
+			let third: OwnerIntent | undefined;
+			await expect(
+				close(state, generation, "dispatch-3", async intent => {
+					third = intent;
+					return null;
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			expect(retired(crashed)).toBeTrue();
+			expect(third?.dispatch_id).toBe("dispatch-3");
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an expired intent that the supervisor relayed as permanent replay evidence", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-relayed-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					ownerOnly(paths.relayFile, relayRecord(intent, generation));
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			await expect(close(state, generation, "dispatch-2", expiredWait)).rejects.toThrow("owner_intent_replay");
+			expect(fsSync.existsSync(paths.intentFile)).toBe(true);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("does not retire an expired intent while its relay evidence is unreadable", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-uncertain-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					ownerOnly(paths.relayFile, { ...relayRecord(intent, generation), intent_id: "other" });
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			await expect(close(state, generation, "dispatch-2", expiredWait)).rejects.toThrow();
+			expect(fsSync.existsSync(paths.intentFile)).toBe(true);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	/** A real admitted child: postmortem first, then the cooperative installer. */
+	const startCooperativeChild = (state: string, generation: string, cleanupFile: string, preSignal = "") =>
+		Bun.spawn({
+			cmd: [
+				process.execPath,
+				"-e",
+				`import * as postmortem from ${JSON.stringify(path.join(repoRoot, "packages", "utils", "src", "postmortem.ts"))};
+import { appendFileSync } from "node:fs";
+import { installManagedOwnerCooperativeShutdown } from ${JSON.stringify(path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"))};
+postmortem.register("fixture", async reason => { appendFileSync(process.env.CLEANUP_FILE, reason + "\\n"); await Bun.sleep(200); });
+setTimeout(() => process.exit(91), 8_000);
+// A termination signal handled before the installer ran.
+if (process.env.PRE_SIGNAL) { process.kill(process.pid, process.env.PRE_SIGNAL); await Bun.sleep(50); }
+const ready = installManagedOwnerCooperativeShutdown({ stateDir: process.env.STATE, sessionId: "session", generation: process.env.GENERATION, childToken: "token", shutdownStarted: postmortem.cleanupStarted });
+process.stdout.write(ready ? "ready\\n" : "unready\\n");
+setInterval(() => {}, 1_000);`,
+			],
+			cwd: repoRoot,
+			env: {
+				...process.env,
+				STATE: state,
+				GENERATION: generation,
+				CLEANUP_FILE: cleanupFile,
+				PRE_SIGNAL: preSignal,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+	const firstLine = async (child: Bun.Subprocess<"ignore", "pipe", "pipe">) => {
+		const reader = child.stdout.getReader();
+		try {
+			return new TextDecoder().decode((await reader.read()).value);
+		} finally {
+			reader.releaseLock();
+		}
+	};
+
+	it.each([
+		["the relay alone", ["SIGUSR2"], { cause: "cooperative", signal: "SIGUSR2" }, 143],
+		[
+			"an unrelated SIGTERM handled before the relay",
+			["SIGTERM", "SIGUSR2"],
+			{ cause: "signal", signal: "SIGTERM" },
+			143,
+		],
+		["a SIGHUP handled before the relay", ["SIGHUP", "SIGUSR2"], { cause: "signal", signal: "SIGHUP" }, 129],
+	] as const)("records the first termination cause an admitted child handles: %s", async (_case, signals, cause, exitCode) => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-cause-"));
+		const cleanupFile = path.join(state, "cleanup");
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			child = startCooperativeChild(state, generation, cleanupFile);
+			expect(await firstLine(child)).toBe("ready\n");
+			// Readiness is published only after the handlers exist, and names this child.
+			expect(readSecureOwnerJson(paths.cooperativeReadyFile)).toEqual({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				child_token: "token",
+				child_pid: child.pid,
+				signal: "SIGUSR2",
+			});
+			for (const signal of signals) {
+				// `Subprocess.kill` would map SIGUSR2 to Darwin's SIGSYS.
+				process.kill(child.pid, signal);
+				// The earlier signal is handled before the next one is sent.
+				if (signal !== "SIGUSR2") await waitForPath(paths.shutdownCauseFile);
+			}
+			expect(await child.exited).toBe(exitCode);
+			expect(readSecureOwnerJson(paths.shutdownCauseFile)).toMatchObject({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				child_token: "token",
+				child_pid: child.pid,
+				...cause,
+			});
+			// One shutdown: a relay after another cause starts no second one.
+			expect((await fs.readFile(cleanupFile, "utf8")).trim().split("\n")).toHaveLength(1);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores the relay when the child cannot record it as its first cause", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-cause-taken-"));
+		const cleanupFile = path.join(state, "cleanup");
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			const taken = shutdownCause(generation, "signal", { child_pid: 1 });
+			ownerOnly(paths.shutdownCauseFile, taken);
+			child = startCooperativeChild(state, generation, cleanupFile);
+			expect(await firstLine(child)).toBe("ready\n");
+			process.kill(child.pid, "SIGUSR2");
+			await Bun.sleep(300);
+			// No cooperative shutdown started, and the existing record is untouched.
+			expect(child.exitCode).toBeNull();
+			expect(fsSync.existsSync(cleanupFile)).toBe(false);
+			expect(readSecureOwnerJson(paths.shutdownCauseFile)).toEqual(taken);
+			child.kill("SIGTERM");
+			expect(await child.exited).toBe(143);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes no readiness once a signal began shutdown before the installer ran", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-early-"));
+		const cleanupFile = path.join(state, "cleanup");
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			child = startCooperativeChild(state, generation, cleanupFile, "SIGTERM");
+			// The shutdown has no cause record, so readiness would let a relay claim it.
+			expect(await firstLine(child)).toBe("unready\n");
+			expect(fsSync.existsSync(paths.cooperativeReadyFile)).toBe(false);
+			expect(await child.exited).toBe(143);
+			expect(fsSync.existsSync(paths.shutdownCauseFile)).toBe(false);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("makes the owner-loss incident durable before recording an unexplained exit", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-exit-order-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const intent = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 10_000).toISOString(),
+			});
+			// The child published its expected verdict before it died.
+			ownerOnly(paths.relayFile, relayRecord(intent, generation));
+			ownerOnly(paths.shutdownCauseFile, shutdownCause(generation, "cooperative"));
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: intent.dispatch_id,
+			});
+			expect(verdict.classification).toBe("expected_operator_shutdown");
+			expect(fsSync.existsSync(paths.incidentFile)).toBe(false);
+			// The exit record cannot be written (as if the supervisor died first).
+			ownerOnly(paths.childExitFile, { stale: true });
+			const exit = {
+				schema_version: 1 as const,
+				generation,
+				session_id: "session",
+				child_token: "token",
+				child_pid: COOPERATIVE_CHILD_PID,
+				intent_id: intent.intent_id,
+				dispatch_id: intent.dispatch_id,
+				signal: "SIGABRT",
+				exit_code: null,
+				explained: false,
+				observed_at: new Date().toISOString(),
+			};
+			await expect(recordManagedOwnerChildExit(state, exit)).rejects.toThrow("managed_owner_child_exit_unrecorded");
+			expect(readSecureOwnerJson(paths.incidentFile)).toEqual({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				dedupe_key: verdict.dedupe_key,
+				created_at: verdict.observed_at,
+				classification: "unexpected_owner_loss",
+			});
+			// Idempotent with the incident an unexpected verdict would publish.
+			fsSync.rmSync(paths.childExitFile);
+			await recordManagedOwnerChildExit(state, exit);
+			expect(readSecureOwnerJson(paths.childExitFile)).toEqual(exit);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["no verdict", null],
+		["a corrupt verdict", "{"],
+		["another generation's verdict", "other"],
+	] as const)("records no unexplained exit without a reconciled verdict: %s", async (_case, verdict) => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-exit-unreconciled-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			if (verdict === "{") fsSync.writeFileSync(paths.verdictFile, "{\n", { mode: 0o600 });
+			if (verdict === "other")
+				ownerOnly(paths.verdictFile, {
+					schema_version: 1,
+					generation: "other",
+					session_id: "session",
+					server_key: "socket",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: null,
+					result: "owner_term_then_session_cleanup",
+					observer: "sidecar",
+					classification: "expected_operator_shutdown",
+					reason: "process_postmortem",
+					intent_id: "intent",
+					dedupe_key: "owner-loss:session:other",
+				});
+			await expect(
+				recordManagedOwnerChildExit(state, {
+					schema_version: 1,
+					generation,
+					session_id: "session",
+					child_token: "token",
+					child_pid: COOPERATIVE_CHILD_PID,
+					intent_id: "intent",
+					dispatch_id: "dispatch",
+					signal: "SIGKILL",
+					exit_code: null,
+					explained: false,
+					observed_at: new Date().toISOString(),
+				}),
+			).rejects.toThrow("managed_owner_child_exit_unreconciled");
+			expect(fsSync.existsSync(paths.childExitFile)).toBe(false);
+			expect(fsSync.existsSync(paths.incidentFile)).toBe(false);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes no readiness from an unsafe lifecycle root", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-unsafe-"));
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			fsSync.chmodSync(paths.root, 0o755);
+			child = startCooperativeChild(state, generation, path.join(state, "cleanup"));
+			expect(await firstLine(child)).toBe("unready\n");
+			expect(fsSync.existsSync(paths.cooperativeReadyFile)).toBe(false);
+			child.kill("SIGTERM");
+			expect(await child.exited).toBe(143);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["no relay", false, "cooperative", {}],
+		["no shutdown cause", true, null, {}],
+		// An unrelated SIGTERM the child handled before the relay arrived.
+		["a SIGTERM handled before the relay", true, "signal", {}],
+		["another child's cooperative cause", true, "cooperative", { child_token: "other" }],
+		["another generation's cooperative cause", true, "cooperative", { generation: "other" }],
+		["a malformed cause", true, "cooperative", { extra: true }],
+		["the relay handled first", true, "cooperative", {}],
+	] as const)("classifies a SIGTERM as operator shutdown only when the child handled the relay first: %s", async (_case, relayed, cause, overrides) => {
+		{
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-classify-"));
+			try {
+				const generation = await replaceOwnerGeneration(state, "session", "generation");
+				const paths = lifecyclePaths(state, "session", generation);
+				ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+				const intent = await createOwnerIntent(state, {
+					generation,
+					session_id: "session",
+					server_key: "socket",
+					expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+					dispatch_id: "dispatch",
+					created_at: new Date(Date.now() - 1_000).toISOString(),
+					expires_at: new Date(Date.now() + 10_000).toISOString(),
+				});
+				if (relayed) ownerOnly(paths.relayFile, relayRecord(intent, generation));
+				if (cause) ownerOnly(paths.shutdownCauseFile, shutdownCause(generation, cause, overrides));
+				// The child sidecar copies the relay's dispatch id at postmortem start; only
+				// delivery the child handled as its first cause makes that an operator close.
+				const verdict = await observeOwnerTerminal({
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: "session",
+					owner_generation: generation,
+					state_dir: state,
+					socket_key: "socket",
+					observer: "sidecar",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: null,
+					exit_kind: "SIGTERM",
+					reason: "process_postmortem",
+					operator_dispatch_id: intent.dispatch_id,
+				});
+				expect(verdict.classification).toBe(
+					_case === "the relay handled first" ? "expected_operator_shutdown" : "unexpected_owner_loss",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it.each([
+		["no reconciliation", null],
+		["a fatal exit after the child's verdict", { signal: "SIGABRT", exit_code: null, explained: false }],
+		["another intent's exit", { intent_id: "other" }],
+		["another dispatch's exit", { dispatch_id: "other" }],
+		["another child's exit", { child_token: "other" }],
+		["a malformed record", { extra: true }],
+		["an explained exit", {}],
+	] as const)("completes a cooperative close only after the supervisor explained the child's exit: %s", async (_case, exit) => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-exit-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			let cleanups = 0;
+			const closing = closeExactTmuxOwner(
+				{
+					stateDir: state,
+					sessionId: "session",
+					generation,
+					serverKey: "socket",
+					pid: 10,
+					startTime: "start",
+					dispatchId: "dispatch",
+					createdAt: new Date(Date.now() - 10).toISOString(),
+					expiresAt: new Date(Date.now() + 5_000).toISOString(),
+				},
+				{
+					readStartTime: async () => "start",
+					shutdown: {
+						kind: "cooperative_intent",
+						publishNoReplace: publishOwnerIntentNoReplace,
+						assertCooperativeOwner: () => {},
+					},
+					// The child published its expected verdict for the relayed intent, then
+					// its supervisor reconciled the actual exit.
+					waitForVerdict: async intent => {
+						ownerOnly(paths.relayFile, relayRecord(intent, generation));
+						if (exit) publishChildExitForTest(paths, intent, exit);
+						return {
+							schema_version: 1,
+							generation,
+							session_id: "session",
+							server_key: "socket",
+							observed_at: new Date().toISOString(),
+							signal: "SIGTERM",
+							exit_code: null,
+							result: "owner_term_then_session_cleanup",
+							observer: "sidecar",
+							classification: "expected_operator_shutdown",
+							reason: "process_postmortem",
+							intent_id: intent.intent_id,
+							dedupe_key: `owner-loss:session:${generation}`,
+						};
+					},
+					cleanupSession: async () => {
+						cleanups += 1;
+					},
+				},
+			);
+			if (_case === "an explained exit") {
+				await expect(closing).resolves.toMatchObject({ classification: "expected_operator_shutdown" });
+				expect(cleanups).toBe(1);
+			} else {
+				await expect(closing).rejects.toThrow("owner_term_child_exit_unexplained");
+				expect(cleanups).toBe(0);
+			}
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["observed before the relay", -5, 10_000, "unexpected_owner_loss"],
+		["observed at the relay", 0, 10_000, "expected_operator_shutdown"],
+		["observed after expiry following a timely relay", 20, 10, "expected_operator_shutdown"],
+		["relayed only after expiry", 0, -1, "unexpected_owner_loss"],
+	] as const)("orders the observation against the confirmed relay: %s", async (_case, observedOffset, relayWindow, expected) => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-order-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const relayedAt = Date.now() - 100;
+			const intent = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(relayedAt - 1_000).toISOString(),
+				expires_at: new Date(relayedAt + relayWindow).toISOString(),
+			});
+			ownerOnly(paths.relayFile, {
+				...relayRecord(intent, generation),
+				relayed_at: new Date(relayedAt).toISOString(),
+			});
+			ownerOnly(paths.shutdownCauseFile, shutdownCause(generation, "cooperative"));
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date(relayedAt + observedOffset).toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: intent.dispatch_id,
+			});
+			expect(verdict.classification).toBe(expected);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"declined",
+		"reread-fault",
+		"expired-before-signal",
+	] as const)("withdraws a relay record whose signal was not sent: %s", async fault => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-unsent-"));
+		const realRead = natives.readOwnerOnlyFile;
+		const nativeRead = spyOn(natives, "readOwnerOnlyFile");
+		let releaseCloser = () => {};
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation,
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "start",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+			};
+			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			publishCooperativeReadyForTest(paths, binding.generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const intent = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(Date.now() - 100).toISOString(),
+				expires_at: new Date(Date.now() + (fault === "expired-before-signal" ? 500 : 10_000)).toISOString(),
+			});
+			if (fault === "reread-fault")
+				nativeRead.mockImplementation((file, limit) =>
+					file === paths.relayPendingFile ? { ok: false, code: "read_failed" } : realRead(file, limit),
+				);
+			if (fault === "expired-before-signal")
+				// The supervisor stalls between publication and signal until the intent expires.
+				nativeRead.mockImplementation((file, limit) => {
+					if (file === paths.relayPendingFile)
+						while (Date.now() <= Date.parse(intent.expires_at)) Bun.sleepSync(10);
+					return realRead(file, limit);
+				});
+			releaseCloser = holdCloser(paths);
+			let relays = 0;
+			consumeCooperativeOwnerIntent({
+				childPid: COOPERATIVE_CHILD_PID,
+				stateDir: state,
+				publishNoReplace: publishRelayForTest,
+				binding,
+				serverKey: "socket",
+				canRelay: () => true,
+				relay: () => {
+					relays += 1;
+					return false;
+				},
+			});
+			nativeRead.mockRestore();
+			expect(relays).toBe(fault === "declined" ? 1 : 0);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+			expect(fsSync.existsSync(`${paths.relayPendingFile}.${intent.intent_id}.unsent`)).toBe(true);
+			// An unrelated SIGTERM afterwards is owner loss, not an operator close.
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: intent.dispatch_id,
+			});
+			expect(verdict.classification).toBe("unexpected_owner_loss");
+		} finally {
+			releaseCloser();
+			nativeRead.mockRestore();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("treats a pending relay record left by a crash as uncertain, never as delivery", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-crash-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			let first: OwnerIntent | undefined;
+			// The supervisor published its pending record, then crashed before signaling.
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					first = intent;
+					ownerOnly(paths.relayPendingFile, relayRecord(intent, generation));
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			// Uncertain delivery is never retired or rearmed.
+			await expect(close(state, generation, "dispatch-2", expiredWait)).rejects.toThrow("owner_intent_replay");
+			expect(readSecureOwnerJson(paths.intentFile)).toEqual(first);
+			// And it never explains an unrelated SIGTERM.
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date(Date.parse(first!.created_at) + 1).toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: first!.dispatch_id,
+			});
+			expect(verdict.classification).toBe("unexpected_owner_loss");
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("never treats a missing supervisor index as delivery evidence", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-no-index-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			// A closer published its intent; the index is gone and no relay happened.
+			const published = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch-1",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 10_000).toISOString(),
+			});
+			expect(fsSync.existsSync(paths.supervisorIndexFile)).toBe(false);
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: published.dispatch_id,
+			});
+			expect(verdict.classification).toBe("unexpected_owner_loss");
+			expect(readSecureOwnerJson(paths.intentFile)).toEqual(published);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses an operator-shutdown verdict for a cooperative close without relay evidence", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-accept-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const forged = (intent: OwnerIntent): OwnerVerdict => ({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: 0,
+				result: "owner_term_then_session_cleanup",
+				observer: "sidecar",
+				classification: "expected_operator_shutdown",
+				reason: "test",
+				intent_id: intent.intent_id,
+				dedupe_key: `owner-loss:session:${generation}`,
+			});
+			await expect(close(state, generation, "dispatch-1", async intent => forged(intent))).rejects.toThrow(
+				"owner_term_verdict_timeout",
+			);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("owner generation publication time", () => {
+	it("never publishes a successor earlier than its predecessor after a backward clock correction", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-monotonic-"));
+		try {
+			replaceOwnerGenerationSync(state, "session", "first", captureOwnerGenerationBaselineSync(state, "session"));
+			const first = captureOwnerGenerationBaselineSync(state, "session");
+			if (first.state !== "current") throw new Error("first generation missing");
+			setSystemTime(new Date(Date.now() - 10 * 60_000));
+			replaceOwnerGenerationSync(state, "session", "second", first);
+			const second = captureOwnerGenerationBaselineSync(state, "session");
+			if (second.state !== "current") throw new Error("second generation missing");
+			expect(Date.parse(second.published_at)).toBeGreaterThan(Date.parse(first.published_at));
+		} finally {
+			setSystemTime();
 			await fs.rm(state, { recursive: true, force: true });
 		}
 	});

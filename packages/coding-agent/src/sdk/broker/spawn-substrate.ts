@@ -198,7 +198,7 @@ function stateFileFor(spec: SpawnSubstrateLaunchSpec, providerIdentity: string):
 	return path.join(sessionRuntimeDir(spec.cwd, spec.childSessionId), "spawn-substrates", `${providerIdentity}.json`);
 }
 
-async function writeHeadlessState(file: string, value: HeadlessState): Promise<void> {
+async function writeHeadlessState(file: string, value: HeadlessState, platform: NodeJS.Platform): Promise<void> {
 	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
 	const handle = await fs.open(file, "wx", 0o600);
 	try {
@@ -207,6 +207,10 @@ async function writeHeadlessState(file: string, value: HeadlessState): Promise<v
 	} finally {
 		await handle.close();
 	}
+	// Windows cannot flush a directory handle opened read-only, the same limit the
+	// lifecycle store observes. There the proof file itself is still flushed and
+	// exclusively created; only the directory-entry durability barrier is POSIX-only.
+	if (platform === "win32") return;
 	const directory = await fs.open(path.dirname(file), "r");
 	try {
 		await directory.sync();
@@ -441,7 +445,7 @@ export function createSpawnSubstrateProvider(
 		};
 		const stateFile = stateFileFor(spec, providerIdentity);
 		try {
-			await writeHeadlessState(stateFile, state);
+			await writeHeadlessState(stateFile, state, platform);
 		} catch {
 			child.terminate();
 			return {

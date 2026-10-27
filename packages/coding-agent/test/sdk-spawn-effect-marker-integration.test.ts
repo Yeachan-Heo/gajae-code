@@ -20,7 +20,11 @@ import { Broker, type SpawnPromptLayer } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest, writeSessionLifecycleFailure } from "../src/sdk/broker/lifecycle";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
-import { SpawnAuthorityStore, type SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
+import {
+	SpawnAuthorityStore,
+	type SpawnLifecycleOwnerResolution,
+	type SpawnSubstrateProof,
+} from "../src/sdk/broker/spawn-authority";
 import { createSpawnSubstrateProvider } from "../src/sdk/broker/spawn-substrate";
 
 const ownerId = "marker-test-owner";
@@ -446,6 +450,9 @@ test.skipIf(!realTmuxAvailable)(
 		let passed = false;
 		let cleanupProven = false;
 		const bootstrapDiagnostics: string[] = [];
+		const wrongOuterLifetimeSeconds = process.platform === "linux" ? 60 : 5;
+		const outerChildren: (number[] | null)[] = [];
+		const resolutions: SpawnLifecycleOwnerResolution[] = [];
 		const provider = createSpawnSubstrateProvider({
 			env,
 			selectMultiplexer: () => "tmux",
@@ -464,8 +471,17 @@ test.skipIf(!realTmuxAvailable)(
 						createManagedGjcTmuxSession(spec, environment, {
 							platform,
 							// Inert pane command: `sh -c` ignores the supervisor flag and child argv
-							// the managed invocation appends as positional parameters.
-							supervisorArgvForTest: ["/bin/sh", "-c", "sleep 5", "gjc-wrong-outer"],
+							// the managed invocation appends as positional parameters, and `exec`
+							// makes the pane process the sleep itself, with no child to adopt on
+							// any shell (one that forks would leave `sleep` as a direct child).
+							// Linux must outlive resolution so its release is the Broker's exact
+							// close, not a natural exit racing it; Darwin relies on that exit.
+							supervisorArgvForTest: [
+								"/bin/sh",
+								"-c",
+								`exec sleep ${wrongOuterLifetimeSeconds}`,
+								"gjc-wrong-outer",
+							],
 						}),
 					environment,
 					bootstrapDiagnostics,
@@ -485,8 +501,14 @@ test.skipIf(!realTmuxAvailable)(
 					}
 					return result;
 				},
-				resolveLifecycleOwner: (proof, deadline) =>
-					provider.resolveLifecycleOwner(proof, Math.min(deadline, Date.now() + 1_000)),
+				resolveLifecycleOwner: async (proof, deadline) => {
+					// The premise is checked, not assumed: the pinned outer has no direct child.
+					const outer = nativeProcessBindings().Process.fromPid(proof.pid!);
+					outerChildren.push(outer ? outer.children().map(child => child.pid) : null);
+					const result = await provider.resolveLifecycleOwner(proof, Math.min(deadline, Date.now() + 1_000));
+					resolutions.push(result);
+					return result;
+				},
 			},
 		});
 		setLifecycleCommandResolverForTest(broker, () => ({
@@ -500,6 +522,10 @@ test.skipIf(!realTmuxAvailable)(
 			expect(response.ok).toBe(false);
 			expect(allocations).toBe(1);
 			expect(validInnerObserved).toBe(true);
+			expect({ outerChildren, resolutions }).toEqual({
+				outerChildren: [[]],
+				resolutions: [{ ok: false, code: expect.stringMatching(/^owner_(proof_failed|deadline)$/) }],
+			});
 			expect(headlessAttempts).toBe(0);
 			expect(broker.index.listSessionIdentities().filter(row => row.sessionId !== ownerId)).toHaveLength(0);
 			const ledger = await Bun.file(path.join(broker.settings.agentDir, "sdk", "spawn-authority.jsonl")).text();
@@ -753,9 +779,14 @@ for (const lane of ["headless", "managed-source", "managed-compiled", "managed-e
 				// sink. Its transient staging files race the complete product-sink scan.
 				BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
 			};
+			// The program prefix only: the managed invocation appends the supervisor flag and
+			// the child argv. Source mode matches the product (`--no-env-file` on macOS), and
+			// a compiled binary is its own program.
 			const supervisorArgv = compiled
-				? [compiledCli, "--internal-managed-owner-supervisor"]
-				: [process.execPath, "run", sourceCli, "--internal-managed-owner-supervisor"];
+				? [compiledCli]
+				: process.platform === "darwin"
+					? [process.execPath, "--no-env-file", sourceCli]
+					: [process.execPath, sourceCli];
 			const provider = createSpawnSubstrateProvider({
 				env: launchEnvironment,
 				...(managed

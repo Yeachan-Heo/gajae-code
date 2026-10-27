@@ -1256,7 +1256,6 @@ describe("executeBash", () => {
 			// Explicitly unset managed-owner vars like the bash tool does
 			const unsetEnv = [
 				"GJC_MANAGED_OWNER_CHILD_TOKEN",
-				"GJC_MANAGED_OWNER_COMMAND_JSON",
 				"GJC_COORDINATOR_SESSION_ID",
 				"GJC_TMUX_OWNER_GENERATION",
 				"GJC_TMUX_OWNER_STATE_DIR",

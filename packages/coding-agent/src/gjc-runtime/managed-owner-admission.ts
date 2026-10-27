@@ -3,6 +3,8 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+// Its signal handlers must precede the cooperative-shutdown cause recorders.
+import * as postmortem from "@gajae-code/utils/postmortem";
 import {
 	isManagedOwnerBinding,
 	isManagedOwnerSigabrtReceipt,
@@ -11,7 +13,12 @@ import {
 } from "./managed-owner-binding";
 import { assertSafePathComponent } from "./session-layout";
 import { trustedCoordinatorEnv } from "./sidecar-bootstrap-env";
-import { lifecyclePaths, parseExactOwnerJson, readSecureOwnerJson } from "./tmux-owner-isolation";
+import {
+	installManagedOwnerCooperativeShutdown,
+	lifecyclePaths,
+	parseExactOwnerJson,
+	readSecureOwnerJson,
+} from "./tmux-owner-isolation";
 import {
 	persistUltragoalRecoveryDecision,
 	planUltragoalOwnerLossRecovery,
@@ -90,6 +97,7 @@ export type ManagedOwnerAdmission =
 	| { kind: "recovery"; context: ManagedOwnerRecoveryContext }
 	| { kind: "blocked" };
 interface OwnerEnvironment {
+	stateDir: string;
 	root: string;
 	generation: string;
 	sessionId: string;
@@ -124,7 +132,7 @@ function ownerEnvironment(): OwnerEnvironment | null {
 		throw new Error("managed_owner_admission_path_unsafe");
 	const root = lifecyclePaths(stateDir, sessionId, generation).root;
 	if (!root.startsWith(`${path.resolve(stateDir)}${path.sep}`)) throw new Error("managed_owner_admission_path_unsafe");
-	return { root, generation, sessionId, runId, incarnation };
+	return { stateDir, root, generation, sessionId, runId, incarnation };
 }
 function safeChildToken(value: string): boolean {
 	try {
@@ -256,7 +264,19 @@ async function admitManagedOwner(): Promise<ManagedOwnerAdmission> {
 		}
 		if (!safeChildToken(childToken)) return deny(owner, "exact_child_binding_unavailable");
 		const binding = readCurrentChildBinding(owner.root, childToken);
-		if (isManagedOwnerBinding(binding, { ...owner, token: childToken })) return { kind: "supervised" };
+		if (isManagedOwnerBinding(binding, { ...owner, token: childToken })) {
+			// Darwin: before the CLI, so the supervisor's cooperative relay can never
+			// meet the signal's default action. Without readiness it never relays, and
+			// a cooperative close then fails closed.
+			installManagedOwnerCooperativeShutdown({
+				stateDir: owner.stateDir,
+				sessionId: owner.sessionId,
+				generation: owner.generation,
+				childToken,
+				shutdownStarted: postmortem.cleanupStarted,
+			});
+			return { kind: "supervised" };
+		}
 		return deny(owner, "exact_child_binding_unavailable");
 	}
 	const predecessorGeneration = process.env[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]?.trim();

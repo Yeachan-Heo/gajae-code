@@ -20,8 +20,10 @@ import {
 } from "./managed-owner-admission";
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES,
+	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
-	MANAGED_OWNER_SUPERVISOR_ARG,
+	managedOwnerSupervisorInvocation,
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -44,6 +46,7 @@ import {
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
+	canonicalManagedStateFile,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_COMMAND_ENV,
@@ -511,7 +514,13 @@ function resolveCurrentGjcCommand(context: CommandResolutionContext): string[] {
 		const resolvedEntrypoint = pathModule.isAbsolute(entrypoint)
 			? entrypoint
 			: pathModule.resolve(context.cwd, entrypoint);
-		return [executable, resolvedEntrypoint];
+		// A macOS managed pane process must stay the pinned supervisor PID. Bun's cwd
+		// `.env` autoload could reintroduce the malloc variables the pane scrubs and
+		// make the CLI malloc guard re-exec below the pane PID, so source launches
+		// disable it like a compiled binary does.
+		return context.managedOwnerSupervisor && context.platform === "darwin"
+			? [executable, "--no-env-file", resolvedEntrypoint]
+			: [executable, resolvedEntrypoint];
 	}
 
 	const executable =
@@ -541,16 +550,13 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 		});
 	const command = resolveCurrentGjcCommand(context);
 	const childArgs = stripRootTmuxFlag(rawArgs);
-	const supervisorEnv: Record<string, string> = context.managedOwnerSupervisor
-		? { GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]) }
-		: {};
 	const invocationArgs = context.managedOwnerSupervisor
-		? [...command, MANAGED_OWNER_SUPERVISOR_ARG]
+		? managedOwnerSupervisorInvocation(command, [...command, ...childArgs])
 		: [...command, ...childArgs];
 	const quoted = invocationArgs.map(shellQuote).join(" ");
 	const unsetArgs =
 		context.managedOwnerSupervisor && context.platform === "darwin" ? `${macOSMallocEnvUnsetArgs().join(" ")} ` : "";
-	const invocation = `env ${unsetArgs}${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv, ...supervisorEnv })}${
+	const invocation = `env ${unsetArgs}${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv })}${
 		context.bootstrapSecret
 			? ` ${context.bootstrapSecret.urlEnv}=${shellQuote(context.bootstrapSecret.path)} ${context.bootstrapSecret.keyIdEnv}=${shellQuote(context.bootstrapSecret.keyId)}`
 			: ""
@@ -1130,9 +1136,14 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	// tmux launches with no GJC session context. Project dotenv pins are already
 	// removed from identityEnv.
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
+	const derivedStateFile = tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+	// Supervised launches verify their lifecycle root with no-follow walks, so a derived
+	// path through a symlinked workspace is named canonically; an operator pin is verbatim.
 	const sessionStateFile =
 		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
-		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+		(platform === "linux" || platform === "darwin"
+			? canonicalManagedStateFile(cwd, derivedStateFile)
+			: derivedStateFile);
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	// Stage only the one-shot channel descriptor (path + key id). The PKCS#8 key
 	// itself stays in memory until writeCoordinatorSidecarBootstrapFile runs
@@ -1210,6 +1221,25 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	};
 }
 
+/**
+ * Linux supervised launches persist the child argv in a recoverable binding that
+ * the native owner-only reader caps at 64 KiB. JSON escaping can expand an argv
+ * that fits tmux's command limit (control characters become six bytes), so check
+ * the exact serialized command before any tmux session exists and report it as an
+ * input limit instead of failing in the supervisor after launch.
+ */
+function assertRecoverableCommandFits(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
+	const command = resolveCurrentGjcCommand({
+		cwd: plan.cwd,
+		argv: context.argv ?? process.argv,
+		execPath: context.execPath ?? process.execPath,
+		platform: plan.platform,
+	});
+	const childArgv = [...command, ...stripRootTmuxFlag(context.rawArgs)];
+	if (Buffer.byteLength(JSON.stringify(childArgv)) > MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES)
+		throw new Error("managed_owner_command_too_large: pass a large prompt through a file (@file) instead");
+}
+
 function trustedReplacementAuthority(
 	stateDir: string,
 	sessionId: string,
@@ -1237,6 +1267,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	plan.ownerRunId = runId;
 	plan.ownerIncarnation = incarnation;
 	const supervised = plan.platform === "linux" || plan.platform === "darwin";
+	if (plan.platform === "linux") assertRecoverableCommandFits(plan, context);
 	const innerCommand = buildInnerCommand(
 		{
 			cwd: plan.cwd,
@@ -1260,6 +1291,9 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
 				[MANAGED_OWNER_RUN_ID_ENV]: runId,
 				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+				// Darwin close needs only the binding identity, and owner-loss recovery is
+				// Linux-only; never persist the child argv (prompts, API keys) there.
+				...(plan.platform === "darwin" ? { [MANAGED_OWNER_REDACT_COMMAND_ENV]: "1" } : {}),
 				...(replacement
 					? {
 							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: replacement.predecessorToken,

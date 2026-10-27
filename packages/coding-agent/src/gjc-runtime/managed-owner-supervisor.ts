@@ -1,13 +1,23 @@
 import * as crypto from "node:crypto";
+import * as os from "node:os";
 import * as path from "node:path";
 import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { prepareManagedDirectoryRoot, publishManagedFileNoReplace } from "../session/internal/managed-session-storage";
+import { MACOS_MALLOC_ENV_VARS } from "../cli/malloc-env-guard";
+import {
+	managedDirectoryRoot,
+	prepareManagedDirectoryRoot,
+	publishManagedFileNoReplace,
+	publishManagedFileNoReplaceSync,
+} from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime } from "./linux-proc";
 import {
 	isManagedOwnerBinding,
+	isManagedOwnerCommand,
+	MANAGED_OWNER_COOPERATIVE_SIGNAL,
 	type ManagedOwnerBinding,
 	type ManagedOwnerSigabrtReceipt,
+	type ManagedOwnerSupervisorIndex,
 	managedOwnerCommandDigest,
 } from "./managed-owner-binding";
 import { assertSafePathComponent } from "./session-layout";
@@ -15,20 +25,27 @@ import {
 	consumeCooperativeOwnerIntent,
 	isValidOwnerIntent,
 	lifecyclePaths,
+	managedOwnerCooperativeCause,
 	type OwnerIntent,
 	observeOwnerTerminal,
 	readOwnerOnlyFileSettled,
 	readSecureOwnerJson,
+	recordManagedOwnerChildExit,
+	type TerminalSignal,
 } from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 export const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
-export const MANAGED_OWNER_COMMAND_ENV = "GJC_MANAGED_OWNER_COMMAND_JSON";
 export const MANAGED_OWNER_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 export const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
 export const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 export const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
+/**
+ * Serialized child argv budget inside a recoverable binding. The binding's other
+ * fields stay under 1 KiB, so the whole record fits the 64 KiB owner-only reader.
+ */
+export const MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES = 63 * 1024;
 /** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
 export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
 
@@ -87,9 +104,8 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 	assertSafe();
 	const authority = prepareManagedDirectoryRoot(root);
 	const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
-	// Not an input limit in practice: a recoverable binding is its fixed fields (~540 B)
-	// plus the same command JSON the pane command carries in GJC_MANAGED_OWNER_COMMAND_JSON,
-	// and tmux refuses pane commands over ~16 KiB ("command too long") before this runs.
+	// Launchers check MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES before creating a
+	// session; this is the last fail-closed guard for the owner-only reader limit.
 	if (bytes.length > 65536) throw new Error("managed_owner_binding_too_large");
 	await publishManagedFileNoReplace(file, bytes, assertSafe, authority);
 	const persisted = readOwnerOnlyFileSettled(file, 65536);
@@ -97,30 +113,46 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 		throw new Error("managed_owner_durable_reread_failed");
 }
 
-function childCommand(): string[] {
-	const command = JSON.parse(requiredEnvironment(MANAGED_OWNER_COMMAND_ENV)) as unknown;
-	if (!Array.isArray(command) || command.length === 0 || command.some(value => typeof value !== "string" || !value))
-		throw new Error("managed_owner_command_invalid");
+/**
+ * Supervisor invocation: `<gjc> --internal-managed-owner-supervisor -- <child argv...>`.
+ *
+ * The child argv travels as ordinary shell-quoted arguments, never re-encoded (JSON
+ * escaping would double backslashes and quotes inside tmux's ~16 KiB command limit).
+ */
+export function managedOwnerSupervisorInvocation(
+	supervisorArgv: readonly string[],
+	childArgv: readonly string[],
+): string[] {
+	return [...supervisorArgv, MANAGED_OWNER_SUPERVISOR_ARG, "--", ...childArgv];
+}
+
+/** The supervised child's actual termination in the terminal verdict's signal domain. */
+function supervisedChildTerminalSignal(signalCode: NodeJS.Signals | null): TerminalSignal {
+	if (signalCode === null) return "EXIT";
+	return signalCode === "SIGTERM" || signalCode === "SIGHUP" || signalCode === "SIGINT" || signalCode === "SIGKILL"
+		? signalCode
+		: "UNKNOWN";
+}
+
+/** Child argv from the supervisor's CLI arguments (after the program entry). */
+export function managedOwnerSupervisorChildArgv(args: readonly string[]): string[] {
+	const command = args[0] === MANAGED_OWNER_SUPERVISOR_ARG && args[1] === "--" ? args.slice(2) : null;
+	if (!isManagedOwnerCommand(command)) throw new Error("managed_owner_command_invalid");
 	return command;
 }
 
-export function isManagedOwnerSupervisorArgv(args: readonly string[]): boolean {
-	return args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG;
-}
-
 /** Runs one exact child and publishes authority only for a directly observed Linux signal 6. */
-export async function runManagedOwnerSupervisor(): Promise<void> {
+export async function runManagedOwnerSupervisor(args: readonly string[]): Promise<void> {
 	try {
-		await superviseManagedOwner();
+		await superviseManagedOwner(managedOwnerSupervisorChildArgv(args));
 	} catch {
-		// Spawn and JSON errors can contain opaque command bytes.
+		// Spawn errors can contain opaque command bytes.
 		throw new Error("managed_owner_supervisor_failed");
 	}
 }
 
-async function superviseManagedOwner(): Promise<void> {
+async function superviseManagedOwner(command: string[]): Promise<void> {
 	const { root, stateDir, generation, sessionId, runId, incarnation } = lifecycleRoot();
-	const command = childCommand();
 	let sigtermPending = bootstrapSigtermPending;
 	const captureEarlySigterm = () => {
 		sigtermPending = true;
@@ -152,9 +184,23 @@ async function superviseManagedOwner(): Promise<void> {
 	};
 	if (!isManagedOwnerBinding(binding)) throw new Error("managed_owner_binding_invalid");
 	await writeDurableExclusive(path.join(root, `child-${childToken}.binding.json`), binding);
+	if (process.platform === "darwin") {
+		const index: ManagedOwnerSupervisorIndex = {
+			schema_version: 1,
+			generation,
+			session_id: sessionId,
+			child_token: childToken,
+			supervisor_pid: process.pid,
+			supervisor_start_time: supervisorStartTime,
+		};
+		await writeDurableExclusive(lifecyclePaths(stateDir, sessionId, generation).supervisorIndexFile, index);
+	}
 	const childEnvironment: NodeJS.ProcessEnv = { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken };
-	delete childEnvironment[MANAGED_OWNER_COMMAND_ENV];
 	delete childEnvironment[MANAGED_OWNER_REDACT_COMMAND_ENV];
+	// The pane started this supervisor without the malloc variables, but the
+	// environment module re-applies a project `.env` to `process.env`. The child
+	// inherits the launcher's re-exec guard, so it would not scrub them itself.
+	if (process.platform === "darwin") for (const name of MACOS_MALLOC_ENV_VARS) delete childEnvironment[name];
 	const child = Bun.spawn({
 		cmd: command,
 		stdin: "inherit",
@@ -200,33 +246,44 @@ async function superviseManagedOwner(): Promise<void> {
 	let sigtermRelayed = false;
 	let relayedIntent: OwnerIntent | null = null;
 	let relayedAt: string | null = null;
-	const relayChild = (candidateIntent: OwnerIntent | null, observedAt: string) => {
-		if (childExited || sigtermRelayed) return;
+	// Only the direct parent may use its original spawn handle. External process
+	// references still have no identity-bound Darwin signal API.
+	const darwinChildRelayable = () =>
+		!childExited &&
+		!sigtermRelayed &&
+		child.exitCode === null &&
+		child.signalCode === null &&
+		childProcess.pid === child.pid &&
+		childProcess.incarnation === childStartTime &&
+		childProcess.ppid === process.pid &&
+		// Bun reports an exit only after reaping. A child that an unrelated signal
+		// already terminated is an unreaped zombie here, and a relay to it would
+		// claim a death it did not cause.
+		childProcess.status() === "running";
+	const relayChild = (candidateIntent: OwnerIntent | null, observedAt: string): boolean => {
+		if (childExited || sigtermRelayed) return false;
 		try {
 			if (process.platform === "darwin") {
-				// Only the direct parent may use its original spawn handle. External
-				// process references still have no identity-bound Darwin signal API.
-				if (
-					child.exitCode !== null ||
-					child.signalCode !== null ||
-					childProcess.pid !== child.pid ||
-					childProcess.incarnation !== childStartTime ||
-					childProcess.ppid !== process.pid
-				)
-					return;
-				if (candidateIntent && Date.now() >= Date.parse(candidateIntent.expires_at)) return;
+				// Intent expiry was checked under the generation lock right before the
+				// relay record was published; once that record exists, deliver.
+				if (!darwinChildRelayable()) return false;
 				sigtermRelayed = true;
-				child.kill("SIGTERM");
+				// Only a cooperative intent uses the child's cooperative signal; an OS
+				// SIGTERM to the supervisor is forwarded as SIGTERM and never explained.
+				// Bun's Subprocess.kill resolves signal names with Linux numbers (SIGUSR2
+				// would send Darwin's SIGSYS), so the cooperative signal goes by number.
+				child.kill(candidateIntent ? os.constants.signals[MANAGED_OWNER_COOPERATIVE_SIGNAL] : "SIGTERM");
 			} else {
-				if (!childProcess.signalRoot(15)) return;
+				if (!childProcess.signalRoot(15)) return false;
 				sigtermRelayed = true;
 			}
 		} catch {
 			// The child exited between intent capture and delivery.
-			return;
+			return false;
 		}
 		relayedAt = observedAt;
 		relayedIntent = candidateIntent;
+		return true;
 	};
 	const pollIntent = () => {
 		if (childExited || sigtermRelayed) return;
@@ -235,7 +292,10 @@ async function superviseManagedOwner(): Promise<void> {
 				stateDir,
 				binding,
 				serverKey: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				childPid: child.pid,
+				canRelay: darwinChildRelayable,
 				relay: (intent, observedAt) => relayChild(intent, observedAt),
+				publishNoReplace: (file, bytes) => publishManagedFileNoReplaceSync(file, bytes, managedDirectoryRoot(root)),
 			});
 		} catch {
 			// Release failures cannot reset the relay latch or authorize a retry.
@@ -280,21 +340,55 @@ async function superviseManagedOwner(): Promise<void> {
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = relayedAt as string | null;
 	if (sigtermRelayed && terminalObservedAt && terminalIntent) {
-		await observeOwnerTerminal({
-			schema_version: 1,
-			op: "observe_terminal",
-			session_id: sessionId,
-			owner_generation: generation,
-			state_dir: stateDir,
-			socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
-			observer: "raw_monitor",
-			observed_at: terminalObservedAt,
-			signal: "SIGTERM",
-			exit_code: exitCode,
-			exit_kind: "supervisor_child_exit",
-			reason: "managed_owner_supervisor_exit",
-			operator_dispatch_id: terminalIntent.dispatch_id,
-		});
+		// A relay explains the child's end only if the child ended the way SIGTERM
+		// ends it: through its own exit or the default SIGTERM action. Any other
+		// fatal signal (SIGABRT, SIGSEGV, SIGKILL, ...) is preserved as owner loss.
+		// On Darwin the child must also have handled the cooperative signal as its
+		// first cause, and its own exit must be a clean one (0, or 143 from its SIGTERM
+		// shutdown): a failure code is not explained either. A verdict it published
+		// earlier never outranks this reconciliation.
+		const relayExplainsExit =
+			process.platform === "darwin"
+				? (child.signalCode === "SIGTERM" || (child.signalCode === null && (exitCode === 0 || exitCode === 143))) &&
+					managedOwnerCooperativeCause(lifecyclePaths(stateDir, sessionId, generation), binding, child.pid)
+				: child.signalCode === null || child.signalCode === "SIGTERM";
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				observer: "raw_monitor",
+				observed_at: relayExplainsExit ? terminalObservedAt : new Date().toISOString(),
+				signal: relayExplainsExit ? "SIGTERM" : supervisedChildTerminalSignal(child.signalCode),
+				exit_code: exitCode,
+				exit_kind: "supervisor_child_exit",
+				reason: "managed_owner_supervisor_exit",
+				...(relayExplainsExit ? { operator_dispatch_id: terminalIntent.dispatch_id } : {}),
+			});
+		} finally {
+			// After the verdict exists, so its incident and this reconciliation agree.
+			if (process.platform === "darwin")
+				try {
+					await recordManagedOwnerChildExit(stateDir, {
+						schema_version: 1,
+						generation,
+						session_id: sessionId,
+						child_token: childToken,
+						child_pid: child.pid,
+						intent_id: terminalIntent.intent_id,
+						dispatch_id: terminalIntent.dispatch_id,
+						signal: child.signalCode,
+						exit_code: child.signalCode === null ? exitCode : null,
+						explained: relayExplainsExit,
+						observed_at: new Date().toISOString(),
+					});
+				} catch {
+					// Without this record a cooperative close fails closed.
+				}
+		}
 	}
 	if (child.signalCode === "SIGABRT") {
 		if (process.platform === "linux" && binding.binding_kind === "recoverable") {

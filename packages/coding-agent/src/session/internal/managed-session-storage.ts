@@ -4107,9 +4107,13 @@ export async function publishManagedFileNoReplace(
 		if (stagingIdentity && (linkPublished || !renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 			await fsp
 				.lstat(staging, { bigint: true })
-				.then(stat => {
-					if (stat.dev === stagingIdentity?.dev && stat.ino === stagingIdentity.ino) return fsp.unlink(staging);
-					throw new Error("staging_identity_changed");
+				.then(async stat => {
+					if (stat.dev !== stagingIdentity?.dev || stat.ino !== stagingIdentity.ino)
+						throw new Error("staging_identity_changed");
+					await fsp.unlink(staging);
+					// A link-fallback publication is complete only once the staging name is
+					// durably gone; otherwise a crash can restore it and leave nlink=2.
+					if (linkPublished && failure === undefined) await fsyncDirectoryAsync(parent);
 				})
 				.catch(error => {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
@@ -4180,6 +4184,8 @@ export function publishManagedFileNoReplaceSync(
 				throw new Error("staging_identity_changed");
 			}
 			fs.unlinkSync(staging);
+			// See publishManagedFileNoReplace: the fallback is durable only after this.
+			if (linkPublished && failure === undefined) fsyncDirectory(parent);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
 		}
