@@ -87,6 +87,9 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 	assertSafe();
 	const authority = prepareManagedDirectoryRoot(root);
 	const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
+	// Not an input limit in practice: a recoverable binding is its fixed fields (~540 B)
+	// plus the same command JSON the pane command carries in GJC_MANAGED_OWNER_COMMAND_JSON,
+	// and tmux refuses pane commands over ~16 KiB ("command too long") before this runs.
 	if (bytes.length > 65536) throw new Error("managed_owner_binding_too_large");
 	await publishManagedFileNoReplace(file, bytes, assertSafe, authority);
 	const persisted = readOwnerOnlyFileSettled(file, 65536);
