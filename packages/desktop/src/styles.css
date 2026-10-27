@@ -65,3 +65,4 @@ summary { cursor:pointer; padding:8px 0; overflow-wrap:anywhere; }
 .queued-input { display:flex; gap:8px; align-items:center; justify-content:space-between; font-size:12px; }
 .queued-input span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .session-search { margin:8px 0; }
+.notice { color: var(--fg-muted, #8a8f98); margin: 8px 0; }

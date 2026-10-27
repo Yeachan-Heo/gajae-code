@@ -189,6 +189,10 @@ export default function App() {
 		setHistoryLimit(100);
 	}, [selected]);
 	useEffect(() => {
+		// A notice describes one action; it must not leak into another conversation.
+		setNotice("");
+	}, [selected]);
+	useEffect(() => {
 		if (follow.current && conversation.current) conversation.current.scrollTop = conversation.current.scrollHeight;
 	}, [session?.messages, session?.question]);
 	useEffect(() => {
@@ -686,11 +690,11 @@ export default function App() {
 								`question:${selected}`,
 								`abort:${selected}`,
 								`queue:${selected}`,
-								// Palette dispatch happens after its dialog closes, so its failures
-								// and queue notices must render here or disappear entirely.
-								`command:${selected}`,
+								// Palette dispatch closes its dialog first, so its failures and queue
+								// notices need this surface; while a dialog is open it renders there.
+								...(dialog ? [] : [`command:${selected}`]),
 							].map(scope => errors[scope] && <ErrorBanner key={scope}>{errors[scope]}</ErrorBanner>)}
-							{notice && <p role="status">{notice}</p>}
+							{!dialog && notice && <p className="notice">{notice}</p>}
 						</div>
 						{session.queued && session.queued.length > 0 && (
 							<div className="queued-inputs">
