@@ -6,6 +6,7 @@ import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-
 import packageJson from "../package.json";
 import { parseArgs } from "../src/cli/args";
 import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli-main";
+import { prepareManagedDirectoryRoot } from "../src/session/internal/managed-session-storage";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -92,6 +93,9 @@ describe("GJC public CLI command surface", () => {
 		if (process.platform !== "linux") return;
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
 		const lifecycle = lifecyclePaths(stateDir, "session-cli-route", "generation-cli-route");
+		// The launcher prepares each owner-only lifecycle root before the supervisor runs.
+		prepareManagedDirectoryRoot(lifecycle.root);
+		prepareManagedDirectoryRoot(lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked").root);
 		const managedOwnerEnv = {
 			...process.env,
 			GJC_TMUX_OWNER_STATE_DIR: stateDir,

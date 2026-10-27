@@ -938,9 +938,15 @@ describe("GJC tmux session management", () => {
 		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
 	});
 
-	it.skipIf(process.platform === "win32")(
-		"verifies a Broker launch from a symlinked workspace through its canonical lifecycle root",
-		async () => {
+	// A Linux service cgroup plans a scoped bootstrap that carries the tmux argv
+	// in its stdin request; a safe cgroup (and macOS) executes the tmux argv directly.
+	it.skipIf(process.platform === "win32").each([
+		{ platform: "darwin" as const, cgroup: null },
+		{ platform: "linux" as const, cgroup: "0::/user.slice/user-1000.slice/session-1.scope\n" },
+		{ platform: "linux" as const, cgroup: "0::/system.slice/gjc-ci.service\n" },
+	])(
+		"verifies a Broker launch from a symlinked workspace through its canonical lifecycle root ($platform $cgroup)",
+		async ({ platform, cgroup }) => {
 			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-symlinked-")));
 			fixtureDirectories.push(root);
 			const real = path.join(root, "real");
@@ -948,10 +954,19 @@ describe("GJC tmux session management", () => {
 			await fs.mkdir(real);
 			await fs.symlink(real, cwd);
 			let plannedArgv: string[] | undefined;
+			let plannedMode: string | undefined;
 			__setCreateOwnerIsolationForTests({
+				probe: {
+					readCallerCgroup: () => cgroup,
+					probeServer: () => ({ state: "absent" }),
+				},
 				execute: plan => {
 					if (!plan.ok) throw new Error("expected owner-isolation plan");
-					plannedArgv = plan.execution.argv;
+					plannedMode = plan.execution.mode;
+					plannedArgv =
+						plan.execution.mode === "scoped"
+							? (JSON.parse(plan.execution.stdin_line) as { tmux_argv: string[] }).tmux_argv
+							: plan.execution.argv;
 					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
 				},
 			});
@@ -959,12 +974,11 @@ describe("GJC tmux session management", () => {
 			expect(() =>
 				createGjcTmuxSession(
 					{ GJC_TMUX_COMMAND: "tmux" },
-					{
-						platform: process.platform === "linux" ? "linux" : "darwin",
-						launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] },
-					},
+					{ platform, launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] } },
 				),
 			).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+			expect(plannedMode).toBe(cgroup?.includes(".service") ? "scoped" : "direct");
+			expect(plannedArgv?.[0]).toBe("tmux");
 			// The child still runs in the workspace spelling the Broker authorized.
 			expect(plannedArgv?.[plannedArgv.indexOf("-c") + 1]).toBe(cwd);
 			const innerCommand = plannedArgv?.at(-1) ?? "";
@@ -973,7 +987,10 @@ describe("GJC tmux session management", () => {
 			expect(/GJC_COORDINATOR_SESSION_STATE_FILE='([^']+)'/.exec(innerCommand)?.[1]).toStartWith(
 				`${real}${path.sep}`,
 			);
-			expect(fsSync.readdirSync(path.join(stateDir!, "broker-child", "owner-lifecycle"))).toEqual([]);
+			// Only a scoped bootstrap records its attempt capability before execution.
+			expect(fsSync.readdirSync(path.join(stateDir!, "broker-child", "owner-lifecycle"))).toEqual(
+				plannedMode === "scoped" ? [expect.stringMatching(/^attempt-[0-9a-f-]{36}\.json$/)] : [],
+			);
 		},
 	);
 
