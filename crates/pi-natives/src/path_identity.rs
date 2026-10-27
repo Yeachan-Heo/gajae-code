@@ -4113,19 +4113,27 @@ pub(crate) mod platform {
 			}
 			let name = c"system.posix_acl_default";
 			// SAFETY: fd and byte storage are live, name is NUL terminated.
-			assert_eq!(
-				unsafe {
-					libc::fsetxattr(
-						directory.as_raw_fd(),
-						name.as_ptr(),
-						acl.as_ptr().cast(),
-						acl.len(),
-						0,
-					)
-				},
-				0,
-				"fixture requires POSIX ACL support"
-			);
+			let stored = unsafe {
+				libc::fsetxattr(
+					directory.as_raw_fd(),
+					name.as_ptr(),
+					acl.as_ptr().cast(),
+					acl.len(),
+					0,
+				)
+			};
+			if stored != 0 {
+				let error = std::io::Error::last_os_error();
+				// A filesystem without POSIX ACL storage (for example mounted `noacl`)
+				// cannot carry the ACL under test; the reader accepts that storage.
+				assert_eq!(
+					error.raw_os_error(),
+					Some(libc::EOPNOTSUPP),
+					"unexpected ACL fixture failure: {error}"
+				);
+				assert!(read_owner_only_file(&fixture.path(), 65536).is_ok());
+				return;
+			}
 			assert_eq!(read_owner_only_file(&fixture.path(), 65536), Err("unsafe_security"));
 			assert!(!super::verify_owner_only_path_security(&fixture.0, "directory").ok);
 		}

@@ -104,7 +104,9 @@ function fastSigabrtCommand(): string[] {
 	return [process.execPath, "-e", "process.kill(process.pid, 'SIGABRT')"];
 }
 
-describe("managed owner supervisor", () => {
+// A real supervisor rereads its binding through the owner-only reader, which is
+// unsupported on Windows; Broker launches there select headless instead.
+describe.skipIf(process.platform === "win32")("managed owner supervisor", () => {
 	it("delivers exact whitespace arguments to a nonredacted child and preserves their binding digest", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-whitespace-child-"));
 		try {
