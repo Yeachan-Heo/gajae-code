@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { MACOS_MALLOC_ENV_VARS } from "../cli/malloc-env-guard";
 import {
 	managedDirectoryRoot,
 	prepareManagedDirectoryRoot,
@@ -192,6 +193,10 @@ async function superviseManagedOwner(command: string[]): Promise<void> {
 	}
 	const childEnvironment: NodeJS.ProcessEnv = { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken };
 	delete childEnvironment[MANAGED_OWNER_REDACT_COMMAND_ENV];
+	// The pane started this supervisor without the malloc variables, but the
+	// environment module re-applies a project `.env` to `process.env`. The child
+	// inherits the launcher's re-exec guard, so it would not scrub them itself.
+	if (process.platform === "darwin") for (const name of MACOS_MALLOC_ENV_VARS) delete childEnvironment[name];
 	const child = Bun.spawn({
 		cmd: command,
 		stdin: "inherit",

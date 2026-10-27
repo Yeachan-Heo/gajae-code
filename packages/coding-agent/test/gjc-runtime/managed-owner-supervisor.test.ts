@@ -52,11 +52,20 @@ function cleanManagedEnvironment(): NodeJS.ProcessEnv {
 	return env;
 }
 
+type SupervisorOptions = {
+	forceMissingNativeReferenceMarker?: string;
+	prepareRoot?: boolean;
+	/** Working directory of the supervisor process (its project `.env`). */
+	cwd?: string;
+	/** Bun runtime flags before `-e`, as the product's source launch passes them. */
+	bunArgs?: string[];
+};
+
 function startSupervisor(
 	stateDir: string,
 	command: string[],
 	env: Record<string, string> = {},
-	options: { forceMissingNativeReferenceMarker?: string; prepareRoot?: boolean } = {},
+	options: SupervisorOptions = {},
 ) {
 	if (options.prepareRoot !== false)
 		fsSync.mkdirSync(lifecyclePaths(stateDir, "session-2681", "generation-2681").root, {
@@ -69,8 +78,8 @@ function startSupervisor(
 		? `import { appendFileSync } from "node:fs"; import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; } return actualPid; } }); return child; }; try { await runManagedOwnerSupervisor(${supervisorArgs}); } finally { Bun.spawn = originalSpawn; }`
 		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor(${supervisorArgs});`;
 	return Bun.spawn({
-		cmd: [process.execPath, "-e", script],
-		cwd: repoRoot,
+		cmd: [process.execPath, ...(options.bunArgs ?? []), "-e", script],
+		cwd: options.cwd ?? repoRoot,
 		stdout: "pipe",
 		stderr: "pipe",
 		env: {
@@ -88,7 +97,7 @@ async function runSupervisor(
 	stateDir: string,
 	command: string[],
 	env: Record<string, string> = {},
-	options: { forceMissingNativeReferenceMarker?: string; prepareRoot?: boolean } = {},
+	options: SupervisorOptions = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = startSupervisor(stateDir, command, env, options);
 	const [stdout, stderr, exitCode] = await Promise.all([
@@ -403,6 +412,48 @@ try { await runManagedOwnerSupervisor(${supervisorArgs}); process.exitCode = 22;
 					throw new Error("invalid fixture binding");
 				expect(isManagedOwnerSigabrtReceipt(receipt, binding)).toBe(true);
 				expect(files.filter(file => file.startsWith("sigabrt-")).length).toBe(1);
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+	);
+	it.skipIf(process.platform !== "darwin")(
+		"keeps project .env malloc variables out of the supervised child's startup environment on macOS",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-malloc-env-"));
+			try {
+				const workspace = path.join(stateDir, "workspace");
+				await fs.mkdir(workspace);
+				await fs.writeFile(
+					path.join(workspace, ".env"),
+					"MallocStackLogging=0\nMallocStackLoggingNoCompact=1\nGJC_F3_DOTENV_PROBE=loaded\n",
+				);
+				const observed = path.join(stateDir, "child-env.json");
+				// The child records its own OS startup environment, as later spawns inherit it.
+				const command = [
+					"/bin/sh",
+					"-c",
+					`printf '{"malloc":"%s","noCompact":"%s","probe":"%s"}' "\${MallocStackLogging-unset}" "\${MallocStackLoggingNoCompact-unset}" "\${GJC_F3_DOTENV_PROBE-unset}" > ${JSON.stringify(observed)}`,
+				];
+				const environment = cleanManagedEnvironment();
+				delete environment.MallocStackLogging;
+				delete environment.MallocStackLoggingNoCompact;
+				const result = await runSupervisor(
+					stateDir,
+					command,
+					// The launcher's re-exec guard is inherited, so the child never scrubs itself.
+					{ GJC_MALLOC_ENV_REEXEC: "1" },
+					// The product's macOS source launch: no Bun dotenv autoload, cwd = workspace.
+					{ cwd: workspace, bunArgs: ["--no-env-file"] },
+				);
+				expect(result.exitCode, result.stderr).toBe(0);
+				// The project overlay did reach the supervisor (the probe passes through),
+				// but the malloc variables do not reach the child.
+				expect(JSON.parse(await fs.readFile(observed, "utf8"))).toEqual({
+					malloc: "unset",
+					noCompact: "unset",
+					probe: "loaded",
+				});
 			} finally {
 				await fs.rm(stateDir, { recursive: true, force: true });
 			}
