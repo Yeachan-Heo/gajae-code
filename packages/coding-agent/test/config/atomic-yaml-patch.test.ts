@@ -9,8 +9,11 @@ import {
 	type AtomicYamlPatch,
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
+	applyAtomicYamlPatchesWithCurrent,
 	atomicYamlPathHash,
 	deleteByPath,
+	enqueueAtomicYamlOperation,
+	reserveAtomicYamlPatchSlot,
 	reserveAtomicYamlUpdateSlot,
 	setByPath,
 	withAtomicYamlConfigTransaction,
@@ -38,6 +41,203 @@ afterEach(async () => {
 });
 
 describe("atomic YAML patches", () => {
+	for (const writer of ["direct", "supplier", "builder", "transaction", "combined"] as const) {
+		test(`snapshots getter-backed patches and preserves stale CAS in ${writer}`, async () => {
+			const configPath = await configPathForTest();
+			const before = "feature:\n  keep: true\n";
+			await Bun.write(configPath, before);
+			let pathReads = 0,
+				opReads = 0,
+				expectedReads = 0,
+				expectedPathReads = 0,
+				hashReads = 0;
+			const patch = {
+				get path() {
+					return ++pathReads === 1 ? "feature.keep" : "";
+				},
+				get op() {
+					return ++opReads === 1 ? ("set" as const) : ("invalid" as const);
+				},
+				value: false,
+				get expected() {
+					expectedReads++;
+					return {
+						get path() {
+							return ++expectedPathReads === 1 ? "feature.keep" : "";
+						},
+						get hash() {
+							return ++hashReads === 1 ? "stale" : "";
+						},
+					};
+				},
+			} as unknown as AtomicYamlPatch;
+			const patches: AtomicYamlPatch[] = [{ path: "sibling", op: "set", value: 1 }, patch];
+			const run = () =>
+				writer === "direct"
+					? applyAtomicYamlPatches(configPath, patches)
+					: writer === "supplier"
+						? reserveAtomicYamlPatchSlot(configPath, async () => patches)
+						: writer === "builder"
+							? applyAtomicYamlPatchesWithCurrent(configPath, async () => patches)
+							: withAtomicYamlConfigTransaction(configPath, async tx =>
+									writer === "transaction"
+										? tx.applyPatches(patches)
+										: tx.applyPatchesAndRemoveTopLevelKeys(patches, []),
+								);
+			await expect(run()).rejects.toBeInstanceOf(AtomicYamlConflictError);
+			expect([pathReads, opReads, expectedReads, expectedPathReads, hashReads]).toEqual([1, 1, 1, 1, 1]);
+			expect(await Bun.file(configPath).text()).toBe(before);
+		});
+	}
+
+	test("uses the first valid getter values even when later reads would be malformed", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\n");
+		let pathReads = 0,
+			opReads = 0,
+			expectedReads = 0;
+		const expected = { path: "feature", hash: atomicYamlPathHash({ feature: "old" }, "feature") };
+		const patch = {
+			get path() {
+				return ++pathReads === 1 ? "feature" : "";
+			},
+			get op() {
+				return ++opReads === 1 ? "set" : "invalid";
+			},
+			get expected() {
+				return ++expectedReads === 1 ? expected : false;
+			},
+			value: "new",
+		} as unknown as AtomicYamlPatch;
+		const receipt = await applyAtomicYamlPatchesWithCurrent(configPath, () => [patch], {
+			validateRoot: (_root, supplied) => {
+				(supplied[0] as { path: string }).path = "other";
+			},
+		});
+		expect([pathReads, opReads, expectedReads]).toEqual([1, 1, 1]);
+		expect(await readYaml(configPath)).toEqual({ feature: "new" });
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(await readYaml(configPath)).toEqual({ feature: "old" });
+	});
+
+	test("snapshots before queue wait, sanitizes clone errors, and leaves the queue usable", async () => {
+		const configPath = await configPathForTest();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const pending = enqueueAtomicYamlOperation(configPath, async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		await entered.promise;
+		const value = { nested: { keep: true } };
+		const write = applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value }]);
+		value.nested.keep = false;
+		expect(() =>
+			applyAtomicYamlPatches(configPath, [
+				{
+					path: "bad",
+					op: "set",
+					value: {
+						get secret() {
+							throw new Error("private-secret");
+						},
+					},
+				},
+			]),
+		).toThrow("could not be read or cloned");
+		gate.resolve();
+		await pending;
+		const receipt = await write;
+		expect(await readYaml(configPath)).toEqual({ feature: { nested: { keep: true } } });
+		expect((await receipt.restore()).status).toBe("restored");
+	});
+
+	test("rejects reentrant transaction mutation during input cloning", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\n");
+		let writes = 0;
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			const attempts: Promise<PromiseSettledResult<unknown>>[] = [];
+			const value = {
+				get nested() {
+					attempts.push(
+						tx.applyPatches([{ path: "other", op: "set", value: "private" }]).then(
+							result => ({ status: "fulfilled" as const, value: result }),
+							reason => ({ status: "rejected" as const, reason }),
+						),
+					);
+					return true;
+				},
+			};
+			const [outer] = await Promise.allSettled([
+				tx.applyPatches([{ path: "feature", op: "set", value }], {
+					exactReplace: (source, destination, expectedSource, expectedDestination) => {
+						writes++;
+						return exactReplacePath(source, destination, expectedSource, expectedDestination);
+					},
+				}),
+			]);
+			const results = await Promise.all(attempts);
+			expect(results).toHaveLength(1);
+			expect(results[0]?.status).toBe("rejected");
+			if (results[0]?.status === "rejected") {
+				expect(results[0].reason).toBeInstanceOf(Error);
+				expect(results[0].reason.message).toContain("cannot mutate while patch input is being read");
+			}
+			if (outer!.status === "rejected") throw outer!.reason;
+			expect(outer!.value.revisions.map(revision => revision.path)).toEqual(["feature"]);
+			expect(tx.written).toBe(true);
+		});
+		expect(writes).toBe(1);
+		expect(await readYaml(configPath)).toEqual({ feature: { nested: true } });
+		const remaining = (await fs.readdir(path.dirname(configPath))).filter(name => name !== path.basename(configPath));
+		for (const name of remaining) {
+			expect(name).toMatch(/^\.gjc-exact-replace-destination-[0-9a-f]+-[0-9a-f]+$/);
+			expect((await fs.stat(path.join(path.dirname(configPath), name))).size).toBe(0);
+		}
+	});
+
+	test("builder and transaction inspection cannot mutate writer-owned YAML", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature:\n  nested:\n    keep: true\nother: old\n");
+		const receipt = await applyAtomicYamlPatchesWithCurrent(configPath, async current => {
+			(current.feature as { nested: { keep: boolean } }).nested.keep = false;
+			return [{ path: "other", op: "set", value: "new" }];
+		});
+		expect(await readYaml(configPath)).toEqual({ feature: { nested: { keep: true } }, other: "new" });
+		expect((await receipt.restore()).status).toBe("restored");
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			(tx.current.feature as { nested: { keep: boolean } }).nested.keep = false;
+			(tx.root as { feature: { nested: { keep: boolean } } }).feature.nested.keep = false;
+			await tx.applyPatches([{ path: "other", op: "set", value: "transaction" }]);
+		});
+		expect(await readYaml(configPath)).toEqual({ feature: { nested: { keep: true } }, other: "transaction" });
+	});
+
+	for (const ancestor of ["selector", null, ["selector"]]) {
+		test(`rejects set across non-record ancestor ${JSON.stringify(ancestor)} without partial state`, async () => {
+			const configPath = await configPathForTest();
+			await Bun.write(configPath, YAML.stringify({ modelRoles: { custom: ancestor }, sibling: "old" }));
+			const before = await Bun.file(configPath).text();
+			const patches: AtomicYamlPatch[] = [
+				{ path: "sibling", op: "set", value: "new" },
+				{ path: "modelRoles.custom.child", op: "set", value: "new" },
+			];
+			await expect(applyAtomicYamlPatches(configPath, patches)).rejects.toThrow("non-record ancestor");
+			await withAtomicYamlConfigTransaction(configPath, async tx => {
+				await expect(tx.applyPatches(patches)).rejects.toThrow("non-record ancestor");
+				expect(tx.current).toEqual({ modelRoles: { custom: ancestor }, sibling: "old" });
+				expect(tx.written).toBe(false);
+			});
+			expect(await Bun.file(configPath).text()).toBe(before);
+			await expect(
+				applyAtomicYamlPatches(configPath, [{ ...patches[1]!, expected: { path: "sibling", hash: "stale" } }]),
+			).rejects.toBeInstanceOf(AtomicYamlConflictError);
+			const receipt = await applyAtomicYamlPatches(configPath, [{ path: "new.parent.child", op: "set", value: 1 }]);
+			expect((await receipt.restore()).status).toBe("restored");
+			expect((await readYaml(configPath)).modelRoles).toEqual({ custom: ancestor });
+		});
+	}
 	test("rejects malformed present preconditions before any batch write", async () => {
 		const configPath = await configPathForTest();
 		const before = "feature:\n  keep: true\n";
@@ -524,6 +724,83 @@ describe("atomic YAML patches", () => {
 		const after = YAML.parse(await fs.readFile(target, "utf8")) as Record<string, unknown>;
 		expect(after.a).toBe(99);
 		expect(after.b).toBeUndefined();
+	});
+
+	test("builder rejects an external edit after its read and retains the editor's file", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\nsibling: old\n");
+		await expect(
+			applyAtomicYamlPatchesWithCurrent(configPath, async () => {
+				await Bun.write(configPath, "feature: old\nsibling: external\n");
+				return [{ path: "feature", op: "set", value: "new" }];
+			}),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await readYaml(configPath)).toEqual({ feature: "old", sibling: "external" });
+	});
+
+	for (const writer of ["builder", "restore"] as const) {
+		test(`${writer} preserves an external save at the exact identity exchange`, async () => {
+			const configPath = await configPathForTest();
+			await Bun.write(configPath, "feature: old\nsibling: old\n");
+			let inject = writer === "builder";
+			const options = {
+				exactReplace: async (
+					source: string,
+					destination: string,
+					expectedSource: Parameters<typeof exactReplacePath>[2],
+					expectedDestination: Parameters<typeof exactReplacePath>[3],
+				) => {
+					if (inject) {
+						inject = false;
+						await Bun.write(
+							destination,
+							writer === "builder" ? "feature: old\nsibling: external\n" : "feature: new\nsibling: external\n",
+						);
+					}
+					return exactReplacePath(source, destination, expectedSource, expectedDestination);
+				},
+			};
+			if (writer === "builder") {
+				await expect(
+					applyAtomicYamlPatchesWithCurrent(
+						configPath,
+						() => [{ path: "feature", op: "set", value: "new" }],
+						options,
+					),
+				).rejects.toBeInstanceOf(AtomicYamlConflictError);
+				expect(await readYaml(configPath)).toEqual({ feature: "old", sibling: "external" });
+			} else {
+				const receipt = await applyAtomicYamlPatches(
+					configPath,
+					[{ path: "feature", op: "set", value: "new" }],
+					options,
+				);
+				inject = true;
+				await expect(receipt.restore()).rejects.toBeInstanceOf(AtomicYamlConflictError);
+				expect(await readYaml(configPath)).toEqual({ feature: "new", sibling: "external" });
+				expect((await receipt.restore()).status).toBe("restored");
+				expect(await readYaml(configPath)).toEqual({ feature: "old", sibling: "external" });
+			}
+			expect((await fs.readdir(path.dirname(configPath))).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+		});
+	}
+
+	test("restore detects an external edit during validation without consuming its receipt", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\nsibling: old\n");
+		let inject = false;
+		const receipt = await applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "new" }], {
+			validateRoot: async () => {
+				if (inject) {
+					inject = false;
+					await Bun.write(configPath, "feature: external\nsibling: old\n");
+				}
+			},
+		});
+		inject = true;
+		await expect(receipt.restore()).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await readYaml(configPath)).toEqual({ feature: "external", sibling: "old" });
+		expect(await receipt.restore()).toEqual({ status: "conflict", paths: ["feature"] });
 	});
 
 	test("preserves an editor save injected at the final identity-checked exchange", async () => {

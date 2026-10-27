@@ -324,13 +324,35 @@ function assertPatch(patch: AtomicYamlPatch): void {
 	}
 	if (patch.op === "set") {
 		if (patch.value === undefined) {
-			throw new TypeError(`Atomic YAML set patch for ${patch.path} cannot carry undefined; use unset instead.`);
+			throw new TypeError("Atomic YAML set patch cannot carry undefined; use unset instead.");
 		}
 		return;
 	}
 	if (patch.op !== "unset") {
-		throw new Error(`Unknown atomic YAML patch operation: ${(patch as { op?: unknown }).op}`);
+		throw new Error("Unknown atomic YAML patch operation.");
 	}
+}
+
+// Read caller-owned properties only once, before validation or any writer mutation.
+function snapshotPatches(patches: readonly AtomicYamlPatch[]): readonly AtomicYamlPatch[] {
+	let snapshots: AtomicYamlPatch[];
+	try {
+		snapshots = Array.from(patches, patch => {
+			const path = patch.path;
+			const op = patch.op;
+			const expectedInput = patch.expected;
+			const expected =
+				expectedInput !== undefined && expectedInput !== null && typeof expectedInput === "object"
+					? Object.freeze({ path: expectedInput.path, hash: expectedInput.hash })
+					: expectedInput;
+			const value = op === "set" ? structuredClone(patch.value) : undefined;
+			return Object.freeze({ path, op, value, expected }) as AtomicYamlPatch;
+		});
+	} catch {
+		throw new Error("Atomic YAML patch input could not be read or cloned.");
+	}
+	for (const patch of snapshots) assertPatch(patch);
+	return Object.freeze(snapshots);
 }
 
 /** Ancestor/descendant paths cannot share one independently restorable receipt. */
@@ -364,6 +386,21 @@ function stateAtPath(value: Record<string, unknown>, segments: readonly string[]
 	}
 	const key = segments[segments.length - 1]!;
 	return Object.hasOwn(current, key) ? { exists: true, value: current[key] } : { exists: false, value: undefined };
+}
+
+/** Reject set paths that would replace a non-record ancestor outside the receipt's scope.
+ * Missing ancestors may be created; unset paths do not replace ancestors.
+ */
+export function assertAtomicYamlSetAncestors(value: Record<string, unknown>, segments: readonly string[]): void {
+	assertSafePath(segments);
+	let current = value;
+	for (let index = 0; index < segments.length - 1; index++) {
+		const segment = segments[index]!;
+		if (!Object.hasOwn(current, segment)) return;
+		const next = record(current[segment]);
+		if (!next) throw new Error("Atomic YAML set path cannot replace a non-record ancestor.");
+		current = next;
+	}
 }
 
 /** Set a dotted YAML path, creating object intermediates as needed. */
@@ -922,7 +959,8 @@ function createReceipt(
 			return await enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
 				if (discarded) return { status: "discarded" };
 				return await withFileLock(canonicalPath, async () => {
-					const { current, root } = await readYaml(canonicalPath);
+					const state = await readYaml(canonicalPath);
+					const { current, root } = state;
 					const conflicts = [
 						...new Set([
 							...changes
@@ -943,14 +981,14 @@ function createReceipt(
 							? { path: change.path, op: "set", value: structuredClone(change.before.value) }
 							: { path: change.path, op: "unset" },
 					);
-					await options.validateRoot?.(root, restorePatches);
+					await options.validateRoot?.(structuredClone(root), structuredClone(restorePatches));
 					const receipt = await applyPatchesUnderLock(
 						canonicalPath,
 						current,
 						restorePatches,
 						options,
 						false,
-						undefined,
+						state,
 						lexicalPath,
 					);
 					await options.onRestored?.(restorePatches);
@@ -979,6 +1017,11 @@ async function applyPatchesUnderLock(
 		if (actualHash !== patch.expected.hash) {
 			throw new AtomicYamlConflictError(patch.expected.path, patch.expected.hash, actualHash);
 		}
+	}
+
+	// Preflight the whole batch before changing the transaction's in-memory state.
+	for (const patch of patches) {
+		if (patch.op === "set") assertAtomicYamlSetAncestors(current, patch.path.split("."));
 	}
 
 	const changesByPath = new Map<string, ReceiptChange>();
@@ -1032,11 +1075,11 @@ export function applyAtomicYamlPatchesWithCurrent(
 	return enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
-			const { current, root } = await readYaml(canonicalPath);
-			const patches = await buildPatches(current);
-			for (const patch of patches) assertPatch(patch);
-			await options.validateRoot?.(root, patches);
-			return await applyPatchesUnderLock(canonicalPath, current, patches, options, false, undefined, lexicalPath);
+			const state = await readYaml(canonicalPath);
+			const { current, root } = state;
+			const patches = snapshotPatches(await buildPatches(structuredClone(current)));
+			await options.validateRoot?.(structuredClone(root), structuredClone(patches));
+			return await applyPatchesUnderLock(canonicalPath, current, patches, options, false, state, lexicalPath);
 		});
 	});
 }
@@ -1107,19 +1150,36 @@ export function withAtomicYamlConfigTransaction<T>(
 				}
 			};
 			let written = false;
+			let snapshotting = false;
+			const assertNotSnapshotting = (): void => {
+				if (snapshotting) throw new Error("Atomic YAML transaction cannot mutate while patch input is being read.");
+			};
+			const snapshotTransactionPatches = (patches: readonly AtomicYamlPatch[]): readonly AtomicYamlPatch[] => {
+				assertNotSnapshotting();
+				snapshotting = true;
+				try {
+					return snapshotPatches(patches);
+				} finally {
+					snapshotting = false;
+				}
+			};
 			const markWritten = (): void => {
 				written = true;
 			};
 			return await operation({
 				configPath: canonicalPath,
-				root,
-				current,
+				get root() {
+					return structuredClone(root);
+				},
+				get current() {
+					return structuredClone(current);
+				},
 				get written(): boolean {
 					return written;
 				},
-				applyPatches: async (patches, options = {}) => {
-					for (const patch of patches) assertPatch(patch);
-					await options.validateRoot?.(root, patches);
+				applyPatches: async (input, options = {}) => {
+					const patches = snapshotTransactionPatches(input);
+					await options.validateRoot?.(structuredClone(root), structuredClone(patches));
 					await casGuard();
 					const receipt = await applyPatchesUnderLock(
 						canonicalPath,
@@ -1137,6 +1197,7 @@ export function withAtomicYamlConfigTransaction<T>(
 					return receipt;
 				},
 				removeTopLevelKeys: async (keys, options = {}) => {
+					assertNotSnapshotting();
 					for (const key of keys) delete current[key];
 					await casGuard();
 					lastKnownState = await writeAtomicYaml(
@@ -1162,9 +1223,9 @@ export function withAtomicYamlConfigTransaction<T>(
 						},
 					};
 				},
-				applyPatchesAndRemoveTopLevelKeys: async (patches, topLevelKeys, options = {}) => {
-					for (const patch of patches) assertPatch(patch);
-					await options.validateRoot?.(root, patches);
+				applyPatchesAndRemoveTopLevelKeys: async (input, topLevelKeys, options = {}) => {
+					const patches = snapshotTransactionPatches(input);
+					await options.validateRoot?.(structuredClone(root), structuredClone(patches));
 					await casGuard();
 					await applyPatchesUnderLock(canonicalPath, current, patches, options, true, undefined, lexicalPath);
 					for (const key of topLevelKeys) delete current[key];
@@ -1189,6 +1250,7 @@ export function withAtomicYamlConfigTransaction<T>(
 					};
 				},
 				replaceCurrent: async (next, options = {}) => {
+					assertNotSnapshotting();
 					for (const key of Object.keys(current)) delete current[key];
 					Object.assign(current, next);
 					await casGuard();
@@ -1249,13 +1311,12 @@ export function reserveAtomicYamlPatchSlot(
 	options: AtomicYamlPatchOptions = {},
 ): Promise<CasReceipt> {
 	return enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
-		const nextPatches = await patches();
-		for (const patch of nextPatches) assertPatch(patch);
+		const nextPatches = snapshotPatches(await patches());
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
 			const state = await readYaml(canonicalPath);
 			const { current, root } = state;
-			await options.validateRoot?.(root, nextPatches);
+			await options.validateRoot?.(structuredClone(root), structuredClone(nextPatches));
 			return await applyPatchesUnderLock(
 				canonicalPath,
 				current,
@@ -1317,17 +1378,6 @@ export function applyAtomicYamlPatches(
 	patches: readonly AtomicYamlPatch[],
 	options: AtomicYamlPatchOptions = {},
 ): Promise<CasReceipt> {
-	for (const patch of patches) assertPatch(patch);
-	const immutablePatches = patches.map(patch => {
-		const expected = patch.expected ? { ...patch.expected } : undefined;
-		return patch.op === "set"
-			? ({
-					path: patch.path,
-					op: "set",
-					value: structuredClone(patch.value),
-					...(expected ? { expected } : {}),
-				} as const)
-			: ({ path: patch.path, op: "unset", ...(expected ? { expected } : {}) } as const);
-	});
+	const immutablePatches = snapshotPatches(patches);
 	return reserveAtomicYamlPatchSlot(configPath, () => immutablePatches, options);
 }
