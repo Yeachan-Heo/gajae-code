@@ -61,3 +61,6 @@ summary { cursor:pointer; padding:8px 0; overflow-wrap:anywhere; }
 .command-run { display:flex; flex-wrap:wrap; gap:8px; align-items:end; }
 .command-run input { flex:1 1 240px; min-width:0; }
 .command-list small { color:var(--muted); }
+.queued-inputs { display:flex; flex-direction:column; gap:6px; padding:8px 12px; border-top:1px solid var(--border); background:var(--surface, #1113); }
+.queued-input { display:flex; gap:8px; align-items:center; justify-content:space-between; font-size:12px; }
+.queued-input span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }

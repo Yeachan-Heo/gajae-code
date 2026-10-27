@@ -27,6 +27,7 @@ export const DESKTOP_METHODS = [
 	"command.list",
 	"command.run",
 	"history.get",
+	"queue.cancel",
 	"diff.get",
 	"tools.list",
 	"tools.set",
@@ -60,11 +61,20 @@ export interface DesktopQuestion {
 	initialValue?: string;
 }
 
+export interface DesktopQueuedInput {
+	id: string;
+	text: string;
+	deliverAs: "steer" | "followUp";
+	/** False once the SDK has already admitted the input into the run. */
+	cancelable: boolean;
+	execution?: "joined-current-run" | "promoted-to-run" | "completed" | "removed";
+}
 export interface DesktopSession {
 	id: string;
 	projectId: string;
 	title: string;
 	status: "idle" | "running" | "waiting" | "error";
+	queued?: DesktopQueuedInput[];
 	starred: boolean;
 	model?: string;
 	messages: DesktopMessage[];

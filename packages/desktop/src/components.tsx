@@ -75,6 +75,7 @@ export function Composer({
 	disabled,
 	deliverAs,
 	onDeliverAs,
+	onSlash,
 }: {
 	value: string;
 	onChange: (value: string) => void;
@@ -84,6 +85,7 @@ export function Composer({
 	disabled?: boolean;
 	deliverAs?: "steer" | "followUp";
 	onDeliverAs?: (value: "steer" | "followUp") => void;
+	onSlash?: () => void;
 }) {
 	const id = useId();
 	const deliverId = useId();
@@ -106,6 +108,11 @@ export function Composer({
 				rows={3}
 				disabled={disabled}
 				onKeyDown={event => {
+					if (event.key === "/" && !value && onSlash && !event.nativeEvent.isComposing) {
+						event.preventDefault();
+						onSlash();
+						return;
+					}
 					if (
 						event.key === "Enter" &&
 						(event.metaKey || event.ctrlKey) &&
@@ -275,11 +282,21 @@ export function SettingField({
 			onSubmit={event => {
 				event.preventDefault();
 				try {
-					const parsed: unknown = setting.type === "string" ? value : JSON.parse(value);
+					// Only JSON-shaped types need parsing; strings and enum choices are literal.
+					const parsed: unknown =
+						setting.type === "boolean"
+							? value === "true"
+								? true
+								: value === "false"
+									? false
+									: JSON.parse(value)
+							: setting.type === "number"
+								? JSON.parse(value)
+								: value;
 					setError("");
 					onSave(parsed);
 				} catch {
-					setError("올바른 JSON 값을 입력하세요.");
+					setError("올바른 값을 입력하세요.");
 				}
 			}}
 		>

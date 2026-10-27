@@ -642,10 +642,45 @@ export default function App() {
 								/>
 							)}
 							{session.error && <ErrorBanner>{session.error}</ErrorBanner>}
-							{[selected, `select:${selected}`, `question:${selected}`, `abort:${selected}`].map(
-								scope => errors[scope] && <ErrorBanner key={scope}>{errors[scope]}</ErrorBanner>,
-							)}
+							{[
+								selected,
+								`select:${selected}`,
+								`question:${selected}`,
+								`abort:${selected}`,
+								`queue:${selected}`,
+							].map(scope => errors[scope] && <ErrorBanner key={scope}>{errors[scope]}</ErrorBanner>)}
 						</div>
+						{session.queued && session.queued.length > 0 && (
+							<div className="queued-inputs">
+								<strong>대기열 {session.queued.length}건</strong>
+								{session.queued.map(item => (
+									<div className="queued-input" key={item.id}>
+										<span>
+											{item.deliverAs === "steer" ? "개입" : "후속"} · {item.text.slice(0, 120)}
+										</span>
+										<small>
+											{item.execution === "joined-current-run" || item.execution === "promoted-to-run"
+												? "실행에 반영됨"
+												: item.cancelable
+													? "대기 중"
+													: "처리 중"}
+										</small>
+										{item.cancelable && (
+											<Button
+												disabled={!connected}
+												onClick={() =>
+													void run(`queue:${selected}`, async () => {
+														await request("queue.cancel", { sessionId: selected, queueId: item.id });
+													})
+												}
+											>
+												취소
+											</Button>
+										)}
+									</div>
+								))}
+							</div>
+						)}
 						<div className="composer-area">
 							<Composer
 								value={drafts[selected] || ""}
@@ -655,6 +690,7 @@ export default function App() {
 								busy={session.status === "running" || session.status === "waiting"}
 								deliverAs={deliverAs}
 								onDeliverAs={setDeliverAs}
+								onSlash={openCommands}
 								disabled={!connected}
 							/>
 						</div>

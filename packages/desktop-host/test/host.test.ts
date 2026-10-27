@@ -114,16 +114,31 @@ describe("desktop protocol validation", () => {
 	test("the explicit history page keeps every message with a larger per-message bound", () => {
 		const messages = Array.from({ length: 400 }, (_, index) => ({
 			role: "user" as const,
-			content: `${index}:${"y".repeat(40_000)}`,
+			content: `${index}:${"y".repeat(1_000)}`,
 		}));
 		expect(projectMessages(messages)).toHaveLength(160);
-		const { total, page } = projectHistoryPage(messages, 500);
-		expect(total).toBe(400);
-		expect(page).toHaveLength(400);
-		expect(page.every(message => message.text.length <= 32_000)).toBe(true);
+		const first = projectHistoryPage(messages, 0, 500);
+		expect(first.total).toBe(400);
+		expect(first.page).toHaveLength(400);
+		expect(first.truncated).toBe(false);
+		expect(first.page.every(message => message.text.length <= 32_000)).toBe(true);
 		// Projection keeps the tail of long text but preserves message order.
-		expect(page[0]?.id.startsWith("0:")).toBe(true);
-		expect(page[399]?.id.startsWith("399:")).toBe(true);
+		expect(first.page[0]?.id.startsWith("0:")).toBe(true);
+		expect(first.page[399]?.id.startsWith("399:")).toBe(true);
+		// A later page must be addressable, not empty.
+		const second = projectHistoryPage(messages, 380, 50);
+		expect(second.page).toHaveLength(20);
+		expect(second.page[0]?.id.startsWith("380:")).toBe(true);
+		expect(second.page[19]?.id.startsWith("399:")).toBe(true);
+		// The byte budget stops a page early instead of exceeding the frame limit.
+		const huge = projectHistoryPage(
+			Array.from({ length: 200 }, () => ({ role: "assistant" as const, content: "z".repeat(32_000) })),
+			0,
+			200,
+		);
+		expect(huge.page.length).toBeLessThan(200);
+		expect(huge.truncated).toBe(true);
+		expect(huge.page.reduce((total, message) => total + message.text.length, 0)).toBeLessThanOrEqual(2_000_000);
 	});
 });
 
@@ -138,6 +153,9 @@ describe("desktop settings surface", () => {
 		expect(items.some(item => item.path === "theme.dark")).toBe(false);
 		expect(items.some(item => /token|secret|password|credential/i.test(item.path))).toBe(false);
 		expect(items.every(item => ["boolean", "number", "enum"].includes(item.type))).toBe(true);
+		// Terminal-only settings stay visible but are not writable from the desktop.
+		const uiLanguage = items.find(item => item.path === "ui.language");
+		if (uiLanguage) expect(uiLanguage.writable).toBe(false);
 	});
 	test("validates writes against the schema instead of accepting arbitrary values", () => {
 		expect(validateDesktopSetting("compaction.enabled", false)).toBe("compaction.enabled");
@@ -148,7 +166,14 @@ describe("desktop settings surface", () => {
 			"Setting is not editable from the desktop host",
 		);
 		expect(() => validateDesktopSetting("not.a.path", true)).toThrow("Unknown setting path");
-		expect(() => validateDesktopSetting("ui.language", "xx")).toThrow("Setting value is not a valid choice");
+		expect(() => validateDesktopSetting("ui.language", "xx")).toThrow(
+			"Setting only affects the terminal UI and cannot be changed from the desktop host",
+		);
+		// Enum validation still rejects an unknown choice for an app-effective enum.
+		expect(() => validateDesktopSetting("compaction.strategy", "nonsense")).toThrow(
+			"Setting value is not a valid choice",
+		);
+		expect(validateDesktopSetting("compaction.strategy", "off")).toBe("compaction.strategy");
 	});
 });
 

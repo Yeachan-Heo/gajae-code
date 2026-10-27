@@ -6,6 +6,10 @@ import * as path from "node:path";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { getUi, SETTINGS_SCHEMA, type SettingPath } from "@gajae-code/coding-agent/config/settings-schema";
+import {
+	clearPluginRootsAndCaches,
+	resolveActiveProjectRegistryPath,
+} from "@gajae-code/coding-agent/discovery/helpers";
 import type { ExtensionUIContext, ExtensionUIDialogOptions } from "@gajae-code/coding-agent/extensibility/extensions";
 import {
 	ACP_BUILTIN_SLASH_COMMANDS,
@@ -15,7 +19,7 @@ import {
 	executeAcpBuiltinSlashCommand,
 	type SlashCommandRuntime,
 } from "@gajae-code/coding-agent/sdk";
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import type { AgentSession, QueuedInputSubmission } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { setAgentDir } from "@gajae-code/utils";
@@ -31,6 +35,7 @@ import type {
 	DesktopMessage,
 	DesktopProject,
 	DesktopQuestion,
+	DesktopQueuedInput,
 	DesktopRequest,
 	DesktopSession,
 	DesktopSetting,
@@ -42,6 +47,7 @@ const HISTORY_LIMIT = 160;
 const TEXT_LIMIT = 8_000;
 const FULL_TEXT_LIMIT = 32_000;
 const HISTORY_PAGE_LIMIT = 500;
+const HISTORY_PAGE_BYTES = 2_000_000;
 const COMMAND_OUTPUT_LIMIT = 200_000;
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 /**
@@ -51,6 +57,13 @@ const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
  * before writing, the same contract as `gjc config set`.
  */
 const WITHHELD_SETTING = /token|secret|password|credential|apiKey|broker|oauth/i;
+/**
+ * Settings that only change the terminal UI. They are still readable so the app
+ * shows the truth, but saving them from the desktop would promise an effect the
+ * app cannot deliver.
+ */
+const TERMINAL_ONLY_SETTING =
+	/^(statusLine\.|theme\.|clipboard\.|ui\.|symbolPreset$|syntaxTheme|footer|header|editor\.)/i;
 const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
 
 export const CAPABILITIES: DesktopCapability[] = [
@@ -144,9 +157,11 @@ export function desktopSettings(settings: Settings): DesktopSetting[] {
 				path,
 				value: settings.get(path),
 				type: definition.type,
-				description: ui?.description ?? "Application-wide setting; persisted to the desktop config.",
+				description: TERMINAL_ONLY_SETTING.test(path)
+					? `${ui?.description ?? ""} (터미널 전용: 데스크톱 앱 화면에는 영향을 주지 않습니다.)`.trim()
+					: (ui?.description ?? "Application-wide setting; persisted to the desktop config."),
 				...(choices && choices.length > 0 ? { choices } : {}),
-				writable: true,
+				writable: settings.canPersistDurableConfig() && !TERMINAL_ONLY_SETTING.test(path),
 			} satisfies DesktopSetting,
 		];
 	});
@@ -159,6 +174,8 @@ export function validateDesktopSetting(path: unknown, value: unknown): SettingPa
 	const definition = SETTINGS_SCHEMA[settingPath];
 	if (!EDITABLE_SETTING_TYPES.has(definition.type) || WITHHELD_SETTING.test(settingPath))
 		throw new Error("Setting is not editable from the desktop host");
+	if (TERMINAL_ONLY_SETTING.test(settingPath))
+		throw new Error("Setting only affects the terminal UI and cannot be changed from the desktop host");
 	if (definition.type === "boolean" && typeof value !== "boolean") throw new Error("Setting requires a boolean");
 	if (definition.type === "number") {
 		if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Setting requires a number");
@@ -211,13 +228,28 @@ export function projectMessages(messages: readonly unknown[]): DesktopMessage[] 
 	return projectVisibleMessages(messages.slice(-HISTORY_LIMIT), TEXT_LIMIT);
 }
 
-/** On-demand projection for the explicit history view: no message-count cap. */
+/**
+ * On-demand projection for the explicit history view: no message-count cap.
+ * `offset` is applied to the full projection so every page is addressable.
+ */
 export function projectHistoryPage(
 	messages: readonly unknown[],
+	offset: number,
 	limit: number,
-): { total: number; page: DesktopMessage[] } {
+): { total: number; page: DesktopMessage[]; truncated: boolean } {
 	const all = projectVisibleMessages(messages, FULL_TEXT_LIMIT);
-	return { total: all.length, page: all.slice(0, limit) };
+	const page: DesktopMessage[] = [];
+	// Bound the response by characters as well as message count so one huge page
+	// cannot exceed the frame budget.
+	let budget = HISTORY_PAGE_BYTES;
+	for (const message of all.slice(offset, offset + limit)) {
+		if (page.length > 0 && message.text.length > budget) {
+			return { total: all.length, page, truncated: true };
+		}
+		budget -= message.text.length;
+		page.push(message);
+	}
+	return { total: all.length, page, truncated: offset + page.length < all.length };
 }
 
 interface SavedSession {
@@ -232,6 +264,10 @@ interface Catalog {
 	projects: DesktopProject[];
 	sessions: SavedSession[];
 }
+interface TrackedQueuedInput {
+	dto: DesktopQueuedInput;
+	submission: QueuedInputSubmission;
+}
 interface LiveSession {
 	sdk: AgentSession;
 	metadata: SavedSession;
@@ -242,6 +278,8 @@ interface LiveSession {
 	settings: Settings;
 	notices: DesktopMessage[];
 	streamingMessage?: unknown;
+	/** Explicitly queued steering/follow-up submissions, in admission order. */
+	queued: Map<string, TrackedQueuedInput>;
 }
 interface PendingQuestion {
 	question: DesktopQuestion;
@@ -437,6 +475,7 @@ export class DesktopHost {
 				: [],
 			...(live && live.sdk.messages.length + live.notices.length > HISTORY_LIMIT ? { historyTruncated: true } : {}),
 			...(question ? { question } : {}),
+			...(live && live.queued.size > 0 ? { queued: [...live.queued.values()].map(item => ({ ...item.dto })) } : {}),
 			...(live?.error ? { error: live.error } : {}),
 		};
 	}
@@ -476,6 +515,7 @@ export class DesktopHost {
 	#publish(live: LiveSession): void {
 		if (live.timer) clearTimeout(live.timer);
 		live.timer = undefined;
+		if (!this.#live.has(live.metadata.id)) return;
 		this.#emit({ type: "session", session: this.#dto(live.metadata) });
 	}
 	#schedule(live: LiveSession): void {
@@ -541,6 +581,7 @@ export class DesktopHost {
 				busy: false,
 				unsubscribe: () => {},
 				notices: [],
+				queued: new Map(),
 			};
 			this.#live.set(metadata.id, live);
 			result.setToolUIContext(this.#ui(live), true);
@@ -838,15 +879,13 @@ export class DesktopHost {
 				throw new Error("Invalid history offset");
 			if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > HISTORY_PAGE_LIMIT)
 				throw new Error("Invalid history limit");
-			const { total, page } = projectHistoryPage(live.sdk.messages, limit);
+			const { total, page, truncated } = projectHistoryPage(live.sdk.messages, offset, limit);
 			return {
 				sessionId: live.metadata.id,
 				total,
 				offset,
-				messages: page
-					.slice(offset, offset + limit)
-					.map(message => ({ ...message, text: this.#redact(message.text) })),
-				truncated: offset + limit < total,
+				messages: page.map(message => ({ ...message, text: this.#redact(message.text) })),
+				truncated,
 			} satisfies DesktopHistory;
 		}
 		const sessionMethods = [
@@ -865,6 +904,7 @@ export class DesktopHost {
 			"tools.list",
 			"tools.set",
 			"goal.operate",
+			"queue.cancel",
 		];
 		if (!sessionMethods.includes(method)) throw new Error("Unknown method");
 		const metadata = this.#metadata(params);
@@ -888,6 +928,36 @@ export class DesktopHost {
 				// TUI parity: an active run accepts steering or a follow-up instead of rejecting input.
 				const deliverAs = params.deliverAs === "followUp" ? "followUp" : "steer";
 				const submission = await live.sdk.submitUserMessage(text, { deliverAs, trackSubmission: true });
+				const dto: DesktopQueuedInput = {
+					id: submission.submissionId,
+					text: this.#redact(text).slice(0, TEXT_LIMIT),
+					deliverAs,
+					cancelable: true,
+				};
+				live.queued.set(dto.id, { dto, submission });
+				const settle = (execution?: DesktopQueuedInput["execution"]) => {
+					const tracked = live.queued.get(dto.id);
+					if (!tracked) return;
+					if (execution) tracked.dto.execution = execution;
+					// A resolved execution means the SDK already owns the input.
+					tracked.dto.cancelable = false;
+					this.#publish(live);
+				};
+				void submission.execution.then(
+					outcome => settle(outcome.disposition),
+					() => settle("removed"),
+				);
+				void submission.terminal.then(
+					outcome => {
+						live.queued.delete(dto.id);
+						void outcome;
+						this.#publish(live);
+					},
+					() => {
+						live.queued.delete(dto.id);
+						this.#publish(live);
+					},
+				);
 				this.#publish(live);
 				return { queued: true, submissionId: submission.submissionId };
 			}
@@ -895,6 +965,15 @@ export class DesktopHost {
 				await live.sdk.prompt(text);
 				return null;
 			});
+		}
+		if (method === "queue.cancel") {
+			const id = requiredString(params, "queueId", 200);
+			const tracked = live.queued.get(id);
+			if (!tracked) throw new Error("Queued input not found");
+			const removed = tracked.submission.cancel();
+			if (removed) live.queued.delete(id);
+			this.#publish(live);
+			return { removed };
 		}
 		return this.#exclusive(live, async () => {
 			switch (method) {
@@ -912,6 +991,7 @@ export class DesktopHost {
 					return null;
 				case "session.delete": {
 					this.#cancelQuestions(metadata.id);
+					live.queued.clear();
 					live.unsubscribe();
 					if (live.timer) clearTimeout(live.timer);
 					await live.sdk.dispose();
@@ -1000,6 +1080,18 @@ export class DesktopHost {
 			}
 		});
 	}
+	/** Mirror the session's own title into the desktop catalog after a command changed it. */
+	async #syncTitle(live: LiveSession): Promise<void> {
+		const title = live.sdk.sessionManager.getSessionName?.();
+		if (!title || title === live.metadata.title) {
+			this.#publishSnapshot();
+			return;
+		}
+		live.metadata.title = title.slice(0, 200);
+		await this.#save().catch(() => {});
+		this.#publishSnapshot();
+		this.#publish(live);
+	}
 	/**
 	 * Run one builtin slash command through the public SDK dispatcher so the app
 	 * executes exactly the same handlers as text/ACP mode. Commands that only
@@ -1009,11 +1101,14 @@ export class DesktopHost {
 		const live = await this.#open(metadata);
 		const chunks: string[] = [];
 		let written = 0;
+		let dropped = false;
 		const append = (value: string) => {
 			if (written >= COMMAND_OUTPUT_LIMIT) return;
-			const bounded = this.#redact(value).slice(0, COMMAND_OUTPUT_LIMIT - written);
+			const redacted = this.#redact(value);
+			const bounded = redacted.slice(0, COMMAND_OUTPUT_LIMIT - written);
 			chunks.push(bounded);
 			written += bounded.length;
+			if (bounded.length < redacted.length) dropped = true;
 		};
 		const runtime: SlashCommandRuntime = {
 			session: live.sdk,
@@ -1022,10 +1117,14 @@ export class DesktopHost {
 			cwd: live.sdk.sessionManager.getCwd(),
 			output: value => append(String(value)),
 			refreshCommands: () => this.#publishSnapshot(),
-			reloadPlugins: () => {
-				throw new Error("Plugin reload is not available through the desktop host yet");
+			reloadPlugins: async () => {
+				// Mirror the TUI runtime so /move leaves the session in a consistent state.
+				const projectPath = await resolveActiveProjectRegistryPath(live.sdk.sessionManager.getCwd());
+				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+				await live.sdk.reloadSkills();
+				this.#publishSnapshot();
 			},
-			notifyTitleChanged: () => this.#publishSnapshot(),
+			notifyTitleChanged: () => this.#syncTitle(live),
 			notifyConfigChanged: () => this.#publishSnapshot(),
 		};
 		try {
@@ -1033,8 +1132,15 @@ export class DesktopHost {
 			let forwarded: string | undefined;
 			let consumed = false;
 			if (result === false) {
-				// Unknown builtin: the host forwards the text as a prompt, like ACP mode.
-				forwarded = text;
+				if (text.trimStart().startsWith("/")) {
+					// A slash-prefixed name no builtin can drive is a TUI-only or unknown
+					// command; refuse instead of silently sending it to the model.
+					append("이 명령은 데스크톱 앱에서 사용할 수 없습니다. 일반 메시지는 슬래시 없이 보내세요.");
+					consumed = true;
+				} else {
+					// Plain text: forward as a prompt, matching ACP mode.
+					forwarded = text;
+				}
 			} else if ("prompt" in result) {
 				forwarded = result.prompt;
 				consumed = true;
@@ -1049,13 +1155,11 @@ export class DesktopHost {
 				consumed,
 				output: chunks.join("\n").trim(),
 				...(forwarded !== undefined ? { prompt: forwarded } : {}),
-				...(written >= COMMAND_OUTPUT_LIMIT ? { outputTruncated: true } : {}),
+				...(dropped ? { outputTruncated: true } : {}),
 			};
 		} finally {
 			await this.#flushSession(live).catch(() => {});
-			await this.#save().catch(() => {});
-			this.#publishSnapshot();
-			this.#publish(live);
+			await this.#syncTitle(live).catch(() => {});
 		}
 	}
 	async #diff(projectId: string): Promise<DesktopDiff[]> {
