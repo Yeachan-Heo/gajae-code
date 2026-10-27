@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ResolvedTmuxBinary } from "./psmux-detect";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 
@@ -312,4 +314,27 @@ export function normalizeTmuxCreatedAt(raw: string): string {
 	const seconds = Number.parseInt(raw, 10);
 	if (!Number.isFinite(seconds) || seconds <= 0) return raw;
 	return new Date(seconds * 1000).toISOString();
+}
+
+/**
+ * A derived managed state file with every existing ancestor resolved, so a workspace
+ * reached through a symlink (or a symlinked `.gjc`) has one canonical spelling that
+ * lifecycle preparation, verification, supervision and admission all share. Missing
+ * components are appended verbatim. An unresolvable path is returned unchanged and
+ * fails closed in the no-follow verification of managed storage.
+ */
+export function canonicalManagedStateFile(file: string): string {
+	const missing: string[] = [];
+	let existing = path.resolve(file);
+	for (;;) {
+		try {
+			return path.join(fs.realpathSync.native(existing), ...missing);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return file;
+			const parent = path.dirname(existing);
+			if (parent === existing) return file;
+			missing.unshift(path.basename(existing));
+			existing = parent;
+		}
+	}
 }

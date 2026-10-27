@@ -1280,9 +1280,17 @@ orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
 
-Managed tmux startup on macOS and Linux publishes a private (`0600` file in a
-`0700` lifecycle root) child binding before the supervised child starts, for
-every launch. A Broker-redacted launch publishes an opaque binding that carries
+Supervised managed tmux launches (Broker-spawned sessions on macOS and Linux,
+and interactive root `gjc --tmux` launches on Linux) publish a private (`0600`
+file in a `0700` lifecycle root) child binding before the supervised child
+starts. Launches that do not run the supervisor, such as `gjc session create`
+without a launch specification or an ordinary macOS `gjc --tmux`, start `gjc`
+directly and receive neither a binding nor exact CLI admission. The derived
+state path of a supervised launch names its workspace canonically (every
+existing ancestor resolved), so a workspace or `.gjc` reached through a symlink
+passes the no-follow verification of the private lifecycle root, which still
+rejects any link inside managed storage; an operator-pinned
+`GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim. A Broker-redacted launch publishes an opaque binding that carries
 neither the launch command nor a command digest; an ordinary launch publishes a
 recoverable binding with its exact command and digest. The CLI validates its
 exact session, generation, run, incarnation and child token through
@@ -1312,6 +1320,8 @@ retained private authority (always the case off Linux) it writes the bounded
 `managed_owner_admission_blocked: handoff_not_persisted` diagnostic.
 
 Source installations must rebuild the native addon (`bun run build:native`)
-when updating this admission boundary; compiled installations need a matching
+when updating this admission boundary; the native loader rejects any candidate
+addon, including a retained same-version variant, that lacks `readOwnerOnlyFile`
+and moves on to the next compatible one; compiled installations need a matching
 CLI/native build. Editing source or replacing files does not update a running
 Broker.

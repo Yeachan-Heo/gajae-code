@@ -39,6 +39,7 @@ import {
 	buildGjcTmuxSessionSlug,
 	buildGjcTmuxUntaggedSessionError,
 	buildTmuxProviderCommand,
+	canonicalManagedStateFile,
 	GJC_TMUX_BRANCH_OPTION,
 	GJC_TMUX_BRANCH_SLUG_OPTION,
 	GJC_TMUX_COMMAND_ENV,
@@ -781,9 +782,16 @@ export function createGjcTmuxSession(
 	const sessionName = buildGjcTmuxSessionName(launchEnvironment);
 	const sessionId = launch?.childSessionId ?? (identityEnv[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || sessionName);
 	const filteredGjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
+	const derivedStateFile = tmuxRuntimeSessionPath(
+		cwd,
+		launch?.childSessionId ?? filteredGjcSessionId,
+		buildGjcTmuxSessionSlug(sessionName),
+	);
 	const stateFile =
 		(!launch ? identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() : undefined) ||
-		tmuxRuntimeSessionPath(cwd, launch?.childSessionId ?? filteredGjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+		// A managed launch verifies its lifecycle root with no-follow walks, so a
+		// workspace reached through a symlink must be named by its canonical path.
+		(launch && platform !== "win32" ? canonicalManagedStateFile(derivedStateFile) : derivedStateFile);
 	const stateDir = (platform === "win32" ? path.win32 : path).dirname(stateFile);
 	const generation = crypto.randomUUID();
 	if (launch) {
