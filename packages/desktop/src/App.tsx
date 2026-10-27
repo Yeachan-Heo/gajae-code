@@ -293,24 +293,27 @@ export default function App() {
 		const generation = dialogGeneration.current;
 		setNotice("");
 		void run(`command:${sessionId}`, async () => {
+			// A forwarded prompt streams into the conversation; the modal would hide it
+			// and make a mid-run question unanswerable, so close before dispatch.
+			if (!text.trimStart().startsWith("/")) closeDialog();
 			const result = await request<DesktopCommandResult>("command.run", { sessionId, text });
 			if (dialogGeneration.current !== generation) return;
 			setCommandOutput(
 				[
 					result.output,
-					result.prompt
-						? `모델로 전달한 입력: ${result.prompt}`
-						: result.consumed
-							? "명령을 실행했습니다."
-							: "내장 명령이 아니므로 모델에 메시지로 전달했습니다.",
-					result.outputTruncated ? "출력이 길어 일부만 표시했습니다." : "",
+					result.refused
+						? "실행하지 않았습니다."
+						: result.prompt
+							? `모델로 전달한 입력: ${result.prompt}`
+							: result.consumed
+								? result.outputTruncated
+									? "명령을 실행했습니다. 출력이 길어 일부만 표시했습니다."
+									: "명령을 실행했습니다."
+								: "내장 명령이 아니므로 모델에 메시지로 전달했습니다.",
 				]
 					.filter(Boolean)
 					.join("\n\n"),
 			);
-			// A forwarded prompt streams into the conversation; the modal would hide it
-			// and make a mid-run question unanswerable.
-			if (result.prompt) closeDialog();
 		});
 	};
 	const openHistory = () => {
@@ -872,7 +875,7 @@ export default function App() {
 					{dialog === "commands" && (
 						<>
 							<p className="muted">
-								TUI와 같은 내장 슬래시 명령을 그대로 실행합니다. 내장 명령이 아니면 메시지로 모델에 전달됩니다.
+								TUI와 같은 내장 슬래시 명령을 실행합니다. 실행할 수 없는 명령은 실행하지 않고 이유를 표시합니다.
 							</p>
 							<label htmlFor="command-search">명령 검색</label>
 							<input id="command-search" value={filter} onChange={event => setFilter(event.target.value)} />
@@ -900,6 +903,7 @@ export default function App() {
 									실행
 								</Button>
 							</form>
+							{errors[`command:${dialogOwner}`] && <ErrorBanner>{errors[`command:${dialogOwner}`]}</ErrorBanner>}
 							{commandOutput && <pre className="bounded-output">{commandOutput}</pre>}
 							<div className="command-list">
 								{commands
@@ -949,7 +953,13 @@ export default function App() {
 								))}
 						</>
 					)}
-					{dialog === "history" && history === null && <p>전체 기록 불러오는 중…</p>}
+					{dialog === "history" &&
+						history === null &&
+						(errors[`history:${dialogOwner}`] ? (
+							<ErrorBanner>{errors[`history:${dialogOwner}`]}</ErrorBanner>
+						) : (
+							<p>전체 기록 불러오는 중…</p>
+						))}
 					{dialog === "history" && history !== null && (
 						<>
 							<p className="muted">

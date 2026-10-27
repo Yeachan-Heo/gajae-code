@@ -70,7 +70,7 @@ const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
  * or relocate the transcript behind the catalog's back, leaving it unreopenable.
  * They stay visibly unavailable instead of half-applying.
  */
-const DESKTOP_OWNED_COMMANDS = new Set(["move", "session", "rename", "star", "unstar"]);
+const DESKTOP_OWNED_COMMANDS = new Set(["move", "session", "rename", "star", "unstar", "handoff"]);
 
 export const CAPABILITIES: DesktopCapability[] = [
 	{ id: "sessions", label: "Independent SDK sessions and streaming", available: true },
@@ -200,7 +200,7 @@ export function validateDesktopSetting(path: unknown, value: unknown): SettingPa
  * credentials are never serialized. `limit` bounds per-message text; the caller
  * decides how many messages to keep.
  */
-function projectVisibleMessages(messages: readonly unknown[], limit: number): DesktopMessage[] {
+function projectVisibleMessages(messages: readonly unknown[], limit: number, startIndex = 0): DesktopMessage[] {
 	return messages.flatMap((value, index) => {
 		const message = record(value);
 		if (!message || !["user", "assistant", "toolResult"].includes(String(message.role))) return [];
@@ -218,7 +218,7 @@ function projectVisibleMessages(messages: readonly unknown[], limit: number): De
 					: "";
 		return [
 			{
-				id: `${index}:${String(message.timestamp ?? "")}`,
+				id: `${startIndex + index}:${String(message.timestamp ?? "")}`,
 				role,
 				text: text.slice(-limit),
 				...(text.length > limit ? { truncated: true } : {}),
@@ -227,6 +227,19 @@ function projectVisibleMessages(messages: readonly unknown[], limit: number): De
 			},
 		];
 	});
+}
+
+/** How many messages the transcript view would show, without projecting text. */
+function countVisibleMessages(messages: readonly unknown[]): number {
+	let count = 0;
+	for (const message of messages) {
+		const role =
+			message && typeof message === "object" && typeof (message as { role?: unknown }).role === "string"
+				? (message as { role: string }).role
+				: "";
+		if (role === "user" || role === "assistant" || role === "toolResult") count += 1;
+	}
+	return count;
 }
 
 /** Bounded snapshot projection used for every session in the snapshot frame. */
@@ -243,19 +256,21 @@ export function projectHistoryPage(
 	offset: number,
 	limit: number,
 ): { total: number; page: DesktopMessage[]; truncated: boolean } {
-	const all = projectVisibleMessages(messages, FULL_TEXT_LIMIT);
+	// Slice before projecting: projecting every message would allocate the whole
+	// transcript (32k chars each) just to discard all but one page.
 	const page: DesktopMessage[] = [];
 	// Bound the response by characters as well as message count so one huge page
 	// cannot exceed the frame budget.
 	let budget = HISTORY_PAGE_BYTES;
-	for (const message of all.slice(offset, offset + limit)) {
+	for (const message of projectVisibleMessages(messages.slice(offset, offset + limit), FULL_TEXT_LIMIT, offset)) {
 		if (page.length > 0 && message.text.length > budget) {
-			return { total: all.length, page, truncated: true };
+			return { total: countVisibleMessages(messages), page, truncated: true };
 		}
 		budget -= message.text.length;
 		page.push(message);
 	}
-	return { total: all.length, page, truncated: offset + page.length < all.length };
+	const total = countVisibleMessages(messages);
+	return { total, page, truncated: offset + page.length < total };
 }
 
 interface SavedSession {
@@ -741,7 +756,7 @@ export class DesktopHost {
 		};
 	}
 	async #exclusive<T>(live: LiveSession, operation: () => Promise<T>): Promise<T> {
-		if (live.busy || live.sdk.isStreaming) throw new Error("Session busy");
+		if (live.busy || live.sdk.isStreaming) throw new Error("다른 작업이 실행 중입니다. 끝난 뒤 다시 시도하세요.");
 		live.busy = true;
 		live.error = undefined;
 		this.#publish(live);
@@ -874,7 +889,7 @@ export class DesktopHost {
 			return null;
 		}
 		if (method === "command.list")
-			return ACP_BUILTIN_SLASH_COMMANDS.map(
+			return ACP_BUILTIN_SLASH_COMMANDS.filter(command => !DESKTOP_OWNED_COMMANDS.has(command.name)).map(
 				command =>
 					({
 						name: command.name,
@@ -984,7 +999,9 @@ export class DesktopHost {
 			const tracked = live.queued.get(id);
 			if (!tracked) throw new Error("Queued input not found");
 			const removed = tracked.submission.cancel();
-			if (removed) live.queued.delete(id);
+			// Either way this queue id is settled: keeping it would leave a cancelable
+			// chip whose delivery already happened.
+			live.queued.delete(id);
 			this.#publish(live);
 			return { removed };
 		}
@@ -1113,12 +1130,16 @@ export class DesktopHost {
 	async #command(metadata: SavedSession, text: string): Promise<DesktopCommandResult> {
 		const live = await this.#open(metadata);
 		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
-		if (live.busy || live.sdk.isStreaming)
-			throw new Error("실행 중에는 슬래시 명령을 실행할 수 없습니다. 끝난 뒤 다시 시도하세요.");
 		if (DESKTOP_OWNED_COMMANDS.has(name))
-			throw new Error(
-				`/${name}은(는) 데스크톱 앱이 세션을 직접 관리하므로 사용할 수 없습니다. 앱의 대화 메뉴를 사용하세요.`,
-			);
+			return {
+				consumed: false,
+				refused: true,
+				output: `/${name}은(는) 데스크톱 앱이 세션을 직접 관리하므로 사용할 수 없습니다. 앱의 대화 메뉴를 사용하세요.`,
+			};
+		// Commands mutate the same session as prompts, so they take the same lock.
+		return this.#exclusive(live, () => this.#runCommand(live, text));
+	}
+	async #runCommand(live: LiveSession, text: string): Promise<DesktopCommandResult> {
 		const chunks: string[] = [];
 		let written = 0;
 		let dropped = false;
@@ -1155,8 +1176,11 @@ export class DesktopHost {
 				if (text.trimStart().startsWith("/")) {
 					// A slash-prefixed name no builtin can drive is a TUI-only or unknown
 					// command; refuse instead of silently sending it to the model.
-					append("이 명령은 데스크톱 앱에서 사용할 수 없습니다. 일반 메시지는 슬래시 없이 보내세요.");
-					consumed = true;
+					return {
+						consumed: false,
+						refused: true,
+						output: "이 명령은 데스크톱 앱에서 사용할 수 없습니다. 일반 메시지는 슬래시 없이 보내세요.",
+					};
 				} else {
 					// Plain text: forward as a prompt, matching ACP mode.
 					forwarded = text;
@@ -1167,10 +1191,8 @@ export class DesktopHost {
 			} else {
 				consumed = true;
 			}
-			if (forwarded !== undefined) {
-				if (live.sdk.isStreaming) throw new Error("Session busy");
-				await live.sdk.prompt(forwarded);
-			}
+			await this.#syncTitle(live);
+			if (forwarded !== undefined) await live.sdk.prompt(forwarded);
 			return {
 				consumed,
 				output: chunks.join("\n").trim(),
@@ -1178,14 +1200,9 @@ export class DesktopHost {
 				...(dropped ? { outputTruncated: true } : {}),
 			};
 		} finally {
-			try {
-				this.#rememberCredentials();
-				await this.#flushSession(live);
-				await this.#syncTitle(live);
-			} catch (error) {
-				live.error = this.#error(error);
-				this.#publish(live);
-			}
+			// A command may have stored credentials; keep redaction current even when
+			// the command itself failed.
+			this.#rememberCredentials();
 		}
 	}
 	async #diff(projectId: string): Promise<DesktopDiff[]> {

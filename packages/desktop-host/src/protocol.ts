@@ -125,8 +125,10 @@ export interface DesktopCommand {
 	hint?: string;
 }
 export interface DesktopCommandResult {
-	/** True when the builtin handled the text; false means the host forwarded it as a prompt. */
+	/** True when the builtin handled the text; false means nothing was executed. */
 	consumed: boolean;
+	/** The host declined to run this text; `output` explains why and nothing happened. */
+	refused?: boolean;
 	/** Text the command emitted for the operator. */
 	output: string;
 	/** Residual prompt that the command asked to forward to the model. */

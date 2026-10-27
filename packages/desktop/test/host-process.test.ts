@@ -115,18 +115,24 @@ test("real isolated host creates, persists and resumes sessions without provider
 		expect(jobs.output).toContain("No background jobs running");
 		// Session lifecycle is catalog-owned: these commands refuse instead of
 		// half-applying and leaving an unreopenable transcript.
-		await expect(host.request("command.run", { sessionId: session.id, text: "/move /tmp" })).rejects.toThrow(
-			"데스크톱 앱이 세션을 직접 관리",
-		);
-		await expect(host.request("command.run", { sessionId: session.id, text: "/session delete" })).rejects.toThrow(
-			"데스크톱 앱이 세션을 직접 관리",
-		);
+		for (const text of ["/move /tmp", "/session delete", "/handoff"]) {
+			const refused = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text });
+			expect(refused.refused).toBe(true);
+			expect(refused.consumed).toBe(false);
+			expect(refused.output).toContain("데스크톱 앱이 세션을 직접 관리");
+		}
+		// The palette can only offer commands the host will actually run.
+		const catalog = await host.request<{ name: string }[]>("command.list");
+		for (const name of ["move", "session", "handoff", "rename"]) {
+			expect(catalog.some(command => command.name === name)).toBe(false);
+		}
 		// Unknown slash text is refused, never sent to a provider as a prompt.
 		const unknown = await host.request<DesktopCommandResult>("command.run", {
 			sessionId: session.id,
 			text: "/not-a-real-command",
 		});
-		expect(unknown.consumed).toBe(true);
+		expect(unknown.consumed).toBe(false);
+		expect(unknown.refused).toBe(true);
 		expect(unknown.prompt).toBeUndefined();
 		expect(unknown.output).toContain("사용할 수 없습니다");
 		// Queue cancellation is only valid for an input this session still owns.
