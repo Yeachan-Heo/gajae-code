@@ -8,13 +8,14 @@ import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxProfileCommands,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
-import { replaceOwnerGeneration } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import { lifecyclePaths, replaceOwnerGeneration } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
 	forceCloseGjcTmuxSession,
 	listGjcTmuxSessions,
 	readTmuxSessionTagsForGc,
 	statusGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
+import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
 
 const tmux = Bun.which("tmux");
 const systemdRun = Bun.which("systemd-run");
@@ -151,6 +152,8 @@ try {
 			GJC_MANAGED_OWNER_INCARNATION: incarnation,
 		};
 		isolatedServers.push({ env, stateDir, scopeName });
+		// The launcher prepares the owner-only lifecycle root before the supervisor runs.
+		prepareManagedDirectoryRoot(lifecyclePaths(stateDir, sessionId, generation).root);
 		const created = Bun.spawnSync(
 			[
 				systemdRun!,
