@@ -2447,10 +2447,9 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		const textBlock = params.prompt.length === 1 && params.prompt[0]?.type === "text" ? params.prompt[0] : undefined;
-		const needsInlineSkillDiscovery =
-			textBlock !== undefined &&
-			!textBlock.text.trimStart().startsWith("/") &&
-			/(^|\s)\/skill:[^\s]+/i.test(textBlock.text);
+		// Inline skill discovery is delegated to the session layer, which respects enableSkillCommands
+		// (review P2: implicit ACP conversion must honor the host's settings, not bypass them via direct SDK invocation).
+		const needsInlineSkillDiscovery = false;
 		const discoveryAdapter = record.adapter;
 		let inlineSkillCommands: Map<string, { name: string }> | undefined;
 		let admissionReservation: PromptAdmissionReservation | undefined;
@@ -2468,6 +2467,10 @@ export class AcpAgent implements Agent {
 			admissionReservation = { wake, woken };
 			record.pendingPromptAdmission = admissionReservation;
 		} else if (needsInlineSkillDiscovery) {
+			// The first turn while the authorized retry is still pending must not be stolen by
+			// a competing prompt's discovery (review P1, issue #5574).
+			if (record.pendingFirstPromptRetry && record.pendingFirstPromptRetry !== retryReservation)
+				throw new AcpSdkAdapterError("conflict", "ACP session is retrying its first prompt.");
 			const { promise: woken, resolve: wake } = Promise.withResolvers<void>();
 			admissionReservation = { localCommand: true, wake, woken };
 			record.pendingPromptAdmission = admissionReservation;
