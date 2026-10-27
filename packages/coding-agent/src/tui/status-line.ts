@@ -42,7 +42,10 @@ export function sanitizeStatusLineText(text: string): string {
 		.replace(/\x1b\[[0-?]*[ -/]*[@-ln-~]/gu, "")
 		.replace(/\u009b[0-?]*[ -/]*[@-ln-~]/gu, "")
 		.replace(/[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]/gu, "")
-		.replace(/\x1b(?!\[[\d;:]*m|\]8;[^\x1b\x07;]*;file:\/\/[^\x1b\x07\s]*(?:\x1b\\|\x07)|\]8;;(?:\x1b\\|\x07)|\\)/gu, "")
+		.replace(
+			/\x1b(?!\[[\d;:]*m|\]8;[^\x1b\x07;]*;file:\/\/[^\x1b\x07\s]*(?:\x1b\\|\x07)|\]8;;(?:\x1b\\|\x07)|\\)/gu,
+			"",
+		)
 		.replace(/[\x80-\x9f]/gu, "");
 }
 
