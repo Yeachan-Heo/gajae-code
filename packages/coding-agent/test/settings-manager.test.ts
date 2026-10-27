@@ -84,6 +84,41 @@ describe("Settings", () => {
 		}
 	});
 
+	for (const durable of [false, true]) {
+		it(`rejects unsafe atomic model role paths without partial writes (${durable ? "disk" : "memory"})`, async () => {
+			const settings = durable ? await Settings.loadForScope({ cwd: projectDir, agentDir }) : Settings.isolated();
+			const marker = "gjcAtomicRoleProbe";
+			const original = Object.getOwnPropertyDescriptor(Object.prototype, marker);
+			try {
+				await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+				const file = settings.getGlobalConfigPath();
+				const before = file ? await Bun.file(file).text() : undefined;
+				for (const segment of ["__proto__", "constructor", "prototype"]) {
+					const unsafe = `modelRoles.${segment}.${marker}` as const;
+					for (const op of ["set", "unset"] as const) {
+						const patch = op === "set" ? { path: unsafe, op, value: true } : { path: unsafe, op };
+						await expect(
+							settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.8 }, patch]),
+						).rejects.toThrow("Unknown setting path");
+						expect(settings.getGlobal("temperature")).toBe(0.2);
+						if (file && before !== undefined) expect(await Bun.file(file).text()).toBe(before);
+						expect(Object.getOwnPropertyDescriptor(Object.prototype, marker)).toEqual(original);
+					}
+				}
+				const receipt = await settings.commitAtomicBatch([
+					{ path: "modelRoles.customRole", op: "set", value: "openai/example" },
+				]);
+				expect(settings.getGlobal("modelRoles")?.customRole).toBe("openai/example");
+				expect((await receipt.restore()).status).toBe("restored");
+				expect(settings.getGlobal("modelRoles")?.customRole).toBeUndefined();
+			} finally {
+				if (original) Object.defineProperty(Object.prototype, marker, original);
+				else delete (Object.prototype as Record<string, unknown>)[marker];
+				await settings.close();
+			}
+		});
+	}
+
 	it("does not log setting override values when initialization options differ", async () => {
 		const initialSecret = "initial-settings-secret";
 		const requestedSecret = "requested-settings-secret";
