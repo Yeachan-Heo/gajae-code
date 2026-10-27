@@ -119,10 +119,13 @@ function providerIdentity(
 	return JSON.stringify([provider.kind, provider.command, provider.namespace, provider.executableIdentity]);
 }
 
-function managedOwnerSupervisorArgv(): string[] {
+function managedOwnerSupervisorArgv(platform: NodeJS.Platform): string[] {
 	const entry = process.argv[1];
 	if (!entry || !/\.(?:[cm]?[jt]s)$/.test(entry) || /\.test\.[^.]+$/.test(entry)) return [process.execPath];
-	return [process.execPath, entry];
+	// The macOS pane process must stay the pinned supervisor PID. Bun's cwd `.env`
+	// autoload could reintroduce the malloc variables the pane scrubs and make the
+	// CLI malloc guard re-exec below the pane PID; a compiled binary never loads it.
+	return platform === "darwin" ? [process.execPath, "--no-env-file", entry] : [process.execPath, entry];
 }
 
 function validManagedLaunchSpec(spec: ManagedTmuxLaunchSpec, platform: NodeJS.Platform): boolean {
@@ -871,12 +874,14 @@ export function createGjcTmuxSession(
 	const command =
 		platform === "win32"
 			? buildWindowsPowerShellInnerCommand({
-					command: launch ? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(), launch.argv) : ["gjc"],
+					command: launch
+						? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(platform), launch.argv)
+						: ["gjc"],
 					environment: childEnvironment,
 				})
 			: (() => {
 					const invocation = launch
-						? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(), launch.argv)
+						? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(platform), launch.argv)
 						: ["gjc"];
 					// The pane process must stay the exact supervisor; never let the CLI malloc
 					// guard re-exec it below the pane PID.

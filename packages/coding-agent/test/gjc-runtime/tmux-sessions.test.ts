@@ -1072,6 +1072,114 @@ describe("GJC tmux session management", () => {
 		expect(fsSync.readdirSync(root)).toEqual([]);
 	});
 
+	it.skipIf(process.platform === "win32")(
+		"runs the Broker managed pane supervisor from source without loading the pane cwd .env on darwin",
+		async () => {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-dotenv-"));
+			const sessionName = "broker-child";
+			const stateFile = tmuxRuntimeSessionPath(cwd, sessionName, buildGjcTmuxSessionSlug(sessionName));
+			const entry = path.join(cwd, "gjc-entry.ts");
+			const observedFile = path.join(cwd, "supervisor-observed.json");
+			// Stands in for the source CLI entry: it records what the pane supervisor saw.
+			await fs.writeFile(
+				entry,
+				`require("node:fs").writeFileSync(${JSON.stringify(observedFile)}, JSON.stringify({ pid: process.pid, malloc: process.env.MallocStackLogging ?? null, noCompact: process.env.MallocStackLoggingNoCompact ?? null, supervisor: process.argv.includes("--internal-managed-owner-supervisor") }));`,
+				{ mode: 0o600 },
+			);
+			await fs.writeFile(path.join(cwd, ".env"), "MallocStackLogging=1\nMallocStackLoggingNoCompact=1\n", {
+				mode: 0o600,
+			});
+			let generation = "";
+			let executedArgv: string[] = [];
+			__setMutationServerProofForTests(() => ({ pid: 1, startTime: "test" }));
+			__setCreateOwnerIsolationForTests({
+				execute: plan => {
+					if (plan.ok) executedArgv = [...plan.execution.argv];
+					return {
+						ok: true,
+						code: "executed",
+						execution: plan.ok ? plan.execution : (undefined as never),
+						server: { state: "safe", pid: 1, startTime: "test", cgroup: { classification: "safe" } },
+						server_key: "tmux",
+						server_pid: 1,
+						server_start_time: "test",
+						server_session: sessionName,
+						native_session_id: "$1",
+					};
+				},
+			});
+			(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation((rawCommand: unknown) => {
+				const command = normalizeSpawnSyncCommand(rawCommand);
+				if (command.includes("if-shell")) {
+					generation = command.join(" ").match(/@gjc-owner-generation" "([^"]+)"/)?.[1] ?? generation;
+					return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+				}
+				if (command.includes("list-sessions"))
+					return spawnResult(
+						0,
+						`${[sessionName, "1", "0", "1770000000", "1", "root", "1", "101,102", "", "", "", sessionName, stateFile, generation, "", "", "$1"].join("\t")}\n`,
+					);
+				if (command.includes("display-message")) {
+					if (command.includes("#{session_id}\t#{session_name}")) return spawnResult(0, `$1\t${sessionName}\n`);
+					return spawnResult(0, command.includes("#{session_name}") ? `${sessionName}\n` : "$1\n");
+				}
+				if (command.includes("show-options")) {
+					const values: Record<string, string> = {
+						"@gjc-profile": "1",
+						"@gjc-session-id": sessionName,
+						"@gjc-session-state-file": stateFile,
+						"@gjc-owner-generation": generation,
+						"@gjc-owner-server-key": "tmux",
+					};
+					return spawnResult(0, `${values[command.at(-1) ?? ""] ?? ""}\n`);
+				}
+				return spawnResult(0, "");
+			});
+			// The managed supervisor argv names the current source entry, as `bun src/cli.ts` does.
+			const originalEntry = process.argv[1];
+			process.argv[1] = entry;
+			try {
+				expect(() =>
+					createManagedGjcTmuxSession(
+						{ childSessionId: sessionName, cwd, argv: ["child-command"] },
+						{ GJC_TMUX_COMMAND: "tmux" },
+						{ platform: "darwin" },
+					),
+				).toThrow("gjc_tmux_managed_launch_proof_unavailable");
+			} finally {
+				process.argv[1] = originalEntry;
+			}
+			const paneCommand = executedArgv.at(-1);
+			if (!paneCommand) throw new Error("managed create did not build a pane command");
+			expect(paneCommand).toContain(
+				`'${process.execPath}' '--no-env-file' '${entry}' '--internal-managed-owner-supervisor' '--' 'child-command'`,
+			);
+			// tmux runs the pane command through `sh -c` in the pane cwd; `exec` keeps its PID.
+			const childEnv: Record<string, string | undefined> = { ...process.env };
+			delete childEnv.GJC_MALLOC_ENV_REEXEC;
+			delete childEnv.MallocStackLogging;
+			delete childEnv.MallocStackLoggingNoCompact;
+			const owner = Bun.spawn(["/bin/sh", "-c", paneCommand], {
+				cwd,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+				env: childEnv,
+			});
+			try {
+				expect(await owner.exited).toBe(0);
+				expect(JSON.parse(await fs.readFile(observedFile, "utf8"))).toEqual({
+					pid: owner.pid,
+					malloc: null,
+					noCompact: null,
+					supervisor: true,
+				});
+			} finally {
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("cleans the exact created session when managed proof rejects multiple pane PIDs", () => {
 		const cwd = path.join(os.tmpdir(), `gjc-managed-proof-cleanup-${crypto.randomUUID()}`);
 		const sessionName = "broker-child";
