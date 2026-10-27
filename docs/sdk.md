@@ -1351,30 +1351,43 @@ supervisor also takes. The binding is found through the generation's own
 supervisor index (`supervisor-<generation>.json`, published by that supervisor
 after its binding), never by scanning the lifecycle root, so history that a
 reused pinned session leaves from earlier generations never limits a close. A close that arrives before the supervisor
-has published its binding, or while that binding's `created_at` is still in the
-future, waits inside the same close deadline only while that exact supervisor
-stays live; an untrusted, ambiguous, or still-unavailable binding fails closed.
+has published its binding waits inside the same close deadline only while that
+exact supervisor stays live; an untrusted, ambiguous, or still-unavailable
+binding fails closed. A binding's `created_at` is never compared with the
+current wall clock, so a backward clock step does not block a close, and the
+close deadline itself runs on monotonic time.
 The supervisor polls for that intent,
 validates it against its own binding, generation and server key, and relays in
 two durable phases under that lock: it publishes a pending record for that
-exact intent (`relay-<generation>.pending.json`), rechecks the intent's
-deadline, relays SIGTERM exactly once through its original child spawn handle,
-and only after the signal was actually sent renames the pending record to the
-confirmed relay record (`relay-<generation>.json`). A declined, expired or
-unverifiable attempt renames it to an `.unsent` name instead. A
+exact intent (`relay-<generation>.pending.json`), samples the relay instant,
+rechecks the intent's deadline on that instant, relays SIGTERM exactly once
+through its original child spawn handle, and only after the signal was actually
+sent publishes the confirmed relay record (`relay-<generation>.json`, stamped
+with that instant) and removes the pending record. A declined, expired or
+unverifiable attempt renames the pending record to an `.unsent` name instead. A
 close succeeds only when both the pinned supervisor has exited and the terminal
 verdict matching the published intent exists; publication alone, a timeout, an
 exit without a verdict, or a verdict while the supervisor is still alive is not
 success, and guarded session cleanup is skipped. A plain OS SIGTERM to the
-supervisor still stops its child but never claims an operator verdict: for a
-generation with a supervisor index, a terminal is classified as an operator
-shutdown only when the confirmed relay record names the pending intent, so an unrelated
-signal that arrives while an intent is still unconsumed is recorded as owner
-loss, whichever observer (supervisor or child sidecar) publishes first.
+supervisor still stops its child but never claims an operator verdict: on
+Darwin, and on any generation with a supervisor index, a terminal is classified
+as an operator shutdown only when the confirmed relay record names the pending
+intent, the intent was still valid at the relay instant, and the terminal was
+observed at or after that instant. An unrelated signal observed before the
+relay is therefore recorded as owner loss, whichever observer (supervisor or
+child sidecar) publishes first, while a child that handles a timely relay late
+still completes. A child observer that finds the generation lock held while a
+relay is pending or its confirmed record is being flushed waits up to 3 seconds
+for it instead of ending with `owner_verdict_unavailable`. A pinned relaunch is
+refused with `managed_owner_predecessor_live` while the current generation's
+supervisor is still live.
 
 A supervisor that is stopped or stalled past the intent's deadline, before or
-during publication, refuses the expired intent and never relays it. The next
-close, under the same generation lock, retires such an intent (renamed to
+during publication, refuses the expired intent and never relays it. A close
+that times out or sees a mismatched verdict retires its own intent at once,
+under the generation lock, when it has neither a pending or confirmed relay
+record nor a verdict. Otherwise the next close, under the same generation lock,
+retires such an intent once expired (renamed to
 `intent-<generation>.<intent_id>.undelivered`) when it is expired and has
 neither a pending or confirmed relay record nor a verdict, and then publishes a
 fresh intent, so retries are not blocked by `owner_intent_replay`. A delivered
