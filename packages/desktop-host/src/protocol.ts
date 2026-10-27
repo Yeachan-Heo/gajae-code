@@ -24,6 +24,9 @@ export const DESKTOP_METHODS = [
 	"auth.answer",
 	"auth.cancel",
 	"question.answer",
+	"command.list",
+	"command.run",
+	"history.get",
 	"diff.get",
 	"tools.list",
 	"tools.set",
@@ -105,6 +108,28 @@ export interface DesktopDiff {
 	path: string;
 	status: string;
 	patch: string;
+}
+export interface DesktopCommand {
+	name: string;
+	description: string;
+	hint?: string;
+}
+export interface DesktopCommandResult {
+	/** True when the builtin handled the text; false means the host forwarded it as a prompt. */
+	consumed: boolean;
+	/** Text the command emitted for the operator. */
+	output: string;
+	/** Residual prompt that the command asked to forward to the model. */
+	prompt?: string;
+	outputTruncated?: boolean;
+}
+export interface DesktopHistory {
+	sessionId: string;
+	/** Total visible messages, independent of the snapshot projection cap. */
+	total: number;
+	offset: number;
+	messages: DesktopMessage[];
+	truncated: boolean;
 }
 export interface DesktopAuthProvider {
 	id: string;

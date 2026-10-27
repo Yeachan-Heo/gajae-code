@@ -4,10 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type {
 	DesktopAuthProvider,
+	DesktopCommand,
+	DesktopCommandResult,
 	DesktopDiff,
 	DesktopFrame,
+	DesktopHistory,
 	DesktopMethod,
 	DesktopSession,
+	DesktopSetting,
 	DesktopSnapshot,
 } from "../../desktop-host/src/protocol";
 
@@ -93,6 +97,32 @@ test("real isolated host creates, persists and resumes sessions without provider
 		expect(snapshot.projects[0]?.path).toBe(await fs.realpath(project));
 		const session = await host.request<DesktopSession>("session.create", { projectId: snapshot.projects[0]!.id });
 		expect(session.status).toBe("idle");
+		// The app palette is driven by the SDK's own advertised builtin commands.
+		const commands = await host.request<DesktopCommand[]>("command.list");
+		expect(commands.some(command => command.name === "tools")).toBe(true);
+		expect(commands.some(command => command.name === "help")).toBe(false);
+		// A headless builtin runs in-process and never reaches a provider.
+		const tools = await host.request<DesktopCommandResult>("command.run", {
+			sessionId: session.id,
+			text: "/tools",
+		});
+		expect(tools.consumed).toBe(true);
+		expect(tools.output).toContain("read");
+		expect(tools.prompt).toBeUndefined();
+		const history = await host.request<DesktopHistory>("history.get", { sessionId: session.id, limit: 50 });
+		expect(history.sessionId).toBe(session.id);
+		expect(history.total).toBeGreaterThanOrEqual(0);
+		expect(Array.isArray(history.messages)).toBe(true);
+		const settings = await host.request<DesktopSetting[]>("settings.get", { sessionId: session.id });
+		expect(settings.length).toBeGreaterThan(2);
+		expect(settings.some(item => item.path === "compaction.enabled")).toBe(true);
+		expect(settings.every(item => ["boolean", "number", "enum"].includes(item.type))).toBe(true);
+		await expect(
+			host.request("settings.set", { path: "theme.dark", value: "red-claw", sessionId: session.id }),
+		).rejects.toThrow("Setting is not editable from the desktop host");
+		await host.request("settings.set", { path: "retry.maxRetries", value: 2, sessionId: session.id });
+		const updated = await host.request<DesktopSetting[]>("settings.get", { sessionId: session.id });
+		expect(updated.find(item => item.path === "retry.maxRetries")?.value).toBe(2);
 		const diff = await host.request<DesktopDiff[]>("diff.get", { sessionId: session.id });
 		expect(diff.find(file => file.path === "review.txt")?.patch).toContain("+실제 변경 내용");
 		await host.request("session.rename", { sessionId: session.id, title: "한국어 작업" });

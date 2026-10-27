@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { isolateEnvironment } from "../src/environment-policy";
-import { projectMessages, requiredString, validateQuestionAnswer } from "../src/host";
+import {
+	desktopSettings,
+	projectHistoryPage,
+	projectMessages,
+	requiredString,
+	validateDesktopSetting,
+	validateQuestionAnswer,
+} from "../src/host";
 import type { DesktopFrame, DesktopQuestion, DesktopRequest } from "../src/protocol";
 import { MAX_FRAME_BYTES, parseRequest } from "../src/protocol";
 import type { ProtocolHost } from "../src/transport";
@@ -102,6 +110,45 @@ describe("desktop protocol validation", () => {
 		expect(projected).toHaveLength(160);
 		expect(projected.every(message => message.text.length <= 8000)).toBe(true);
 		expect(projected.every(message => message.truncated === true)).toBe(true);
+	});
+	test("the explicit history page keeps every message with a larger per-message bound", () => {
+		const messages = Array.from({ length: 400 }, (_, index) => ({
+			role: "user" as const,
+			content: `${index}:${"y".repeat(40_000)}`,
+		}));
+		expect(projectMessages(messages)).toHaveLength(160);
+		const { total, page } = projectHistoryPage(messages, 500);
+		expect(total).toBe(400);
+		expect(page).toHaveLength(400);
+		expect(page.every(message => message.text.length <= 32_000)).toBe(true);
+		// Projection keeps the tail of long text but preserves message order.
+		expect(page[0]?.id.startsWith("0:")).toBe(true);
+		expect(page[399]?.id.startsWith("399:")).toBe(true);
+	});
+});
+
+describe("desktop settings surface", () => {
+	const settings = () => Settings.isolated({ "compaction.enabled": true, "retry.maxRetries": 3 });
+	test("exposes schema scalars while withholding free-form, structured and secret paths", () => {
+		const items = desktopSettings(settings());
+		expect(items.length).toBeGreaterThan(2);
+		const paths = new Set(items.map(item => item.path));
+		expect(paths.has("compaction.enabled")).toBe(true);
+		expect(paths.has("retry.maxRetries")).toBe(true);
+		expect(items.some(item => item.path === "theme.dark")).toBe(false);
+		expect(items.some(item => /token|secret|password|credential/i.test(item.path))).toBe(false);
+		expect(items.every(item => ["boolean", "number", "enum"].includes(item.type))).toBe(true);
+	});
+	test("validates writes against the schema instead of accepting arbitrary values", () => {
+		expect(validateDesktopSetting("compaction.enabled", false)).toBe("compaction.enabled");
+		expect(validateDesktopSetting("retry.maxRetries", 2)).toBe("retry.maxRetries");
+		expect(() => validateDesktopSetting("compaction.enabled", "yes")).toThrow("Setting requires a boolean");
+		expect(() => validateDesktopSetting("retry.maxRetries", Number.NaN)).toThrow("Setting requires a number");
+		expect(() => validateDesktopSetting("theme.dark", "red-claw")).toThrow(
+			"Setting is not editable from the desktop host",
+		);
+		expect(() => validateDesktopSetting("not.a.path", true)).toThrow("Unknown setting path");
+		expect(() => validateDesktopSetting("ui.language", "xx")).toThrow("Setting value is not a valid choice");
 	});
 });
 

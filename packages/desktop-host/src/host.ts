@@ -5,12 +5,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { SETTINGS_SCHEMA } from "@gajae-code/coding-agent/config/settings-schema";
+import { getUi, SETTINGS_SCHEMA, type SettingPath } from "@gajae-code/coding-agent/config/settings-schema";
 import type { ExtensionUIContext, ExtensionUIDialogOptions } from "@gajae-code/coding-agent/extensibility/extensions";
 import {
+	ACP_BUILTIN_SLASH_COMMANDS,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	createAgentSession,
+	executeAcpBuiltinSlashCommand,
+	type SlashCommandRuntime,
 } from "@gajae-code/coding-agent/sdk";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -20,8 +23,11 @@ import { isolateEnvironment } from "./environment-policy";
 import { DesktopOAuthController } from "./oauth";
 import type {
 	DesktopCapability,
+	DesktopCommand,
+	DesktopCommandResult,
 	DesktopDiff,
 	DesktopFrame,
+	DesktopHistory,
 	DesktopMessage,
 	DesktopProject,
 	DesktopQuestion,
@@ -34,13 +40,24 @@ import { PROTOCOL_VERSION } from "./protocol";
 
 const HISTORY_LIMIT = 160;
 const TEXT_LIMIT = 8_000;
+const FULL_TEXT_LIMIT = 32_000;
+const HISTORY_PAGE_LIMIT = 500;
+const COMMAND_OUTPUT_LIMIT = 200_000;
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-const SETTING_PATHS = ["compaction.enabled", "retry.enabled"] as const;
+/**
+ * Settings this host can display and edit generically. Free-form strings are
+ * withheld because they can carry endpoints, paths or credentials, matching the
+ * conservative portable-catalog rule. Values are validated against the schema
+ * before writing, the same contract as `gjc config set`.
+ */
+const WITHHELD_SETTING = /token|secret|password|credential|apiKey|broker|oauth/i;
+const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
 
 export const CAPABILITIES: DesktopCapability[] = [
 	{ id: "sessions", label: "Independent SDK sessions and streaming", available: true },
 	{ id: "questions", label: "Select, confirm, input and editor questions", available: true },
-	{ id: "settings", label: "Auto-compaction and retry settings", available: true },
+	{ id: "settings", label: "Schema-validated boolean, number and enum settings", available: true },
+	{ id: "slash-commands", label: "Builtin slash commands via the public SDK dispatcher", available: true },
 	{
 		id: "terminal-ui",
 		label: "Terminal components and interactive terminal",
@@ -49,9 +66,9 @@ export const CAPABILITIES: DesktopCapability[] = [
 	},
 	{
 		id: "upstream-7322",
-		label: "Full upstream settings, approvals and runtime parity",
+		label: "Terminal-only selectors and remaining runtime parity",
 		available: false,
-		reason: "Requires upstream #7322 public SDK support; private controllers and endpoints are not used.",
+		reason: "TUI modal commands and private controllers are not exposed as SDK operations yet.",
 	},
 	{
 		id: "subprocess-reentry",
@@ -106,9 +123,62 @@ export function desktopDataDir(): string {
 	);
 }
 
-/** Only visible text is projected: thinking, arguments, images, headers and credentials are never serialized. */
-export function projectMessages(messages: readonly unknown[]): DesktopMessage[] {
-	return messages.slice(-HISTORY_LIMIT).flatMap((value, index) => {
+/**
+ * Settings the desktop host can read and write without a feature-specific
+ * controller: schema-constrained scalars only. Free-form strings, arrays and
+ * records are withheld rather than guessed at.
+ */
+export function desktopSettings(settings: Settings): DesktopSetting[] {
+	return (Object.keys(SETTINGS_SCHEMA) as SettingPath[]).flatMap(path => {
+		const definition = SETTINGS_SCHEMA[path];
+		if (!EDITABLE_SETTING_TYPES.has(definition.type) || WITHHELD_SETTING.test(path)) return [];
+		const ui = getUi(path);
+		const choices =
+			definition.type === "enum"
+				? [...((definition as { values: readonly string[] }).values ?? [])]
+				: ui?.options && ui.options !== "runtime"
+					? ui.options.map(option => option.value)
+					: undefined;
+		return [
+			{
+				path,
+				value: settings.get(path),
+				type: definition.type,
+				description: ui?.description ?? "Application-wide setting; persisted to the desktop config.",
+				...(choices && choices.length > 0 ? { choices } : {}),
+				writable: true,
+			} satisfies DesktopSetting,
+		];
+	});
+}
+
+/** Validate one generic settings write against the schema before it is persisted. */
+export function validateDesktopSetting(path: unknown, value: unknown): SettingPath {
+	if (typeof path !== "string" || !(path in SETTINGS_SCHEMA)) throw new Error("Unknown setting path");
+	const settingPath = path as SettingPath;
+	const definition = SETTINGS_SCHEMA[settingPath];
+	if (!EDITABLE_SETTING_TYPES.has(definition.type) || WITHHELD_SETTING.test(settingPath))
+		throw new Error("Setting is not editable from the desktop host");
+	if (definition.type === "boolean" && typeof value !== "boolean") throw new Error("Setting requires a boolean");
+	if (definition.type === "number") {
+		if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Setting requires a number");
+		const validate = (definition as { validate?: (candidate: number) => boolean }).validate;
+		if (validate?.(value) === false) throw new Error("Setting value is out of range");
+	}
+	if (definition.type === "enum") {
+		const values = (definition as { values?: readonly string[] }).values ?? [];
+		if (typeof value !== "string" || !values.includes(value)) throw new Error("Setting value is not a valid choice");
+	}
+	return settingPath;
+}
+
+/**
+ * Only visible text is projected: thinking, arguments, images, headers and
+ * credentials are never serialized. `limit` bounds per-message text; the caller
+ * decides how many messages to keep.
+ */
+function projectVisibleMessages(messages: readonly unknown[], limit: number): DesktopMessage[] {
+	return messages.flatMap((value, index) => {
 		const message = record(value);
 		if (!message || !["user", "assistant", "toolResult"].includes(String(message.role))) return [];
 		const role = message.role === "toolResult" ? "tool" : (message.role as "user" | "assistant");
@@ -127,13 +197,27 @@ export function projectMessages(messages: readonly unknown[]): DesktopMessage[] 
 			{
 				id: `${index}:${String(message.timestamp ?? "")}`,
 				role,
-				text: text.slice(-TEXT_LIMIT),
-				...(text.length > TEXT_LIMIT ? { truncated: true } : {}),
+				text: text.slice(-limit),
+				...(text.length > limit ? { truncated: true } : {}),
 				...(typeof message.toolName === "string" ? { toolName: message.toolName.slice(0, 100) } : {}),
 				...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
 			},
 		];
 	});
+}
+
+/** Bounded snapshot projection used for every session in the snapshot frame. */
+export function projectMessages(messages: readonly unknown[]): DesktopMessage[] {
+	return projectVisibleMessages(messages.slice(-HISTORY_LIMIT), TEXT_LIMIT);
+}
+
+/** On-demand projection for the explicit history view: no message-count cap. */
+export function projectHistoryPage(
+	messages: readonly unknown[],
+	limit: number,
+): { total: number; page: DesktopMessage[] } {
+	const all = projectVisibleMessages(messages, FULL_TEXT_LIMIT);
+	return { total: all.length, page: all.slice(0, limit) };
 }
 
 interface SavedSession {
@@ -715,36 +799,55 @@ export class DesktopHost {
 		}
 		if (method === "settings.get") {
 			const settings = params.sessionId ? (await this.#open(this.#metadata(params))).settings : this.#settings!;
-			return SETTING_PATHS.map(
-				settingPath =>
-					({
-						path: settingPath,
-						value: settings.get(settingPath),
-						type: SETTINGS_SCHEMA[settingPath].type,
-						description: "Application-wide; applies to all live desktop sessions.",
-						writable: true,
-					}) satisfies DesktopSetting,
-			);
+			return desktopSettings(settings);
 		}
 		if (method === "settings.set") {
-			const settingPath = requiredString(params, "path", 100);
-			if (settingPath !== "compaction.enabled" && settingPath !== "retry.enabled")
-				throw new Error(
-					"Setting unavailable: desktop supports only public live auto-compaction and retry controls; broader settings parity requires #7322",
-				);
-			if (typeof params.value !== "boolean") throw new Error("Setting requires boolean value");
+			const settingPath = validateDesktopSetting(params.path, params.value);
 			if (params.sessionId) await this.#open(this.#metadata(params));
-			// These SDK setters persist application settings, so update every live scope.
+			// Settings are application-wide; refuse to change them under an active run.
 			const targets = [...this.#live.values()];
 			if (targets.some(live => live.busy || live.sdk.isStreaming)) throw new Error("Session busy");
 			for (const live of targets) {
-				if (settingPath === "compaction.enabled") live.sdk.setAutoCompactionEnabled(params.value);
-				else live.sdk.setAutoRetryEnabled(params.value);
+				if (settingPath === "compaction.enabled" && typeof params.value === "boolean")
+					live.sdk.setAutoCompactionEnabled(params.value);
+				if (settingPath === "retry.enabled" && typeof params.value === "boolean")
+					live.sdk.setAutoRetryEnabled(params.value);
+				live.settings.set(settingPath, params.value as never);
 				await live.settings.flushOrThrow();
 			}
-			this.#settings!.set(settingPath, params.value);
+			this.#settings!.set(settingPath, params.value as never);
 			await this.#settings!.flushOrThrow();
+			this.#publishSnapshot();
 			return null;
+		}
+		if (method === "command.list")
+			return ACP_BUILTIN_SLASH_COMMANDS.map(
+				command =>
+					({
+						name: command.name,
+						description: command.description,
+						...(command.input?.hint ? { hint: command.input.hint } : {}),
+					}) satisfies DesktopCommand,
+			);
+		if (method === "command.run") return this.#command(this.#metadata(params), requiredString(params, "text"));
+		if (method === "history.get") {
+			const live = await this.#open(this.#metadata(params));
+			const offset = params.offset === undefined ? 0 : params.offset;
+			const limit = params.limit === undefined ? HISTORY_PAGE_LIMIT : params.limit;
+			if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0)
+				throw new Error("Invalid history offset");
+			if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > HISTORY_PAGE_LIMIT)
+				throw new Error("Invalid history limit");
+			const { total, page } = projectHistoryPage(live.sdk.messages, limit);
+			return {
+				sessionId: live.metadata.id,
+				total,
+				offset,
+				messages: page
+					.slice(offset, offset + limit)
+					.map(message => ({ ...message, text: this.#redact(message.text) })),
+				truncated: offset + limit < total,
+			} satisfies DesktopHistory;
 		}
 		const sessionMethods = [
 			"session.select",
@@ -779,11 +882,22 @@ export class DesktopHost {
 		if (method === "tools.list")
 			return { available: live.sdk.getAllToolNames(), active: live.sdk.getActiveToolNames() };
 		if (method === "diff.get") return this.#diff(metadata.projectId);
+		if (method === "prompt") {
+			const text = requiredString(params, "text");
+			if (live.busy || live.sdk.isStreaming) {
+				// TUI parity: an active run accepts steering or a follow-up instead of rejecting input.
+				const deliverAs = params.deliverAs === "followUp" ? "followUp" : "steer";
+				const submission = await live.sdk.submitUserMessage(text, { deliverAs, trackSubmission: true });
+				this.#publish(live);
+				return { queued: true, submissionId: submission.submissionId };
+			}
+			return this.#exclusive(live, async () => {
+				await live.sdk.prompt(text);
+				return null;
+			});
+		}
 		return this.#exclusive(live, async () => {
 			switch (method) {
-				case "prompt":
-					await live.sdk.prompt(requiredString(params, "text"));
-					return null;
 				case "session.rename": {
 					const title = requiredString(params, "title", 200).trim();
 					await live.sdk.setSessionName(title, "user");
@@ -885,6 +999,64 @@ export class DesktopHost {
 					throw new Error("Unknown method");
 			}
 		});
+	}
+	/**
+	 * Run one builtin slash command through the public SDK dispatcher so the app
+	 * executes exactly the same handlers as text/ACP mode. Commands that only
+	 * exist as TUI modals are not advertised and cannot reach this path.
+	 */
+	async #command(metadata: SavedSession, text: string): Promise<DesktopCommandResult> {
+		const live = await this.#open(metadata);
+		const chunks: string[] = [];
+		let written = 0;
+		const append = (value: string) => {
+			if (written >= COMMAND_OUTPUT_LIMIT) return;
+			const bounded = this.#redact(value).slice(0, COMMAND_OUTPUT_LIMIT - written);
+			chunks.push(bounded);
+			written += bounded.length;
+		};
+		const runtime: SlashCommandRuntime = {
+			session: live.sdk,
+			sessionManager: live.sdk.sessionManager,
+			settings: live.settings,
+			cwd: live.sdk.sessionManager.getCwd(),
+			output: value => append(String(value)),
+			refreshCommands: () => this.#publishSnapshot(),
+			reloadPlugins: () => {
+				throw new Error("Plugin reload is not available through the desktop host yet");
+			},
+			notifyTitleChanged: () => this.#publishSnapshot(),
+			notifyConfigChanged: () => this.#publishSnapshot(),
+		};
+		try {
+			const result = await executeAcpBuiltinSlashCommand(text, runtime);
+			let forwarded: string | undefined;
+			let consumed = false;
+			if (result === false) {
+				// Unknown builtin: the host forwards the text as a prompt, like ACP mode.
+				forwarded = text;
+			} else if ("prompt" in result) {
+				forwarded = result.prompt;
+				consumed = true;
+			} else {
+				consumed = true;
+			}
+			if (forwarded !== undefined) {
+				if (live.sdk.isStreaming) throw new Error("Session busy");
+				await live.sdk.prompt(forwarded);
+			}
+			return {
+				consumed,
+				output: chunks.join("\n").trim(),
+				...(forwarded !== undefined ? { prompt: forwarded } : {}),
+				...(written >= COMMAND_OUTPUT_LIMIT ? { outputTruncated: true } : {}),
+			};
+		} finally {
+			await this.#flushSession(live).catch(() => {});
+			await this.#save().catch(() => {});
+			this.#publishSnapshot();
+			this.#publish(live);
+		}
 	}
 	async #diff(projectId: string): Promise<DesktopDiff[]> {
 		const project = this.#catalog.projects.find(item => item.id === projectId)!;
