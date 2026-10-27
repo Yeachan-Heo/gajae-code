@@ -100,7 +100,13 @@ preventing other observers from receiving the change. Atomic batches reject
 ancestor/descendant path mixtures (for example `modelRoles` together with
 `modelRoles.default`) before applying any patch: their restore scopes overlap.
 Write one parent value or disjoint leaf paths instead. Repeated writes to the
-same exact path retain ordered last-write semantics.
+same exact path retain ordered last-write semantics. `commitAtomicBatchWithCurrent`
+fences nonempty asynchronous batches against newer local and runtime override intent;
+prepare again after rejection. Builders returning patches must not perform irreversible
+external work before publication. Empty batches can hold the durable writer queue for
+adjacent work, but cannot prevent synchronous setters or runtime overrides. In particular,
+a concurrent legacy profile-default setter can race profile deletion; lock-only work
+does not guarantee profile ownership safety.
 
 Ordinary saves also publish effective changes adopted from another scoped owner's
 on-disk edits. Overlapping writes through the shared in-process YAML writer fence

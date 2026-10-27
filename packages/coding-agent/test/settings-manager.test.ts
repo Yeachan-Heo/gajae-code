@@ -218,6 +218,72 @@ describe("Settings", () => {
 		});
 	}
 
+	it("publishes a synchronous memory builder before a newer setter", async () => {
+		const settings = Settings.isolated({ temperature: 0.2 });
+		try {
+			const pending = settings.commitAtomicBatchWithCurrent(() => [{ path: "temperature", op: "set", value: 0.4 }]);
+			settings.set("temperature", 0.9);
+			await pending;
+			expect(settings.get("temperature")).toBe(0.9);
+		} finally {
+			await settings.close();
+		}
+	});
+
+	for (const action of ["set", "override", "same", "aba"] as const) {
+		it(`refuses an asynchronous memory builder after newer ${action} intent`, async () => {
+			const settings = Settings.isolated({ temperature: 0.2 }, { overrides: { temperature: 0.3 } });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			try {
+				const pending = settings.commitAtomicBatchWithCurrent(async () => {
+					entered.resolve();
+					await release.promise;
+					return [{ path: "temperature", op: "set", value: 0.4 }];
+				});
+				await entered.promise;
+				if (action === "set") settings.set("temperature", 0.9);
+				else {
+					settings.override("temperature", action === "same" ? 0.3 : 0.7);
+					if (action === "aba") settings.override("temperature", 0.3);
+				}
+				release.resolve();
+				await expect(pending).rejects.toThrow("changed while the atomic batch was preparing");
+				expect(settings.getGlobal("temperature")).toBe(action === "set" ? 0.9 : 0.2);
+				expect(settings.get("temperature")).toBe(action === "override" ? 0.7 : 0.3);
+			} finally {
+				release.resolve();
+				await settings.close();
+			}
+		});
+	}
+
+	it("refuses a queued durable builder after a newer local setter", async () => {
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		try {
+			settings.set("temperature", 0.2);
+			await settings.flushOrThrow();
+			const blocker = enqueueAtomicYamlOperation(getConfigPath(), async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			await entered.promise;
+			const pending = settings.commitAtomicBatchWithCurrent(() => [{ path: "temperature", op: "set", value: 0.4 }]);
+			settings.set("temperature", 0.9);
+			release.resolve();
+			await blocker;
+			await expect(pending).rejects.toThrow("changed while the atomic batch was preparing");
+			await settings.flushOrThrow();
+			expect(settings.get("temperature")).toBe(0.9);
+			expect((await readSettings()).temperature).toBe(0.9);
+		} finally {
+			release.resolve();
+			await settings.close();
+		}
+	});
+
 	it("does not log setting override values when initialization options differ", async () => {
 		const initialSecret = "initial-settings-secret";
 		const requestedSecret = "requested-settings-secret";

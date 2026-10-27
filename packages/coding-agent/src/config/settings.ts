@@ -1513,15 +1513,39 @@ export class Settings implements NotificationSettingsReader {
 		}
 	}
 
-	/** Build a durable batch from the current on-disk YAML under the shared queue and file lock. */
+	/**
+	 * Build a batch from current YAML under the shared queue/lock. New local or
+	 * runtime intent invalidates nonempty batches prepared asynchronously. Such
+	 * builders must not perform irreversible external work before publication.
+	 * Empty batches may hold the durable writer queue for an adjacent action, but
+	 * cannot prevent synchronous setters or runtime overrides during that action.
+	 * Synchronous memory builders publish without yielding to another setter.
+	 */
 	async commitAtomicBatchWithCurrent(
 		buildPatches: (
 			current: Readonly<RawSettings>,
 		) => Promise<readonly SettingsAtomicPatch[]> | readonly SettingsAtomicPatch[],
 	): Promise<CasReceipt> {
 		this.#assertDurableConfigWritable();
+		const admissionRevision = this.#nextRevision;
+		const admissionGeneration = this.#nextGeneration;
+		const admissionRuntimeGeneration = this.#runtimeGeneration;
+		const changedWhilePreparing = () =>
+			new Error("Settings changed while the atomic batch was preparing; build it again.");
 		if (!this.#persist || !this.#configPath) {
-			const patches = await buildPatches(structuredClone(this.#global));
+			const before = structuredClone(this.#global);
+			const runtimeBefore = structuredClone(this.#overrides);
+			const built = buildPatches(structuredClone(before));
+			const patches = stageAtomicSettingsPatches(Array.isArray(built) ? built : await built);
+			if (
+				patches.length > 0 &&
+				(this.#nextRevision !== admissionRevision ||
+					this.#runtimeGeneration !== admissionRuntimeGeneration ||
+					!util.isDeepStrictEqual(before, this.#global) ||
+					!util.isDeepStrictEqual(runtimeBefore, this.#overrides))
+			) {
+				throw changedWhilePreparing();
+			}
 			return this.commitAtomicBatch(patches);
 		}
 
@@ -1531,7 +1555,24 @@ export class Settings implements NotificationSettingsReader {
 		const commit = applyAtomicYamlPatchesWithCurrent(
 			this.#configPath,
 			async current => {
+				if (
+					this.#nextGeneration !== admissionGeneration ||
+					this.#runtimeGeneration !== admissionRuntimeGeneration
+				) {
+					throw changedWhilePreparing();
+				}
+				const builderRevision = this.#nextRevision;
+				const runtimeBefore = structuredClone(this.#overrides);
 				const patches = stageAtomicSettingsPatches(await buildPatches(structuredClone(current)));
+				// Empty batches can serialize adjacent durable work, which cannot be
+				// undone after publication or isolated from synchronous setters.
+				if (
+					patches.length > 0 &&
+					(this.#nextRevision !== builderRevision ||
+						this.#runtimeGeneration !== admissionRuntimeGeneration ||
+						!util.isDeepStrictEqual(runtimeBefore, this.#overrides))
+				)
+					throw changedWhilePreparing();
 				assertNonOverlappingAtomicYamlPatches(patches);
 				const durablePatches: AtomicYamlPatch[] = patches;
 				revisions = durablePatches.map(patch => ({
