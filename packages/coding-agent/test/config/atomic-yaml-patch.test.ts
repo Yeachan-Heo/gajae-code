@@ -5,8 +5,10 @@ import * as path from "node:path";
 import { exactReplacePath } from "@gajae-code/natives";
 import { YAML } from "bun";
 import {
+	type AtomicYamlConfigTransaction,
 	AtomicYamlConflictError,
 	type AtomicYamlPatch,
+	type AtomicYamlPatchOptions,
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
@@ -195,6 +197,215 @@ describe("atomic YAML patches", () => {
 			expect(name).toMatch(/^\.gjc-exact-replace-destination-[0-9a-f]+-[0-9a-f]+$/);
 			expect((await fs.stat(path.join(path.dirname(configPath), name))).size).toBe(0);
 		}
+	});
+
+	for (const kind of ["patch", "remove", "combined", "replace"] as const) {
+		test(`transaction ${kind} excludes concurrent mutations and scopes its receipt`, async () => {
+			const configPath = await configPathForTest();
+			await Bun.write(configPath, "keep: old\nremove: old\n");
+			const entered = Promise.withResolvers<void>();
+			const gate = Promise.withResolvers<void>();
+			const invoke = (tx: AtomicYamlConfigTransaction, options: AtomicYamlPatchOptions = {}) => {
+				switch (kind) {
+					case "patch":
+						return tx.applyPatches([{ path: "first", op: "set", value: 1 }], options);
+					case "remove":
+						return tx.removeTopLevelKeys(["remove"], options);
+					case "combined":
+						return tx.applyPatchesAndRemoveTopLevelKeys(
+							[{ path: "first", op: "set", value: 1 }],
+							["remove"],
+							options,
+						);
+					case "replace":
+						return tx.replaceCurrent({ first: 1 }, options);
+				}
+			};
+			await withAtomicYamlConfigTransaction(configPath, async tx => {
+				const first = invoke(tx, {
+					exactReplace: async (source, destination, sourceIdentity, destinationIdentity) => {
+						entered.resolve();
+						await gate.promise;
+						return exactReplacePath(source, destination, sourceIdentity, destinationIdentity);
+					},
+				});
+				await entered.promise;
+				const attempts = [
+					tx.applyPatches([{ path: "intruder", op: "set", value: true }]),
+					tx.removeTopLevelKeys(["keep"]),
+					tx.applyPatchesAndRemoveTopLevelKeys([{ path: "intruder", op: "set", value: true }], ["keep"]),
+					tx.replaceCurrent({ intruder: true }),
+				];
+				for (const attempt of attempts) await expect(attempt).rejects.toThrow("another mutation is in progress");
+				expect(tx.current).toEqual({ keep: "old", remove: "old" });
+				gate.resolve();
+				const receipt = await first;
+				expect(receipt.revisions.map(revision => revision.path)).toEqual(kind === "patch" ? ["first"] : []);
+				if (kind !== "patch") expect((await receipt.restore()).status).toBe("not-restorable");
+			});
+			expect(await readYaml(configPath)).toEqual(
+				kind === "patch"
+					? { keep: "old", remove: "old", first: 1 }
+					: kind === "remove"
+						? { keep: "old" }
+						: kind === "combined"
+							? { keep: "old", first: 1 }
+							: { first: 1 },
+			);
+			expect((await fs.readdir(path.dirname(configPath))).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		});
+	}
+
+	for (const kind of ["patch", "remove", "combined", "replace"] as const) {
+		test(`failed transaction ${kind} cannot contaminate a later receipt`, async () => {
+			const configPath = await configPathForTest();
+			await Bun.write(configPath, "keep: old\nremove: old\n");
+			await withAtomicYamlConfigTransaction(configPath, async tx => {
+				const options: AtomicYamlPatchOptions = {
+					exactReplace: () => {
+						throw new Error("injected replacement failure");
+					},
+				};
+				const failed =
+					kind === "patch"
+						? tx.applyPatches([{ path: "failed", op: "set", value: true }], options)
+						: kind === "remove"
+							? tx.removeTopLevelKeys(["remove"], options)
+							: kind === "combined"
+								? tx.applyPatchesAndRemoveTopLevelKeys(
+										[{ path: "failed", op: "set", value: true }],
+										["remove"],
+										options,
+									)
+								: tx.replaceCurrent({ failed: true }, options);
+				await expect(failed).rejects.toThrow("injected replacement failure");
+				expect(tx.current).toEqual({ keep: "old", remove: "old" });
+				expect(tx.written).toBe(false);
+				const receipt = await tx.applyPatches([{ path: "success", op: "set", value: true }]);
+				expect(receipt.revisions.map(revision => revision.path)).toEqual(["success"]);
+			});
+			expect(await readYaml(configPath)).toEqual({ keep: "old", remove: "old", success: true });
+			expect((await fs.readdir(path.dirname(configPath))).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		});
+	}
+
+	test("whole-document input getters cannot reenter or leave partial state on failure", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "keep: old\nremove: old\n");
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			const attempts: Promise<unknown>[] = [];
+			const next = {
+				get first() {
+					const attempt = tx.removeTopLevelKeys(["keep"]);
+					void attempt.catch(() => {});
+					attempts.push(attempt);
+					return true;
+				},
+				get second(): never {
+					throw new Error("input failure");
+				},
+			};
+			await expect(tx.replaceCurrent(next)).rejects.toThrow("input failure");
+			expect(attempts).toHaveLength(1);
+			await expect(attempts[0]!).rejects.toThrow("busy");
+			const keys = ["remove"];
+			Object.defineProperty(keys, 0, {
+				get() {
+					const attempt = tx.replaceCurrent({ intruder: true });
+					void attempt.catch(() => {});
+					attempts.push(attempt);
+					throw new Error("key failure");
+				},
+			});
+			await expect(tx.removeTopLevelKeys(keys)).rejects.toThrow("key failure");
+			expect(attempts).toHaveLength(2);
+			await expect(attempts[1]!).rejects.toThrow("busy");
+			expect(tx.current).toEqual({ keep: "old", remove: "old" });
+			const receipt = await tx.applyPatches([{ path: "success", op: "set", value: true }]);
+			expect(receipt.revisions.map(revision => revision.path)).toEqual(["success"]);
+		});
+		expect(await readYaml(configPath)).toEqual({ keep: "old", remove: "old", success: true });
+	});
+
+	test("a caught external conflict cannot contaminate a later mutation", async () => {
+		const configPath = await configPathForTest();
+		const original = "keep: old\nremove: old\n";
+		await Bun.write(configPath, original);
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			await Bun.write(configPath, "keep: external\n");
+			await expect(tx.removeTopLevelKeys(["remove"])).rejects.toBeInstanceOf(AtomicYamlConflictError);
+			expect(tx.current).toEqual({ keep: "old", remove: "old" });
+			expect(await Bun.file(configPath).text()).toBe("keep: external\n");
+			await Bun.write(configPath, original);
+			const receipt = await tx.applyPatches([{ path: "success", op: "set", value: true }]);
+			expect(receipt.revisions.map(revision => revision.path)).toEqual(["success"]);
+		});
+		expect(await readYaml(configPath)).toEqual({ keep: "old", remove: "old", success: true });
+	});
+
+	test("async validation cannot reenter a transaction mutation", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "keep: old\n");
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			const receipt = await tx.applyPatches([{ path: "first", op: "set", value: true }], {
+				validateRoot: async () => {
+					await Promise.resolve();
+					await expect(tx.replaceCurrent({ intruder: true })).rejects.toThrow("another mutation is in progress");
+				},
+			});
+			expect(receipt.revisions.map(revision => revision.path)).toEqual(["first"]);
+		});
+		expect(await readYaml(configPath)).toEqual({ keep: "old", first: true });
+	});
+
+	test("callback completion waits for a pending mutation and rejects subsequent use", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "keep: old\n");
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		let txRef: AtomicYamlConfigTransaction | undefined;
+		let finished = false;
+		const transaction = withAtomicYamlConfigTransaction(configPath, async tx => {
+			txRef = tx;
+			void tx.applyPatches([{ path: "first", op: "set", value: true }], {
+				validateRoot: async () => {
+					entered.resolve();
+					await gate.promise;
+				},
+			});
+			return "done";
+		}).then(value => {
+			finished = true;
+			return value;
+		});
+		await entered.promise;
+		await Promise.resolve();
+		expect(finished).toBe(false);
+		await expect(txRef!.replaceCurrent({ intruder: true })).rejects.toThrow("closed");
+		gate.resolve();
+		await expect(transaction).resolves.toBe("done");
+		expect(await readYaml(configPath)).toEqual({ keep: "old", first: true });
+	});
+
+	test("pending mutation failure is propagated when the callback returns", async () => {
+		const configPath = await configPathForTest();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const transaction = withAtomicYamlConfigTransaction(configPath, async tx => {
+			void tx.applyPatches([{ path: "first", op: "set", value: true }], {
+				validateRoot: async () => {
+					entered.resolve();
+					await gate.promise;
+					throw new Error("validation failed");
+				},
+			});
+		});
+		await entered.promise;
+		gate.resolve();
+		await expect(transaction).rejects.toThrow("validation failed");
+		const receipt = await applyAtomicYamlPatches(configPath, [{ path: "later", op: "set", value: true }]);
+		expect(receipt.revisions.map(revision => revision.path)).toEqual(["later"]);
+		expect(await readYaml(configPath)).toEqual({ later: true });
 	});
 
 	test("builder and transaction inspection cannot mutate writer-owned YAML", async () => {

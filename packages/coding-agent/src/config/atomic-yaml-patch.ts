@@ -1131,7 +1131,9 @@ export function withAtomicYamlConfigTransaction<T>(
 	return enqueueAtomicYamlOperation(configPath, async (canonicalPath, lexicalPath) => {
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
-			const { current, root, raw, exists } = await readYaml(canonicalPath);
+			const state = await readYaml(canonicalPath);
+			let { current } = state;
+			const { root, raw, exists } = state;
 			// External editors do not participate in the file lock, so a save
 			// between the initial read and a write would be silently overwritten.
 			// Guard every write with a compare-and-swap against the last file state
@@ -1150,23 +1152,32 @@ export function withAtomicYamlConfigTransaction<T>(
 				}
 			};
 			let written = false;
-			let snapshotting = false;
-			const assertNotSnapshotting = (): void => {
-				if (snapshotting) throw new Error("Atomic YAML transaction cannot mutate while patch input is being read.");
-			};
-			const snapshotTransactionPatches = (patches: readonly AtomicYamlPatch[]): readonly AtomicYamlPatch[] => {
-				assertNotSnapshotting();
-				snapshotting = true;
-				try {
-					return snapshotPatches(patches);
-				} finally {
-					snapshotting = false;
-				}
+			let busy = false;
+			let closed = false;
+			let pending: Promise<CasReceipt> | undefined;
+			const mutate = (action: () => Promise<CasReceipt>): Promise<CasReceipt> => {
+				if (closed) return Promise.reject(new Error("Atomic YAML transaction is closed."));
+				if (busy)
+					return Promise.reject(
+						new Error(
+							"Atomic YAML transaction is busy: cannot mutate while patch input is being read or another mutation is in progress.",
+						),
+					);
+				busy = true;
+				const result = (async () => {
+					try {
+						return await action();
+					} finally {
+						busy = false;
+					}
+				})();
+				pending = result;
+				return result;
 			};
 			const markWritten = (): void => {
 				written = true;
 			};
-			return await operation({
+			const transaction: AtomicYamlConfigTransaction = {
 				configPath: canonicalPath,
 				get root() {
 					return structuredClone(root);
@@ -1177,103 +1188,133 @@ export function withAtomicYamlConfigTransaction<T>(
 				get written(): boolean {
 					return written;
 				},
-				applyPatches: async (input, options = {}) => {
-					const patches = snapshotTransactionPatches(input);
-					await options.validateRoot?.(structuredClone(root), structuredClone(patches));
-					await casGuard();
-					const receipt = await applyPatchesUnderLock(
-						canonicalPath,
-						current,
-						patches,
-						options,
-						false,
-						lastKnownState ?? initialState,
-						lexicalPath,
-					);
-					if (patches.length > 0) {
-						lastKnownState = { exists: true, raw: YAML.stringify(current, null, 2) };
+				applyPatches: (input, options = {}) =>
+					mutate(async () => {
+						const patches = snapshotPatches(input);
+						await options.validateRoot?.(structuredClone(root), structuredClone(patches));
+						await casGuard();
+						const candidate = structuredClone(current);
+						const receipt = await applyPatchesUnderLock(
+							canonicalPath,
+							candidate,
+							patches,
+							options,
+							false,
+							lastKnownState ?? initialState,
+							lexicalPath,
+						);
+						if (patches.length > 0) {
+							current = candidate;
+							lastKnownState = { exists: true, raw: YAML.stringify(candidate, null, 2) };
+							markWritten();
+						}
+						return receipt;
+					}),
+				removeTopLevelKeys: (input, options = {}) =>
+					mutate(async () => {
+						const keys = Array.from(input);
+						const candidate = structuredClone(current);
+						for (const key of keys) delete candidate[key];
+						await casGuard();
+						lastKnownState = await writeAtomicYaml(
+							canonicalPath,
+							candidate,
+							options,
+							lastKnownState ?? initialState,
+							lexicalPath,
+							keys,
+						);
+						current = candidate;
 						markWritten();
+						// The deleted top-level key values are not journaled, so a
+						// restore() would vacuously claim success; report honestly that
+						// the receipt is not restorable.
+						let discarded = false;
+						return {
+							revisions: [],
+							discard(): void {
+								discarded = true;
+							},
+							async restore(): Promise<CasRestoreResult> {
+								return discarded ? { status: "discarded" } : { status: "not-restorable" };
+							},
+						};
+					}),
+				applyPatchesAndRemoveTopLevelKeys: (input, keys, options = {}) =>
+					mutate(async () => {
+						const patches = snapshotPatches(input);
+						const topLevelKeys = Array.from(keys);
+						await options.validateRoot?.(structuredClone(root), structuredClone(patches));
+						await casGuard();
+						const candidate = structuredClone(current);
+						await applyPatchesUnderLock(canonicalPath, candidate, patches, options, true, undefined, lexicalPath);
+						for (const key of topLevelKeys) delete candidate[key];
+						lastKnownState = await writeAtomicYaml(
+							canonicalPath,
+							candidate,
+							options,
+							lastKnownState ?? initialState,
+							lexicalPath,
+							[...patches.map(patch => patch.path), ...topLevelKeys],
+						);
+						current = candidate;
+						markWritten();
+						let discarded = false;
+						return {
+							revisions: [],
+							discard(): void {
+								discarded = true;
+							},
+							async restore(): Promise<CasRestoreResult> {
+								return discarded ? { status: "discarded" } : { status: "not-restorable" };
+							},
+						};
+					}),
+				replaceCurrent: (next, options = {}) =>
+					mutate(async () => {
+						const candidate = structuredClone(next);
+						await casGuard();
+						lastKnownState = await writeAtomicYaml(
+							canonicalPath,
+							candidate,
+							options,
+							lastKnownState ?? initialState,
+							lexicalPath,
+						);
+						current = candidate;
+						markWritten();
+						let discarded = false;
+						return {
+							revisions: [],
+							discard(): void {
+								discarded = true;
+							},
+							async restore(): Promise<CasRestoreResult> {
+								return discarded ? { status: "discarded" } : { status: "not-restorable" };
+							},
+						};
+					}),
+			};
+			try {
+				const result = await operation(transaction);
+				closed = true;
+				if (busy) await pending;
+				return result;
+			} catch (error) {
+				closed = true;
+				if (busy) {
+					try {
+						await pending;
+					} catch (pendingError) {
+						if (pendingError !== error)
+							throw new AggregateError(
+								[error, pendingError],
+								"Atomic YAML transaction callback and pending mutation failed.",
+							);
 					}
-					return receipt;
-				},
-				removeTopLevelKeys: async (keys, options = {}) => {
-					assertNotSnapshotting();
-					for (const key of keys) delete current[key];
-					await casGuard();
-					lastKnownState = await writeAtomicYaml(
-						canonicalPath,
-						current,
-						options,
-						lastKnownState ?? initialState,
-						lexicalPath,
-						keys,
-					);
-					markWritten();
-					// The deleted top-level key values are not journaled, so a
-					// restore() would vacuously claim success; report honestly that
-					// the receipt is not restorable.
-					let discarded = false;
-					return {
-						revisions: [],
-						discard(): void {
-							discarded = true;
-						},
-						async restore(): Promise<CasRestoreResult> {
-							return discarded ? { status: "discarded" } : { status: "not-restorable" };
-						},
-					};
-				},
-				applyPatchesAndRemoveTopLevelKeys: async (input, topLevelKeys, options = {}) => {
-					const patches = snapshotTransactionPatches(input);
-					await options.validateRoot?.(structuredClone(root), structuredClone(patches));
-					await casGuard();
-					await applyPatchesUnderLock(canonicalPath, current, patches, options, true, undefined, lexicalPath);
-					for (const key of topLevelKeys) delete current[key];
-					lastKnownState = await writeAtomicYaml(
-						canonicalPath,
-						current,
-						options,
-						lastKnownState ?? initialState,
-						lexicalPath,
-						[...patches.map(patch => patch.path), ...topLevelKeys],
-					);
-					markWritten();
-					let discarded = false;
-					return {
-						revisions: [],
-						discard(): void {
-							discarded = true;
-						},
-						async restore(): Promise<CasRestoreResult> {
-							return discarded ? { status: "discarded" } : { status: "not-restorable" };
-						},
-					};
-				},
-				replaceCurrent: async (next, options = {}) => {
-					assertNotSnapshotting();
-					for (const key of Object.keys(current)) delete current[key];
-					Object.assign(current, next);
-					await casGuard();
-					lastKnownState = await writeAtomicYaml(
-						canonicalPath,
-						current,
-						options,
-						lastKnownState ?? initialState,
-						lexicalPath,
-					);
-					markWritten();
-					let discarded = false;
-					return {
-						revisions: [],
-						discard(): void {
-							discarded = true;
-						},
-						async restore(): Promise<CasRestoreResult> {
-							return discarded ? { status: "discarded" } : { status: "not-restorable" };
-						},
-					};
-				},
-			});
+				}
+				throw error;
+			}
 		});
 	});
 }
