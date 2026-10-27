@@ -23,6 +23,7 @@ import {
 	buildGjcTmuxSessionSlug,
 	buildGjcTmuxUntaggedSessionHint,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
+import * as ownerIsolation from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
 	captureOwnerGenerationBaselineSync,
 	isValidOwnerIntent,
@@ -2065,14 +2066,20 @@ describe("GJC tmux session management", () => {
 	// retains the kernel-path exit observer/fallback, tested separately above.
 	for (const scenario of [
 		"complete",
-		...(process.platform === "darwin" ? ["exit_without_verdict", "verdict_without_exit"] : []),
+		...(process.platform === "darwin"
+			? ["exit_without_verdict", "verdict_without_exit", "verdict_read_after_deadline"]
+			: []),
 	]) {
 		const testName =
 			scenario === "complete"
 				? "terminates a genuine managed supervisor only after child cleanup and a matching durable verdict"
 				: scenario === "exit_without_verdict"
 					? "refuses cooperative cleanup when the genuine supervisor exits without publishing a verdict"
-					: "refuses cooperative cleanup when the genuine verdict exists but the supervisor remains alive";
+					: scenario === "verdict_without_exit"
+						? "refuses cooperative cleanup when the genuine verdict exists but the supervisor remains alive"
+						: "refuses cooperative cleanup when the genuine verdict is read only after the close deadline";
+		// Only these scenarios fault the supervisor's terminal publication.
+		const faulted = scenario === "exit_without_verdict" || scenario === "verdict_without_exit";
 		// A real supervisor needs the owner-only reader and a graceful SIGTERM relay;
 		// Windows has neither (signalRoot terminates with exit 1).
 		it.skipIf(process.platform === "win32")(
@@ -2135,7 +2142,7 @@ fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ pid: process.pid
 `,
 					{ mode: 0o600 },
 				);
-				if (scenario !== "complete") {
+				if (faulted) {
 					// Scoped to the actual supervisor process, before CLI module loading.
 					// Do not spoof argv or replace admission, child relay, or terminal data.
 					await fs.writeFile(
@@ -2182,7 +2189,7 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 				const owner = Bun.spawn(
 					[
 						process.execPath,
-						...(scenario === "complete" ? [] : ["--preload", preloadFile]),
+						...(faulted ? ["--preload", preloadFile] : []),
 						cli,
 						"--internal-managed-owner-supervisor",
 						"--",
@@ -2307,7 +2314,34 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 					expect(binding).not.toHaveProperty("command_sha256");
 					expect((await fs.stat(bindingFile)).mode & 0o777).toBe(0o600);
 					expect((await fs.stat(paths.root)).mode & 0o777).toBe(0o700);
-					if (scenario !== "complete") {
+					if (scenario === "verdict_read_after_deadline") {
+						// Everything is genuine, but the close's monotonic clock passes its
+						// deadline while the waiter reads the real verdict evidence.
+						const clock = monotonicCloseClock();
+						let crossed = false;
+						const readEvidence = ownerIsolation.readSecureOwnerJson;
+						spyOn(ownerIsolation, "readSecureOwnerJson").mockImplementation(file => {
+							const value = readEvidence(file);
+							if (path.basename(file) === path.basename(paths.verdictAliasFile) && value !== null)
+								crossed = true;
+							return value;
+						});
+						await expect(
+							forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker, {
+								now: () => (crossed ? new Date(clock().getTime() + 3_600_000) : clock()),
+							}),
+						).rejects.toThrow("owner_term_verdict_timeout");
+						expect(crossed).toBe(true);
+						expect(await waitForOwnerExit(2_000)).toBe(true);
+						expect(await ownerExit, await stderr).toBe(0);
+						expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
+						expect(isValidOwnerVerdict(readEvidence(paths.verdictFile))).toBe(true);
+						expect(calls.filter(cmd => cmd.includes("if-shell"))).toEqual([]);
+						expect(
+							calls.some(cmd => cmd.some(arg => arg.includes("kill-session") || arg.includes("kill-server"))),
+						).toBe(false);
+						expect(rawPidSignal).not.toHaveBeenCalled();
+					} else if (scenario !== "complete") {
 						// Use the original real close deadline: no forged clock, verdict or
 						// injected completion callback can turn one half into conjunction.
 						// While the verdict exists but the supervisor is held alive, make every
@@ -2390,7 +2424,35 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 							expect(fsSync.existsSync(holdExpiredFile)).toBe(false);
 						}
 					} else {
-						await forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker);
+						// On Darwin the wall clock steps an hour forward once the timely verdict
+						// has been read; only the close's monotonic deadline may reject it.
+						const realNow = Date.now;
+						let closing = true;
+						let stepped = false;
+						if (process.platform === "darwin") {
+							const readEvidence = ownerIsolation.readSecureOwnerJson;
+							spyOn(ownerIsolation, "readSecureOwnerJson").mockImplementation(file => {
+								const value = readEvidence(file);
+								if (
+									closing &&
+									!stepped &&
+									path.basename(file) === path.basename(paths.verdictAliasFile) &&
+									value !== null
+								) {
+									stepped = true;
+									const steppedNow = realNow() + 3_600_000;
+									Date.now = () => steppedNow;
+								}
+								return value;
+							});
+						}
+						try {
+							await forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker);
+						} finally {
+							closing = false;
+							Date.now = realNow;
+						}
+						expect(stepped).toBe(process.platform === "darwin");
 						expect(await waitForOwnerExit(1_000)).toBe(true);
 						expect(await ownerExit, await stderr).toBe(0);
 						expect(owner.signalCode).toBeNull();

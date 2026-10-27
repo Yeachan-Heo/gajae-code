@@ -2187,7 +2187,10 @@ export async function forceCloseGjcTmuxSession(
 						{ observe: deps.observeProcess ?? observeProcessIncarnation, now, sleep },
 					);
 					if (!exited || now().getTime() >= verdictDeadline) return null;
-					return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline, intent.intent_id);
+					const verdict = await waitForExpectedVerdict(identity, sleep, now, verdictDeadline, intent.intent_id);
+					// The close deadline is this monotonic clock, not the intent's wall-clock
+					// expiry: evidence whose reads ran past it never completes the close.
+					return verdict && now().getTime() < verdictDeadline ? verdict : null;
 				}
 				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
 				try {

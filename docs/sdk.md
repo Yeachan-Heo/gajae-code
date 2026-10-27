@@ -1373,8 +1373,9 @@ has published its binding waits inside the same close deadline only while that
 exact supervisor stays live; an untrusted, ambiguous, or still-unavailable
 binding fails closed. A binding's `created_at` is never compared with the
 current wall clock, so a backward clock step does not block a close, and the
-close deadline itself runs on monotonic time: once the verdict wait returns a
-timely verdict, a forward clock step during the child's cleanup does not reject it.
+close deadline itself runs on monotonic time: the verdict wait accepts a verdict
+only if its reads completed inside that deadline, and a forward clock step during
+the child's cleanup does not reject a verdict accepted that way.
 Before its CLI starts, an admitted Darwin child installs a handler for the
 cooperative signal (SIGUSR2) and recorders for SIGTERM, SIGHUP and SIGINT, then
 publishes `cooperative-ready-<generation>.json` naming its pid and child token.
