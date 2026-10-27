@@ -1280,6 +1280,14 @@ orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
 
+Closing a spawned headless child first sends `session.close` to the exact
+registration-pinned host endpoint, authorized by the Broker lifecycle marker the
+host was launched with and carries in its own index row, then waits up to the
+host cleanup deadline (5 s) for that exact process to exit. Only a refused,
+unreachable or still-running host is closed through the substrate escalation
+(SIGTERM, then SIGKILL; `TerminateProcess` on Windows), and an identity that is
+no longer re-proven is never asked or signaled.
+
 Supervised managed tmux launches (Broker-spawned sessions and interactive root
 `gjc --tmux` launches, on macOS and Linux) publish a private (`0600` file in a
 `0700` lifecycle root) child binding before the supervised child starts.

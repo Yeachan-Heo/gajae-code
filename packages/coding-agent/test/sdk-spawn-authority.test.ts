@@ -6,7 +6,8 @@ import * as path from "node:path";
 import { Broker, spawnRegistrationMatches } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
-import type { IndexedSession } from "../src/sdk/broker/session-index";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
+import { type IndexedSession, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import {
 	isSpawnClaimV2,
 	type SeedDeliveryV2,
@@ -14,6 +15,8 @@ import {
 	type SpawnClaimV2,
 } from "../src/sdk/broker/spawn-authority";
 import { createSpawnSubstrateProvider } from "../src/sdk/broker/spawn-substrate";
+import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../src/sdk/host/control/runtime-gate";
 
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
@@ -1773,6 +1776,224 @@ describe("Broker spawn close and orphan reaper", () => {
 			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
 			await store.open();
 			expect(store.claims().find(row => row.childId === childId)?.state).toBe("closed");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	const hostCloseLayer = (
+		probe: ProviderProbe,
+		outcome: "accepted-exits" | "accepted-stays" | "accepted-mismatch" | "unavailable" | "throws",
+		calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[],
+	) => ({
+		...promptLayer,
+		close: async (input: { sessionId: string; pinned: { pid: number; endpointGeneration: number } }) => {
+			calls.push({
+				pid: input.pinned.pid,
+				endpointGeneration: input.pinned.endpointGeneration,
+				substrateClosesBefore: probe.closes,
+			});
+			if (outcome === "throws") throw new Error("endpoint exploded");
+			if (outcome === "accepted-exits") probe.verdict = "gone";
+			// A reused pid after the acknowledgement is not proof that this host exited.
+			if (outcome === "accepted-mismatch") probe.verdict = "mismatch";
+			return outcome === "unavailable" ? ("unavailable" as const) : ("accepted" as const);
+		},
+	});
+
+	it("closes a headless host through its own endpoint before any substrate signal", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, "accepted-exits", calls),
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "graceful-key");
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			// Only the registration-pinned endpoint is asked, and no substrate signal follows.
+			expect(calls).toEqual([{ pid: 995, endpointGeneration: 1, substrateClosesBefore: 0 }]);
+			expect(probe.closes).toBe(0);
+			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await store.open();
+			const claim = store.claims().find(row => row.childId === childId);
+			expect(claim?.state).toBe("closed");
+			expect(store.authority(claim?.lifecycleIdentity ?? "")?.closeState).toBe("closed");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it.each([
+		"accepted-stays",
+		"accepted-mismatch",
+		"unavailable",
+		"throws",
+	] as const)("escalates through the exact substrate close when the host close is %s", async outcome => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, outcome, calls),
+			spawnHostCloseGraceMs: 150,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `escalate-${outcome}`);
+			const started = Date.now();
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			expect(calls).toEqual([{ pid: 995, endpointGeneration: 1, substrateClosesBefore: 0 }]);
+			expect(probe.closes).toBe(1);
+			// Only an acknowledged close earns the exit grace before escalation.
+			if (outcome === "accepted-stays") expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it.each([
+		["the Broker lifecycle marker", "lifecycle-marker-close"],
+		["no lifecycle marker", undefined],
+	] as const)("sends the production host close over the pinned endpoint with %s", async (_label, marker) => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const hostIncarnation = processIncarnation(process.pid);
+		const registrations: { childId: string; cwd: string; stateRoot: string }[] = [];
+		const received: Record<string, unknown>[] = [];
+		const token = "spawn-close-token";
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, instance) {
+				if (new URL(request.url).searchParams.get("token") !== token)
+					return new Response("Unauthorized", { status: 401 });
+				if (instance.upgrade(request, { data: undefined })) return undefined;
+				return new Response("WebSocket upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(socket) {
+					socket.send(JSON.stringify({ type: "hello" }));
+				},
+				message(socket, message) {
+					const frame = JSON.parse(String(message)) as Record<string, unknown>;
+					received.push(frame);
+					const input = frame.input as Record<string, unknown> | undefined;
+					const authorized =
+						frame.type === "control_request" &&
+						frame.operation === "session.close" &&
+						input?.[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD] === marker;
+					if (authorized) probe.verdict = "gone";
+					socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: authorized }));
+				},
+			},
+		});
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: {
+				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+					registrations.push(input);
+					return {
+						ok: true as const,
+						registration: {
+							sessionId: input.childId,
+							endpointGeneration: 1,
+							pid: process.pid,
+							processIncarnation: hostIncarnation ?? "missing-incarnation",
+							cwd: input.cwd,
+							stateRoot: input.stateRoot,
+						},
+					};
+				},
+				dispatch: promptLayer.dispatch,
+				reconcile: promptLayer.reconcile,
+			},
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, `endpoint-close-${marker ?? "none"}`);
+			const { cwd, stateRoot } = registrations[0]!;
+			const endpointPath = path.join(stateRoot, "sdk", `${childId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			const url = new URL(server.url);
+			url.protocol = "ws:";
+			await Bun.write(
+				endpointPath,
+				JSON.stringify({ version: 1, sessionId: childId, pid: process.pid, url: url.toString(), token }),
+			);
+			const stat = await fs.stat(endpointPath, { bigint: true });
+			const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+				type: "host_registered",
+				sessionId: childId,
+				locator: { cwd, worktreeRoot: null, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				hostIncarnation,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				endpointFileId: `${stat.dev}:${stat.ino}`,
+				...(marker ? { lifecycleRequestId: marker } : {}),
+				version: SESSION_INDEX_EVENT_VERSION,
+				indexSeq: 1,
+				ts: Date.now(),
+			};
+			const indexFile = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+			await fs.mkdir(path.dirname(indexFile), { recursive: true });
+			await Bun.write(
+				indexFile,
+				`${JSON.stringify({ ...unsigned, checksum: sessionIndexChecksum(unsigned) } as SessionIndexEvent)}\n`,
+			);
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			if (marker) {
+				// The host saw exactly one close carrying its own launch marker, and no
+				// substrate signal was needed.
+				expect(received).toHaveLength(1);
+				expect(received[0]).toMatchObject({
+					type: "control_request",
+					operation: "session.close",
+					input: { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: marker },
+				});
+				expect(probe.closes).toBe(0);
+			} else {
+				// Without the marker the host could not authorize a close, so nothing is
+				// sent and the exact substrate close remains the path.
+				expect(received).toEqual([]);
+				expect(probe.closes).toBe(1);
+			}
+		} finally {
+			await broker.stop();
+			server.stop(true);
+		}
+	});
+
+	it("never asks a host to close when its substrate identity is not re-proven", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const calls: { pid: number; endpointGeneration: number; substrateClosesBefore: number }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: hostCloseLayer(probe, "accepted-exits", calls),
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "mismatch-graceful-key");
+			probe.verdict = "mismatch";
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(calls).toEqual([]);
+			expect(probe.closes).toBe(0);
 		} finally {
 			await broker.stop();
 		}

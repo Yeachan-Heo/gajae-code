@@ -174,6 +174,12 @@ export interface BrokerSettings {
 	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
 	masterOrphanGraceMs?: number;
 	/**
+	 * How long a headless spawn host that acknowledged an endpoint `session.close`
+	 * may take to exit before the substrate close escalates. Defaults to the host's
+	 * own postmortem cleanup deadline.
+	 */
+	spawnHostCloseGraceMs?: number;
+	/**
 	 * Grace before a broker nobody is left to use exits on its own. The clock only
 	 * runs while the index proves no live session host and no open spawn authority,
 	 * so a broker whose client died without closing exits instead of holding its
@@ -225,6 +231,7 @@ type ResolvedBrokerSettings = {
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
+	spawnHostCloseGraceMs: number;
 	abandonedGraceMs: number;
 	reapWhenAbandoned: boolean;
 	restartRequestId?: string;
@@ -538,6 +545,12 @@ export interface SpawnPromptLayer {
 		clientRef: string;
 		pinned: SpawnHostRegistration;
 	}): Promise<SpawnQ26Reconciliation>;
+	/**
+	 * Ask the exact pinned host to close itself through its authenticated endpoint.
+	 * `accepted` means the host acknowledged `session.close`; anything else leaves the
+	 * close to the substrate provider. Production uses the endpoint attachment.
+	 */
+	close?(input: { sessionId: string; pinned: SpawnHostRegistration }): Promise<"accepted" | "unavailable">;
 }
 
 type SpawnAdmissionInput = {
@@ -648,6 +661,9 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
+const SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS = 2_000;
+/** Mirrors the host postmortem's default `GJC_CLEANUP_DEADLINE_MS`. */
+const SPAWN_HOST_CLOSE_GRACE_MS = 5_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
 const BROKER_ABANDONED_GRACE_DEFAULT_MS = 120_000;
 const MANAGED_CLOSE_WAIT_MS = 10_000;
@@ -1666,6 +1682,7 @@ export class Broker {
 	#managedEnrollmentFailed = false;
 	#spawnAuthority: SpawnAuthorityStore | null = null;
 	#spawnPromptLayer: SpawnPromptLayer;
+	#spawnHostClose: NonNullable<SpawnPromptLayer["close"]>;
 	#spawnReapInFlight = false;
 	#admitted = new Set<Promise<void>>();
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
@@ -1720,6 +1737,7 @@ export class Broker {
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
 			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
+			spawnHostCloseGraceMs: settings.spawnHostCloseGraceMs ?? SPAWN_HOST_CLOSE_GRACE_MS,
 			abandonedGraceMs: settings.abandonedGraceMs ?? BROKER_ABANDONED_GRACE_DEFAULT_MS,
 			reapWhenAbandoned: settings.reapWhenAbandoned === true,
 			...(settings.restartRequestId === undefined ? {} : { restartRequestId: settings.restartRequestId }),
@@ -1752,6 +1770,10 @@ export class Broker {
 			dispatch: async input => await this.#dispatchSpawnPrompt(input),
 			reconcile: async input => await this.#reconcileSpawnPrompt(input),
 		};
+		const injectedClose = settings.spawnPromptLayer?.close;
+		this.#spawnHostClose = injectedClose
+			? async input => await injectedClose.call(settings.spawnPromptLayer, input)
+			: async input => await this.#requestSpawnHostClose(input);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
@@ -3430,7 +3452,8 @@ export class Broker {
 		sessionId: string;
 		/** Endpoint identity captured at registration; the exchange refuses to talk to anything else. */
 		pinned: SpawnHostRegistration;
-		frame: (id: string) => Record<string, unknown>;
+		/** Request for the exact pinned row; `undefined` refuses the exchange before connecting. */
+		frame: (id: string, row: IndexedSession) => Record<string, unknown> | undefined;
 		responseType: string;
 		timeoutMs: number;
 	}): Promise<{ handedOff: boolean; frame?: Record<string, unknown> }> {
@@ -3458,6 +3481,8 @@ export class Broker {
 		const endpoint = await readEndpoint(row);
 		if (!endpoint) return { handedOff: false };
 		const id = randomBytes(16).toString("base64url");
+		const request = input.frame(id, row);
+		if (!request) return { handedOff: false };
 		const settled = Promise.withResolvers<Record<string, unknown> | undefined>();
 		let handedOff = false;
 		let complete = false;
@@ -3484,7 +3509,7 @@ export class Broker {
 				}
 				if (frame.type === "hello") {
 					try {
-						socket?.send(JSON.stringify(input.frame(id)));
+						socket?.send(JSON.stringify(request));
 						handedOff = true;
 					} catch {
 						settle(undefined);
@@ -3558,6 +3583,59 @@ export class Broker {
 		const frame = exchange.frame;
 		if (frame?.ok !== true) return { status: "unknown" };
 		return q26FromResponse(frame);
+	}
+
+	/**
+	 * Authenticated graceful close of the exact pinned host. The host accepts it only
+	 * with the Broker lifecycle marker it was launched with, which its own index row
+	 * carries, so no other caller and no other endpoint can satisfy it.
+	 */
+	async #requestSpawnHostClose(input: {
+		sessionId: string;
+		pinned: SpawnHostRegistration;
+	}): Promise<"accepted" | "unavailable"> {
+		const exchange = await this.#spawnChildExchange({
+			sessionId: input.sessionId,
+			pinned: input.pinned,
+			frame: (id, row) =>
+				row.lifecycleRequestId
+					? {
+							type: "control_request",
+							id,
+							operation: "session.close",
+							input: { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: row.lifecycleRequestId },
+						}
+					: undefined,
+			responseType: "control_response",
+			timeoutMs: SPAWN_HOST_CLOSE_EXCHANGE_TIMEOUT_MS,
+		});
+		return exchange.frame?.ok === true ? "accepted" : "unavailable";
+	}
+
+	/**
+	 * A headless host closes through its own endpoint first so it removes its endpoint
+	 * and disposes its session; on Windows a substrate signal is `TerminateProcess`,
+	 * which skips both. True only once the exact substrate is proven gone.
+	 */
+	async #closeSpawnHostGracefully(
+		authority: SpawnAuthorityV1,
+		proof: SpawnSubstrateProof,
+		provider: SpawnSubstrateProvider,
+	): Promise<boolean> {
+		const pinned = spawnPinFromAuthority(authority);
+		if (!pinned) return false;
+		try {
+			if ((await this.#spawnHostClose({ sessionId: pinned.sessionId, pinned })) !== "accepted") return false;
+		} catch {
+			return false;
+		}
+		const deadline = Date.now() + this.settings.spawnHostCloseGraceMs;
+		for (;;) {
+			const verdict = await provider.verify(proof);
+			if (verdict !== "verified") return verdict === "gone";
+			if (Date.now() >= deadline) return false;
+			await Bun.sleep(Math.min(50, Math.max(0, deadline - Date.now())));
+		}
 	}
 
 	/**
@@ -3664,8 +3742,14 @@ export class Broker {
 				).authority!;
 			}
 			if (verdict === "verified" || verdict === "gone") {
-				const closedSubstrate = await provider.close(proof);
-				if (!closedSubstrate.ok) return "retained";
+				const closedByHost =
+					verdict === "verified" &&
+					proof.substrateKind === "headless" &&
+					(await this.#closeSpawnHostGracefully(authority, proof, provider));
+				if (!closedByHost) {
+					const closedSubstrate = await provider.close(proof);
+					if (!closedSubstrate.ok) return "retained";
+				}
 				if ((await provider.verify(proof)) !== "gone") return "retained";
 			} else return "retained";
 			const at = Math.max(Date.now(), authority.updatedAt + 1);
