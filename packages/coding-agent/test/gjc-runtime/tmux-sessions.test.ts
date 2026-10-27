@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as nodeCrypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -921,7 +922,8 @@ describe("GJC tmux session management", () => {
 			const write = spyOn(fsSync, "writeFileSync");
 			const open = spyOn(fsSync, "openSync");
 			const bunWrite = spyOn(Bun, "write");
-			const allocateIdentity = spyOn(crypto, "randomUUID");
+			// Production allocates through node:crypto, not the WebCrypto global.
+			const allocateIdentity = spyOn(nodeCrypto, "randomUUID");
 			const execute = vi.fn(() => {
 				throw new Error("unexpected allocation");
 			});
