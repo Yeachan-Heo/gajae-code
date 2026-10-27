@@ -4114,13 +4114,7 @@ pub(crate) mod platform {
 			let name = c"system.posix_acl_default";
 			// SAFETY: fd and byte storage are live, name is NUL terminated.
 			let stored = unsafe {
-				libc::fsetxattr(
-					directory.as_raw_fd(),
-					name.as_ptr(),
-					acl.as_ptr().cast(),
-					acl.len(),
-					0,
-				)
+				libc::fsetxattr(directory.as_raw_fd(), name.as_ptr(), acl.as_ptr().cast(), acl.len(), 0)
 			};
 			if stored != 0 {
 				let error = std::io::Error::last_os_error();
