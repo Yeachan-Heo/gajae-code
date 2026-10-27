@@ -2935,12 +2935,12 @@ async function seedRalplanState(
 					2,
 					`existing ralplan state is corrupt or tampered (${existingStateRead.error}); refusing to overwrite ${statePath}`,
 				);
+			const existingStateIsActive = existingStateRead.kind === "valid" && existingStateRead.value.active === true;
 			const existingRunId =
-				existingStateRead.kind === "valid" && typeof existingStateRead.value.run_id === "string"
+				existingStateIsActive && typeof existingStateRead.value.run_id === "string"
 					? existingStateRead.value.run_id.trim() || undefined
 					: undefined;
-			const rawExistingBoundary =
-				existingStateRead.kind === "valid" ? existingStateRead.value.execution_boundary : undefined;
+			const rawExistingBoundary = existingStateIsActive ? existingStateRead.value.execution_boundary : undefined;
 			const existingBoundary =
 				rawExistingBoundary === undefined ? undefined : parseRalplanExecutionBoundary(rawExistingBoundary);
 			if (rawExistingBoundary !== undefined && !existingBoundary) {
@@ -2953,7 +2953,8 @@ async function seedRalplanState(
 				existingBoundary === "plan-only" || resolved.executionBoundary === "plan-only"
 					? "plan-only"
 					: (existingBoundary ?? resolved.executionBoundary);
-			const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
+			const clearedPriorRun = existingStateRead.kind === "valid" && !existingStateIsActive;
+			const runId = existingRunId ?? (clearedPriorRun ? defaultRunId() : (resolved.sessionId ?? defaultRunId()));
 			assertSafePathComponent(runId, "run-id");
 			const now = new Date().toISOString();
 			const repositoryBinding = existingRunId

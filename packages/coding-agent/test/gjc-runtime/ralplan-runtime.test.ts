@@ -236,6 +236,29 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(stateMutation.stderr).toContain("execution boundary cannot change");
 	});
 
+	it("starts a new unbounded run after clearing a bounded run", async () => {
+		const root = await tempDir();
+		const first = await runNativeRalplanCommand(
+			["--json", "--execution-boundary", "plan-only", "constrained plan"],
+			root,
+		);
+		expect(first.status).toBe(0);
+		const firstRunId = (JSON.parse(first.stdout ?? "{}") as { run_id: string }).run_id;
+
+		const cleared = await runNativeStateCommand(["clear", "--mode", "ralplan", "--json"], root);
+		expect(cleared.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8")).execution_boundary).toBeUndefined();
+
+		const next = await runNativeRalplanCommand(["--json", "unrelated plan"], root);
+		expect(next.status).toBe(0);
+		const nextSeed = JSON.parse(next.stdout ?? "{}") as { run_id: string; execution_boundary?: string };
+		expect(nextSeed.run_id).not.toBe(firstRunId);
+		expect(nextSeed.execution_boundary).toBeUndefined();
+		expect(JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8")).execution_boundary).toBeUndefined();
+		const plannerWrite = await writeRalplanArtifact(root, nextSeed.run_id, "planner", 1, "# Fresh plan");
+		expect(plannerWrite.status).toBe(0);
+	});
+
 	it("rejects corrupt ralplan state before consensus handoff seeding", async () => {
 		const root = await tempDir();
 		const statePath = ralplanStatePath(root);

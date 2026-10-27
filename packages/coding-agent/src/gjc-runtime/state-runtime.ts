@@ -1780,6 +1780,7 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 				updated_at: clearedAt,
 				version: WORKFLOW_STATE_VERSION,
 			};
+			if (mode === "ralplan") delete cleared.execution_boundary;
 			cleared.skill = mode;
 			const mutationId = `${mode}:clear:${clearedAt}`;
 			const receipt = buildWorkflowStateReceipt({
