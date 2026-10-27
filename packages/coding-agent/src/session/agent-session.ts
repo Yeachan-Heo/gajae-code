@@ -1262,6 +1262,33 @@ type SendUserMessageDispatchOptions = SendUserMessageOptions & {
 };
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
+type PromptAdmissionFence = {
+	generation: number;
+	signal: AbortSignal;
+	sessionId: string | undefined;
+};
+type EagerTodoPrelude = { message: AgentMessage; toolChoice?: ToolChoice };
+type SkillPromptPrelude = {
+	eagerTodoPrelude?: EagerTodoPrelude;
+	workflowIntentDiff?: WorkflowIntentDiff;
+	onQueued?: () => void;
+};
+type SkillInvocationOptions = Pick<
+	PromptOptions,
+	| "onPreflightAccepted"
+	| "onPreflightAcceptCommit"
+	| "onSkillPrepared"
+	| "preflightSignal"
+	| "sdkRunCapability"
+	| "streamingBehavior"
+	| "followUpQueuePolicy"
+	| "steerQueuePolicy"
+	| "toolChoice"
+	| "skipCompactionCheck"
+> & {
+	promptAdmissionFence?: PromptAdmissionFence;
+	promptPrelude?: SkillPromptPrelude;
+};
 interface SdkContinuationOwnership {
 	scope: AttemptScope;
 	token: string;
@@ -1276,8 +1303,11 @@ type InternalCustomMessageOptions = Pick<
 	| "onPreflightAccepted"
 	| "onPreflightAcceptCommit"
 	| "preflightSignal"
+	| "skipCompactionCheck"
 > & {
 	sdkRunToken?: string;
+	promptPreflightGuard?: () => void;
+	promptPrelude?: SkillPromptPrelude;
 };
 
 function assertQueuedInputQueuePolicy(queuePolicy: unknown): asserts queuePolicy is QueuedInputQueuePolicy | undefined {
@@ -3977,6 +4007,7 @@ export class AgentSession {
 	#deepInterviewTurnOwnerEpoch = 0;
 	#deepInterviewGenuineUserMessageEpochs = new WeakMap<object, number>();
 	#deepInterviewPreclaimedCustomInputEpochs = new WeakMap<object, number>();
+	#userTurnFallbackResetMessages = new WeakSet<object>();
 	#deepInterviewAssistantIdentities = new WeakMap<object, string>();
 	#nextDeepInterviewAssistantFallbackId = 0;
 	#handledDeepInterviewAssistantIds = new Set<string>();
@@ -5142,6 +5173,11 @@ export class AgentSession {
 		if (this.#isPromptPreflightCancelled(generation, signal)) {
 			throw promptPreflightCancelledError();
 		}
+	}
+
+	#assertPromptAdmissionFence(fence: PromptAdmissionFence): void {
+		this.#throwIfPromptPreflightCancelled(fence.generation, fence.signal);
+		if (this.sessionManager.getSessionId() !== fence.sessionId) throw promptPreflightCancelledError();
 	}
 
 	async #awaitPromptPreflight<T>(generation: number, signal: AbortSignal, pending: Promise<T>): Promise<T> {
@@ -8181,6 +8217,18 @@ export class AgentSession {
 			if (epoch !== undefined) {
 				this.#deepInterviewContinuationBudget = { epoch, committed: 0, reserved: 0 };
 				this.#deepInterviewTurnOwnerEpoch = epoch;
+			}
+			if (
+				event.message.role === "custom" &&
+				event.message.customType === SKILL_PROMPT_MESSAGE_TYPE &&
+				event.message.attribution === "user" &&
+				!this.#userTurnFallbackResetMessages.has(event.message)
+			) {
+				this.#userTurnFallbackResetMessages.add(event.message);
+				await this.#resetDefaultFallbackForNewTurn();
+				await this.#ensureDefaultFallbackResolution();
+				this.#defaultFallbackChain().resetAttemptBudget();
+				this.#overflowMaintenanceAttempts = 0;
 			}
 		}
 		const userMessageText =
@@ -13991,23 +14039,23 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<
-			PromptOptions,
-			| "onPreflightAccepted"
-			| "onPreflightAcceptCommit"
-			| "onSkillPrepared"
-			| "preflightSignal"
-			| "sdkRunCapability"
-			| "streamingBehavior"
-			| "followUpQueuePolicy"
-			| "steerQueuePolicy"
-		>,
+		options?: SkillInvocationOptions,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
-		const internalOptions = {
-			...options,
-			sdkRunToken: readSdkRunCapability(options?.sdkRunCapability),
+		const { promptAdmissionFence, promptPrelude, ...promptOptions } = options ?? {};
+		const assertPromptAdmission = () => {
+			if (promptAdmissionFence) this.#assertPromptAdmissionFence(promptAdmissionFence);
 		};
-		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+		const preparationSignal = promptAdmissionFence
+			? promptOptions.preflightSignal
+				? AbortSignal.any([promptAdmissionFence.signal, promptOptions.preflightSignal])
+				: promptAdmissionFence.signal
+			: promptOptions.preflightSignal;
+		const internalOptions = {
+			...promptOptions,
+			sdkRunToken: readSdkRunCapability(promptOptions.sdkRunCapability),
+		};
+		assertPromptAdmission();
+		if (promptOptions.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
 		if (typeof args !== "string")
@@ -14026,8 +14074,9 @@ export class AgentSession {
 				skillName: skill.name,
 				args,
 			}),
-			options?.preflightSignal,
+			preparationSignal,
 		);
+		assertPromptAdmission();
 		const built = await awaitPromptInvocationPreflight(
 			buildSkillPromptMessage(skill, activation.cleanedArgs, {
 				subskillActivation: activation.activation,
@@ -14035,8 +14084,9 @@ export class AgentSession {
 				cwd: this.sessionManager.getCwd(),
 				sessionId: this.sessionId,
 			}),
-			options?.preflightSignal,
+			preparationSignal,
 		);
+		assertPromptAdmission();
 		const skillPromptMessage = {
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,
@@ -14045,14 +14095,19 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
-		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
-		options?.onSkillPrepared?.({
+		if (promptOptions.preflightSignal?.aborted) throw promptPreflightCancelledError();
+		promptOptions.onSkillPrepared?.({
 			name: skill.name,
 			path: skill.filePath,
 			lineCount: built.details.lineCount,
 			cleanedArgs: activation.cleanedArgs || undefined,
 		});
-		await this.promptCustomMessage(skillPromptMessage, internalOptions as InternalCustomMessageOptions);
+		assertPromptAdmission();
+		await this.promptCustomMessage(skillPromptMessage, {
+			...internalOptions,
+			...(promptAdmissionFence ? { promptPreflightGuard: assertPromptAdmission } : {}),
+			...(promptPrelude ? { promptPrelude } : {}),
+		} as InternalCustomMessageOptions);
 		return {
 			name: skill.name,
 			path: skill.filePath,
@@ -14860,7 +14915,7 @@ export class AgentSession {
 	 * that must mirror it, such as startup title seeding.
 	 */
 	resolvePromptSkillInvocation(text: string, images?: readonly unknown[]): ParsedSkillInvocation | undefined {
-		if (images?.length) return;
+		if (this.#skillsSettings?.enableSkillCommands === false || images?.length) return;
 		const skillCommands = new Map(this.skills.map(skill => [getSkillSlashCommandName(skill), skill]));
 		const invocations = parseSkillInvocations(text, skillCommands);
 		return invocations.length === 1 ? invocations[0] : undefined;
@@ -14894,44 +14949,80 @@ export class AgentSession {
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		if (options?.synthetic !== true && options?.attribution !== "agent")
 			invalidateSessionTitleGeneration(this.sessionManager);
-		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
-		const internalOptions: InternalPromptOptions | undefined = options
-			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
-			: undefined;
 		this.#assertRecoveryHydrationPromoted();
 		this.#assertExternalSessionIngress();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
 
 		if (expandPromptTemplates) {
-			const invocation = this.resolvePromptSkillInvocation(text, options?.images);
+			const invocation = claimsGenuineUserIntent
+				? this.resolvePromptSkillInvocation(text, options?.images)
+				: undefined;
 			if (invocation) {
-				const skillOptions: Pick<
-					PromptOptions,
-					| "onPreflightAccepted"
-					| "onPreflightAcceptCommit"
-					| "preflightSignal"
-					| "sdkRunCapability"
-					| "streamingBehavior"
-					| "followUpQueuePolicy"
-					| "steerQueuePolicy"
-				> = {
+				const sessionId = this.sessionManager.getSessionId();
+				let promptAdmissionFence: PromptAdmissionFence = {
+					generation: this.#promptGeneration,
+					signal: options?.preflightSignal
+						? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
+						: this.#promptPreflightAbortController.signal,
+					sessionId,
+				};
+				if (this.#pendingSelectionFences > 0)
+					await awaitPromptInvocationPreflight(this.#selectionFenceTail, promptAdmissionFence.signal);
+				if (this.#abortUnwind) {
+					if (!(await this.#awaitAbortUnwindFence())) throw promptPreflightCancelledError();
+					promptAdmissionFence = {
+						...promptAdmissionFence,
+						generation: this.#promptGeneration,
+						signal: options?.preflightSignal
+							? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
+							: this.#promptPreflightAbortController.signal,
+					};
+				}
+				this.#assertPromptAdmissionFence(promptAdmissionFence);
+				const promptAdmissionContended =
+					options?.streamingBehavior !== undefined &&
+					(this.#activeSessionAdmission?.kind === "prompt" ||
+						this.#sessionAdmissionQueue.some(entry => entry.kind === "prompt"));
+				const busySubmission = this.#isLiveTurnBusy() || promptAdmissionContended;
+				if (busySubmission && !options?.streamingBehavior) throw new AgentBusyError();
+				const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
+				const eagerTodoPrelude =
+					!busySubmission && !hasPendingUserDirective ? this.#createEagerTodoPrelude(text) : undefined;
+				const workflowIntentDiff = buildWorkflowIntentDiff(text) ?? undefined;
+				let skillPromptQueued = false;
+				const skillOptions: SkillInvocationOptions = {
 					...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
-					...(options?.onPreflightAcceptCommit ? { onPreflightAcceptCommit: options.onPreflightAcceptCommit } : {}),
+					...(options?.onPreflightAcceptCommit
+						? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
+						: {}),
+					...(options?.onSkillPrepared ? { onSkillPrepared: options.onSkillPrepared } : {}),
 					...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-					...(options?.sdkRunCapability !== undefined ? { sdkRunCapability: options.sdkRunCapability } : {}),
+					...(options?.sdkRunCapability !== undefined
+						? { sdkRunCapability: options.sdkRunCapability }
+						: {}),
 					...(options?.streamingBehavior !== undefined ? { streamingBehavior: options.streamingBehavior } : {}),
 					...(options?.followUpQueuePolicy !== undefined
 						? { followUpQueuePolicy: options.followUpQueuePolicy }
 						: {}),
 					...(options?.steerQueuePolicy !== undefined ? { steerQueuePolicy: options.steerQueuePolicy } : {}),
+					...(options?.toolChoice !== undefined ? { toolChoice: options.toolChoice } : {}),
+					...(options?.skipCompactionCheck !== undefined
+						? { skipCompactionCheck: options.skipCompactionCheck }
+						: {}),
+					promptAdmissionFence,
+					promptPrelude: {
+						...(eagerTodoPrelude ? { eagerTodoPrelude } : {}),
+						...(workflowIntentDiff ? { workflowIntentDiff } : {}),
+						onQueued: () => {
+							skillPromptQueued = true;
+						},
+					},
 				};
-				await this.invokeSkill(
-					invocation.skill.name,
-					invocation.args,
-					Object.keys(skillOptions).length > 0 || internalOptions?.sdkRunToken ? skillOptions : undefined,
-				);
+				await this.invokeSkill(invocation.skill.name, invocation.args, skillOptions);
+				if (!skillPromptQueued) await this.#enforcePlanModeToolDecision();
 				return;
 			}
 		}
@@ -14967,7 +15058,6 @@ export class AgentSession {
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
-		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
 		let admissionGeneration = this.#promptGeneration;
 		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
@@ -15245,13 +15335,16 @@ export class AgentSession {
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
 			| "sdkRunCapability"
-		>,
+			| "skipCompactionCheck"
+		> &
+			Pick<InternalCustomMessageOptions, "promptPreflightGuard" | "promptPrelude">,
 	): Promise<void> {
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalCustomMessageOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
 			: undefined;
 		this.#assertExternalSessionIngress();
+		options?.promptPreflightGuard?.();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
@@ -15268,7 +15361,11 @@ export class AgentSession {
 				? (preclaimedUserIntentEpoch ?? this.#claimDeepInterviewUserIntent())
 				: preclaimedUserIntentEpoch;
 
-		if (this.isStreaming) {
+		const promptAdmissionContended =
+			options?.streamingBehavior !== undefined &&
+			(this.#activeSessionAdmission?.kind === "prompt" ||
+				this.#sessionAdmissionQueue.some(entry => entry.kind === "prompt"));
+		if (this.isStreaming || promptAdmissionContended) {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
@@ -15279,6 +15376,16 @@ export class AgentSession {
 				followUpQueuePolicy: options.followUpQueuePolicy,
 				steerQueuePolicy: options.steerQueuePolicy,
 			});
+			if (options.promptPrelude?.workflowIntentDiff)
+				this.sessionManager.appendCustomEntry(
+					WORKFLOW_INTENT_DIFF_CUSTOM_TYPE,
+					options.promptPrelude.workflowIntentDiff,
+				);
+			this.#assertExternalSessionIngress();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
+			this.#assertExternalSessionIngress();
+			options.promptPrelude?.onQueued?.();
 			return;
 		}
 
@@ -15287,6 +15394,7 @@ export class AgentSession {
 		await this.#withSessionAdmission(
 			"prompt",
 			async admission => {
+				options?.promptPreflightGuard?.();
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
 				if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 				const customMessage: CustomMessage<T> = {
@@ -15322,12 +15430,22 @@ export class AgentSession {
 					}
 				};
 				try {
+					if (options?.promptPrelude?.eagerTodoPrelude?.toolChoice) {
+						this.#toolChoiceQueue.pushOnce(options.promptPrelude.eagerTodoPrelude.toolChoice, {
+							label: "eager-todo",
+						});
+					}
 					await this.#promptWithMessage(customMessage, textContent, {
 						...internalOptions,
+						prependMessages: options?.promptPrelude?.eagerTodoPrelude
+							? [options.promptPrelude.eagerTodoPrelude.message]
+							: undefined,
+						workflowIntentDiff: options?.promptPrelude?.workflowIntentDiff,
 						onPreflightAccepted: undefined,
 						onPreflightAcceptCommit: commitAcceptance,
 						admissionLease: admission,
 						resetRetryReplaySafety: true,
+						skipCompactionCheck: options?.skipCompactionCheck,
 					});
 				} catch (error) {
 					if (isPromptPreflightCancelledError(error) || !durableAcceptanceCompleted) {
@@ -15336,6 +15454,7 @@ export class AgentSession {
 					}
 					throw error;
 				} finally {
+					this.#toolChoiceQueue.removeByLabel("eager-todo");
 					if (!preflightCancelled) await this.#syncSkillPromptActiveStateSafely(customMessage, false);
 				}
 			},
@@ -15434,7 +15553,12 @@ export class AgentSession {
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			if (options?.resetRetryReplaySafety) this.#resetRetryReplaySafety();
-			if (message.role === "user") {
+			const userSkillPrompt =
+				message.role === "custom" &&
+				message.customType === SKILL_PROMPT_MESSAGE_TYPE &&
+				message.attribution === "user";
+			if (message.role === "user" || userSkillPrompt) {
+				if (userSkillPrompt) this.#userTurnFallbackResetMessages.add(message);
 				await this.#resetDefaultFallbackForNewTurn();
 				await this.#ensureDefaultFallbackResolution();
 				this.#defaultFallbackChain().resetAttemptBudget();
@@ -16900,7 +17024,11 @@ export class AgentSession {
 			}
 			return;
 		}
-		if (this.isStreaming) {
+		const followUpAdmissionContended =
+			options?.deliverAs === "followUp" &&
+			(this.#activeSessionAdmission?.kind === "prompt" ||
+				this.#sessionAdmissionQueue.some(entry => entry.kind === "prompt"));
+		if (this.isStreaming || followUpAdmissionContended) {
 			// A handoff transition owns the session; a background/custom trigger (cron,
 			// monitor, skill) must not steer/follow-up/queue against the outgoing turn
 			// while an (auto-)handoff is unwinding it.
@@ -23706,7 +23834,7 @@ export class AgentSession {
 		});
 	}
 
-	#createEagerTodoPrelude(promptText: string): { message: AgentMessage; toolChoice?: ToolChoice } | undefined {
+	#createEagerTodoPrelude(promptText: string): EagerTodoPrelude | undefined {
 		const eagerTodosEnabled = this.settings.get("todo.eager");
 		const todosEnabled = this.settings.get("todo.enabled");
 		if (!eagerTodosEnabled || !todosEnabled) {
