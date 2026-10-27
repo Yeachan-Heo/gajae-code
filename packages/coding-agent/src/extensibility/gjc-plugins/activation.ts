@@ -77,7 +77,7 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 		const flagPattern = new RegExp(`(^|\\s)${flagToken.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}(\\s|$)`);
 		cleanedArgs = input.args.replace(flagPattern, (match, before, after) => {
 			// Preserve one whitespace boundary if present
-			return before || after ? (before || after) : "";
+			return before || after ? before || after : "";
 		});
 	}
 	return {
