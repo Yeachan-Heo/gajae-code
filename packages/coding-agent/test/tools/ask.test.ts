@@ -4310,7 +4310,12 @@ describe("AskTool Round-0 intent recovery", () => {
 
 	it("normalizes strict-provider null placeholders and preserves bounded adapter context before exact Round-0 recovery", () => {
 		const pair = roundZeroPair();
-		Object.assign(pair.questions[0], { multi: null, recommended: null, workflowGate: null });
+		Object.assign(pair.questions[0], {
+			multi: null,
+			recommended: null,
+			requireExplicitAnswer: null,
+			workflowGate: null,
+		});
 		Object.assign(pair.questions[0].deepInterview, {
 			round_id: null,
 			confused_terms: ["eventual consistency"],
@@ -4330,6 +4335,7 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(question.deepInterview).not.toHaveProperty("round_id");
 		expect(question).not.toHaveProperty("multi");
 		expect(question).not.toHaveProperty("recommended");
+		expect(question).not.toHaveProperty("requireExplicitAnswer");
 		expect(question).not.toHaveProperty("workflowGate");
 	});
 
@@ -4352,6 +4358,54 @@ describe("AskTool Round-0 intent recovery", () => {
 		});
 
 		expect(result.questions[0]).not.toHaveProperty("deepInterview");
+	});
+
+	it("accepts requireExplicitAnswer: null on Round-0 topology ask and strips it", () => {
+		const pair = roundZeroPair();
+		Object.assign(pair.questions[0], { requireExplicitAnswer: null });
+		const question = validateAsk(pair).questions[0];
+		expect(question).not.toHaveProperty("requireExplicitAnswer");
+		expect(question).toMatchObject({
+			deepInterview: { intent_contract: expect.any(Object) },
+		});
+	});
+
+	it("accepts requireExplicitAnswer: true on Round-0 topology ask and preserves it", () => {
+		const pair = roundZeroPair();
+		Object.assign(pair.questions[0], { requireExplicitAnswer: true });
+		const question = validateAsk(pair).questions[0];
+		expect(question).toHaveProperty("requireExplicitAnswer", true);
+		expect(question).toMatchObject({
+			deepInterview: { intent_contract: expect.any(Object) },
+		});
+	});
+
+	it("accepts requireExplicitAnswer: null on post-topology intent_review ask and strips it", () => {
+		const postRoundReview = roundZeroPair();
+		Reflect.deleteProperty(postRoundReview.questions[0].deepInterview, "intent_contract");
+		postRoundReview.questions[0].deepInterview.round = 1;
+		postRoundReview.questions[0].deepInterview.component = "locked-intent";
+		postRoundReview.questions[0].deepInterview.dimension = "constraints";
+		Object.assign(postRoundReview.questions[0], { requireExplicitAnswer: null });
+		const question = validateAsk(postRoundReview, "post-topology").questions[0];
+		expect(question).not.toHaveProperty("requireExplicitAnswer");
+		expect(question).toMatchObject({
+			deepInterview: { intent_review: expect.any(Object) },
+		});
+	});
+
+	it("accepts requireExplicitAnswer: true on post-topology intent_review ask and preserves it", () => {
+		const postRoundReview = roundZeroPair();
+		Reflect.deleteProperty(postRoundReview.questions[0].deepInterview, "intent_contract");
+		postRoundReview.questions[0].deepInterview.round = 1;
+		postRoundReview.questions[0].deepInterview.component = "locked-intent";
+		postRoundReview.questions[0].deepInterview.dimension = "constraints";
+		Object.assign(postRoundReview.questions[0], { requireExplicitAnswer: true });
+		const question = validateAsk(postRoundReview, "post-topology").questions[0];
+		expect(question).toHaveProperty("requireExplicitAnswer", true);
+		expect(question).toMatchObject({
+			deepInterview: { intent_review: expect.any(Object) },
+		});
 	});
 
 	it("returns bounded corrections for strict-wire intent constraints that local validation must enforce", () => {

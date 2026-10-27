@@ -471,7 +471,7 @@ function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): R
 	if (!isPlainRecord(question) || !isPlainRecord(question.deepInterview)) return arguments_;
 	const normalizedQuestion = { ...question };
 	let changed = false;
-	for (const key of ["multi", "recommended", "workflowGate"] as const) {
+	for (const key of ["multi", "recommended", "requireExplicitAnswer", "workflowGate"] as const) {
 		if (Object.hasOwn(normalizedQuestion, key) && normalizedQuestion[key] === null) {
 			delete normalizedQuestion[key];
 			changed = true;
@@ -635,7 +635,16 @@ export function recoverRoundZeroIntentContract(
 
 	const question = normalizedArguments.questions[0];
 	if (!isPlainRecord(question)) return { outcome: "reject" };
-	const questionKeys = ["id", "question", "options", "multi", "recommended", "deepInterview", "workflowGate"];
+	const questionKeys = [
+		"id",
+		"question",
+		"options",
+		"multi",
+		"recommended",
+		"requireExplicitAnswer",
+		"deepInterview",
+		"workflowGate",
+	];
 	if (!hasOnlyAllowedOwnKeys(question, questionKeys)) return { outcome: "reject" };
 	if (
 		typeof question.id !== "string" ||
