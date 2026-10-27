@@ -1495,10 +1495,18 @@ async function acquireSqliteLock(paths: LifecyclePaths, waitMs: number): Promise
  */
 function holdCloserLock(paths: LifecyclePaths): Database | null {
 	try {
-		const database = new Database(paths.closerLockFile);
+		// Never open or chmod a path that is not already this owner's private file: a
+		// missing lock is created exclusively without following links.
 		try {
-			setLockDatabaseMode(paths.closerLockFile);
-			if (!verifyOwnerOnlyPathSecurity(paths.closerLockFile, "file").ok) throw new Error("closer_lock_unsafe");
+			fsSync.lstatSync(paths.closerLockFile);
+		} catch (error) {
+			if (!isCode(error, "ENOENT")) return null;
+			const { O_CREAT, O_EXCL, O_NOFOLLOW, O_RDWR } = fsSync.constants;
+			fsSync.closeSync(fsSync.openSync(paths.closerLockFile, O_CREAT | O_EXCL | O_NOFOLLOW | O_RDWR, 0o600));
+		}
+		if (!verifyOwnerOnlyPathSecurity(paths.closerLockFile, "file").ok) return null;
+		const database = new Database(paths.closerLockFile, { readwrite: true, create: false });
+		try {
 			configureLockDatabase(database, 0);
 			database.exec("BEGIN IMMEDIATE");
 			return database;

@@ -2637,6 +2637,31 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 		}
 	});
 
+	it.each(["symlink", "hardlink"] as const)("refuses a %s closer lock without touching its target", async kind => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-closer-link-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-closer-target-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const target = path.join(outside, "external.sqlite");
+			const external = new Database(target);
+			external.exec("CREATE TABLE kept (value TEXT)");
+			external.close();
+			await fs.chmod(target, 0o644);
+			const before = await fs.readFile(target);
+			if (kind === "symlink") await fs.symlink(target, paths.closerLockFile);
+			else await fs.link(target, paths.closerLockFile);
+			await expect(close(state, generation, "dispatch", expiredWait)).rejects.toThrow("generation_lock_contended");
+			expect((await fs.stat(target)).mode & 0o777).toBe(0o644);
+			expect(await fs.readFile(target)).toEqual(before);
+			expect(fsSync.existsSync(paths.intentFile)).toBe(false);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
 	it("never relays an intent its closer abandoned without being able to retire it", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-abandoned-"));
 		try {
