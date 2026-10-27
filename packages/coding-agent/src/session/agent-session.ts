@@ -20542,6 +20542,9 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 			followUpQueuePolicy?: "respect-mode" | "sequential";
 			steerQueuePolicy?: "respect-mode" | "sequential";
+			/** Cancellation signal for queued prompts. When aborted, prevents queued
+			 *  prompts from executing (review blocker P2 issue #7321). */
+			preflightSignal?: AbortSignal;
 			/** INTERNAL trusted option: origin of a hidden next-turn message —
 			 *  "turn" (produced by the current turn's continuation machinery,
 			 *  purged by a terminal abort) or "external" (background producers,

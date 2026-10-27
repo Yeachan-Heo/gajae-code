@@ -208,6 +208,27 @@ describe("parseSkillInvocations", () => {
 				expectedCommandCount: 1,
 				expectedCommands: ["skill:alpha"],
 			},
+			// Non-matching backtick runs inside a span should be treated as literal text
+			{
+				description: "Non-matching backticks inside span are literal text",
+				text: "Show ``a `tick`` then /skill:alpha",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:alpha"],
+			},
+			// Longer closing fence should close the code block
+			{
+				description: "Longer closing fence closes code block",
+				text: "Example:\n```\n/skill:alpha\n````\n/skill:beta after",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:beta"],
+			},
+			// Equal length fence still closes
+			{
+				description: "Equal length fence closes",
+				text: "Example:\n```\n/skill:alpha\n```\n/skill:beta after",
+				expectedCommandCount: 1,
+				expectedCommands: ["skill:beta"],
+			},
 		];
 
 		for (const testCase of testCases) {
