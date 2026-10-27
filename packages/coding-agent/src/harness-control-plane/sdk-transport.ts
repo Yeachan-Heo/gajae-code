@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { readSdkSessionEndpoint, SdkClient } from "../sdk/client";
+import { classifyEndpoint } from "../sdk/client/liveness";
+import { isHarnessLoopbackEndpointUrl } from "./harness-endpoint-url";
 import type { HarnessSessionTransport, SessionStateSnapshot } from "./session-transport";
 
 const DISCOVERY_TIMEOUT_MS = 10_000;
@@ -31,7 +33,40 @@ export interface CreateSdkSessionTransportOptions {
 	discoveryTimeoutMs?: number;
 	/** Test seam: inject SDK client/endpoint resolution to avoid a process-global module mock. */
 	connect?: typeof SdkClient.connect;
-	readEndpoint?: (repo: string, sessionId: string) => Promise<{ url: string; token: string } | null>;
+	readEndpoint?: (
+		repo: string,
+		sessionId: string,
+	) => Promise<{ url: string; token: string; pid?: number; stale?: boolean; sessionId?: string } | null>;
+}
+
+type DiscoveredHarnessEndpoint = {
+	url: string;
+	token: string;
+	pid?: number;
+	stale?: boolean;
+	sessionId?: string;
+};
+
+/**
+ * A discovery record may replace spawning only when it is a live loopback endpoint
+ * for this session. Any other record is ignored so the owner starts the real session.
+ */
+function isOwnedHarnessDiscoveryEndpoint(endpoint: DiscoveredHarnessEndpoint, sessionId: string): boolean {
+	if (typeof endpoint.url !== "string" || typeof endpoint.token !== "string" || endpoint.token.length === 0)
+		return false;
+	if (endpoint.stale === true) return false;
+	if (endpoint.sessionId !== undefined && endpoint.sessionId !== sessionId) return false;
+	if (!isHarnessLoopbackEndpointUrl(endpoint.url)) return false;
+	return (
+		classifyEndpoint({
+			sessionId,
+			url: endpoint.url,
+			token: endpoint.token,
+			path: "",
+			...(typeof endpoint.pid === "number" ? { pid: endpoint.pid } : {}),
+			...(typeof endpoint.stale === "boolean" ? { stale: endpoint.stale } : {}),
+		}) === "live"
+	);
 }
 
 function invalidResponse(detail: string): never {
@@ -133,14 +168,19 @@ export async function createSdkSessionTransport(
 ): Promise<HarnessSessionTransport> {
 	let child: SpawnedHarnessSession | undefined;
 	const readEndpoint = options.readEndpoint ?? readSdkSessionEndpoint;
-	let endpoint = await readEndpoint(options.repo, options.sessionId);
+	const readOwnedEndpoint = async (): Promise<DiscoveredHarnessEndpoint | null> => {
+		const found = await readEndpoint(options.repo, options.sessionId);
+		if (!found || !isOwnedHarnessDiscoveryEndpoint(found, options.sessionId)) return null;
+		return found;
+	};
+	let endpoint = await readOwnedEndpoint();
 	if (!endpoint && options.spawn) child = await options.spawn();
 	const timeoutMs = options.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS;
 	const deadline = Date.now() + timeoutMs;
 	while (!endpoint && Date.now() < deadline) {
 		await new Promise(resolve => setTimeout(resolve, DISCOVERY_POLL_MS));
 		try {
-			endpoint = await readEndpoint(options.repo, options.sessionId);
+			endpoint = await readOwnedEndpoint();
 		} catch (error) {
 			// A discovery read that fails after spawn must not orphan the spawned child;
 			// await stop before propagating, preserving both causes on dual failure (no double stop).
