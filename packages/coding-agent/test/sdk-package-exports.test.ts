@@ -21,6 +21,7 @@ import * as publicSdk from "@gajae-code/coding-agent/sdk";
 import * as bus from "@gajae-code/coding-agent/sdk/bus";
 import packageJson from "../package.json";
 import * as root from "../src/index";
+import { initializeExtensions } from "../src/modes/runtime-init";
 import * as sdk from "../src/sdk";
 import * as session from "../src/sdk/session";
 
@@ -61,6 +62,12 @@ describe("SDK package exports", () => {
 	});
 	it("loads the public SDK and bus package subpaths", () => {
 		expect(publicSdk.createAgentSession).toBeFunction();
+		expect(publicSdk.initializeExtensions).toBe(initializeExtensions);
+		expect(root.initializeExtensions).toBe(initializeExtensions);
+		expect(publicSdk.ExtensionInteractionService).toBeFunction();
+		expect(publicSdk.JobObservation).toBeFunction();
+		expect(root.ExtensionInteractionService).toBe(publicSdk.ExtensionInteractionService);
+		expect(root.JobObservation).toBe(publicSdk.JobObservation);
 		expect(publicSdk.lifecycle.SessionLifecycleService).toBeFunction();
 		expect(publicSdk.lifecycle.SessionLifecycleService.prototype.lookup).toBeFunction();
 		expect(bus.createNotificationsExtension).toBeFunction();

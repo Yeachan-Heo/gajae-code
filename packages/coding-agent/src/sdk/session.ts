@@ -234,6 +234,7 @@ import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { JobObservation } from "./job-observation";
 import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	isStableSessionApiKeyCredentialType,
@@ -704,6 +705,13 @@ export interface CreateAgentSessionOptions {
 export interface CreateAgentSessionResult {
 	/** The created session */
 	session: AgentSession;
+	/**
+	 * Lazy, session-owned view scoped to the factory's captured agent owner, not its session ID.
+	 * Undefined without a background manager, or when first queried after disposal.
+	 * Repeated reads return the same view, including after it is disposed. Session cleanup
+	 * disposes it; disposing it manually does not recreate it or dispose the manager.
+	 */
+	readonly jobObservation?: JobObservation;
 	/** Extensions result (loaded extensions + runtime) */
 	extensionsResult: LoadExtensionsResult;
 	/** Update tool UI context (interactive mode) */
@@ -6196,8 +6204,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// creation result through every controller.
 		session.gjcRuntimeSnapshot = gjcRuntimeStore;
 		session.gjcActivationGeneration = gjcActivationGeneration;
+		let jobObservation: JobObservation | undefined;
+		const observationSession = session;
+		const observationManager = asyncJobManager;
 		return {
 			session,
+			get jobObservation() {
+				if (observationSession.isDisposed) {
+					jobObservation?.dispose();
+					return jobObservation;
+				}
+				if (!jobObservation && observationManager) {
+					const view = new JobObservation(observationManager, resolvedAgentId);
+					observationSession.registerToolSessionCleanup(() => view.dispose());
+					jobObservation = view;
+				}
+				return jobObservation;
+			},
 			extensionsResult,
 			setToolUIContext,
 			mcpManager: ownsMcpManager && mcpManager?.isToolsOnly() ? undefined : mcpManager,

@@ -98,9 +98,63 @@ phase) finish before hooks and ordinary observers run. A failing subscriber
 is logged by setting path without hiding the commit receipt or
 preventing other observers from receiving the change.
 
+Ordinary saves also publish effective changes adopted from another scoped owner's
+on-disk edits. Overlapping writes through the shared in-process YAML writer fence
+older receipts, including same-value and ABA writes and canonical-path aliases.
+Unrelated model-role writes do not invalidate a default-role receipt. These
+ownership generations are process-local: unknown or cross-process writers retain
+the existing hash/exact-file checks, which do not prove same-value or ABA ownership.
+
+Only the singleton created by `Settings.init` owns process-global presentation
+hooks. Scoped and isolated settings, including runtime overrides, do not change
+another host's theme, symbol preset, color-blind mode, or tab width.
+
 `Settings.isolated()` remains memory-only. Check
 `canPersistDurableConfig()` before describing an atomic result as durable.
 This contract covers sampling, not every setting's live/reload/restart behavior.
+
+### Portable host services
+
+The following exports are available from `@gajae-code/coding-agent/sdk` and the
+package root. They are trusted embedding compositions, not new managed operations.
+
+- **Extension interactions:** construct `ExtensionInteractionService` for one
+  session ID and admit a renderer with `connect()`. Keep its connection ID private
+  to that renderer. Install `service.ui` separately through
+  `result.setToolUIContext(service.ui, true)` and the public
+  `initializeExtensions(session, { uiContext: service.ui, reportSendError,
+  reportRuntimeError, onShutdown })` helper. The latter initializes extension and
+  function-hook context and emits `session_start`; it is not a repeated UI setter.
+  `subscribe()`/`snapshot()` expose bounded pending requests; replies require the
+  matching session, connection and request IDs. Reconnect rotates responder
+  authority while preserving pending requests. Register `service.dispose()` with
+  `session.registerToolSessionCleanup`, and dispose before switching session
+  identity. Terminal factories and unsupported dialog callbacks fail explicitly.
+  A reply, including a workflow-approval reply, grants no execution permission.
+- **Owned jobs:** `result.jobObservation` lazily returns one session-owned view,
+  captured from the factory's actual manager and agent owner. It never borrows the
+  process-global manager. It is unavailable when that factory has no manager or
+  when first accessed after disposal. Snapshots include owner-filtered jobs, task
+  identities and cron schedules; monitor actions require the observed generation,
+  and cron deletion requires the observed `createdAt`. Folded work remains
+  read-only. Terminal monitor cancellation refuses with `already_terminal`.
+  Session cleanup disposes an existing view; stale handles refuse further work,
+  and a manually disposed view is not silently recreated.
+- **Local notification setup:** `createNotificationsEditorOperations` accepts
+  `{ settings, session, sessionManager }` and reuses the same service as the TUI.
+  `preflightProposedIdentity`/`commitConfigure` and
+  `prepareProviderConfiguration`/`commitProviderConfiguration` retain preflight,
+  CAS and saved-but-activation-failed outcomes. Keep prepared objects in the
+  trusted host: they are frozen, instance-bound, one-shot authority, not arbitrary
+  renderer JSON. Forward only display data and bind renderer actions to the
+  retained object. Discard prepared configuration on cancellation; prepare a fresh
+  draft after a commit attempt, including a failed attempt. Forged, copied,
+  foreign, discarded or replayed provider drafts return `invalid_draft` without
+  saving bindings. Secret inputs use the one-way `NotificationSetupSecretValue`
+  contract; do not serialize credentials into renderer state or generic queries.
+
+These compositions do not install generic-host `auth.login`, relax notification
+binding/secret restrictions on `config.patch`, or certify full TUI parity.
 
 ### Required vs optional inputs
 

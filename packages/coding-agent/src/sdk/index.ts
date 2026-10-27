@@ -9,6 +9,7 @@ export {
 	type UnknownModelProfileDetails,
 	UnknownModelProfileError,
 } from "../config/model-profile-contract";
+export * from "../modes/runtime-init";
 export {
 	PROJECT_PROGRESS_SNAPSHOT_SCHEMA,
 	type ProgressSnapshotAttention,
@@ -30,7 +31,9 @@ export type {
 } from "../session/agent-session";
 export * as bus from "./bus";
 export * from "./diagnostics/observe-broker";
+export * from "./extension-interaction";
 export * as host from "./host";
+export * from "./job-observation";
 export * as lifecycle from "./lifecycle";
 export * as mcp from "./mcp";
 export type {
@@ -41,6 +44,8 @@ export type {
 	Q10ThinkingEffort,
 	Q10ThinkingMode,
 } from "./models";
+export * from "./notification-setup";
+export * from "./notification-setup-contract";
 export * from "./prompt-status";
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
 export * as router from "./router";

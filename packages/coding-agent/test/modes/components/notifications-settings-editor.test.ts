@@ -1,22 +1,22 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import {
-	type NotificationsConfigureCommitResult,
-	type NotificationsEditorOperations,
-	type NotificationsEditorPreferences,
-	type NotificationsEditorSetupInput,
-	type NotificationsEditorState,
-	type NotificationsPreflightResult,
-	type NotificationsProviderSetupInput,
-	type NotificationsSaveInactiveResult,
-	NotificationsSettingsEditorComponent,
-	type PreparedNotificationProviderConfiguration,
-} from "@gajae-code/coding-agent/modes/components/notifications-settings-editor";
+import { NotificationsSettingsEditorComponent } from "@gajae-code/coding-agent/modes/components/notifications-settings-editor";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { NotificationProvider } from "@gajae-code/coding-agent/sdk/bus/config";
 import type {
 	NotificationHealthReport,
 	NotificationStatusReport,
 } from "@gajae-code/coding-agent/sdk/bus/notification-service";
+import type {
+	NotificationsConfigureCommitResult,
+	NotificationsEditorOperations,
+	NotificationsEditorPreferences,
+	NotificationsEditorSetupInput,
+	NotificationsEditorState,
+	NotificationsPreflightResult,
+	NotificationsProviderSetupInput,
+	NotificationsSaveInactiveResult,
+	PreparedNotificationProviderConfiguration,
+} from "@gajae-code/coding-agent/sdk/notification-setup-contract";
 
 beforeAll(async () => {
 	await initTheme();

@@ -4,21 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { CasReceipt } from "@gajae-code/coding-agent/config/atomic-yaml-patch";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import type {
-	NotificationsEditorOperations,
-	NotificationsEditorPreferences,
-	NotificationsEditorState,
-	NotificationsMutationResult,
-	NotificationsPreflightResult,
-	NotificationsProviderSetupInput,
-	PreparedNotificationProviderConfiguration,
-} from "@gajae-code/coding-agent/modes/components/notifications-settings-editor";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
-import {
-	createNotificationsEditorOperations,
-	type NotificationsEditorAdapterContext,
-	type NotificationsEditorOperationDependencies,
-} from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import {
 	getNotificationConfig,
@@ -38,6 +24,20 @@ import type {
 	NotificationSessionReconcileResult,
 	NotificationSessionStatus,
 } from "@gajae-code/coding-agent/sdk/bus/session-control";
+import {
+	createNotificationsEditorOperations,
+	type NotificationsEditorAdapterContext,
+	type NotificationsEditorOperationDependencies,
+} from "@gajae-code/coding-agent/sdk/notification-setup";
+import type {
+	NotificationsEditorOperations,
+	NotificationsEditorPreferences,
+	NotificationsEditorState,
+	NotificationsMutationResult,
+	NotificationsPreflightResult,
+	NotificationsProviderSetupInput,
+	PreparedNotificationProviderConfiguration,
+} from "@gajae-code/coding-agent/sdk/notification-setup-contract";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -280,6 +280,84 @@ beforeEach(async () => {
 });
 
 describe("notification settings controller adapter", () => {
+	it("rejects forged, foreign, discarded, and replayed provider drafts without side effects", async () => {
+		const commitAtomicBatch = vi.fn(async () => receipt());
+		const settings = {
+			getNotificationSettingsSnapshot: () =>
+				snapshot({
+					discord: {
+						botToken: "stored-secret",
+						applicationId: "app",
+						guildId: "guild",
+						parentChannelId: "parent",
+					},
+				}),
+			commitAtomicBatch,
+		} as unknown as Settings;
+		const activate = vi.fn(async () => {});
+		const deactivate = vi.fn(async () => {});
+		const notifyConfigChanged = vi.fn(async () => {});
+		const ctx: NotificationsEditorAdapterContext = {
+			settings,
+			session: {} as NotificationsEditorAdapterContext["session"],
+			sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+			notifyConfigChanged,
+		};
+		const deps = { providerRuntime: { activate, deactivate } };
+		const operations = createNotificationsEditorOperations(ctx, deps);
+		const other = createNotificationsEditorOperations(ctx, deps);
+		const input: NotificationsProviderSetupInput = {
+			provider: "discord",
+			botToken: { action: "keep" },
+			parentChannelId: "prepared-parent",
+		};
+		const foreign = await other.prepareProviderConfiguration(input);
+		const discarded = await operations.prepareProviderConfiguration(input);
+		operations.discardProviderConfiguration(discarded);
+		const prepared = await operations.prepareProviderConfiguration(input);
+		expect(Reflect.set(prepared, "parentChannelId", "forged-parent")).toBe(false);
+		for (const draft of [
+			{
+				provider: "discord",
+				botTokenDisposition: "keep",
+				botTokenMask: "unset",
+				parentChannelId: "forged-destination",
+			} as const,
+			{
+				provider: "slack",
+				botTokenDisposition: "keep",
+				botTokenMask: "unset",
+				channelId: "forged-destination",
+			} as const,
+			foreign,
+			discarded,
+			{ ...prepared },
+		]) {
+			expect(await operations.commitProviderConfiguration(draft)).toMatchObject({
+				outcome: "failed",
+				code: "invalid_draft",
+			});
+		}
+		expect(commitAtomicBatch).not.toHaveBeenCalled();
+		expect(activate).not.toHaveBeenCalled();
+		expect(deactivate).not.toHaveBeenCalled();
+		expect(notifyConfigChanged).not.toHaveBeenCalled();
+		const [committed, concurrent] = await Promise.all([
+			operations.commitProviderConfiguration(prepared),
+			operations.commitProviderConfiguration(prepared),
+		]);
+		expect(committed.outcome).toBe("success");
+		expect(concurrent).toMatchObject({ outcome: "failed", code: "invalid_draft" });
+		expect(commitAtomicBatch).toHaveBeenCalledTimes(1);
+		expect(activate).toHaveBeenCalledTimes(1);
+		expect(await operations.commitProviderConfiguration(prepared)).toMatchObject({
+			outcome: "failed",
+			code: "invalid_draft",
+		});
+		expect(commitAtomicBatch).toHaveBeenCalledTimes(1);
+		expect(activate).toHaveBeenCalledTimes(1);
+		other.discardProviderConfiguration(foreign);
+	});
 	it("maps editor operations to notification services, session control, and atomic commits", async () => {
 		const staleIdentity = telegramActivationIdentity(TOKEN, "validated-chat");
 		const staleMarker = createTelegramActivationMarker({
@@ -479,7 +557,12 @@ describe("notification settings controller adapter", () => {
 		if (!discoveredPreflight.draft) throw new Error("Expected discovered setup draft.");
 		operations.discardConfigureDraft(discoveredPreflight.draft);
 		if (!firstPreflight.draft) throw new Error("Expected prepared Telegram draft.");
-		await operations.commitConfigure(firstPreflight.draft);
+		const firstCommit = operations.commitConfigure(firstPreflight.draft);
+		await Promise.all([
+			expect(operations.commitConfigure(firstPreflight.draft)).rejects.toThrow("draft expired"),
+			expect(operations.saveInactive(firstPreflight.draft)).rejects.toThrow("draft expired"),
+		]);
+		await firstCommit;
 		expect(batches[0]).toEqual([
 			{ path: "notifications.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.botToken", op: "set", value: TOKEN },
@@ -503,7 +586,12 @@ describe("notification settings controller adapter", () => {
 		);
 		if (!secondPreflight.draft) throw new Error("Expected prepared Telegram draft.");
 		notifyFailure = true;
-		const inactiveResult = await operations.saveInactive(secondPreflight.draft);
+		const inactiveCommit = operations.saveInactive(secondPreflight.draft);
+		await Promise.all([
+			expect(operations.saveInactive(secondPreflight.draft)).rejects.toThrow("draft expired"),
+			expect(operations.commitConfigure(secondPreflight.draft)).rejects.toThrow("draft expired"),
+		]);
+		const inactiveResult = await inactiveCommit;
 		expect(inactiveResult).toMatchObject({ status: "observer_failed", receipt: expect.anything() });
 		notifyFailure = false;
 		const inactiveIdentity = telegramActivationIdentity(TOKEN, "validated-chat");
