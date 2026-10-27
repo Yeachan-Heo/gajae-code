@@ -1378,7 +1378,11 @@ relay is therefore recorded as owner loss, whichever observer (supervisor or
 child sidecar) publishes first, while a child that handles a timely relay late
 still completes. A child observer that finds the generation lock held while a
 relay is pending or its confirmed record is being flushed waits up to 3 seconds
-for it instead of ending with `owner_verdict_unavailable`. A pinned relaunch is
+for it instead of ending with `owner_verdict_unavailable`. That wait stays inside
+the child's postmortem cleanup deadline, and only the child holds the key that
+signs its runtime marker, so a relay whose persistence outlasts the wait leaves
+the recoverable `owner_verdict_unavailable` marker even if the close later
+succeeds. A pinned relaunch is
 refused with `managed_owner_predecessor_live` while the current generation's
 supervisor is still live. The closer holds a per-generation closer lock
 (`closer-<generation>.sqlite`) from before its intent is visible until it stops
