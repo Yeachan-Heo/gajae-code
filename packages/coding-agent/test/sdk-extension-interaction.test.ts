@@ -380,6 +380,118 @@ describe("portable extension interactions", () => {
 		}
 	});
 
+	it("bounds the detached payload rather than caller-controlled serialization", async () => {
+		const { service, address } = fixture();
+		let deliveries = 0;
+		service.subscribe(() => deliveries++);
+		const large = "x".repeat(2 * 1024 * 1024);
+		const inherited = Object.assign(Object.create({ toJSON: () => ({}) }), {
+			kind: "input",
+			title: large,
+		}) as ExtensionInteractionPayload;
+		const nested = Object.assign([large], { toJSON: () => [] });
+		const inheritedNested = Object.setPrototypeOf(
+			[large],
+			Object.assign(Object.create(Array.prototype), {
+				toJSON: () => [],
+			}),
+		);
+		for (const payload of [
+			inherited,
+			{ kind: "select", title: "Choose", options: nested },
+			{ kind: "select", title: "Choose", options: inheritedNested },
+			{ kind: "input", title: "Name", toJSON: () => ({}) },
+			{ kind: "input", title: "Name", extra: large },
+		] as ExtensionInteractionPayload[]) {
+			errorCode(() => service.request(payload), "invalid-request");
+		}
+		expect(service.snapshot().pending).toEqual([]);
+		expect(deliveries).toBe(0);
+
+		const base = Buffer.byteLength(JSON.stringify({ kind: "input", title: "" }));
+		const limit = EXTENSION_INTERACTION_LIMITS.payloadBytes;
+		const title = "é".repeat(Math.floor((limit - base) / 2)) + "x".repeat((limit - base) % 2);
+		const payload = { kind: "input" as const, title };
+		const pending = service.request(payload);
+		payload.title = "changed";
+		expect(service.snapshot().pending[0]!.payload.title).toBe(title);
+		errorCode(() => service.request({ kind: "input", title: `${title}x` }), "invalid-request");
+		expect(deliveries).toBe(1);
+		service.respond(address(), "ok");
+		expect(await pending).toEqual({ status: "answered", value: "ok" });
+		service.dispose();
+	});
+
+	it("reads payload getters once, redacts errors, and respects reentrant admission", async () => {
+		const { service, address } = fixture();
+		let deliveries = 0;
+		service.subscribe(() => deliveries++);
+		let reads = 0;
+		const pending = service.request({
+			kind: "input",
+			get title() {
+				reads++;
+				return reads === 1 ? "first" : "x".repeat(2 * 1024 * 1024);
+			},
+		});
+		expect(reads).toBe(1);
+		expect(service.snapshot().pending[0]!.payload.title).toBe("first");
+		service.respond(address(), "ok");
+		await pending;
+		const before = deliveries;
+		try {
+			service.request({
+				kind: "input",
+				get title(): string {
+					throw new Error("private accessor detail");
+				},
+			});
+			throw new Error("Expected invalid request");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ExtensionInteractionError);
+			expect((error as ExtensionInteractionError).code).toBe("invalid-request");
+			expect((error as Error).message).not.toContain("private accessor detail");
+		}
+		expect(service.snapshot().pending).toEqual([]);
+		expect(deliveries).toBe(before);
+
+		const reentrant = {
+			kind: "input" as const,
+			get title() {
+				service.disconnect(addressConnection);
+				return "disconnected";
+			},
+		};
+		const { connectionId: addressConnection } = service.connect();
+		const beforeDisconnect = deliveries;
+		errorCode(() => service.request(reentrant), "unavailable");
+		expect(deliveries).toBe(beforeDisconnect + 1);
+		expect(service.snapshot().pending).toEqual([]);
+		service.dispose();
+	});
+
+	it("rechecks capacity after a payload getter reenters admission", async () => {
+		const { service } = fixture();
+		const pending: Promise<unknown>[] = [];
+		let reads = 0;
+		const payload = {
+			kind: "input" as const,
+			get title() {
+				reads++;
+				for (let i = 0; i < EXTENSION_INTERACTION_LIMITS.pending; i++) {
+					pending.push(service.request({ kind: "input", title: "inner" }));
+				}
+				return "outer";
+			},
+		};
+		errorCode(() => service.request(payload), "capacity-exceeded");
+		expect(reads).toBe(1);
+		expect(service.snapshot().pending).toHaveLength(EXTENSION_INTERACTION_LIMITS.pending);
+		expect(service.snapshot().pending.every(request => request.payload.title === "inner")).toBe(true);
+		service.dispose();
+		await Promise.all(pending);
+	});
+
 	it("validates malformed payloads and timeout boundaries before creating pending work", () => {
 		const { service } = fixture();
 		for (const payload of [

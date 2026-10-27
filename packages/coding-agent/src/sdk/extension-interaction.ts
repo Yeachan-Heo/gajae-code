@@ -241,7 +241,9 @@ export class ExtensionInteractionService {
 		purpose: ExtensionInteractionPurpose = "interaction",
 	): Promise<ExtensionInteractionResult> {
 		this.#assertAvailable();
-		this.#validatePayload(payload);
+		const detachedPayload = this.#detachPayload(payload);
+		// Cloning can invoke caller getters, which may reenter and disconnect or dispose the service.
+		this.#assertAvailable();
 		if (!["interaction", "workflow-approval"].includes(purpose)) {
 			throw new ExtensionInteractionError("invalid-request", "Interactions cannot grant execution permission");
 		}
@@ -260,7 +262,7 @@ export class ExtensionInteractionService {
 		const abort = () => this.#finish(requestId, { status: "cancelled", reason: "aborted" });
 		let timer: Timer | undefined;
 		const item: PendingInteraction = {
-			request: { sessionId: this.#sessionId, requestId, purpose, payload: structuredClone(payload) },
+			request: { sessionId: this.#sessionId, requestId, purpose, payload: detachedPayload },
 			resolve,
 			reject,
 			cleanup: () => {
@@ -327,43 +329,80 @@ export class ExtensionInteractionService {
 		this.#listeners.clear();
 	}
 
-	#validatePayload(payload: ExtensionInteractionPayload): void {
-		const invalid = () => {
+	#detachPayload(input: ExtensionInteractionPayload): ExtensionInteractionPayload {
+		const invalid = (): never => {
 			throw new ExtensionInteractionError("invalid-request", "Invalid portable interaction payload");
 		};
-		if (!payload || typeof payload.title !== "string") invalid();
+		let payload: ExtensionInteractionPayload;
+		try {
+			payload = structuredClone(input);
+		} catch {
+			return invalid();
+		}
+		if (!payload || typeof payload !== "object" || Array.isArray(payload)) return invalid();
+		const own = (key: string) => Object.hasOwn(payload, key);
+		if (!own("title") || typeof payload.title !== "string" || !own("kind")) return invalid();
+		let allowed: readonly string[] = [];
 		switch (payload.kind) {
 			case "select":
+				allowed = ["kind", "title", "options", "initialIndex", "helpText"];
 				if (
+					!own("options") ||
 					!Array.isArray(payload.options) ||
 					payload.options.length === 0 ||
 					payload.options.length > EXTENSION_INTERACTION_LIMITS.selectOptions ||
-					Array.from(payload.options).some(option => typeof option !== "string")
+					Object.keys(payload.options).length !== payload.options.length
 				)
-					invalid();
+					return invalid();
+				for (let i = 0; i < payload.options.length; i++) {
+					if (!Object.hasOwn(payload.options, i) || typeof payload.options[i] !== "string") return invalid();
+				}
 				if (
+					own("initialIndex") &&
 					payload.initialIndex !== undefined &&
 					(!Number.isInteger(payload.initialIndex) ||
 						payload.initialIndex < 0 ||
 						payload.initialIndex >= payload.options.length)
 				)
 					invalid();
-				if (payload.helpText !== undefined && typeof payload.helpText !== "string") invalid();
+				if (own("helpText") && payload.helpText !== undefined && typeof payload.helpText !== "string") invalid();
 				break;
 			case "confirm":
-				if (typeof payload.message !== "string") invalid();
+				allowed = ["kind", "title", "message"];
+				if (!own("message") || typeof payload.message !== "string") invalid();
 				break;
 			case "input":
-				if (payload.placeholder !== undefined && typeof payload.placeholder !== "string") invalid();
+				allowed = ["kind", "title", "placeholder"];
+				if (own("placeholder") && payload.placeholder !== undefined && typeof payload.placeholder !== "string")
+					invalid();
 				break;
 			case "editor":
-				if (payload.prefill !== undefined && typeof payload.prefill !== "string") invalid();
-				if (payload.promptStyle !== undefined && typeof payload.promptStyle !== "boolean") invalid();
+				allowed = ["kind", "title", "prefill", "promptStyle"];
+				if (own("prefill") && payload.prefill !== undefined && typeof payload.prefill !== "string") invalid();
+				if (own("promptStyle") && payload.promptStyle !== undefined && typeof payload.promptStyle !== "boolean")
+					invalid();
 				break;
 			default:
 				invalid();
 		}
-		if (Buffer.byteLength(JSON.stringify(payload)) > EXTENSION_INTERACTION_LIMITS.payloadBytes) invalid();
+		// Serialize only validated own data, without invoking inherited toJSON or array iterators.
+		const fields: string[] = [];
+		for (const key of Object.keys(payload)) {
+			if (!allowed.includes(key)) return invalid();
+			const value = (payload as unknown as Record<string, unknown>)[key];
+			if (value === undefined) continue;
+			let encoded: string;
+			if (key === "options" && Array.isArray(value)) {
+				const entries: string[] = [];
+				for (let i = 0; i < value.length; i++) entries.push(JSON.stringify(value[i]));
+				encoded = `[${entries.join(",")}]`;
+			} else {
+				encoded = JSON.stringify(value)!;
+			}
+			fields.push(`${JSON.stringify(key)}:${encoded}`);
+		}
+		if (Buffer.byteLength(`{${fields.join(",")}}`) > EXTENSION_INTERACTION_LIMITS.payloadBytes) return invalid();
+		return payload;
 	}
 
 	#validateDialogOptions(options?: ExtensionUIDialogOptions): void {
