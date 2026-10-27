@@ -3,7 +3,11 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildWindowsPowerShellInnerCommand } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
+import type { Args } from "@gajae-code/coding-agent/cli/args";
+import {
+	buildWindowsPowerShellInnerCommand,
+	launchDefaultTmuxIfNeeded,
+} from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import { isManagedOwnerBinding } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
 import {
 	__setBinaryResolverForTests,
@@ -1022,19 +1026,23 @@ describe("GJC tmux session management", () => {
 		const sessionName = "broker-child";
 		const stateFile = tmuxRuntimeSessionPath(cwd, sessionName, buildGjcTmuxSessionSlug(sessionName));
 		let generation = "";
+		let executedArgv: string[] = [];
 		__setMutationServerProofForTests(() => ({ pid: 1, startTime: "test" }));
 		__setCreateOwnerIsolationForTests({
-			execute: plan => ({
-				ok: true,
-				code: "executed",
-				execution: plan.ok ? plan.execution : (undefined as never),
-				server: { state: "safe", pid: 1, startTime: "test", cgroup: { classification: "safe" } },
-				server_key: "tmux",
-				server_pid: 1,
-				server_start_time: "test",
-				server_session: sessionName,
-				native_session_id: "$1",
-			}),
+			execute: plan => {
+				if (plan.ok) executedArgv = [...plan.execution.argv];
+				return {
+					ok: true,
+					code: "executed",
+					execution: plan.ok ? plan.execution : (undefined as never),
+					server: { state: "safe", pid: 1, startTime: "test", cgroup: { classification: "safe" } },
+					server_key: "tmux",
+					server_pid: 1,
+					server_start_time: "test",
+					server_session: sessionName,
+					native_session_id: "$1",
+				};
+			},
 		});
 		const calls: string[][] = [];
 		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation((rawCommand: unknown) => {
@@ -1092,11 +1100,24 @@ describe("GJC tmux session management", () => {
 
 		expect(() =>
 			createManagedGjcTmuxSession(
-				{ childSessionId: sessionName, cwd, argv: ["child-command"] },
+				// An explicit spawn override must not re-add the scrubbed malloc variable.
+				{
+					childSessionId: sessionName,
+					cwd,
+					argv: ["child-command"],
+					env: { MallocStackLogging: "1", KEEP: "yes" },
+				},
 				{ GJC_TMUX_COMMAND: "tmux" },
 				{ platform: "darwin" },
 			),
 		).toThrow("gjc_tmux_managed_launch_proof_unavailable");
+		// The Broker pane command execs the supervisor with the macOS malloc env scrubbed,
+		// so the CLI malloc guard cannot re-exec it below the pinned pane PID.
+		const paneCommand = executedArgv.at(-1);
+		expect(paneCommand).toStartWith("exec env -u MallocStackLogging -u MallocStackLoggingNoCompact ");
+		expect(paneCommand).toEndWith("'--internal-managed-owner-supervisor'");
+		expect(paneCommand).not.toContain("MallocStackLogging=");
+		expect(paneCommand).toContain("KEEP='yes'");
 		const cleanup = calls.find(
 			command =>
 				command[1] === "-u" &&
@@ -2179,6 +2200,258 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 			if (failures.length > 0) throw new AggregateError(failures, "Managed close verification or teardown failed");
 		}, 65_000);
 	}
+
+	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
+		"force-closes an ordinary interactive macOS root launch through the pane command the root launcher built",
+		async () => {
+			// The pane command is the one `gjc --tmux` hands tmux; only tmux itself is
+			// replaced. Supervisor, binding, admission, intent relay and verdict are real.
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-root-launch-"));
+			const sessionId = "root-session";
+			const stateFile = path.join(stateDir, "runtime-state.json");
+			const repoRoot = path.resolve(import.meta.dir, "../../../..");
+			const cli = path.join(repoRoot, "packages/coding-agent/src/cli.ts");
+			const admissionModule = path.join(
+				repoRoot,
+				"packages/coding-agent/src/gjc-runtime/managed-owner-admission.ts",
+			);
+			const entry = path.join(stateDir, "gjc-entry.ts");
+			const readyFile = path.join(stateDir, "child-ready.json");
+			const cleanupFile = path.join(stateDir, "child-cleanup.json");
+			const expiredFile = path.join(stateDir, "child-self-expired");
+			// One entry stands in for the installed CLI: the launcher's supervisor argv
+			// runs the real CLI, and the supervised child command runs an owned child.
+			await fs.writeFile(
+				entry,
+				`
+import * as fs from "node:fs";
+if (process.argv.includes("--internal-managed-owner-supervisor")) {
+  const { runCli } = await import(${JSON.stringify(cli)});
+  await runCli(process.argv.slice(2));
+} else {
+  const { admitManagedOwnerBeforeCli } = await import(${JSON.stringify(admissionModule)});
+  const admission = await admitManagedOwnerBeforeCli();
+  if (admission.kind !== "supervised") process.exit(75);
+  process.removeAllListeners("SIGTERM");
+  const expiry = setTimeout(() => {
+    fs.writeFileSync(${JSON.stringify(expiredFile)}, "containment-only\\n");
+    process.exit(91);
+  }, 30_000);
+  process.on("SIGTERM", () => {
+    fs.writeFileSync(${JSON.stringify(cleanupFile)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid }));
+    clearTimeout(expiry);
+    process.exit(0);
+  });
+  fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid, admission: admission.kind, token: process.env.GJC_MANAGED_OWNER_CHILD_TOKEN }));
+}
+`,
+				{ mode: 0o600 },
+			);
+			const launchCalls: string[][] = [];
+			const launchDiagnostics: string[] = [];
+			const launchProbe = () => {
+				let serverCreated = false;
+				return {
+					readCallerCgroup: () => null,
+					probeServer: () => {
+						if (!serverCreated) {
+							serverCreated = true;
+							return { state: "absent" as const };
+						}
+						return {
+							state: "safe" as const,
+							pid: 123,
+							startTime: "42",
+							cgroup: { classification: "not_applicable" as const },
+						};
+					},
+					recordAttempt: () => {},
+				};
+			};
+			const launchContext = {
+				parsed: { messages: [], fileArgs: [], unknownFlags: new Map(), tmux: true } as Args,
+				rawArgs: ["--tmux"],
+				cwd: stateDir,
+				env: {
+					GJC_PSMUX_DETECTION: "off",
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_TMUX_SESSION: "root",
+					GJC_COORDINATOR_SESSION_ID: sessionId,
+					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+				},
+				argv: [process.execPath, entry],
+				execPath: process.execPath,
+				// Plan the ordinary macOS root launch on any POSIX host; the close path is the host's.
+				platform: "darwin" as const,
+				tty: { stdin: true, stdout: true },
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				currentBranch: "",
+			};
+			const handled = launchDefaultTmuxIfNeeded({
+				...launchContext,
+				ownerIsolationProbe: launchProbe(),
+				diagnosticWriter: message => launchDiagnostics.push(message),
+				spawnSync: (_command, spawnArgs) => {
+					launchCalls.push([...spawnArgs]);
+					return {
+						exitCode: 0,
+						stdout: spawnArgs[0] === "display-message" ? "$0\troot" : "$0",
+					};
+				},
+			});
+			expect(handled).toBe(true);
+			expect(launchDiagnostics).toEqual([]);
+			const paneCommand = launchCalls.find(call => call[0] === "new-session")?.at(-1);
+			if (!paneCommand) throw new Error("root launch did not build a pane command");
+			const generation = (
+				JSON.parse(
+					await fs.readFile(path.join(stateDir, sessionId, "owner-lifecycle", "generation.json"), "utf8"),
+				) as { generation: string }
+			).generation;
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			const childEnv = { ...process.env };
+			for (const key of Object.keys(childEnv)) {
+				if (
+					key.startsWith("GJC_MANAGED_OWNER_") ||
+					key.startsWith("GJC_TMUX_OWNER_") ||
+					key.includes("CAPABILITY") ||
+					key === "GJC_COORDINATOR_SESSION_ID"
+				)
+					delete childEnv[key];
+			}
+			// A tmux server can carry a contaminated macOS malloc environment. The pane
+			// command must scrub it so the CLI malloc guard never re-execs the supervisor
+			// below the pane PID.
+			childEnv.MallocStackLogging = "0";
+			delete childEnv.GJC_MALLOC_ENV_REEXEC;
+			expect(paneCommand).toStartWith("exec env -u MallocStackLogging -u MallocStackLoggingNoCompact ");
+			// tmux runs the pane command through `sh -c`; `exec` keeps this PID as the supervisor.
+			const owner = Bun.spawn(["/bin/sh", "-c", paneCommand], {
+				cwd: stateDir,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "pipe",
+				env: childEnv,
+			});
+			const ownerPid = owner.pid;
+			const stderr = new Response(owner.stderr).text();
+			const waitForOwnerExit = async (timeoutMs: number): Promise<boolean> => {
+				const timeout = Promise.withResolvers<boolean>();
+				const timer = setTimeout(() => timeout.resolve(false), timeoutMs);
+				try {
+					return await Promise.race([owner.exited.then(() => true), timeout.promise]);
+				} finally {
+					clearTimeout(timer);
+				}
+			};
+			let childProcess: Process | null = null;
+			const calls: string[][] = [];
+			const rawPidSignal = spyOn(process, "kill");
+			(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation((rawSpawn: unknown) => {
+				const cmd = spawnArgv(rawSpawn);
+				calls.push(cmd);
+				if (cmd.includes("if-shell")) {
+					expect(owner.exitCode).toBe(0);
+					return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+				}
+				if (cmd.includes("list-sessions"))
+					return spawnResult(
+						0,
+						`root\t1\t0\t1770000000\t1\troot\t1\t${ownerPid}\t\t\t\t${sessionId}\t${stateFile}\t${generation}\t\n`,
+					);
+				if (cmd.includes("list-panes")) return spawnResult(0, `${ownerPid}\n`);
+				if (cmd.includes("display-message")) return spawnResult(0, "$0\n");
+				if (cmd.includes("show-options")) {
+					const option = cmd.at(-1);
+					return spawnResult(
+						0,
+						option === "@gjc-profile"
+							? "1\n"
+							: option === "@gjc-session-id"
+								? `${sessionId}\n`
+								: option === "@gjc-owner-generation"
+									? `${generation}\n`
+									: option === "@gjc-owner-server-key"
+										? "tmux\n"
+										: `${stateFile}\n`,
+					);
+				}
+				return spawnResult(0, "");
+			});
+			injectSafeMutationProof();
+			const failures: unknown[] = [];
+			try {
+				const readyDeadline = Date.now() + 10_000;
+				while (!fsSync.existsSync(readyFile) && owner.exitCode === null && Date.now() < readyDeadline)
+					await Bun.sleep(20);
+				if (!fsSync.existsSync(readyFile))
+					throw new Error(
+						`root-launched child did not become ready (owner exit ${owner.exitCode}): ${owner.exitCode === null ? "" : await stderr}\n${paneCommand}`,
+					);
+				const ready = JSON.parse(await fs.readFile(readyFile, "utf8"));
+				expect(ready).toMatchObject({ admission: "supervised", parentPid: ownerPid });
+				childProcess = nativeProcessBindings().Process.fromPid(ready.pid);
+				if (!childProcess) throw new Error("managed_child_reference_unavailable");
+				expect(readSecureOwnerJson(path.join(paths.root, `child-${ready.token}.binding.json`))).toMatchObject({
+					session_id: sessionId,
+					generation,
+					supervisor_pid: ownerPid,
+					child_token: ready.token,
+				});
+				await forceCloseGjcTmuxSession("root", { GJC_TMUX_COMMAND: "tmux" }, sessionId, stateFile);
+				expect(await waitForOwnerExit(1_000)).toBe(true);
+				expect(await owner.exited, await stderr).toBe(0);
+				expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
+				expect(JSON.parse(await fs.readFile(cleanupFile, "utf8"))).toEqual({ pid: ready.pid, parentPid: ownerPid });
+				expect(fsSync.existsSync(expiredFile)).toBe(false);
+				expect(readSecureOwnerJson(paths.verdictFile)).toMatchObject({
+					session_id: sessionId,
+					generation,
+					server_key: "tmux",
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+					classification: "expected_operator_shutdown",
+				});
+				expect(rawPidSignal).not.toHaveBeenCalled();
+				expect(calls.filter(cmd => cmd.includes("if-shell"))).toHaveLength(1);
+				if (process.platform === "darwin") {
+					// Relaunch the same pinned session over the real retained binding of the
+					// normally closed supervisor; it is history, not recovery evidence.
+					const relaunchCalls: string[][] = [];
+					const relaunchDiagnostics: string[] = [];
+					launchDefaultTmuxIfNeeded({
+						...launchContext,
+						ownerIsolationProbe: launchProbe(),
+						diagnosticWriter: message => relaunchDiagnostics.push(message),
+						spawnSync: (_command, spawnArgs) => {
+							relaunchCalls.push([...spawnArgs]);
+							return { exitCode: 0, stdout: spawnArgs[0] === "display-message" ? "$0\troot" : "$0" };
+						},
+					});
+					expect(relaunchDiagnostics).toEqual([]);
+					const relaunched = relaunchCalls.find(call => call[0] === "new-session")?.at(-1);
+					expect(relaunched).toContain("--internal-managed-owner-supervisor");
+					expect(relaunched).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
+					expect(relaunched).not.toContain(generation);
+				}
+			} catch (error) {
+				failures.push(error);
+			} finally {
+				try {
+					if (owner.exitCode === null) owner.kill("SIGTERM");
+				} catch {
+					// A raced exit is settled below.
+				}
+				const ownerStopped = await waitForOwnerExit(35_000);
+				const childStopped = childProcess ? await childProcess.waitForExit({ timeoutMs: 1_000 }) : true;
+				if (ownerStopped && childStopped) await fs.rm(stateDir, { recursive: true, force: true });
+				else failures.push(new Error(`managed_close_teardown_uncertain:evidence_retained:${stateDir}`));
+			}
+			if (failures.length > 0) throw new AggregateError(failures, "Root-launch managed close verification failed");
+		},
+		65_000,
+	);
 
 	it("surfaces an exact compatibility cleanup failure after a matching SIGTERM verdict", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-close-cleanup-failure-"));

@@ -1305,6 +1305,9 @@ on Windows, because it selects the headless substrate before launch (see the
 lifecycle-owner resolution notes below), so Windows `session.spawn` is not
 rejected. A rejected managed launch is never retried as headless. Ordinary
 unmanaged Windows launches are unchanged.
+Off Linux, a prior generation's child binding without any receipt is ordinary
+history, so relaunching the same pinned session starts fresh; any receipt there
+still fails closed as unavailable recovery evidence.
 
 Admission denial does not depend on being able to save a diagnostic. Unsafe or
 unavailable storage never receives a fallback pathname write: the child stays
@@ -1323,9 +1326,10 @@ signaling a reconstructed supervisor PID. `forceCloseGjcTmuxSession` proves the
 pinned supervisor, its single private child binding and the tmux session
 metadata, then publishes the intent no-replace while holding the generation
 lock that the supervisor also takes. A close that arrives before the supervisor
-has published its binding waits, inside the same close deadline, only while that
-exact supervisor stays live; an untrusted, ambiguous, or still-missing binding
-fails closed. The supervisor polls for that intent,
+has published its binding, or while that binding's `created_at` is still in the
+future, waits inside the same close deadline only while that exact supervisor
+stays live; an untrusted, ambiguous, or still-unavailable binding fails closed.
+The supervisor polls for that intent,
 validates it against its own binding, generation and server key, and relays
 SIGTERM exactly once through its original child spawn handle. A close succeeds
 only when both the pinned supervisor has exited and the terminal verdict
@@ -1352,3 +1356,9 @@ owner that cannot be resolved fails as `lifecycle_owner_unresolved` once the
 substrate release is proven, and stays `terminal_uncertain` while it is not. Editing source or replacing files does not
 update a running Broker; verify a fresh isolated runtime before a separately
 controlled Broker replacement.
+
+Interactive `gjc --tmux` root launches on Linux and Darwin both exec the
+managed owner supervisor as the tmux pane process, so ordinary root sessions
+and Broker-spawned sessions share the same close path. Because the pane process
+must be that exact supervisor, these launches do not wrap it in the
+`tmux-exit.json` exit-marker shell; other platforms keep the marker.
