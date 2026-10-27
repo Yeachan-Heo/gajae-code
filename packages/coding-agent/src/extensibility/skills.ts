@@ -464,17 +464,21 @@ function buildInlineSkillInvocationArgs<TSkill extends Pick<Skill, "name">>(
 }
 
 /**
- * Check if a given position in text is inside an inline code span (backtick-delimited)
- * or a fenced code block (triple-backtick-delimited). Handles escaped backticks correctly.
+ * Build a single-pass span tracking for all code blocks and inline spans.
+ * Returns a function that checks if a position is inside a code span or fence.
  * Per CommonMark:
  * - An inline code span opens with a backtick run and closes with a backtick run of equal length
  * - A fenced code block starts with a backtick run (3+) at the start of a line
+ * - A closing fence may be longer than the opener (counts as valid close)
+ * - Non-matching backtick runs inside a span are treated as literal text, not delimiters
  */
-function isPositionInsideInlineCode(text: string, position: number): boolean {
-	// Stack to track nested code spans/blocks: [length, isAtLineStart]
-	const delimiterStack: Array<[length: number, isAtLineStart: boolean]> = [];
+function buildCodeSpanChecker(text: string): (position: number) => boolean {
+	// Stack to track code spans/blocks: [openLength, isAtLineStart, startPosition]
+	const delimiterStack: Array<[length: number, isAtLineStart: boolean, startPos: number]> = [];
+	// Set of all positions that are inside code spans/blocks
+	const insideCodePositions = new Set<number>();
 
-	for (let i = 0; i < position && i < text.length; ) {
+	for (let i = 0; i < text.length; ) {
 		if (text[i] !== "`") {
 			i += 1;
 			continue;
@@ -500,16 +504,18 @@ function isPositionInsideInlineCode(text: string, position: number): boolean {
 
 		// Handle fenced code blocks (3+ backticks at line start)
 		if (isAtLineStart && runLength >= 3) {
-			if (
-				delimiterStack.length > 0 &&
-				delimiterStack[delimiterStack.length - 1]?.[0] === runLength &&
-				delimiterStack[delimiterStack.length - 1]?.[1]
-			) {
-				// Closing fence with matching length
+			const top = delimiterStack[delimiterStack.length - 1];
+			if (top && top[1] && runLength >= top[0]) {
+				// Closing fence: length must be >= opener (per CommonMark)
+				const [, , openPos] = top;
+				// Mark all positions from opener to closer as inside code
+				for (let pos = openPos; pos < runEnd; pos++) {
+					insideCodePositions.add(pos);
+				}
 				delimiterStack.pop();
 			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
 				// Opening fence (only if not already inside another fence)
-				delimiterStack.push([runLength, true]);
+				delimiterStack.push([runLength, true, i]);
 			}
 			i = runEnd;
 			continue;
@@ -529,19 +535,32 @@ function isPositionInsideInlineCode(text: string, position: number): boolean {
 			const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
 			if (!openIsAtLineStart && openLength === runLength) {
 				// Closing inline code span with matching length
-				delimiterStack.pop();
+				const [, , openPos] = delimiterStack.pop()!;
+				// Mark all positions from opener to closer as inside code
+				for (let pos = openPos; pos < runEnd; pos++) {
+					insideCodePositions.add(pos);
+				}
 				i = runEnd;
 				continue;
 			}
+			// Non-matching run inside a span: treat as literal text, not a delimiter
+		} else {
+			// Opening inline code span (not a fence opener, not inside another span)
+			delimiterStack.push([runLength, false, i]);
 		}
-
-		// Opening inline code span (not a fence opener)
-		delimiterStack.push([runLength, false]);
 
 		i = runEnd;
 	}
 
-	return delimiterStack.length > 0;
+	// For any unclosed spans, mark them as code to preserve parity
+	while (delimiterStack.length > 0) {
+		const [, , openPos] = delimiterStack.pop()!;
+		for (let pos = openPos; pos < text.length; pos++) {
+			insideCodePositions.add(pos);
+		}
+	}
+
+	return (position: number) => insideCodePositions.has(position);
 }
 
 export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
@@ -558,6 +577,10 @@ export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 			normalizedSkillsByCommandName.set(normalizedCommandName, skill);
 		}
 	}
+
+	// Build code-span checker in a single forward pass (O(N))
+	const isInsideCode = buildCodeSpanChecker(trimmedText);
+
 	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/gi;
 	const matches: SkillTokenMatch<TSkill>[] = [];
 	for (const match of trimmedText.matchAll(canonicalSkillCommandPattern)) {
@@ -567,8 +590,8 @@ export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 		if (!skill) continue;
 		const leading = match[1] ?? "";
 		const index = (match.index ?? 0) + leading.length;
-		// Skip matches inside inline code spans to avoid invoking skills in backtick-delimited text
-		if (isPositionInsideInlineCode(trimmedText, index)) continue;
+		// Skip matches inside inline code spans (O(1) set lookup instead of O(N) scan)
+		if (isInsideCode(index)) continue;
 		matches.push({
 			index,
 			end: index + commandName.length + 1,
