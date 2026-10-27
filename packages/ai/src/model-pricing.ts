@@ -343,17 +343,14 @@ export function applyOpenAIModelPricing<TApi extends Api>(model: Model<TApi>): v
 		};
 		return;
 	}
-	// Non-batch OpenRouter models: only apply long-context pricing tier, not base cost override.
-	// OpenRouter publishes accurate base rates via their API; we add the missing tier.
-	const modelIdMatch = model.id.match(/^[^/]+\/([^:]+)$/);
-	if (modelIdMatch) {
-		const baseModelId = modelIdMatch[1];
-		const basePricing = OPENAI_GPT_5_6_PRICING.get(baseModelId);
-		if (basePricing && !model.longContextPricing) {
-			model.longContextPricing = {
-				threshold: basePricing.longContextPricing.threshold,
-				cost: { ...basePricing.longContextPricing.cost },
-			};
-		}
-	}
+	// OpenRouter passes OpenAI's rates through, so openai/* models take OpenAI's base and
+	// long-context tiers as one pair; a stale discovered base must not pair with a current tier.
+	if (!model.id.startsWith("openai/")) return;
+	const pricing = OPENAI_GPT_5_6_PRICING.get(model.id.slice("openai/".length));
+	if (!pricing) return;
+	model.cost = { ...pricing.cost };
+	model.longContextPricing = {
+		threshold: pricing.longContextPricing.threshold,
+		cost: { ...pricing.longContextPricing.cost },
+	};
 }

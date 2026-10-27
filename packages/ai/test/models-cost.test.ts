@@ -734,8 +734,8 @@ describe("calculateCost", () => {
 		calculateCost(model, threshold);
 		calculateCost(model, aboveThreshold);
 
-		// 200K input @ $4 + 1K output @ $20 + 72K cacheRead @ $0.40
-		expect(threshold.cost.total).toBeCloseTo(0.8488, 8);
+		// 200K input @ $5 + 1K output @ $30 + 72K cacheRead @ $0.50 (OpenAI's tier pair)
+		expect(threshold.cost.total).toBeCloseTo(1.066, 8);
 		// above 272K: 200K @ $10 + 1K @ $45 + 72K @ $1 + 1 @ $12.5
 		expect(aboveThreshold.cost.total).toBeCloseTo(2.1170125, 8);
 	});
