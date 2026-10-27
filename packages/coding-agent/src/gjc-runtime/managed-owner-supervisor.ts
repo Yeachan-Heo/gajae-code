@@ -26,6 +26,7 @@ import {
 	observeOwnerTerminal,
 	readOwnerOnlyFileSettled,
 	readSecureOwnerJson,
+	type TerminalSignal,
 } from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -118,6 +119,14 @@ export function managedOwnerSupervisorInvocation(
 	childArgv: readonly string[],
 ): string[] {
 	return [...supervisorArgv, MANAGED_OWNER_SUPERVISOR_ARG, "--", ...childArgv];
+}
+
+/** The supervised child's actual termination in the terminal verdict's signal domain. */
+function supervisedChildTerminalSignal(signalCode: NodeJS.Signals | null): TerminalSignal {
+	if (signalCode === null) return "EXIT";
+	return signalCode === "SIGTERM" || signalCode === "SIGHUP" || signalCode === "SIGINT" || signalCode === "SIGKILL"
+		? signalCode
+		: "UNKNOWN";
 }
 
 /** Child argv from the supervisor's CLI arguments (after the program entry). */
@@ -237,7 +246,11 @@ async function superviseManagedOwner(command: string[]): Promise<void> {
 		child.signalCode === null &&
 		childProcess.pid === child.pid &&
 		childProcess.incarnation === childStartTime &&
-		childProcess.ppid === process.pid;
+		childProcess.ppid === process.pid &&
+		// Bun reports an exit only after reaping. A child that an unrelated signal
+		// already terminated is an unreaped zombie here, and a relay to it would
+		// claim a death it did not cause.
+		childProcess.status() === "running";
 	const relayChild = (candidateIntent: OwnerIntent | null, observedAt: string): boolean => {
 		if (childExited || sigtermRelayed) return false;
 		try {
@@ -313,6 +326,10 @@ async function superviseManagedOwner(command: string[]): Promise<void> {
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = relayedAt as string | null;
 	if (sigtermRelayed && terminalObservedAt && terminalIntent) {
+		// A relay explains the child's end only if the child ended the way SIGTERM
+		// ends it: through its own exit or the default SIGTERM action. Any other
+		// fatal signal (SIGABRT, SIGSEGV, SIGKILL, ...) is preserved as owner loss.
+		const relayExplainsExit = child.signalCode === null || child.signalCode === "SIGTERM";
 		await observeOwnerTerminal({
 			schema_version: 1,
 			op: "observe_terminal",
@@ -321,12 +338,12 @@ async function superviseManagedOwner(command: string[]): Promise<void> {
 			state_dir: stateDir,
 			socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
 			observer: "raw_monitor",
-			observed_at: terminalObservedAt,
-			signal: "SIGTERM",
+			observed_at: relayExplainsExit ? terminalObservedAt : new Date().toISOString(),
+			signal: relayExplainsExit ? "SIGTERM" : supervisedChildTerminalSignal(child.signalCode),
 			exit_code: exitCode,
 			exit_kind: "supervisor_child_exit",
 			reason: "managed_owner_supervisor_exit",
-			operator_dispatch_id: terminalIntent.dispatch_id,
+			...(relayExplainsExit ? { operator_dispatch_id: terminalIntent.dispatch_id } : {}),
 		});
 	}
 	if (child.signalCode === "SIGABRT") {

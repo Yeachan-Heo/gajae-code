@@ -639,6 +639,76 @@ setInterval(() => {}, 1_000);`;
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "Managed supervisor verification or teardown failed");
 	}, 20_000);
+	it.skipIf(process.platform !== "darwin")(
+		"preserves a fatal child signal after a cooperative relay as owner loss",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+			const readyFile = path.join(stateDir, "child-ready");
+			let supervisor: Bun.Subprocess | undefined;
+			try {
+				await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
+				// The relayed SIGTERM arrives, then the child dies of an unrelated fault
+				// before any sidecar of its own could publish a verdict.
+				const childScript = `import { writeFile } from "node:fs/promises";
+setTimeout(() => process.exit(91), 6_000);
+process.on("SIGTERM", () => process.kill(process.pid, "SIGABRT"));
+await writeFile(process.env.READY_FILE!, JSON.stringify({ pid: process.pid }));
+setInterval(() => {}, 1_000);`;
+				supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+					READY_FILE: readyFile,
+					GJC_TMUX_OWNER_SERVER_KEY: "fixture-socket",
+				});
+				const ownedSupervisor = supervisor;
+				await waitForFile(readyFile);
+				const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+				const bindingFile = (await fs.readdir(paths.root)).find(file => file.endsWith(".binding.json"))!;
+				const binding = readSecureOwnerJson(path.join(paths.root, bindingFile));
+				if (!isManagedOwnerBinding(binding)) throw new Error("fixture_binding_invalid");
+				const nativeSupervisor = nativeProcessBindings().Process.fromPid(supervisor.pid);
+				let published: unknown = null;
+				const closing = closeExactTmuxOwner(
+					{
+						stateDir,
+						sessionId: binding.session_id,
+						generation: binding.generation,
+						serverKey: "fixture-socket",
+						pid: binding.supervisor_pid,
+						startTime: binding.supervisor_start_time,
+						dispatchId: "fixture-dispatch",
+						createdAt: new Date().toISOString(),
+						expiresAt: new Date(Date.now() + 3_000).toISOString(),
+					},
+					{
+						readStartTime: async () => nativeSupervisor?.incarnation ?? null,
+						shutdown: {
+							kind: "cooperative_intent",
+							publishNoReplace: publishOwnerIntentNoReplace,
+							assertCooperativeOwner: () => {},
+						},
+						waitForVerdict: async () => {
+							await Promise.race([ownedSupervisor.exited, Bun.sleep(3_000)]);
+							published = readSecureOwnerJson(paths.verdictFile);
+							return isValidOwnerVerdict(published) ? published : null;
+						},
+						cleanupSession: async () => {},
+					},
+				);
+				await expect(closing).rejects.toThrow("owner_term_verdict_timeout");
+				expect(await ownedSupervisor.exited).toBe(134);
+				expect(published).toMatchObject({
+					classification: "unexpected_owner_loss",
+					signal: "UNKNOWN",
+					exit_code: 134,
+				});
+				expect(published).not.toHaveProperty("intent_id");
+			} finally {
+				if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null)
+					supervisor.kill("SIGTERM");
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
 	it("routes a replacement supervisor child through predecessor recovery before normal CLI", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-cwd-"));

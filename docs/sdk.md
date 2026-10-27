@@ -1394,6 +1394,12 @@ still complete; its pending record then marks the delivery as uncertain. The
 child sidecar captures the intent's dispatch synchronously when its postmortem
 begins, and only if a relay record for that intent is already visible, so a
 SIGTERM whose postmortem began before the relay is never attributed to it. The
+supervisor never relays to a child the OS already reports terminated but not
+yet reaped. When the child publishes no verdict of its own, the supervisor's
+fallback observation claims the relayed intent only if the child ended through
+its own exit or the default SIGTERM action; any other fatal signal, such as
+SIGABRT, is published with its actual termination as `unexpected_owner_loss`.
+The
 remaining limits are an unrelated signal that arrives after the pending record
 is durable but before delivery combined with a backward wall-clock step, and
 the latency between signal arrival and the start of the postmortem, which no
@@ -1420,4 +1426,8 @@ Interactive `gjc --tmux` root launches on Linux and Darwin both exec the
 managed owner supervisor as the tmux pane process, so ordinary root sessions
 and Broker-spawned sessions share the same close path. Because the pane process
 must be that exact supervisor, these launches do not wrap it in the
-`tmux-exit.json` exit-marker shell; other platforms keep the marker.
+`tmux-exit.json` exit-marker shell; other platforms keep the marker. On macOS
+the pane command unsets `MallocStackLogging` and `MallocStackLoggingNoCompact`,
+and a source-mode launch runs Bun with `--no-env-file` (as a compiled binary
+already does), so neither the tmux server environment nor a cwd `.env` can make
+the CLI malloc guard re-exec the supervisor below the pane PID.
