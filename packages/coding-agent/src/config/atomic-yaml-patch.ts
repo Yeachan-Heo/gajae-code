@@ -154,6 +154,7 @@ type ReceiptChange = {
 type QueueContext = { path: string; active: boolean; parent: QueueContext | undefined };
 
 const queues = new Map<string, Promise<void>>();
+const activeQueueHolders = new Set<string>();
 const queueContext = new AsyncLocalStorage<QueueContext>();
 let nextReceiptRevision = 0;
 // Process-local authority shared by every queued writer, keyed by the canonical
@@ -1356,8 +1357,21 @@ function assertNoActiveCanonicalYamlOperation(canonicalPath: string): void {
 	}
 }
 
-export function assertNoActiveAtomicYamlOperation(configPath: string): void {
-	assertNoActiveCanonicalYamlOperation(canonicalConfigPath(configPath));
+/**
+ * Settings may reserve a deferred save without inheriting the caller's lease.
+ * Reject a nested flush against an actively held file, even across independent
+ * roots: waiting for that save can otherwise form a cycle. A reservation alone
+ * is not a holder, so a nested flush of an idle different file remains valid.
+ * This process-local policy cannot rule out cross-process waits.
+ */
+export function assertSafeAtomicYamlSettingsFlush(configPath: string): void {
+	const canonicalPath = canonicalConfigPath(configPath);
+	assertNoActiveCanonicalYamlOperation(canonicalPath);
+	if (activeQueueHolders.has(canonicalPath)) {
+		for (let context = queueContext.getStore(); context; context = context.parent) {
+			if (context.active) throw new Error(`Cannot flush Settings for busy atomic YAML file ${canonicalPath}.`);
+		}
+	}
 }
 
 /**
@@ -1396,10 +1410,12 @@ export function enqueueAtomicYamlOperation<T>(
 		.catch(() => undefined)
 		.then(async () => {
 			const context: QueueContext = { path: canonicalPath, active: true, parent };
+			activeQueueHolders.add(canonicalPath);
 			try {
 				return await queueContext.run(context, () => operation(canonicalPath, configPath));
 			} finally {
 				context.active = false;
+				activeQueueHolders.delete(canonicalPath);
 			}
 		});
 	const completion = result.then(

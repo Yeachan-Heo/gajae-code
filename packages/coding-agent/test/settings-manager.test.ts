@@ -21,7 +21,7 @@ import {
 	setDefaultTabWidth,
 } from "@gajae-code/utils";
 import { YAML } from "bun";
-import { enqueueAtomicYamlOperation } from "../src/config/atomic-yaml-patch";
+import { enqueueAtomicYamlOperation, withAtomicYamlConfigTransaction } from "../src/config/atomic-yaml-patch";
 import { withFileLock } from "../src/config/file-lock";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 
@@ -397,6 +397,40 @@ describe("Settings", () => {
 			} finally {
 				release.resolve();
 				await settings.close();
+			}
+		});
+	}
+
+	for (const method of ["flush", "flushOrThrow"] as const) {
+		it(`refuses opposing cross-file ${method} waits while preserving deferred saves`, async () => {
+			const first = await Settings.loadForScope({ cwd: projectDir, agentDir: path.join(testDir, "first") });
+			const second = await Settings.loadForScope({ cwd: projectDir, agentDir: path.join(testDir, "second") });
+			const both = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const attempted = Promise.withResolvers<void>();
+			let enteredCount = 0;
+			let attemptedCount = 0;
+			try {
+				const run = (own: Settings, other: Settings, value: number) =>
+					withAtomicYamlConfigTransaction(own.getGlobalConfigPath()!, async () => {
+						if (++enteredCount === 2) both.resolve();
+						await both.promise;
+						other.set("temperature", value);
+						await expect(other[method]()).rejects.toThrow("Cannot flush Settings for busy atomic YAML file");
+						if (++attemptedCount === 2) attempted.resolve();
+						await release.promise;
+					});
+				const roots = Promise.all([run(first, second, 0.6), run(second, first, 0.7)]);
+				void roots.catch(() => {});
+				await attempted.promise;
+				const flushes = [first.flushOrThrow(), second.flushOrThrow()];
+				release.resolve();
+				await Promise.all([roots, ...flushes]);
+				expect(first.getGlobal("temperature")).toBe(0.7);
+				expect(second.getGlobal("temperature")).toBe(0.6);
+			} finally {
+				release.resolve();
+				await Promise.all([first.close(), second.close()]);
 			}
 		});
 	}

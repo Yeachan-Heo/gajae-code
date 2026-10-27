@@ -50,8 +50,8 @@ import {
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
 	assertAtomicYamlSetAncestors,
-	assertNoActiveAtomicYamlOperation,
 	assertNonOverlappingAtomicYamlPatches,
+	assertSafeAtomicYamlSettingsFlush,
 	atomicYamlPathHash,
 	type CasReceipt,
 	deleteByPath,
@@ -1711,9 +1711,13 @@ export class Settings implements NotificationSettingsReader {
 		this.#publishSettingsChanges(new Map([[path, previous]]));
 	}
 
-	/** Flush a reserved debounced save without allowing it to be overtaken. */
+	/**
+	 * Flush a reserved debounced save without allowing it to be overtaken.
+	 * A caller holding a YAML lease cannot flush an actively held file, even a
+	 * different one; independent callers still wait in FIFO order.
+	 */
 	async flush(): Promise<void> {
-		if (this.#persist && this.#configPath) assertNoActiveAtomicYamlOperation(this.#configPath);
+		if (this.#persist && this.#configPath) assertSafeAtomicYamlSettingsFlush(this.#configPath);
 		this.#releasePendingSaveSlot();
 		if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 		this.#releasePendingSaveSlot();
@@ -1749,7 +1753,7 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Like {@link flush}, but reports a durable save failure to the caller. */
 	async flushOrThrow(): Promise<void> {
-		if (this.#persist && this.#configPath) assertNoActiveAtomicYamlOperation(this.#configPath);
+		if (this.#persist && this.#configPath) assertSafeAtomicYamlSettingsFlush(this.#configPath);
 		this.#releasePendingSaveSlot();
 		if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 		this.#releasePendingSaveSlot();
