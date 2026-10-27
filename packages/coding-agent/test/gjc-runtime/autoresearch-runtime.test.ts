@@ -84,6 +84,9 @@ Improve the tokenizer hot path without changing the public API.
 - No public API change
 - Memory under 512 MB
 
+## Assumptions
+- The tokenizer input corpus is representative of production usage.
+
 ## Deliverables
 - Benchmark report
 - Patch series
@@ -521,13 +524,23 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 	it("handoff intake via --spec writes the mission and asks zero questions", async () => {
 		const root = await tempDir();
 		const specPath = await writeSpec(root, HANDBOFF_SPEC);
-		const result = await runNativeAutoresearchCommand(["--spec", specPath, "--json"], root);
+		const result = await runNativeAutoresearchCommand(
+			["--spec", specPath, "--assumption", "Limit measurements to the current runtime", "--json"],
+			root,
+		);
 		expect(result.status).toBe(0);
 		expect(result.intake).toBe("handoff");
 		expect(result.missionCreated).toBe(true);
 		const payload = JSON.parse(result.stdout!) as {
 			intake: string;
-			mission: { objective: string; mode: string; slug: string; deliverables: string[]; constraints: string[] };
+			mission: {
+				objective: string;
+				mode: string;
+				slug: string;
+				deliverables: string[];
+				constraints: string[];
+				assumptions: string[];
+			};
 			mission_path: string;
 		};
 		expect(payload.intake).toBe("handoff");
@@ -536,6 +549,10 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect(payload.mission.objective).toBe("Optimize the tokenizer hot path");
 		expect(payload.mission.deliverables).toEqual(["Benchmark report", "Patch series"]);
 		expect(payload.mission.constraints).toEqual(["No public API change", "Memory under 512 MB"]);
+		expect(payload.mission.assumptions).toEqual([
+			"The tokenizer input corpus is representative of production usage.",
+			"Limit measurements to the current runtime",
+		]);
 		// Zero clarification questions: no clarification signal in the receipt.
 		expect(JSON.stringify(payload)).not.toContain("clarification_required");
 
@@ -572,9 +589,15 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		const result = await runNativeAutoresearchCommand(["--json"], root);
 		expect(result.status).toBe(0);
 		expect(result.intake).toBe("cold");
-		const payload = JSON.parse(result.stdout!) as { intake: string; clarification_required: boolean };
+		const payload = JSON.parse(result.stdout!) as {
+			intake: string;
+			clarification_required: boolean;
+			next: string;
+		};
 		expect(payload.intake).toBe("cold");
 		expect(payload.clarification_required).toBe(true);
+		expect(payload.next).toContain("success criterion");
+		expect(payload.next).toContain("scope");
 		// No mission may exist: clarification must happen before research begins.
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
@@ -588,10 +611,12 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 			intake: string;
 			goal: string;
 			clarification_required: boolean;
+			next: string;
 		};
 		expect(payload.intake).toBe("cold");
 		expect(payload.goal).toBe("Optimize the tokenizer throughput");
 		expect(payload.clarification_required).toBe(true);
+		expect(payload.next).toContain("success criterion");
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
 
@@ -610,24 +635,35 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 				"Verdict",
 				"--constraint",
 				"No source edits",
+				"--assumption",
+				"Measure the existing parser workload as representative",
+				"--assumption",
+				"Treat throughput as the primary success criterion",
 				"--json",
 			],
 			root,
 		);
 		expect(write.status).toBe(0);
-		const written = JSON.parse(write.stdout!) as { mission: { slug: string; mode: string; objective: string } };
+		const written = JSON.parse(write.stdout!) as {
+			mission: { slug: string; mode: string; objective: string; assumptions: string[] };
+		};
 		expect(written.mission.slug).toBe("parser-throughput");
 		expect(written.mission.mode).toBe("data");
 		expect(written.mission.objective).toBe("Measure parser throughput");
+		expect(written.mission.assumptions).toEqual([
+			"Measure the existing parser workload as representative",
+			"Treat throughput as the primary success criterion",
+		]);
 		const read = await runNativeAutoresearchCommand(["read", "--json"], root);
 		expect(read.status).toBe(0);
 		const readPayload = JSON.parse(read.stdout!) as {
 			exists: boolean;
-			mission: { slug: string };
+			mission: { slug: string; assumptions: string[] };
 			ledger: Array<{ event: string }>;
 		};
 		expect(readPayload.exists).toBe(true);
 		expect(readPayload.mission.slug).toBe("parser-throughput");
+		expect(readPayload.mission.assumptions).toEqual(written.mission.assumptions);
 		expect(readPayload.ledger.map(entry => entry.event)).toEqual(["mission_created"]);
 		const cleared = await runNativeAutoresearchCommand(["clear", "--json"], root);
 		expect(cleared.status).toBe(0);
@@ -735,6 +771,7 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		const result = await runNativeAutoresearchCommand(["--help"], root);
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("--spec");
+		expect(result.stdout).toContain("--assumption");
 		expect(result.stdout).toContain("Spec intake");
 		expect(result.stdout).toContain("intake --spec");
 		expect(result.stdout).toContain("Cold intake");
