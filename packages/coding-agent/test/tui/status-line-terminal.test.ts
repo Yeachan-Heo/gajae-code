@@ -176,6 +176,28 @@ test("normalizes horizontal tabs to spaces to prevent layout desynchronization",
 	expect(rendered).toContain("foo bar baz");
 });
 
+test("strips non-file OSC 8 hyperlinks and unterminated OSC 8 sequences", () => {
+	// 1. BEL-terminated https OSC 8
+	const httpsLink = "x\x1b]8;;https://evil.com\x07tail";
+	const renderedHttps = renderStatusLine({ title: "Tool", description: httpsLink }, theme);
+	expect(renderedHttps).not.toContain("https://evil.com");
+	expect(renderedHttps).not.toContain("\x1b]8;");
+	expect(renderedHttps).toContain("tail");
+
+	// 2. Unterminated OSC 8 (missing ST/BEL)
+	const unterminated = "a\x1b]8;;file:///etc/passwd tail";
+	const renderedUnterminated = renderStatusLine({ title: "Tool", description: unterminated }, theme);
+	expect(renderedUnterminated).not.toContain("\x1b]8;");
+	expect(renderedUnterminated).toContain("a]8;;file:///etc/passwd tail");
+
+	// 3. C1 8-bit unterminated or https OSC 8
+	const c1Https = "a\u009d8;;https://evil.com\u009cb";
+	const renderedC1 = renderStatusLine({ title: "Tool", description: c1Https }, theme);
+	expect(renderedC1).not.toContain("https://evil.com");
+	expect(renderedC1).not.toContain("\u009d");
+	expect(renderedC1).toContain("ab");
+});
+
 test("property: status line strips arbitrary terminal controls, fc.property seed 71291, numRuns 64", () => {
 	const mark = fc.stringMatching(/^[A-Za-z]{6,12}$/);
 	const wrapper = fc.constantFrom(
