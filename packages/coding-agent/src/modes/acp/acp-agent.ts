@@ -1277,28 +1277,14 @@ function configValues(query: unknown): Map<string, string> {
 	return values;
 }
 
-/**
- * Check if inline skill command discovery is enabled in the session settings.
- * Returns true if the setting is explicitly enabled, false if disabled, undefined if not found.
- * Handles both real config shape (id: "skills.enableSkillCommands", value: string)
- * and legacy format (enableSkillCommands as direct boolean or string).
- */
-function isInlineSkillDiscoveryEnabled(configQuery: unknown): boolean | undefined {
-	const values = configValues(configQuery);
-	// Try real config key first
-	let value = values.get("skills.enableSkillCommands");
-	// Fall back to legacy key format
-	if (value === undefined) value = values.get("enableSkillCommands");
-	if (value === undefined) return undefined;
-	return value !== "false";
+/** Inline skill conversion follows the host session's `enableSkillCommands` config item; anything but `"true"` disables it. */
+function isInlineSkillDiscoveryEnabled(configQuery: unknown): boolean {
+	return configValues(configQuery).get("enableSkillCommands") === "true";
 }
 
-/**
- * Check if text contains an inline skill token candidate (/skill:name).
- * Used for cheap pre-check to avoid unnecessary config queries.
- */
+/** Cheap pre-check so prompts without a `/skill:` token never pay for config or skill queries. */
 function hasInlineSkillTokenCandidate(text: string): boolean {
-	return /\/skill:\S+/.test(text);
+	return !text.startsWith("/") && /\s\/skill:\S/i.test(text);
 }
 
 /**
@@ -2471,21 +2457,8 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		const textBlock = params.prompt.length === 1 && params.prompt[0]?.type === "text" ? params.prompt[0] : undefined;
-		// Inline skill discovery is delegated to the session layer, which respects enableSkillCommands
-		// (review P2: implicit ACP conversion must honor the host's settings, not bypass them via direct SDK invocation).
-		let needsInlineSkillDiscovery = false;
-		// Only query config when text prompt contains an inline skill token candidate (cheap pre-check).
-		if (textBlock !== undefined && hasInlineSkillTokenCandidate(textBlock.text)) {
-			try {
-				const configQuery = await record.adapter.query("config.list/get");
-				const enabled = isInlineSkillDiscoveryEnabled(configQuery);
-				// Fail closed: if setting is not found or query fails, don't enable discovery.
-				needsInlineSkillDiscovery = enabled === true;
-			} catch {
-				// Query failure: fail closed (don't enable discovery).
-				needsInlineSkillDiscovery = false;
-			}
-		}
+		// The host's enableSkillCommands setting is read under admission ownership below (review P2).
+		const needsInlineSkillDiscovery = textBlock !== undefined && hasInlineSkillTokenCandidate(textBlock.text);
 		const discoveryAdapter = record.adapter;
 		let inlineSkillCommands: Map<string, { name: string }> | undefined;
 		let admissionReservation: PromptAdmissionReservation | undefined;
@@ -2532,7 +2505,14 @@ export class AcpAgent implements Agent {
 				// Discovery runs before a host turn exists, even when this prompt first waited
 				// for a cancelled predecessor to settle.
 				discoveryReservation.localCommand = true;
-				const discovery = this.#discoverInlineSkillCommands(record, discoveryAdapter);
+				// A disabled setting or a failed config read leaves inline tokens as plain text.
+				const discovery = discoveryAdapter
+					.query("config.list/get")
+					.then(config =>
+						isInlineSkillDiscoveryEnabled(config)
+							? this.#discoverInlineSkillCommands(record, discoveryAdapter)
+							: undefined,
+					);
 				void discovery.catch(() => undefined);
 				const result = await Promise.race([
 					discovery.then(
@@ -2545,7 +2525,7 @@ export class AcpAgent implements Agent {
 				if (settlement?.kind === "rejected") throw settlement.error;
 				if (settlement?.kind === "cancelled" || discoveryReservation.cancelled || "cancelled" in result)
 					return { stopReason: "cancelled" };
-				if ("value" in result) inlineSkillCommands = result.value.commands;
+				if ("value" in result) inlineSkillCommands = result.value?.commands;
 				if (this.#sessions.get(params.sessionId) !== record || record.adapter !== discoveryAdapter)
 					throw new AcpSdkAdapterError(
 						"conflict",

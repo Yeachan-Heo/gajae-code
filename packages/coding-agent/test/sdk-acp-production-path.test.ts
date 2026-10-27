@@ -493,7 +493,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 										model: `gajae-code/${activeModelPreset}`,
 										modelPreset: activeModelPreset,
 										thinking: "medium",
-										enableSkillCommands: true,
+										enableSkillCommands: "true",
 									},
 								]
 							: frame.query === "models.profiles.list"

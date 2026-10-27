@@ -14025,6 +14025,7 @@ export class AgentSession {
 			steeringMode: this.steeringMode,
 			followUpMode: this.followUpMode,
 			toolInterruptPolicy: this.toolInterruptPolicy,
+			enableSkillCommands: String(this.#skillsSettings?.enableSkillCommands !== false),
 		};
 	}
 
@@ -14115,7 +14116,7 @@ export class AgentSession {
 				`/skill:${skill.name}${activation.cleanedArgs ? " " + activation.cleanedArgs : ""}`,
 				"followUp",
 			);
-			(skillPromptMessage.details as Record<string, unknown>).__pendingDisplayTag = pendingDisplayTag;
+			skillPromptMessage.details.__pendingDisplayTag = pendingDisplayTag;
 		}
 		await this.promptCustomMessage(skillPromptMessage, {
 			...internalOptions,
