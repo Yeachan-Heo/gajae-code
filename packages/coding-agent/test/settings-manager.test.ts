@@ -119,6 +119,68 @@ describe("Settings", () => {
 		});
 	}
 
+	it("keeps memory state and receipt ownership when a later batch value cannot be cloned or hashed", async () => {
+		for (const invalid of [() => {}, 1n]) {
+			const settings = Settings.isolated({ temperature: 0.2 });
+			const receipt = await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.4 }]);
+			const changes: string[] = [];
+			settings.onChanged(settingPath => changes.push(settingPath));
+			await expect(
+				settings.commitAtomicBatch([
+					{ path: "temperature", op: "set", value: 0.8 },
+					{ path: "topP", op: "set", value: invalid },
+				]),
+			).rejects.toThrow();
+			expect(settings.getGlobal("temperature")).toBe(0.4);
+			expect(settings.get("temperature")).toBe(0.4);
+			expect(changes).toEqual([]);
+			expect((await receipt.restore()).status).toBe("restored");
+			expect(settings.get("temperature")).toBe(0.2);
+			await settings.close();
+		}
+	});
+
+	for (const durable of [false, true]) {
+		for (const builder of [false, true]) {
+			it(`rejects invalid batch operations without mutation (${durable ? "disk" : "memory"}, ${builder ? "builder" : "direct"})`, async () => {
+				const settings = durable ? await Settings.loadForScope({ cwd: projectDir, agentDir }) : Settings.isolated();
+				try {
+					await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+					const patches = [
+						{ path: "temperature", op: "set", value: 0.8 },
+						{ path: "topP", op: "invalid", value: 0.3 },
+					] as never;
+					const result = builder
+						? settings.commitAtomicBatchWithCurrent(async () => patches)
+						: settings.commitAtomicBatch(patches);
+					await expect(result).rejects.toThrow("Unknown settings atomic patch operation");
+					expect(settings.getGlobal("temperature")).toBe(0.2);
+					expect(settings.get("temperature")).toBe(0.2);
+				} finally {
+					await settings.close();
+				}
+			});
+		}
+	}
+
+	it("does not clear a runtime setting through an inherited prototype alias", async () => {
+		const settings = Settings.isolated();
+		const display = Object.getOwnPropertyDescriptor(Object.prototype, "display");
+		const tabWidth = Object.getOwnPropertyDescriptor(Object.prototype, "tabWidth");
+		try {
+			Object.defineProperty(Object.prototype, "display", { value: Object.prototype, configurable: true });
+			Object.defineProperty(Object.prototype, "tabWidth", { value: 7, configurable: true });
+			settings.clearOverride("display.tabWidth");
+			expect(Object.getOwnPropertyDescriptor(Object.prototype, "tabWidth")?.value).toBe(7);
+		} finally {
+			if (display) Object.defineProperty(Object.prototype, "display", display);
+			else delete (Object.prototype as Record<string, unknown>).display;
+			if (tabWidth) Object.defineProperty(Object.prototype, "tabWidth", tabWidth);
+			else delete (Object.prototype as Record<string, unknown>).tabWidth;
+			await settings.close();
+		}
+	});
+
 	it("does not log setting override values when initialization options differ", async () => {
 		const initialSecret = "initial-settings-secret";
 		const requestedSecret = "requested-settings-secret";

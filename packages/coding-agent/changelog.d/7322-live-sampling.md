@@ -4,7 +4,7 @@
 - Publish sampling adopted during successful or failed ordinary saves, isolate process-global presentation hooks, and fence overlapping same-value/ABA writes across in-process settings owners without rejecting unrelated model-role changes. Cross-process ownership still uses the existing hash/exact-file checks.
 - Reject forged, copied, foreign, discarded, and replayed notification provider drafts; claim Telegram setup drafts before asynchronous work to prevent concurrent commits.
 
-- Reject prototype-traversal paths and ambiguous ancestor/descendant atomic batches before mutation; preserve ordered writes to one exact path.
+- Reject prototype-traversal paths, invalid operations, and ambiguous ancestor/descendant atomic batches before mutation; stage in-memory updates atomically and preserve ordered writes to one exact path. Avoid inherited-property traversal when clearing runtime overrides.
 - Return failed notification saves to fresh setup instead of retrying consumed drafts. Require portable interaction shutdown before session shutdown and settle only validated request identities.
 
 ### Added
