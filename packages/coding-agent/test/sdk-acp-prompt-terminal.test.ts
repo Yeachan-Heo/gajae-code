@@ -147,6 +147,8 @@ async function createFixture(
 		deferRecoveryAcknowledgement?: boolean;
 		retainRecoveryQuery?: boolean;
 		deferSkillDiscovery?: boolean;
+		paginateSkillDiscovery?: boolean;
+		skillCatalogNames?: string[];
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -351,6 +353,7 @@ async function createFixture(
 				}
 				if (frame.type === "query_request") {
 					queryCalls.push(String(frame.query));
+					const skillCatalogCursor = typeof frame.cursor === "string" ? frame.cursor : undefined;
 					if (frame.query === "turn.result" && options.retainRecoveryQuery) {
 						recoveryInputs.push(frame.input as Record<string, unknown>);
 						recoveryQuery = { socket, id: frame.id };
@@ -363,9 +366,15 @@ async function createFixture(
 								? [{ provider: "openai", id: "gpt", name: "GPT" }]
 								: frame.query === "providers.list/active"
 									? [{ provider: "openai", connectionKind: "credential" }]
-									: frame.query === "skill.list/state" && options.deferSkillDiscovery
-										? [{ name: "fixture-skill", description: "Fixture skill" }]
-										: [];
+									: frame.query === "skill.list/state" && options.paginateSkillDiscovery
+										? skillCatalogCursor === "skills-page-2"
+											? [{ name: "fixture-skill", description: "Fixture skill" }]
+											: [{ name: "first-page-skill", description: "First page skill" }]
+										: frame.query === "skill.list/state" && options.skillCatalogNames
+											? options.skillCatalogNames.map(name => ({ name, description: `${name} skill` }))
+											: frame.query === "skill.list/state" && options.deferSkillDiscovery
+												? [{ name: "fixture-skill", description: "Fixture skill" }]
+												: [];
 					const result =
 						frame.query === "runtime.capabilities"
 							? { promptTerminalOutcomeVersion: 1, primaryControlSurface: "sdk" }
@@ -385,7 +394,20 @@ async function createFixture(
 												complete: true,
 											},
 										}
-									: { page: { items, complete: true } };
+									: {
+											page: {
+												items,
+												complete:
+													frame.query !== "skill.list/state" ||
+													!options.paginateSkillDiscovery ||
+													skillCatalogCursor === "skills-page-2",
+												...(frame.query === "skill.list/state" &&
+												options.paginateSkillDiscovery &&
+												skillCatalogCursor !== "skills-page-2"
+													? { continuationCursor: "skills-page-2" }
+													: {}),
+											},
+										};
 					if (
 						blockAdvisoryQuery &&
 						frame.query === options.blockedAdvisoryQuery &&
@@ -813,6 +835,47 @@ test("ACP inline skill discovery reserves prompt ownership and honors cancellati
 		expect(fixture.queryCalls.filter(query => query === "skill.list/state")).toHaveLength(1);
 	} finally {
 		fixture.releaseSkillDiscovery();
+		fixture.dispose();
+	}
+});
+
+test("ACP inline skill dispatch uses every page of a fresh catalog", async () => {
+	const fixture = await createFixture({ paginateSkillDiscovery: true });
+	try {
+		await waitFor(
+			() => fixture.updates.some(update => update.update.sessionUpdate === "available_commands_update"),
+			"initial paginated skill catalog publication",
+		);
+		const pending = prompt(fixture, "Explain /skill:fixture-skill using the later catalog page");
+		await bounded(fixture.promptDelivered, "inline skill dispatch from later page");
+		expect(fixture.mutationInputs[0]).toMatchObject({ name: "fixture-skill" });
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "later-page skill completion")).toEqual({ stopReason: "end_turn" });
+		expect(fixture.queryCalls.filter(query => query === "skill.list/state")).toHaveLength(4);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP inline skill dispatch refreshes names after a catalog change", async () => {
+	const skillCatalogNames = ["fixture-skill"];
+	const fixture = await createFixture({ skillCatalogNames });
+	try {
+		await waitFor(
+			() => fixture.updates.some(update => update.update.sessionUpdate === "available_commands_update"),
+			"initial skill catalog publication",
+		);
+		skillCatalogNames.splice(0, 1, "replacement-skill");
+		const promptText = "Explain /skill:fixture-skill literally after catalog refresh";
+		const pending = prompt(fixture, promptText);
+		await bounded(fixture.promptDelivered, "ordinary prompt after catalog refresh");
+		expect(fixture.mutationInputs[0]).toMatchObject({ text: promptText });
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "ordinary prompt completion after catalog refresh")).toEqual({
+			stopReason: "end_turn",
+		});
+		expect(fixture.queryCalls.filter(query => query === "skill.list/state")).toHaveLength(2);
+	} finally {
 		fixture.dispose();
 	}
 });

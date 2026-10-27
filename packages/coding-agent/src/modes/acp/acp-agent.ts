@@ -285,9 +285,7 @@ type SessionRecord = {
 	inboundSequence: number;
 	/** Updated at ingress so a prompt acknowledgement can distinguish a steer from a fresh turn. */
 	busy: boolean;
-	/** Cached names from the last published skill list; prompt dispatch must not await discovery before claiming ownership. */
-	inlineSkillCommands?: Map<string, { name: string }>;
-	inlineSkillState?: unknown;
+	/** Shared only while a complete, current skill catalog snapshot is being fetched. */
 	inlineSkillDiscovery?: Promise<{ skills: unknown; commands: Map<string, { name: string }> }>;
 	/** Last SDK activity state; ACP prompt settlement can precede the SDK's idle publication. */
 	sdkIdle: boolean;
@@ -566,6 +564,37 @@ function acpSkillCommandMap(query: unknown): Map<string, { name: string }> {
 		skills.set(command.name, { name });
 	}
 	return skills;
+}
+
+const MAX_SKILL_COMMAND_PAGES = 100;
+
+async function collectInlineSkillCatalog(
+	adapter: Pick<AcpSdkAdapter, "query">,
+): Promise<{ skills: unknown; commands: Map<string, { name: string }> }> {
+	const items: unknown[] = [];
+	const seenCursors = new Set<string>();
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_SKILL_COMMAND_PAGES; pageCount++) {
+		const page = queryPage(await adapter.query("skill.list/state", {}, cursor));
+		if (!page) throw new AcpSdkAdapterError("protocol_error", "skill.list/state returned no page.");
+		if (!Array.isArray(page.items))
+			throw new AcpSdkAdapterError("protocol_error", "skill.list/state returned a malformed page.");
+		items.push(...page.items);
+		if (page.complete === true) {
+			const skills = { page: { items, complete: true } };
+			return { skills, commands: acpSkillCommandMap(skills) };
+		}
+		if (typeof page.continuationCursor !== "string" || page.continuationCursor.length === 0)
+			throw new AcpSdkAdapterError(
+				"protocol_error",
+				"skill.list/state page is incomplete without a continuation cursor.",
+			);
+		if (seenCursors.has(page.continuationCursor))
+			throw new AcpSdkAdapterError("protocol_error", "skill.list/state repeated a continuation cursor.");
+		seenCursors.add(page.continuationCursor);
+		cursor = page.continuationCursor;
+	}
+	throw new AcpSdkAdapterError("protocol_error", "skill.list/state exceeded the page budget.");
 }
 
 function hasCorrelation(correlation: PromptCorrelation): boolean {
@@ -2419,10 +2448,11 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		const textBlock = params.prompt.length === 1 && params.prompt[0]?.type === "text" ? params.prompt[0] : undefined;
 		const needsInlineSkillDiscovery =
-			record.inlineSkillCommands === undefined &&
 			textBlock !== undefined &&
 			!textBlock.text.trimStart().startsWith("/") &&
 			/(^|\s)\/skill:[^\s]+/i.test(textBlock.text);
+		const discoveryAdapter = record.adapter;
+		let inlineSkillCommands: Map<string, { name: string }> | undefined;
 		let admissionReservation: PromptAdmissionReservation | undefined;
 		if (record.pendingPromptAdmission)
 			throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
@@ -2457,13 +2487,13 @@ export class AcpAgent implements Agent {
 						return { stopReason: "cancelled" };
 				}
 			}
-			if (needsInlineSkillDiscovery && record.inlineSkillCommands === undefined) {
+			if (needsInlineSkillDiscovery) {
 				const discoveryReservation = admissionReservation;
 				if (!discoveryReservation) throw new Error("Inline skill discovery requires prompt admission ownership.");
 				// Discovery runs before a host turn exists, even when this prompt first waited
 				// for a cancelled predecessor to settle.
 				discoveryReservation.localCommand = true;
-				const discovery = this.#discoverInlineSkillCommands(params.sessionId, record, record.adapter);
+				const discovery = this.#discoverInlineSkillCommands(record, discoveryAdapter);
 				void discovery.catch(() => undefined);
 				const result = await Promise.race([
 					discovery.then(
@@ -2476,8 +2506,20 @@ export class AcpAgent implements Agent {
 				if (settlement?.kind === "rejected") throw settlement.error;
 				if (settlement?.kind === "cancelled" || discoveryReservation.cancelled || "cancelled" in result)
 					return { stopReason: "cancelled" };
+				if ("value" in result) inlineSkillCommands = result.value.commands;
+				if (this.#sessions.get(params.sessionId) !== record || record.adapter !== discoveryAdapter)
+					throw new AcpSdkAdapterError(
+						"conflict",
+						"ACP session attachment changed during inline skill discovery; retry the prompt.",
+					);
 			}
-			return await this.#submitPromptCore(params, echoUserMessage, retryReservation, admissionReservation);
+			return await this.#submitPromptCore(
+				params,
+				echoUserMessage,
+				retryReservation,
+				admissionReservation,
+				inlineSkillCommands,
+			);
 		} finally {
 			if (record.pendingPromptAdmission === admissionReservation) record.pendingPromptAdmission = undefined;
 		}
@@ -2539,6 +2581,7 @@ export class AcpAgent implements Agent {
 		echoUserMessage: boolean,
 		retryReservation?: FirstPromptRetryReservation,
 		admissionReservation?: PromptAdmissionReservation,
+		inlineSkillCommands?: Map<string, { name: string }>,
 	): Promise<PromptResponse> {
 		const admissionSettlement = admissionReservation?.settlement;
 		if (admissionSettlement?.kind === "rejected") throw admissionSettlement.error;
@@ -2574,7 +2617,7 @@ export class AcpAgent implements Agent {
 			);
 
 		const payload = acpPromptPayload(params.prompt);
-		const skillInvocation = acpSkillInvocation(params.prompt, record.inlineSkillCommands);
+		const skillInvocation = acpSkillInvocation(params.prompt, inlineSkillCommands);
 		const clientRef = randomUUID();
 		if (!skillInvocation) {
 			const promptError = validateRequiredPromptText("turn.prompt", {
@@ -4251,7 +4294,14 @@ export class AcpAgent implements Agent {
 		try {
 			await this.#attachExisting(id, cwd, mcpServers);
 			const current = this.#sessions.get(id);
-			if (current) void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
+			if (current) {
+				void this.#publishPromptPhase(id, current.adapter, this.#promptPhaseOwner(current));
+				void this.#publishAvailableCommands(id, current.adapter).catch(error =>
+					logger.warn(`ACP session ${id} could not republish commands after transport recovery`, {
+						error: error instanceof Error ? error.message : String(error),
+					}),
+				);
+			}
 		} catch (attachError) {
 			const detail = attachError instanceof Error ? attachError.message : String(attachError);
 			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${detail}`);
@@ -5672,25 +5722,17 @@ export class AcpAgent implements Agent {
 	}
 
 	#discoverInlineSkillCommands(
-		id: string,
 		record: SessionRecord,
 		adapter: AcpSdkAdapter,
-	): Promise<{ skills: unknown; commands: Map<string, { name: string }> }> {
-		if (record.inlineSkillCommands) {
-			return Promise.resolve({ skills: record.inlineSkillState, commands: record.inlineSkillCommands });
-		}
+	): Promise<{
+		skills: unknown;
+		commands: Map<string, { name: string }>;
+	}> {
 		if (record.inlineSkillDiscovery) return record.inlineSkillDiscovery;
-		const discovery = adapter.query("skill.list/state").then(skills => ({
-			skills,
-			commands: acpSkillCommandMap(skills),
-		}));
+		const discovery = collectInlineSkillCatalog(adapter);
 		record.inlineSkillDiscovery = discovery;
 		void discovery.then(
-			result => {
-				if (this.#sessions.get(id) === record && record.adapter === adapter) {
-					record.inlineSkillState = result.skills;
-					record.inlineSkillCommands = result.commands;
-				}
+			() => {
 				if (record.inlineSkillDiscovery === discovery) record.inlineSkillDiscovery = undefined;
 			},
 			() => {
@@ -5706,8 +5748,8 @@ export class AcpAgent implements Agent {
 		try {
 			skills =
 				record?.adapter === adapter
-					? (await this.#discoverInlineSkillCommands(id, record, adapter)).skills
-					: await adapter.query("skill.list/state");
+					? (await this.#discoverInlineSkillCommands(record, adapter)).skills
+					: (await collectInlineSkillCatalog(adapter)).skills;
 		} catch {
 			// Builtins remain useful when an older SDK host cannot expose skill state.
 		}
