@@ -1,0 +1,73 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import type { DesktopFrame, DesktopMethod, DesktopRequest } from "../../desktop-host/src/protocol";
+
+interface PendingRequest {
+	resolve: (value: unknown) => void;
+	reject: (reason: Error) => void;
+}
+const pending = new Map<string, PendingRequest>();
+const listeners = new Set<(frame: DesktopFrame) => void>();
+let connection: Promise<void> | undefined;
+
+function receive(frame: DesktopFrame): void {
+	if (frame.type === "response") {
+		const waiter = pending.get(frame.id);
+		if (waiter) {
+			pending.delete(frame.id);
+			if (frame.ok) waiter.resolve(frame.result);
+			else waiter.reject(new Error(frame.error));
+		}
+	} else if (frame.type === "fatal") {
+		for (const waiter of pending.values()) waiter.reject(new Error(frame.error));
+		pending.clear();
+	}
+	for (const listener of listeners) listener(frame);
+}
+
+async function connect(): Promise<void> {
+	if (!isTauri())
+		throw new Error("데스크톱 앱에서 실행해 주세요. 브라우저에서는 ?showcase로 디자인을 확인할 수 있습니다.");
+	if (!connection) {
+		connection = listen<DesktopFrame>("engine-frame", event => receive(event.payload))
+			.then(() => undefined)
+			.catch(error => {
+				connection = undefined;
+				throw error;
+			});
+	}
+	await connection;
+}
+
+export async function subscribe(listener: (frame: DesktopFrame) => void): Promise<() => void> {
+	listeners.add(listener);
+	try {
+		await connect();
+	} catch (error) {
+		listeners.delete(listener);
+		throw error;
+	}
+	return () => {
+		listeners.delete(listener);
+	};
+}
+
+export async function request<T>(method: DesktopMethod, params: Record<string, unknown> = {}): Promise<T> {
+	await connect();
+	const id = crypto.randomUUID();
+	const result = Promise.withResolvers<unknown>();
+	pending.set(id, { resolve: result.resolve, reject: result.reject });
+	const envelope: DesktopRequest = { id, method, params };
+	try {
+		await invoke("engine_request", { request: envelope });
+	} catch (error) {
+		pending.delete(id);
+		result.reject(error instanceof Error ? error : new Error(String(error)));
+	}
+	return (await result.promise) as T;
+}
+
+export async function selectProject(): Promise<string | null> {
+	await connect();
+	return invoke<string | null>("select_project");
+}

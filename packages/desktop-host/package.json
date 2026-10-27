@@ -1,0 +1,23 @@
+{
+	"name": "@gajae-code/desktop-host",
+	"version": "0.19.0",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": "./src/host.ts",
+		"./protocol": "./src/protocol.ts"
+	},
+	"scripts": {
+		"start": "bun src/index.ts",
+		"test": "bun test test/host.test.ts",
+		"check": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@gajae-code/coding-agent": "workspace:*",
+		"@gajae-code/utils": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"typescript": "catalog:"
+	}
+}
