@@ -3198,10 +3198,17 @@ export class Broker {
 		if (verdict === "gone") return "gone";
 		if (verdict !== "verified") return "unresolved";
 		try {
-			return (await provider.close(proof)).ok ? "closed" : "unresolved";
+			if ((await provider.close(proof)).ok) return "closed";
 		} catch {
-			// The substrate may survive. The caller still records uncertainty, which
-			// is the honest durable outcome for an unclosed unowned substrate.
+			// Reconciled below: the substrate may survive.
+		}
+		// An unowned substrate can exit on its own while its close runs (a host that gave
+		// up at its readiness cutoff), which fails or refuses the exact close. Its proven
+		// absence releases it exactly as before the close; anything else stays uncertain,
+		// the honest durable outcome for an unclosed unowned substrate.
+		try {
+			return (await provider.verify(proof)) === "gone" ? "gone" : "unresolved";
+		} catch {
 			return "unresolved";
 		}
 	}

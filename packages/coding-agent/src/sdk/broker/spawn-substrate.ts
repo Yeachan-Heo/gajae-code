@@ -360,7 +360,7 @@ function headlessProofMatches(proof: SpawnSubstrateProof, state: HeadlessState):
 	);
 }
 
-async function waitForSubstrateExit(
+async function waitForHeadlessExit(
 	proof: SpawnSubstrateProof,
 	verify: (proof: SpawnSubstrateProof) => Promise<"verified" | "mismatch" | "gone">,
 	sleep: (milliseconds: number) => Promise<void>,
@@ -658,12 +658,7 @@ export function createSpawnSubstrateProvider(
 					await closeManaged(managed, env);
 					return { ok: true };
 				} catch {
-					// A substrate that exits on its own while the close runs (a host giving up at
-					// its readiness cutoff) fails the exact close; its proven absence still
-					// releases it.
-					return (await waitForSubstrateExit(proof, provider.verify, sleep)) === "gone"
-						? { ok: true }
-						: { ok: false, code: "substrate_close_failed" };
+					return { ok: false, code: "substrate_close_failed" };
 				}
 			}
 			if (!isPositiveInteger(proof.pid) || !isNonEmptyString(proof.processIncarnation))
@@ -683,14 +678,14 @@ export function createSpawnSubstrateProvider(
 				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
-			const afterTerm = await waitForSubstrateExit(proof, verifyAfterSignal, sleep);
+			const afterTerm = await waitForHeadlessExit(proof, verifyAfterSignal, sleep);
 			if (afterTerm === "gone") return { ok: true };
 			if (afterTerm !== "verified") return closeFailure(afterTerm);
 			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGKILL")) {
 				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
-			const afterKill = await waitForSubstrateExit(proof, verifyAfterSignal, sleep);
+			const afterKill = await waitForHeadlessExit(proof, verifyAfterSignal, sleep);
 			return afterKill === "gone" ? { ok: true } : closeFailure(afterKill);
 		},
 	};
