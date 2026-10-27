@@ -1373,7 +1373,9 @@ Whichever of these signals the child handles first creates
 `shutdown-cause-<generation>.json` exclusively: `cooperative` for SIGUSR2, which
 then starts the ordinary SIGTERM shutdown, or `signal` for any other. A
 cooperative signal that arrives after another cause records nothing and starts
-no second shutdown.
+no second shutdown. A child whose shutdown already began before the installer
+ran (its postmortem cleanup started) publishes no readiness and is never
+relayed to.
 The supervisor polls for that intent,
 validates it against its own binding, generation and server key, relays only to
 a child whose readiness record names that exact child, and relays in
@@ -1391,10 +1393,14 @@ the child's exit (`supervised-exit-<generation>.json`) explains it: the child
 recorded the relay as its first cause and ended through its own exit with 0 or
 143, or through SIGTERM. Publication alone, a timeout, an exit without a
 verdict, a verdict while the supervisor is still alive, or an unexplained child
-exit (`owner_term_child_exit_unexplained`, which also publishes the generation's
-`unexpected_owner_loss` incident) is not success, and guarded session cleanup is
+exit (`owner_term_child_exit_unexplained`; the supervisor publishes the
+generation's `unexpected_owner_loss` incident before the exit record) is not success, and guarded session cleanup is
 skipped. A verdict the child published before such an exit stays immutable
-history but never completes the close. A plain OS SIGTERM to the
+history but never completes the close. The child's runtime-state marker is its
+own signed report at the moment it wrote it, and the supervisor cannot re-sign
+it: a child that persisted `completed` and then died keeps that marker, so the
+failed close, the incident and the `supervised-exit` record are the reconciled
+outcome. A plain OS SIGTERM to the
 supervisor still stops its child but never claims an operator verdict: on
 Darwin, and on any generation with a supervisor index, a terminal is classified
 as an operator shutdown only when the confirmed relay record names the pending

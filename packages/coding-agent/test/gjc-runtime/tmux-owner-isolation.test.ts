@@ -30,6 +30,7 @@ import {
 	planTmuxOwnerIsolation,
 	planTmuxOwnerIsolationSync,
 	readSecureOwnerJson,
+	recordManagedOwnerChildExit,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
@@ -2910,7 +2911,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evid
 	});
 
 	/** A real admitted child: postmortem first, then the cooperative installer. */
-	const startCooperativeChild = (state: string, generation: string, cleanupFile: string) =>
+	const startCooperativeChild = (state: string, generation: string, cleanupFile: string, preSignal = "") =>
 		Bun.spawn({
 			cmd: [
 				process.execPath,
@@ -2920,12 +2921,20 @@ import { appendFileSync } from "node:fs";
 import { installManagedOwnerCooperativeShutdown } from ${JSON.stringify(path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"))};
 postmortem.register("fixture", async reason => { appendFileSync(process.env.CLEANUP_FILE, reason + "\\n"); await Bun.sleep(200); });
 setTimeout(() => process.exit(91), 8_000);
-const ready = installManagedOwnerCooperativeShutdown({ stateDir: process.env.STATE, sessionId: "session", generation: process.env.GENERATION, childToken: "token" });
+// A termination signal handled before the installer ran.
+if (process.env.PRE_SIGNAL) { process.kill(process.pid, process.env.PRE_SIGNAL); await Bun.sleep(50); }
+const ready = installManagedOwnerCooperativeShutdown({ stateDir: process.env.STATE, sessionId: "session", generation: process.env.GENERATION, childToken: "token", shutdownStarted: postmortem.cleanupStarted });
 process.stdout.write(ready ? "ready\\n" : "unready\\n");
 setInterval(() => {}, 1_000);`,
 			],
 			cwd: repoRoot,
-			env: { ...process.env, STATE: state, GENERATION: generation, CLEANUP_FILE: cleanupFile },
+			env: {
+				...process.env,
+				STATE: state,
+				GENERATION: generation,
+				CLEANUP_FILE: cleanupFile,
+				PRE_SIGNAL: preSignal,
+			},
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -3009,6 +3018,141 @@ setInterval(() => {}, 1_000);`,
 			expect(await child.exited).toBe(143);
 		} finally {
 			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes no readiness once a signal began shutdown before the installer ran", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-early-"));
+		const cleanupFile = path.join(state, "cleanup");
+		let child: ReturnType<typeof startCooperativeChild> | undefined;
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			child = startCooperativeChild(state, generation, cleanupFile, "SIGTERM");
+			// The shutdown has no cause record, so readiness would let a relay claim it.
+			expect(await firstLine(child)).toBe("unready\n");
+			expect(fsSync.existsSync(paths.cooperativeReadyFile)).toBe(false);
+			expect(await child.exited).toBe(143);
+			expect(fsSync.existsSync(paths.shutdownCauseFile)).toBe(false);
+		} finally {
+			if (child && child.exitCode === null) child.kill("SIGKILL");
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("makes the owner-loss incident durable before recording an unexplained exit", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-exit-order-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const intent = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 10_000).toISOString(),
+			});
+			// The child published its expected verdict before it died.
+			ownerOnly(paths.relayFile, relayRecord(intent, generation));
+			ownerOnly(paths.shutdownCauseFile, shutdownCause(generation, "cooperative"));
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: intent.dispatch_id,
+			});
+			expect(verdict.classification).toBe("expected_operator_shutdown");
+			expect(fsSync.existsSync(paths.incidentFile)).toBe(false);
+			// The exit record cannot be written (as if the supervisor died first).
+			ownerOnly(paths.childExitFile, { stale: true });
+			const exit = {
+				schema_version: 1 as const,
+				generation,
+				session_id: "session",
+				child_token: "token",
+				child_pid: COOPERATIVE_CHILD_PID,
+				intent_id: intent.intent_id,
+				dispatch_id: intent.dispatch_id,
+				signal: "SIGABRT",
+				exit_code: null,
+				explained: false,
+				observed_at: new Date().toISOString(),
+			};
+			await expect(recordManagedOwnerChildExit(state, exit)).rejects.toThrow("managed_owner_child_exit_unrecorded");
+			expect(readSecureOwnerJson(paths.incidentFile)).toEqual({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				dedupe_key: verdict.dedupe_key,
+				created_at: verdict.observed_at,
+				classification: "unexpected_owner_loss",
+			});
+			// Idempotent with the incident an unexpected verdict would publish.
+			fsSync.rmSync(paths.childExitFile);
+			await recordManagedOwnerChildExit(state, exit);
+			expect(readSecureOwnerJson(paths.childExitFile)).toEqual(exit);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["no verdict", null],
+		["a corrupt verdict", "{"],
+		["another generation's verdict", "other"],
+	] as const)("records no unexplained exit without a reconciled verdict: %s", async (_case, verdict) => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-exit-unreconciled-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			if (verdict === "{") fsSync.writeFileSync(paths.verdictFile, "{\n", { mode: 0o600 });
+			if (verdict === "other")
+				ownerOnly(paths.verdictFile, {
+					schema_version: 1,
+					generation: "other",
+					session_id: "session",
+					server_key: "socket",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: null,
+					result: "owner_term_then_session_cleanup",
+					observer: "sidecar",
+					classification: "expected_operator_shutdown",
+					reason: "process_postmortem",
+					intent_id: "intent",
+					dedupe_key: "owner-loss:session:other",
+				});
+			await expect(
+				recordManagedOwnerChildExit(state, {
+					schema_version: 1,
+					generation,
+					session_id: "session",
+					child_token: "token",
+					child_pid: COOPERATIVE_CHILD_PID,
+					intent_id: "intent",
+					dispatch_id: "dispatch",
+					signal: "SIGKILL",
+					exit_code: null,
+					explained: false,
+					observed_at: new Date().toISOString(),
+				}),
+			).rejects.toThrow("managed_owner_child_exit_unreconciled");
+			expect(fsSync.existsSync(paths.childExitFile)).toBe(false);
+			expect(fsSync.existsSync(paths.incidentFile)).toBe(false);
+		} finally {
 			await fs.rm(state, { recursive: true, force: true });
 		}
 	});

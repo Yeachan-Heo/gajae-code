@@ -2,9 +2,9 @@ import { Buffer } from "node:buffer";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
-// Its signal handlers must precede the cooperative-shutdown cause recorders.
-import "@gajae-code/utils/postmortem";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "@gajae-code/utils/env-file";
+// Its signal handlers must precede the cooperative-shutdown cause recorders.
+import * as postmortem from "@gajae-code/utils/postmortem";
 import {
 	isManagedOwnerBinding,
 	isManagedOwnerSigabrtReceipt,
@@ -273,6 +273,7 @@ async function admitManagedOwner(): Promise<ManagedOwnerAdmission> {
 				sessionId: owner.sessionId,
 				generation: owner.generation,
 				childToken,
+				shutdownStarted: postmortem.cleanupStarted,
 			});
 			return { kind: "supervised" };
 		}

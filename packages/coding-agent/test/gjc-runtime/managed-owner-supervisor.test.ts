@@ -731,6 +731,73 @@ setInterval(() => {}, 1_000);`
 		if (failures.length > 0) throw new AggregateError(failures, "Managed supervisor verification or teardown failed");
 	}, 20_000);
 	it.skipIf(process.platform !== "darwin")(
+		"never relays to a child whose shutdown began before admission",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+			const readyFile = path.join(stateDir, "child-ready");
+			let supervisor: Bun.Subprocess | undefined;
+			try {
+				await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
+				// The unrelated SIGTERM starts a slow postmortem cleanup before admission
+				// could install any cause recorder.
+				const childScript = admittedChildScript(
+					"",
+					'postmortem.register("slow", () => Bun.sleep(1_500)); process.kill(process.pid, "SIGTERM"); await Bun.sleep(50);',
+				);
+				supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+					READY_FILE: readyFile,
+					GJC_TMUX_OWNER_SERVER_KEY: "fixture-socket",
+				});
+				const ownedSupervisor = supervisor;
+				await waitForFile(readyFile);
+				const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+				expect(fsSync.existsSync(paths.cooperativeReadyFile)).toBe(false);
+				const bindingFile = (await fs.readdir(paths.root)).find(file => file.endsWith(".binding.json"))!;
+				const binding = readSecureOwnerJson(path.join(paths.root, bindingFile));
+				if (!isManagedOwnerBinding(binding)) throw new Error("fixture_binding_invalid");
+				const nativeSupervisor = nativeProcessBindings().Process.fromPid(supervisor.pid);
+				const closing = closeExactTmuxOwner(
+					{
+						stateDir,
+						sessionId: binding.session_id,
+						generation: binding.generation,
+						serverKey: "fixture-socket",
+						pid: binding.supervisor_pid,
+						startTime: binding.supervisor_start_time,
+						dispatchId: "fixture-dispatch",
+						createdAt: new Date().toISOString(),
+						expiresAt: new Date(Date.now() + 3_000).toISOString(),
+					},
+					{
+						readStartTime: async () => nativeSupervisor?.incarnation ?? null,
+						shutdown: {
+							kind: "cooperative_intent",
+							publishNoReplace: publishOwnerIntentNoReplace,
+							assertCooperativeOwner: () => {},
+						},
+						waitForVerdict: async () => {
+							await Promise.race([ownedSupervisor.exited, Bun.sleep(3_000)]);
+							const verdict = readSecureOwnerJson(paths.verdictFile);
+							return isValidOwnerVerdict(verdict) ? verdict : null;
+						},
+						cleanupSession: async () => {},
+					},
+				);
+				await expect(closing).rejects.toThrow("owner_term_verdict_timeout");
+				expect(await ownedSupervisor.exited).toBe(143);
+				// The pending intent was never relayed, so nothing can claim the shutdown.
+				expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+				expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+				expect(fsSync.existsSync(paths.childExitFile)).toBe(false);
+			} finally {
+				if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null)
+					supervisor.kill("SIGTERM");
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+		20_000,
+	);
+	it.skipIf(process.platform !== "darwin")(
 		"never attributes a shutdown an unrelated SIGTERM began to a later cooperative relay",
 		async () => {
 			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));

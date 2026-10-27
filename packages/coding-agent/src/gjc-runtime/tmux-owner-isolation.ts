@@ -2184,8 +2184,14 @@ export function installManagedOwnerCooperativeShutdown(input: {
 	sessionId: string;
 	generation: string;
 	childToken: string;
+	/**
+	 * Whether this process already began shutting down. A termination signal handled
+	 * before the recorders existed left no cause record, so such a child never
+	 * announces readiness and is never relayed to.
+	 */
+	shutdownStarted(): boolean;
 }): boolean {
-	if (process.platform !== "darwin") return false;
+	if (process.platform !== "darwin" || input.shutdownStarted()) return false;
 	const paths = lifecyclePaths(input.stateDir, input.sessionId, input.generation);
 	const identity = {
 		schema_version: 1 as const,
@@ -2278,26 +2284,30 @@ function readSupervisorIndex(paths: LifecyclePaths, intent: OwnerIntent) {
 export async function recordManagedOwnerChildExit(stateDir: string, record: ManagedOwnerChildExit): Promise<void> {
 	if (!isManagedOwnerChildExit(record)) throw new Error("managed_owner_child_exit_invalid");
 	const paths = lifecyclePaths(stateDir, record.session_id, record.generation);
+	if (!record.explained) {
+		// The incident is durable before the record that ends reconciliation, so a
+		// supervisor killed in between never leaves an unexplained exit without it.
+		// It reuses the existing verdict's key and time: an unexpected verdict already
+		// published this exact incident, an expected one did not. Without a valid
+		// verdict nothing is reconciled, and no exit record is written.
+		const verdict = await readJson<OwnerVerdict>(paths.verdictFile);
+		if (
+			!isValidOwnerVerdict(verdict) ||
+			verdict.generation !== record.generation ||
+			verdict.session_id !== record.session_id
+		)
+			throw new Error("managed_owner_child_exit_unreconciled");
+		await publishImmutableIncident(paths.incidentFile, {
+			schema_version: 1,
+			generation: record.generation,
+			session_id: record.session_id,
+			dedupe_key: verdict.dedupe_key,
+			created_at: verdict.observed_at,
+			classification: "unexpected_owner_loss",
+		});
+	}
 	if (!createOwnerOnlyRecordSync(paths.root, paths.childExitFile, record))
 		throw new Error("managed_owner_child_exit_unrecorded");
-	if (record.explained) return;
-	// An unexpected verdict already published this exact incident; an expected one did
-	// not. Without a verdict, whichever observer publishes it records the incident.
-	const verdict = await readJson<OwnerVerdict>(paths.verdictFile);
-	if (
-		!isValidOwnerVerdict(verdict) ||
-		verdict.generation !== record.generation ||
-		verdict.session_id !== record.session_id
-	)
-		return;
-	await publishImmutableIncident(paths.incidentFile, {
-		schema_version: 1,
-		generation: record.generation,
-		session_id: record.session_id,
-		dedupe_key: verdict.dedupe_key,
-		created_at: verdict.observed_at,
-		classification: "unexpected_owner_loss",
-	});
 }
 
 /** Darwin: only an explained child exit for this exact intent completes a cooperative close. */
