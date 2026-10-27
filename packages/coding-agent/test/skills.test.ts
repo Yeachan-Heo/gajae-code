@@ -104,6 +104,9 @@ describe("parseSkillInvocations", () => {
 	it("does not treat aliases or unknown leading skill commands as invocations", () => {
 		expect(parseSkillInvocations("/alpha autocomplete alias is not invocation", skillsByCommandName)).toEqual([]);
 		expect(parseSkillInvocations("/skill:unknown /skill:alpha later", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("keep /skill:unknown in the prompt", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("path/skill:alpha is just a path", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("https://example.test/skill:alpha is a URL", skillsByCommandName)).toEqual([]);
 	});
 });
 

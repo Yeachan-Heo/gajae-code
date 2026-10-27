@@ -283,6 +283,12 @@ export function extractSlashCommandTokenPrefix(text: string): string | null {
 	if (isInsideInlineCodeSpan(text.slice(0, tokenStart))) return null;
 	return tokenStart === 0 || isSkillSlashCommandToken(token) ? token : null;
 }
+
+function getSkillSlashCommandPrefix(text: string): string | null {
+	const token = extractSlashCommandTokenPrefix(text);
+	return token?.toLowerCase().startsWith("/skill:") ? token : null;
+}
+
 export function isSlashCommandPromptStart(lines: string[], cursorLine: number, textBeforeCursor: string): boolean {
 	return lines.slice(0, cursorLine).every(line => line.trim() === "") && textBeforeCursor.trimStart().startsWith("/");
 }
@@ -372,12 +378,15 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		return "name" in cmd ? cmd.name : cmd.value;
 	}
 
-	#getSlashCommandNameSuggestions(prefix: string): AutocompleteItem[] {
+	#getSlashCommandNameSuggestions(
+		prefix: string,
+		commands: (SlashCommand | AutocompleteItem)[] = this.#commands,
+	): AutocompleteItem[] {
 		const lowerPrefix = prefix.toLowerCase();
 		const normalizedPrefix = normalizeFuzzyText(prefix);
 		if (prefix.length > 0 && normalizedPrefix.length === 0) return [];
 
-		return this.#commands
+		return commands
 			.filter(cmd => {
 				const name = this.#getCommandName(cmd);
 				if (!name) return false;
@@ -481,6 +490,22 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			};
 		}
 
+		const promptBeforeCursor = [...lines.slice(0, cursorLine), textBeforeCursor].join("\n");
+		const skillPrefix = getSkillSlashCommandPrefix(promptBeforeCursor);
+		if (skillPrefix) {
+			const skillCommands = this.#commands.filter(command =>
+				this.#getCommandName(command).toLowerCase().startsWith("skill:"),
+			);
+			const matches = this.#getSlashCommandNameSuggestions(skillPrefix.slice(1), skillCommands);
+			if (matches.length === 0) return null;
+
+			return {
+				items: matches,
+				kind: "slash-command",
+				prefix: skillPrefix,
+			};
+		}
+
 		const pathMatch = this.#extractPathPrefix(textBeforeCursor, false);
 
 		// Check for file paths - triggered by Tab or if we detect a path pattern
@@ -522,9 +547,10 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
 		const afterCursor = currentLine.slice(cursorCol);
 
-		// Slash commands are completed only at the start of the prompt.
+		// Plain slash commands are completed only at the start of the prompt.
 		const isSlashCommand = prefix.startsWith("/") && !prefix.slice(1).includes("/") && beforePrefix.trim() === "";
-		if (isSlashCommand) {
+		const isSkillSlashCommand = /^\/skill:/i.test(prefix);
+		if (isSlashCommand || isSkillSlashCommand) {
 			// This is a command name completion
 			const newLine = `${beforePrefix}/${item.value} ${afterCursor}`;
 			const newLines = [...lines];
@@ -1013,6 +1039,15 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		return command.getInlineHint(argumentText);
 	}
 	trySyncSlashCompletion(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
+		const skillPrefix = getSkillSlashCommandPrefix(textBeforeCursor);
+		if (skillPrefix) {
+			const skillCommands = this.#commands.filter(command =>
+				this.#getCommandName(command).toLowerCase().startsWith("skill:"),
+			);
+			const matches = this.#getSlashCommandNameSuggestions(skillPrefix.slice(1), skillCommands);
+			return matches.length === 0 ? null : { items: matches, prefix: skillPrefix };
+		}
+
 		const commandText = textBeforeCursor.trimStart();
 		if (!commandText.startsWith("/")) return null;
 		if (commandText.length <= 1) return null; // Bare "/" alone, don't auto-complete

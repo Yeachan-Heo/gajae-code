@@ -431,20 +431,23 @@ export interface ResolvedSkillSlashCommand {
 	skill: Skill;
 }
 
-export interface ParsedSkillInvocation {
+export interface ParsedSkillInvocation<TSkill extends Pick<Skill, "name"> = Skill> {
 	commandName: string;
 	args: string;
-	skill: Skill;
+	skill: TSkill;
 }
 
-interface SkillTokenMatch {
+interface SkillTokenMatch<TSkill extends Pick<Skill, "name"> = Skill> {
 	index: number;
 	end: number;
 	commandName: string;
-	skill: Skill;
+	skill: TSkill;
 }
 
-function buildInlineSkillInvocationArgs(text: string, matches: readonly SkillTokenMatch[]): string {
+function buildInlineSkillInvocationArgs<TSkill extends Pick<Skill, "name">>(
+	text: string,
+	matches: readonly SkillTokenMatch<TSkill>[],
+): string {
 	const pieces: string[] = [];
 	let cursor = 0;
 	for (const match of matches) {
@@ -460,13 +463,13 @@ function buildInlineSkillInvocationArgs(text: string, matches: readonly SkillTok
 		.trim();
 }
 
-export function parseSkillInvocations(
+export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 	text: string,
-	skillsByCommandName: ReadonlyMap<string, Skill>,
-): ParsedSkillInvocation[] {
+	skillsByCommandName: ReadonlyMap<string, TSkill>,
+): ParsedSkillInvocation<TSkill>[] {
 	const trimmedText = text.trim();
 	if (!trimmedText) return [];
-	const normalizedSkillsByCommandName = new Map<string, Skill>();
+	const normalizedSkillsByCommandName = new Map<string, TSkill>();
 	for (const [commandName, skill] of skillsByCommandName) {
 		const normalizedCommandName = commandName.toLowerCase();
 		if (!normalizedSkillsByCommandName.has(normalizedCommandName)) {
@@ -474,7 +477,7 @@ export function parseSkillInvocations(
 		}
 	}
 	const canonicalSkillCommandPattern = /(^|\s)\/(skill:[^\s]+)/gi;
-	const matches: SkillTokenMatch[] = [];
+	const matches: SkillTokenMatch<TSkill>[] = [];
 	for (const match of trimmedText.matchAll(canonicalSkillCommandPattern)) {
 		const commandName = match[2];
 		if (!commandName) continue;

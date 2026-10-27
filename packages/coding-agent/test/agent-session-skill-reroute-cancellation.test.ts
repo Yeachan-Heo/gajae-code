@@ -118,7 +118,7 @@ test.serial("forwards preflight cancellation when a prompt reroutes to a skill",
 	});
 });
 
-test.serial("does not reroute ordinary text that merely contains a later skill token", async () => {
+test.serial("loads a skill referenced inline in ordinary prompt text", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-leading-slash-"));
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
@@ -142,14 +142,30 @@ test.serial("does not reroute ordinary text that merely contains a later skill t
 				filePath: "/tmp/fixture-skill/SKILL.md",
 				baseDir: "/tmp/fixture-skill",
 				source: "test",
+				content: "Fixture skill body",
 			},
 		],
 	});
 
-	const invokeSkill = vi.spyOn(session, "invokeSkill");
+	const promptCustomMessage = vi.spyOn(session, "promptCustomMessage").mockResolvedValue(undefined);
 	await session.prompt("xskill:noise /skill:fixture-skill review");
 
-	expect(invokeSkill).not.toHaveBeenCalled();
+	expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+	expect(promptCustomMessage.mock.calls[0]?.[0]).toMatchObject({
+		content: expect.stringContaining("Fixture skill body"),
+		details: expect.objectContaining({ args: "xskill:noise review", name: "fixture-skill" }),
+	});
+	const agentPrompt = vi.spyOn(agent, "prompt").mockResolvedValue(undefined);
+	await session.prompt("preserve /skill:unknown literally");
+	expect(agentPrompt.mock.calls[0]?.[0]).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				role: "user",
+				content: expect.arrayContaining([{ type: "text", text: "preserve /skill:unknown literally" }]),
+			}),
+		]),
+	);
+	expect(session.resolvePromptSkillInvocation("preserve /skill:unknown literally")).toBeUndefined();
 });
 
 test.serial("keeps SDK ownership when an internal skill invocation becomes a custom prompt", async () => {
