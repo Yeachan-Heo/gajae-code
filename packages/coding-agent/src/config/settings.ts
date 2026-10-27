@@ -340,6 +340,20 @@ function isAtomicSettingsPath(path: string): boolean {
 	);
 }
 
+function stageAtomicSettingsPatches(patches: readonly SettingsAtomicPatch[]): SettingsAtomicPatch[] {
+	return patches.map(patch => {
+		if (!isAtomicSettingsPath(patch.path)) {
+			throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
+		}
+		if (patch.op === "unset") return { path: patch.path, op: "unset" };
+		if (patch.op !== "set") throw new TypeError("Unknown settings atomic patch operation.");
+		if (patch.value === undefined) {
+			throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
+		}
+		return { path: patch.path, op: "set", value: structuredClone(patch.value) };
+	});
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Path Utilities
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1329,18 +1343,13 @@ export class Settings implements NotificationSettingsReader {
 		this.#assertDurableConfigWritable();
 		assertNonOverlappingAtomicYamlPatches(patches);
 		if (!this.#persist || !this.#configPath) {
+			const stagedPatches = stageAtomicSettingsPatches(patches);
 			const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 			const changes = new Map<
 				string,
 				{ before: unknown; beforeEffective: unknown; beforeHash: string; afterHash: string; revision: number }
 			>();
-			for (const patch of patches) {
-				if (!isAtomicSettingsPath(patch.path)) {
-					throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
-				}
-				if (patch.op === "set" && patch.value === undefined) {
-					throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
-				}
+			for (const patch of stagedPatches) {
 				if (!changes.has(patch.path)) {
 					changes.set(patch.path, {
 						before: structuredClone(getByPath(this.#global, patch.path.split("."))),
@@ -1353,24 +1362,50 @@ export class Settings implements NotificationSettingsReader {
 					});
 				}
 			}
+			const candidateGlobal = structuredClone(this.#global);
+			const hasNotificationMutation = stagedPatches.some(patch => isNotificationSettingsPath(patch.path));
+			const candidateRawNotifications = hasNotificationMutation
+				? structuredClone(this.#rawNotificationConfig ?? {})
+				: this.#rawNotificationConfig;
+			for (const patch of stagedPatches) {
+				const segments = patch.path.split(".");
+				if (patch.op === "set") setByPath(candidateGlobal, segments, patch.value);
+				else deleteByPath(candidateGlobal, segments);
+				if (isNotificationSettingsPath(patch.path)) {
+					if (patch.op === "set") setByPath(candidateRawNotifications!, segments, structuredClone(patch.value));
+					else deleteByPath(candidateRawNotifications!, segments);
+				}
+			}
+			for (const [patchPath, change] of changes) {
+				change.afterHash = atomicYamlPathHash(candidateGlobal, patchPath);
+			}
+			const candidateMerged = this.#mergeSettingsLayers(candidateGlobal, this.#project, this.#overrides);
+			const candidateDiagnostic = this.#computeAutoroutingDiagnostic(candidateGlobal, candidateMerged);
+			let candidateMalformedRoot = this.#hasMalformedConfigRoot;
+			let candidateInvalidNotifications = this.#hasInvalidNotificationGlobal;
+			if (hasNotificationMutation) {
+				try {
+					parseNotificationSettingsSnapshot(candidateRawNotifications);
+					candidateMalformedRoot = false;
+					candidateInvalidNotifications = false;
+				} catch (error) {
+					if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration")
+						throw error;
+					candidateInvalidNotifications = true;
+				}
+			}
+			this.#global = candidateGlobal;
+			this.#rawNotificationConfig = candidateRawNotifications;
+			this.#merged = candidateMerged;
+			this.#autoroutingLocalIssues = candidateDiagnostic.localIssues;
+			this.#autoroutingEffective = candidateDiagnostic.effective;
+			this.#hasMalformedConfigRoot = candidateMalformedRoot;
+			this.#hasInvalidNotificationGlobal = candidateInvalidNotifications;
+			if (hasNotificationMutation) this.#notificationValidationGeneration++;
 			for (const [settingPath, change] of changes) {
 				change.revision = ++this.#nextRevision;
 				this.#pathRevisions.set(settingPath, change.revision);
 			}
-			for (const patch of patches) {
-				if (patch.op === "set") {
-					setByPath(this.#global, patch.path.split("."), structuredClone(patch.value));
-					this.#applyNotificationMutationToRaw(patch.path, patch.value);
-				} else {
-					deleteByPath(this.#global, patch.path.split("."));
-					this.#applyNotificationMutationToRaw(patch.path, undefined);
-				}
-			}
-			for (const [patchPath, change] of changes) {
-				change.afterHash = atomicYamlPathHash(this.#global, patchPath);
-			}
-			this.#rebuildMerged();
-			this.#revalidateNotificationSettingsAfterMutation(patches.map(patch => patch.path));
 			this.#recordNotificationValidationBatchApply(
 				notificationValidationGuard,
 				patches.map(patch => patch.path),
@@ -1430,16 +1465,7 @@ export class Settings implements NotificationSettingsReader {
 			return receipt;
 		}
 
-		const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
-			if (!isAtomicSettingsPath(patch.path)) {
-				throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
-			}
-			if (patch.op === "unset") return { path: patch.path, op: "unset" };
-			if (patch.value === undefined) {
-				throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
-			}
-			return { path: patch.path, op: "set", value: structuredClone(patch.value) };
-		});
+		const durablePatches: AtomicYamlPatch[] = stageAtomicSettingsPatches(patches);
 
 		// A durable batch is a causal barrier: close the earlier ordinary debounce
 		// inside its already-reserved slot before queueing this batch.
@@ -1500,18 +1526,7 @@ export class Settings implements NotificationSettingsReader {
 			async current => {
 				const patches = await buildPatches(structuredClone(current));
 				assertNonOverlappingAtomicYamlPatches(patches);
-				const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
-					if (!isAtomicSettingsPath(patch.path)) {
-						throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
-					}
-					if (patch.op === "unset") return { path: patch.path, op: "unset" };
-					if (patch.value === undefined) {
-						throw new TypeError(
-							`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`,
-						);
-					}
-					return { path: patch.path, op: "set", value: structuredClone(patch.value) };
-				});
+				const durablePatches: AtomicYamlPatch[] = stageAtomicSettingsPatches(patches);
 				revisions = durablePatches.map(patch => ({
 					patch,
 					revision: ++this.#nextRevision,
@@ -1572,13 +1587,12 @@ export class Settings implements NotificationSettingsReader {
 	clearOverride(path: SettingPath): void {
 		const previous = this.get(path);
 		const segments = path.split(".");
-		let current = this.#overrides;
-		for (let i = 0; i < segments.length - 1; i++) {
-			const segment = segments[i];
-			if (!(segment in current)) return;
-			current = current[segment] as RawSettings;
+		let current: unknown = this.#overrides;
+		for (const segment of segments) {
+			if (current === null || typeof current !== "object" || !Object.hasOwn(current, segment)) return;
+			current = (current as Record<string, unknown>)[segment];
 		}
-		delete current[segments[segments.length - 1]];
+		deleteByPath(this.#overrides, segments);
 		this.#rebuildMerged();
 		this.#publishSettingsChanges(new Map([[path, previous]]));
 	}
@@ -6574,8 +6588,14 @@ export class Settings implements NotificationSettingsReader {
 			throw error;
 		}
 	}
-	#recomputeAutoroutingDiagnostic(): void {
-		this.#autoroutingLocalIssues = [this.#global, this.#project, this.#overrides].flatMap(source => {
+	#computeAutoroutingDiagnostic(
+		global: RawSettings,
+		merged: RawSettings,
+	): {
+		localIssues: SettingsSchemaIssue[];
+		effective: AutoroutingEffective;
+	} {
+		const localIssues = [global, this.#project, this.#overrides].flatMap(source => {
 			const fragment = getByPath(source, ["task", "autorouting"]);
 			return validateAutoroutingLocal(fragment).map(localIssue => ({
 				path: localIssue.path ? `task.autorouting.${localIssue.path}` : "task.autorouting",
@@ -6583,7 +6603,13 @@ export class Settings implements NotificationSettingsReader {
 				detail: localIssue.detail,
 			}));
 		});
-		this.#autoroutingEffective = validateAutoroutingEffective(getByPath(this.#merged, ["task", "autorouting"]));
+		return { localIssues, effective: validateAutoroutingEffective(getByPath(merged, ["task", "autorouting"])) };
+	}
+
+	#recomputeAutoroutingDiagnostic(): void {
+		const diagnostic = this.#computeAutoroutingDiagnostic(this.#global, this.#merged);
+		this.#autoroutingLocalIssues = diagnostic.localIssues;
+		this.#autoroutingEffective = diagnostic.effective;
 	}
 
 	#rebuildMerged(): void {
