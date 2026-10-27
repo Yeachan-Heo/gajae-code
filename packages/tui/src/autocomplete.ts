@@ -276,7 +276,15 @@ function findOpenInlineCodeSpanStart(text: string): number | null {
 			const top = delimiterStack[delimiterStack.length - 1];
 			if (top && top[1] && runLength >= top[0]) {
 				// Closing fence: length must be >= opener (per CommonMark)
-				delimiterStack.pop();
+				// and only whitespace may follow on the line
+				let closingFenceValid = true;
+				for (let j = runEnd; j < text.length && text[j] !== "\n"; j++) {
+					if (text[j] !== " " && text[j] !== "\t") {
+						closingFenceValid = false;
+						break;
+					}
+				}
+				if (closingFenceValid) delimiterStack.pop();
 			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
 				// Opening fence (only if not already inside another fence)
 				delimiterStack.push([runLength, true, i]);
@@ -352,7 +360,15 @@ function isPositionInsideCodeSpan(text: string, position: number): boolean {
 			const top = delimiterStack[delimiterStack.length - 1];
 			if (top && top[1] && runLength >= top[0]) {
 				// Closing fence: length must be >= opener (per CommonMark)
-				delimiterStack.pop();
+				// and only whitespace may follow on the line
+				let closingFenceValid = true;
+				for (let j = runEnd; j < text.length && text[j] !== "\n"; j++) {
+					if (text[j] !== " " && text[j] !== "\t") {
+						closingFenceValid = false;
+						break;
+					}
+				}
+				if (closingFenceValid) delimiterStack.pop();
 			} else if (delimiterStack.length === 0 || !delimiterStack[delimiterStack.length - 1]?.[1]) {
 				// Opening fence (only if not already inside another fence)
 				delimiterStack.push([runLength, true]);
