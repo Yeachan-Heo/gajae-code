@@ -284,6 +284,26 @@ describe("Settings", () => {
 		}
 	});
 
+	for (const durable of [false, true]) {
+		it(`rejects unjournaled scalar role ancestor replacement (${durable ? "disk" : "memory"})`, async () => {
+			const settings = durable ? await Settings.loadForScope({ cwd: projectDir, agentDir }) : Settings.isolated();
+			try {
+				await settings.setGlobalModelRoleAndFlush("custom", "test/selector");
+				await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+				const patches = [
+					{ path: "temperature", op: "set", value: 0.8 },
+					{ path: "modelRoles.custom.child", op: "set", value: "test/new" },
+				] as const;
+				await expect(settings.commitAtomicBatch(patches)).rejects.toThrow("non-record ancestor");
+				await expect(settings.commitAtomicBatchWithCurrent(() => patches)).rejects.toThrow("non-record ancestor");
+				expect(settings.getGlobal("temperature")).toBe(0.2);
+				expect(settings.getGlobal("modelRoles")?.custom).toBe("test/selector");
+			} finally {
+				await settings.close();
+			}
+		});
+	}
+
 	it("preserves literal special role names and siblings across durable reload", async () => {
 		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
 		try {

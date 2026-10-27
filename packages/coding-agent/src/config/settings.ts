@@ -49,6 +49,7 @@ import {
 	AtomicYamlRetargetError,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
+	assertAtomicYamlSetAncestors,
 	assertNonOverlappingAtomicYamlPatches,
 	atomicYamlPathHash,
 	type CasReceipt,
@@ -1394,6 +1395,14 @@ export class Settings implements NotificationSettingsReader {
 				const candidateRawNotifications = hasNotificationMutation
 					? structuredClone(this.#rawNotificationConfig ?? {})
 					: this.#rawNotificationConfig;
+				for (const patch of stagedPatches) {
+					if (patch.op === "set") {
+						const segments = patch.path.split(".");
+						assertAtomicYamlSetAncestors(candidateGlobal, segments);
+						if (isNotificationSettingsPath(patch.path))
+							assertAtomicYamlSetAncestors(candidateRawNotifications!, segments);
+					}
+				}
 				for (const patch of stagedPatches) {
 					const segments = patch.path.split(".");
 					if (patch.op === "set") setByPath(candidateGlobal, segments, patch.value);
