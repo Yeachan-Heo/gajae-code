@@ -362,7 +362,12 @@ async function createFixture(
 					}
 					const items =
 						frame.query === "config.list/get"
-							? [{ mode: "default", model: "openai/gpt", thinking: "medium", enableSkillCommands: options.enableSkillCommands !== false }]
+							? [
+									{ id: "queue.mode", value: "default" },
+									{ id: "models.current", value: "openai/gpt" },
+									{ id: "queue.thinking_level", value: "medium" },
+									{ id: "skills.enableSkillCommands", value: String(options.enableSkillCommands !== false) },
+								]
 							: frame.query === "models.list/current"
 								? [{ provider: "openai", id: "gpt", name: "GPT" }]
 								: frame.query === "providers.list/active"

@@ -1279,15 +1279,26 @@ function configValues(query: unknown): Map<string, string> {
 
 /**
  * Check if inline skill command discovery is enabled in the session settings.
- * Defaults to true if the setting is not present or not explicitly disabled.
+ * Returns true if the setting is explicitly enabled, false if disabled, undefined if not found.
+ * Handles both real config shape (id: "skills.enableSkillCommands", value: string)
+ * and legacy format (enableSkillCommands as direct boolean or string).
  */
-function isInlineSkillDiscoveryEnabled(configQuery: unknown): boolean {
-	for (const item of pageItems(configQuery)) {
-		const record = object(item);
-		if (!record) continue;
-		if (record.enableSkillCommands === false) return false;
-	}
-	return true;
+function isInlineSkillDiscoveryEnabled(configQuery: unknown): boolean | undefined {
+	const values = configValues(configQuery);
+	// Try real config key first
+	let value = values.get("skills.enableSkillCommands");
+	// Fall back to legacy key format
+	if (value === undefined) value = values.get("enableSkillCommands");
+	if (value === undefined) return undefined;
+	return value !== "false";
+}
+
+/**
+ * Check if text contains an inline skill token candidate (/skill:name).
+ * Used for cheap pre-check to avoid unnecessary config queries.
+ */
+function hasInlineSkillTokenCandidate(text: string): boolean {
+	return /\/skill:\S+/.test(text);
 }
 
 /**
@@ -2463,12 +2474,17 @@ export class AcpAgent implements Agent {
 		// Inline skill discovery is delegated to the session layer, which respects enableSkillCommands
 		// (review P2: implicit ACP conversion must honor the host's settings, not bypass them via direct SDK invocation).
 		let needsInlineSkillDiscovery = false;
-		try {
-			const configQuery = await record.adapter.query("config.list/get");
-			needsInlineSkillDiscovery = textBlock !== undefined && isInlineSkillDiscoveryEnabled(configQuery);
-		} catch {
-			// Query failure defaults to discovery enabled (backward compatible); explicit false gate requires session support.
-			needsInlineSkillDiscovery = textBlock !== undefined;
+		// Only query config when text prompt contains an inline skill token candidate (cheap pre-check).
+		if (textBlock !== undefined && hasInlineSkillTokenCandidate(textBlock.text)) {
+			try {
+				const configQuery = await record.adapter.query("config.list/get");
+				const enabled = isInlineSkillDiscoveryEnabled(configQuery);
+				// Fail closed: if setting is not found or query fails, don't enable discovery.
+				needsInlineSkillDiscovery = enabled === true;
+			} catch {
+				// Query failure: fail closed (don't enable discovery).
+				needsInlineSkillDiscovery = false;
+			}
 		}
 		const discoveryAdapter = record.adapter;
 		let inlineSkillCommands: Map<string, { name: string }> | undefined;
