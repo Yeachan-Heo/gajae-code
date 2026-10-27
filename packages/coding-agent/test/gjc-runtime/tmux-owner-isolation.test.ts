@@ -408,69 +408,91 @@ describe("closed managed predecessor evidence", () => {
 		},
 	);
 
-	it("treats a receipt-less prior binding as history only where SIGABRT receipts cannot exist", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-history-"));
-		try {
-			const baseline = {
-				state: "current",
-				schema_version: 1,
-				generation: "generation",
-				session_id: "session",
-				published_at: "2026-09-08T00:00:00.000Z",
-			} as const;
-			const root = lifecyclePaths(stateDir, "session", "generation").root;
-			await fs.mkdir(root, { recursive: true, mode: 0o700 });
-			// A supervised owner that exited normally leaves only its child binding.
-			const binding = {
-				schema_version: 3,
-				binding_kind: "opaque",
-				generation: "generation",
-				session_id: "session",
-				run_id: "run",
-				endpoint_incarnation: "incarnation",
-				child_token: "token",
-				supervisor_pid: 4242,
-				supervisor_start_time: "supervisor-start",
-				created_at: baseline.published_at,
-			};
-			await fs.writeFile(path.join(root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, {
-				mode: 0o600,
-			});
-			const resolve = (observation: ProcessIncarnationObservation = { status: "absent" }) =>
-				resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid => {
-					expect(pid).toBe(4242);
-					return observation;
+	// Owner-only evidence reads do not exist on Windows, where managed launches are refused.
+	itOwnerOnlyReads(
+		"treats a receipt-less prior binding as history only where SIGABRT receipts cannot exist",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-predecessor-history-"));
+			try {
+				const baseline = {
+					state: "current",
+					schema_version: 1,
+					generation: "generation",
+					session_id: "session",
+					published_at: "2026-09-08T00:00:00.000Z",
+				} as const;
+				const root = lifecyclePaths(stateDir, "session", "generation").root;
+				await fs.mkdir(root, { recursive: true, mode: 0o700 });
+				// A supervised owner that exited normally leaves only its child binding.
+				const binding = {
+					schema_version: 3,
+					binding_kind: "opaque",
+					generation: "generation",
+					session_id: "session",
+					run_id: "run",
+					endpoint_incarnation: "incarnation",
+					child_token: "token",
+					supervisor_pid: 4242,
+					supervisor_start_time: "supervisor-start",
+					created_at: baseline.published_at,
+				};
+				await fs.writeFile(path.join(root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, {
+					mode: 0o600,
 				});
-			if (process.platform === "linux")
-				expect(() => resolve()).toThrow("managed_owner_replacement_evidence_ambiguous");
-			else {
-				expect(resolve()).toBeUndefined();
-				// A reused pid is a different process; the exact supervisor has exited.
-				expect(resolve({ status: "present", incarnation: "another-start" })).toBeUndefined();
-				// The exact supervisor is still live: its generation must not be replaced.
-				expect(() => resolve({ status: "present", incarnation: "supervisor-start" })).toThrow(
-					"managed_owner_predecessor_live",
-				);
-				expect(() => resolve({ status: "unknown", reasonCode: "lookup_failed" })).toThrow(
-					"managed_owner_replacement_evidence_unavailable",
-				);
-				for (const patch of [{ generation: "other" }, { session_id: "other" }, { supervisor_pid: 0 }]) {
+				const resolve = (observation: ProcessIncarnationObservation = { status: "absent" }) =>
+					resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid => {
+						expect(pid).toBe(4242);
+						return observation;
+					});
+				if (process.platform === "linux")
+					expect(() => resolve()).toThrow("managed_owner_replacement_evidence_ambiguous");
+				else {
+					expect(resolve()).toBeUndefined();
+					// A reused pid is a different process; the exact supervisor has exited.
+					expect(resolve({ status: "present", incarnation: "another-start" })).toBeUndefined();
+					// The exact supervisor is still live: its generation must not be replaced.
+					expect(() => resolve({ status: "present", incarnation: "supervisor-start" })).toThrow(
+						"managed_owner_predecessor_live",
+					);
+					expect(() => resolve({ status: "unknown", reasonCode: "lookup_failed" })).toThrow(
+						"managed_owner_replacement_evidence_unavailable",
+					);
+					// Bindings of earlier generations share the pinned root and stay history, even
+					// when their pid now names a live process with the recorded start time.
 					await fs.writeFile(
-						path.join(root, "child-token.binding.json"),
-						`${JSON.stringify({ ...binding, ...patch })}\n`,
+						path.join(root, "child-older.binding.json"),
+						`${JSON.stringify({ ...binding, generation: "older-generation", child_token: "older", supervisor_pid: 5151 })}\n`,
 						{ mode: 0o600 },
 					);
-					expect(() => resolve()).toThrow("managed_owner_replacement_evidence_untrusted");
+					expect(
+						resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid =>
+							pid === 5151 ? { status: "present", incarnation: "supervisor-start" } : { status: "absent" },
+						),
+					).toBeUndefined();
+					expect(() =>
+						resolveManagedOwnerPredecessorSync(stateDir, "session", baseline, pid =>
+							pid === 4242 ? { status: "present", incarnation: "supervisor-start" } : { status: "absent" },
+						),
+					).toThrow("managed_owner_predecessor_live");
+					await fs.rm(path.join(root, "child-older.binding.json"));
+					for (const patch of [{ session_id: "other" }, { supervisor_pid: 0 }]) {
+						await fs.writeFile(
+							path.join(root, "child-token.binding.json"),
+							`${JSON.stringify({ ...binding, ...patch })}\n`,
+							{ mode: 0o600 },
+						);
+						expect(() => resolve()).toThrow("managed_owner_replacement_evidence_untrusted");
+					}
 				}
+				// A receipt still fails closed off Linux; it is never trusted as recovery evidence.
+				await fs.writeFile(path.join(root, "sigabrt-token.receipt.json"), "{}\n", { mode: 0o600 });
+				if (process.platform !== "linux")
+					expect(() => resolve()).toThrow("managed_owner_replacement_evidence_unavailable");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
 			}
-			// A receipt still fails closed off Linux; it is never trusted as recovery evidence.
-			await fs.writeFile(path.join(root, "sigabrt-token.receipt.json"), "{}\n", { mode: 0o600 });
-			if (process.platform !== "linux")
-				expect(() => resolve()).toThrow("managed_owner_replacement_evidence_unavailable");
-		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
-		}
-	});
+		},
+	);
 });
 
 describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commit", () => {
@@ -876,6 +898,7 @@ function holdSqliteWriteLock(databaseFile: string): Database {
  * intent. Only Linux closes that way; a Darwin closer needs a supervisor relay.
  */
 const itKernelSignalClose = it.skipIf(process.platform === "darwin");
+const itOwnerOnlyReads = it.skipIf(process.platform === "win32");
 
 describe("tmux owner isolation", () => {
 	it("recognizes only the exact owner-isolation argv", () => {

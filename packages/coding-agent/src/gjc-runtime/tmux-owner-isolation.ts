@@ -1232,13 +1232,11 @@ function assertPredecessorSupervisorExited(
 ): void {
 	if (!/^[A-Za-z0-9._-]+$/.test(token)) throw new Error("managed_owner_replacement_evidence_untrusted");
 	const binding = readSecureOwnerJson(path.join(root, `child-${token}.binding.json`));
-	if (
-		!isManagedOwnerBinding(binding) ||
-		binding.generation !== generation ||
-		binding.session_id !== sessionId ||
-		binding.child_token !== token
-	)
+	if (!isManagedOwnerBinding(binding) || binding.session_id !== sessionId || binding.child_token !== token)
 		throw new Error("managed_owner_replacement_evidence_untrusted");
+	// A pinned session keeps one lifecycle root, so bindings of generations before the
+	// baseline are retained history; each was replaced only after this same check.
+	if (binding.generation !== generation) return;
 	const supervisor = observe(binding.supervisor_pid);
 	if (supervisor.status === "absent") return;
 	if (supervisor.status === "present" && supervisor.incarnation !== binding.supervisor_start_time) return;
@@ -1820,14 +1818,18 @@ function isExpectedOwnerTerminal(
 	);
 }
 
-/** A Darwin supervisor has published its pending relay record and not yet settled it. */
+/**
+ * A Darwin supervisor is relaying under the generation lock: its pending record is
+ * published, or its confirmed record is published and the lock is still held for the
+ * final directory flush.
+ */
 function relayInFlight(paths: LifecyclePaths): boolean {
-	try {
-		fsSync.lstatSync(paths.relayPendingFile);
-		return true;
-	} catch {
-		return false;
-	}
+	for (const file of [paths.relayPendingFile, paths.relayFile])
+		try {
+			fsSync.lstatSync(file);
+			return true;
+		} catch {}
+	return false;
 }
 /** Accept only real UTC timestamps in the canonical evidence serialization. */
 export function isCanonicalUtcTimestamp(value: unknown): value is string {

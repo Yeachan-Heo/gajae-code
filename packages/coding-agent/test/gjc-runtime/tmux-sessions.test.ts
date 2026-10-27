@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -45,6 +46,7 @@ import {
 	createManagedGjcTmuxSession,
 	forceCloseGjcTmuxSession,
 	listGjcTmuxSessions,
+	monotonicCloseClock,
 	removeGjcTmuxSession,
 	statusGjcTmuxSession,
 	waitForPinnedProcessExit,
@@ -2047,8 +2049,10 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 					calls.push(cmd);
 					if (cmd.includes("if-shell")) {
 						expect(scenario, "incomplete cooperative shutdown must never reach guarded cleanup").toBe("complete");
-						// Compatibility cleanup must be last, never the cause of owner exit.
-						expect(owner.exitCode).toBe(0);
+						// Compatibility cleanup must be last, never the cause of owner exit. Bun
+						// publishes `exitCode` a tick after reaping, so ask the process table; the
+						// exit status itself is asserted after the close.
+						expect(observeProcessIncarnation(ownerPid).status).toBe("absent");
 						expect(childProcess?.status()).toBe(nativeProcessBindings().ProcessStatus.Exited);
 						expect(JSON.parse(fsSync.readFileSync(cleanupFile, "utf8"))).toMatchObject({
 							completed: true,
@@ -2483,7 +2487,18 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 					// resumes it must not relay that attempt, and the retry must succeed.
 					const signalOwner = async (signal: string) =>
 						expect(await Bun.spawn(["/bin/kill", `-${signal}`, String(ownerPid)]).exited).toBe(0);
-					await signalOwner("STOP");
+					// Stop the supervisor only while the test holds the generation lock, so it is
+					// never stopped inside its own locked poll (that would be lock contention,
+					// not an undelivered intent).
+					const fence = new Database(paths.lockDatabaseFile);
+					try {
+						fence.exec("PRAGMA busy_timeout = 2000");
+						fence.exec("BEGIN IMMEDIATE");
+						await signalOwner("STOP");
+						fence.exec("COMMIT");
+					} finally {
+						fence.close();
+					}
 					try {
 						await expect(
 							forceCloseGjcTmuxSession("root", { GJC_TMUX_COMMAND: "tmux" }, sessionId, stateFile),
@@ -2981,6 +2996,25 @@ describe("pinned supervisor exit proof", () => {
 		const { result, seen } = run([{ status: "unknown", reasonCode: "sysctl_failed" }], 0);
 		expect(await result).toBe(false);
 		expect(seen).toEqual([4242]);
+	});
+});
+
+describe("force-close clock", () => {
+	it("keeps the close deadline on monotonic time across wall-clock steps", () => {
+		const wall = spyOn(Date, "now").mockReturnValue(1_000_000);
+		const elapsed = spyOn(performance, "now").mockReturnValue(50);
+		try {
+			const clock = monotonicCloseClock();
+			expect(clock().getTime()).toBe(1_000_000);
+			wall.mockReturnValue(0);
+			elapsed.mockReturnValue(1_050);
+			expect(clock().getTime()).toBe(1_001_000);
+			wall.mockReturnValue(9_000_000);
+			expect(clock().getTime()).toBe(1_001_000);
+		} finally {
+			wall.mockRestore();
+			elapsed.mockRestore();
+		}
 	});
 });
 

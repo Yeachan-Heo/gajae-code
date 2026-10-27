@@ -2003,6 +2003,18 @@ export function publishOwnerIntentNoReplace(
 	return publishManagedFileNoReplace(file, bytes, assertOwned, managedDirectoryRoot(root));
 }
 
+/**
+ * @internal The force-close clock: one wall-clock anchor advanced by monotonic elapsed
+ * time, so a wall-clock step during a close neither extends nor shortens its deadline.
+ * After a backward step the published intent reads as created in the future and the
+ * supervisor refuses it until the closer has given up and retired it.
+ */
+export function monotonicCloseClock(): () => Date {
+	const anchor = Date.now();
+	const started = performance.now();
+	return () => new Date(anchor + (performance.now() - started));
+}
+
 export async function forceCloseGjcTmuxSession(
 	sessionName: string,
 	env: NodeJS.ProcessEnv = process.env,
@@ -2055,7 +2067,7 @@ export async function forceCloseGjcTmuxSession(
 
 	const currentStartTime = await (deps.readProcessStartTime ?? readProcessStartTime)(identity.pid);
 	if (currentStartTime !== identity.startTime) throw new Error("owner_pid_identity_mismatch");
-	const now = deps.now ?? (() => new Date());
+	const now = deps.now ?? monotonicCloseClock();
 	const sleep = deps.sleep ?? (ms => Bun.sleep(ms));
 	const dispatchId = crypto.randomUUID();
 	const verdictDeadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;

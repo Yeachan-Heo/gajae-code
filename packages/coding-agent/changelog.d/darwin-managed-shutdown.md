@@ -18,3 +18,4 @@
 - A macOS shutdown verdict is expected only when the owner-loss observation follows the supervisor's confirmed relay of a cooperative intent that was still valid when relayed. A relay committed after a wall-clock rollback is no longer rejected for predating the supervisor binding.
 - A macOS child that is signaled while its supervisor is still durably publishing the relay record now waits for that record instead of ending with `owner_verdict_unavailable`.
 - A macOS close that times out or sees a mismatched verdict retires its undelivered intent at once, so the supervisor cannot relay it later and a retry does not fail with `owner_intent_replay`.
+- A macOS force-close measures its deadline on monotonic time, so a wall-clock step during the close neither extends the wait nor lets an abandoned intent outlive it.
