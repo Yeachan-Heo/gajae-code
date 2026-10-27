@@ -335,9 +335,15 @@ function assertPatch(patch: AtomicYamlPatch): void {
 
 // Read caller-owned properties only once, before validation or any writer mutation.
 function snapshotPatches(patches: readonly AtomicYamlPatch[]): readonly AtomicYamlPatch[] {
-	let snapshots: AtomicYamlPatch[];
+	const snapshots: AtomicYamlPatch[] = [];
 	try {
-		snapshots = Array.from(patches, patch => {
+		if (!Array.isArray(patches)) throw new TypeError();
+		const length = patches.length;
+		if (!Number.isInteger(length) || length < 0 || length > 0xffffffff) throw new TypeError();
+		for (let index = 0; index < length; index++) {
+			if (patches.length !== length || !Object.hasOwn(patches, index)) throw new TypeError();
+			const patch = patches[index];
+			if (patch === null || typeof patch !== "object" || Array.isArray(patch)) throw new TypeError();
 			const path = patch.path;
 			const op = patch.op;
 			const expectedInput = patch.expected;
@@ -346,8 +352,9 @@ function snapshotPatches(patches: readonly AtomicYamlPatch[]): readonly AtomicYa
 					? Object.freeze({ path: expectedInput.path, hash: expectedInput.hash })
 					: expectedInput;
 			const value = op === "set" ? structuredClone(patch.value) : undefined;
-			return Object.freeze({ path, op, value, expected }) as AtomicYamlPatch;
-		});
+			snapshots.push(Object.freeze({ path, op, value, expected }) as AtomicYamlPatch);
+		}
+		if (patches.length !== length) throw new TypeError();
 	} catch {
 		throw new Error("Atomic YAML patch input could not be read or cloned.");
 	}
@@ -1152,6 +1159,7 @@ export function withAtomicYamlConfigTransaction<T>(
 				}
 			};
 			let written = false;
+			let active = true;
 			let busy = false;
 			let closed = false;
 			let pending: Promise<CasReceipt> | undefined;
@@ -1208,7 +1216,17 @@ export function withAtomicYamlConfigTransaction<T>(
 							lastKnownState = { exists: true, raw: YAML.stringify(candidate, null, 2) };
 							markWritten();
 						}
-						return receipt;
+						return {
+							revisions: receipt.revisions,
+							discard: () => receipt.discard(),
+							restore: () => {
+								if (active)
+									return Promise.reject(
+										new Error("Cannot restore a receipt while its atomic YAML transaction is active."),
+									);
+								return receipt.restore();
+							},
+						};
 					}),
 				removeTopLevelKeys: (input, options = {}) =>
 					mutate(async () => {
@@ -1314,6 +1332,8 @@ export function withAtomicYamlConfigTransaction<T>(
 					}
 				}
 				throw error;
+			} finally {
+				active = false;
 			}
 		});
 	});

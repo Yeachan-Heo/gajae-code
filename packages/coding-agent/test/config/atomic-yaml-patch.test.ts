@@ -44,6 +44,113 @@ afterEach(async () => {
 
 describe("atomic YAML patches", () => {
 	for (const writer of ["direct", "supplier", "builder", "transaction", "combined"] as const) {
+		for (const iterator of ["empty", "fake", "throwing"] as const) {
+			test(`${writer} uses indexed patches instead of a ${iterator} iterator`, async () => {
+				const configPath = await configPathForTest();
+				await Bun.write(configPath, "feature: old\n");
+				let valueReads = 0;
+				const patches: AtomicYamlPatch[] = [
+					{
+						path: "feature",
+						op: "set",
+						get value() {
+							valueReads++;
+							return { nested: true };
+						},
+					},
+				];
+				Object.defineProperties(patches, {
+					map: {
+						get() {
+							throw new Error("private map");
+						},
+					},
+					constructor: {
+						get() {
+							throw new Error("private constructor");
+						},
+					},
+					[Symbol.iterator]: {
+						get() {
+							if (iterator === "throwing") throw new Error("private iterator");
+							return function* () {
+								if (iterator === "fake") yield { path: "fake", op: "set", value: true };
+							};
+						},
+					},
+				});
+				const receipt = await (writer === "direct"
+					? applyAtomicYamlPatches(configPath, patches)
+					: writer === "supplier"
+						? reserveAtomicYamlPatchSlot(configPath, () => patches)
+						: writer === "builder"
+							? applyAtomicYamlPatchesWithCurrent(configPath, () => patches)
+							: withAtomicYamlConfigTransaction(configPath, tx =>
+									writer === "transaction"
+										? tx.applyPatches(patches)
+										: tx.applyPatchesAndRemoveTopLevelKeys(patches, []),
+								));
+				expect(valueReads).toBe(1);
+				expect(await readYaml(configPath)).toEqual({ feature: { nested: true } });
+				if (writer === "combined") {
+					expect((await receipt.restore()).status).toBe("not-restorable");
+				} else {
+					expect(receipt.revisions.map(revision => revision.path)).toEqual(["feature"]);
+					expect((await receipt.restore()).status).toBe("restored");
+					expect(await readYaml(configPath)).toEqual({ feature: "old" });
+				}
+			});
+		}
+
+		for (const malformed of ["sparse", "inherited", "growing", "shrinking", "non-array", "invalid-length"] as const) {
+			test(`${writer} rejects ${malformed} patch arrays without writing`, async () => {
+				const configPath = await configPathForTest();
+				const before = "feature: old\n";
+				await Bun.write(configPath, before);
+				const patches: AtomicYamlPatch[] = [{ path: "first", op: "set", value: true }];
+				if (malformed === "sparse" || malformed === "inherited") {
+					patches.length = 2;
+					if (malformed === "inherited") {
+						const prototype = Object.create(Array.prototype);
+						prototype[1] = { path: "feature", op: "set", value: "fake" };
+						Object.setPrototypeOf(patches, prototype);
+					}
+				} else if (malformed === "growing" || malformed === "shrinking") {
+					if (malformed === "shrinking") patches.push({ path: "feature", op: "set", value: true });
+					Object.defineProperty(patches[0], "value", {
+						get() {
+							patches.length = malformed === "growing" ? 2 : 1;
+							return true;
+						},
+					});
+				}
+				const input =
+					malformed === "non-array"
+						? ({ 0: patches[0], length: 1 } as unknown as AtomicYamlPatch[])
+						: malformed === "invalid-length"
+							? new Proxy(patches, {
+									get(target, key, receiver) {
+										return key === "length" ? Number.POSITIVE_INFINITY : Reflect.get(target, key, receiver);
+									},
+								})
+							: patches;
+				const run = async () =>
+					writer === "direct"
+						? applyAtomicYamlPatches(configPath, input)
+						: writer === "supplier"
+							? reserveAtomicYamlPatchSlot(configPath, () => input)
+							: writer === "builder"
+								? applyAtomicYamlPatchesWithCurrent(configPath, () => input)
+								: withAtomicYamlConfigTransaction(configPath, tx =>
+										writer === "transaction"
+											? tx.applyPatches(input)
+											: tx.applyPatchesAndRemoveTopLevelKeys(input, ["feature"]),
+									);
+				await expect(run()).rejects.toThrow("could not be read or cloned");
+				expect(await Bun.file(configPath).text()).toBe(before);
+			});
+		}
+
 		test(`snapshots getter-backed patches and preserves stale CAS in ${writer}`, async () => {
 			const configPath = await configPathForTest();
 			const before = "feature:\n  keep: true\n";
@@ -91,6 +198,68 @@ describe("atomic YAML patches", () => {
 			expect(await Bun.file(configPath).text()).toBe(before);
 		});
 	}
+
+	test("empty indexed array ignores its iterator and does not write", async () => {
+		const configPath = await configPathForTest();
+		const before = "feature: old\n";
+		await Bun.write(configPath, before);
+		const patches: AtomicYamlPatch[] = [];
+		Object.defineProperty(patches, Symbol.iterator, {
+			get() {
+				throw new Error("private iterator");
+			},
+		});
+		const receipt = await applyAtomicYamlPatches(configPath, patches);
+		expect(receipt.revisions).toEqual([]);
+		expect(await Bun.file(configPath).text()).toBe(before);
+	});
+
+	test("transaction guards reentry from indexed getters and redacts their errors", async () => {
+		const configPath = await configPathForTest();
+		const before = "feature: old\n";
+		await Bun.write(configPath, before);
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			let attempt: Promise<unknown> | undefined;
+			const patches: AtomicYamlPatch[] = [{ path: "feature", op: "set", value: true }];
+			Object.defineProperty(patches, 0, {
+				get() {
+					attempt = tx.applyPatches([{ path: "other", op: "set", value: true }]);
+					throw new Error("private indexed getter");
+				},
+			});
+			const error = await tx.applyPatches(patches).catch(reason => reason);
+			expect(error).toBeInstanceOf(Error);
+			expect(error.message).toBe("Atomic YAML patch input could not be read or cloned.");
+			await expect(attempt!).rejects.toThrow("cannot mutate while patch input is being read");
+			expect(tx.written).toBe(false);
+		});
+		expect(await Bun.file(configPath).text()).toBe(before);
+	});
+
+	test("transaction receipt restore rejects while active and works after the transaction closes", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\n");
+		const receipt = await withAtomicYamlConfigTransaction(configPath, async tx => {
+			const result = await tx.applyPatches([{ path: "feature", op: "set", value: "new" }]);
+			const deadline = Promise.withResolvers<"blocked">();
+			void (async () => {
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				deadline.resolve("blocked");
+			})();
+			const outcome = await Promise.race([
+				result.restore().then(
+					() => "restored",
+					error => error.message as string,
+				),
+				deadline.promise,
+			]);
+			expect(outcome).toContain("transaction is active");
+			expect(await readYaml(configPath)).toEqual({ feature: "new" });
+			return result;
+		});
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(await readYaml(configPath)).toEqual({ feature: "old" });
+	});
 
 	test("uses the first valid getter values even when later reads would be malformed", async () => {
 		const configPath = await configPathForTest();
