@@ -1282,9 +1282,15 @@ dispatch inputs and never persist in any durable store, log, or output.
 
 Managed tmux startup on macOS and Linux publishes a private (`0600` file in a
 `0700` lifecycle root) child binding before the supervised child starts, for
-every launch. A Broker-redacted launch publishes an opaque binding that carries
-neither the launch command nor a command digest; an ordinary launch publishes a
-recoverable binding with its exact command and digest. The CLI validates its
+every launch. A Broker-redacted launch, and every macOS launch, publishes an
+opaque binding that carries neither the launch command nor a command digest, so
+prompts and flags such as `--api-key` never reach disk there; an ordinary Linux
+launch publishes a recoverable binding with its exact command and digest, which
+only Linux owner-loss recovery uses. The supervisor receives the child argv as
+its own arguments (`--internal-managed-owner-supervisor -- <argv...>`), shell
+quoted once in the pane command and never re-encoded, and accepts any argv with
+a nonempty executable; empty later arguments of a root `gjc --tmux` launch are
+passed through (a Broker launch spec still requires nonempty arguments). The CLI validates its
 exact session, generation, run, incarnation and child token through
 `readOwnerOnlyFile`, a bounded native read (at most 64 KiB) that keeps the
 acquired descriptor authority for the whole read, reads the bytes twice, and
@@ -1294,12 +1300,18 @@ read whose metadata changed mid-window (`metadata_changed`) is re-acquired from
 scratch a bounded number of times; identity, link-count, ownership and ACL
 failures are never retried. There is no pathname fallback.
 
-The 64 KiB bound is not a new prompt limit. A recoverable binding is its fixed
-fields (about 540 bytes) plus the same command JSON the tmux pane command
-already carries, and tmux rejects any pane command over about 16 KiB
-(`command too long`) before a supervisor exists, as it did before supervision.
-An inline prompt too large for that limit already fails at tmux session
-creation, supervised or not; pass it through a file instead.
+Because the argv is not re-encoded, an argument that fit tmux's pane command
+limit (about 16 KiB, `command too long`) before supervision still fits. JSON
+escaping can still expand a Linux recoverable binding (a control character
+becomes six bytes), so a Linux launch whose serialized argv exceeds 63 KiB is
+refused with `managed_owner_command_too_large` before any tmux session exists,
+rather than failing in the supervisor; pass such input through a file.
+
+Supervised root `gjc --tmux` launches derive their lifecycle state from the
+resolved working directory (Broker launches keep their lexical spec `cwd`), so a worktree reached through a supported symlinked anchor (an
+in-repository `.worktrees` bucket) prepares and verifies the same canonical
+lifecycle root; no-follow checks still apply inside managed storage. An
+operator-pinned `GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim.
 
 Opaque bindings never grant crash-recovery authority. Recoverable predecessor
 bindings and SIGABRT receipts remain a separate Linux-only capability backed by
@@ -1322,21 +1334,46 @@ Broker.
 Darwin has no identity-bound signal API for an external process, so managed
 shutdown there uses the existing generation-fenced owner intent instead of
 signaling a reconstructed supervisor PID. `forceCloseGjcTmuxSession` proves the
-pinned supervisor, its single private child binding and the tmux session
-metadata, then publishes the intent no-replace while holding the generation
-lock that the supervisor also takes. A close that arrives before the supervisor
+pinned supervisor, its child binding and the tmux session metadata, then
+publishes the intent no-replace while holding the generation lock that the
+supervisor also takes. The binding is found through the generation's own
+supervisor index (`supervisor-<generation>.json`, published by that supervisor
+after its binding), never by scanning the lifecycle root, so history that a
+reused pinned session leaves from earlier generations never limits a close. A close that arrives before the supervisor
 has published its binding, or while that binding's `created_at` is still in the
 future, waits inside the same close deadline only while that exact supervisor
 stays live; an untrusted, ambiguous, or still-unavailable binding fails closed.
 The supervisor polls for that intent,
-validates it against its own binding, generation and server key, and relays
-SIGTERM exactly once through its original child spawn handle. A close succeeds
-only when both the pinned supervisor has exited and the terminal verdict
-matching the published intent exists; publication alone, a timeout, an exit
-without a verdict, or a verdict while the supervisor is still alive is not
+validates it against its own binding, generation and server key, and relays in
+two durable phases under that lock: it publishes a pending record for that
+exact intent (`relay-<generation>.pending.json`), rechecks the intent's
+deadline, relays SIGTERM exactly once through its original child spawn handle,
+and only after the signal was actually sent renames the pending record to the
+confirmed relay record (`relay-<generation>.json`). A declined, expired or
+unverifiable attempt renames it to an `.unsent` name instead. A
+close succeeds only when both the pinned supervisor has exited and the terminal
+verdict matching the published intent exists; publication alone, a timeout, an
+exit without a verdict, or a verdict while the supervisor is still alive is not
 success, and guarded session cleanup is skipped. A plain OS SIGTERM to the
-supervisor still stops its child but never claims an operator verdict. Linux
-keeps its kernel-signaled owner path.
+supervisor still stops its child but never claims an operator verdict: for a
+generation with a supervisor index, a terminal is classified as an operator
+shutdown only when the confirmed relay record names the pending intent, so an unrelated
+signal that arrives while an intent is still unconsumed is recorded as owner
+loss, whichever observer (supervisor or child sidecar) publishes first.
+
+A supervisor that is stopped or stalled past the intent's deadline, before or
+during publication, refuses the expired intent and never relays it. The next
+close, under the same generation lock, retires such an intent (renamed to
+`intent-<generation>.<intent_id>.undelivered`) when it is expired and has
+neither a pending or confirmed relay record nor a verdict, and then publishes a
+fresh intent, so retries are not blocked by `owner_intent_replay`. A delivered
+intent stays permanent replay history for its generation. A pending record
+left without confirmation (for example a supervisor crash between publication
+and signal), a verdict, or unreadable relay evidence is uncertain evidence: it
+never classifies a SIGTERM as an operator shutdown, and it keeps the intent in
+place, so cooperative closes of that generation keep failing with
+`owner_intent_replay` until the owner exits. Linux keeps
+its kernel-signaled owner path.
 
 Interactive `gjc --tmux` root launches on Linux and Darwin both exec the
 managed owner supervisor as the tmux pane process, so ordinary root sessions

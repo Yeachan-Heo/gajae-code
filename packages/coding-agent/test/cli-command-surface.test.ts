@@ -101,15 +101,17 @@ describe("GJC public CLI command surface", () => {
 			GJC_MANAGED_OWNER_INCARNATION: "incarnation-cli-route",
 		};
 		try {
-			const admitted = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
-				cwd: repoRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...managedOwnerEnv,
-					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, cliEntry, "--version"]),
+			const admitted = Bun.spawnSync(
+				["bun", cliEntry, "--internal-managed-owner-supervisor", "--", process.execPath, cliEntry, "--version"],
+				{
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...managedOwnerEnv,
+					},
 				},
-			});
+			);
 			const admittedOutput = `${admitted.stdout.toString()}\n${admitted.stderr.toString()}`;
 			expect(admitted.exitCode, admittedOutput).toBe(0);
 			expect(admitted.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
@@ -125,18 +127,20 @@ if (!binding) throw new Error("binding_missing");
 await writeFile(\`\${process.env.GJC_MANAGED_OWNER_BINDING_DIR}/\${binding}\`, "{}\\n");
 const child = Bun.spawn([${JSON.stringify(process.execPath)}, ${JSON.stringify(cliEntry)}, "--version"], { stdout: "inherit", stderr: "inherit" });
 process.exitCode = await child.exited;`;
-			const blocked = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
-				cwd: repoRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...managedOwnerEnv,
-					GJC_TMUX_OWNER_GENERATION: "generation-cli-blocked",
-					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, "-e", unboundChild]),
-					GJC_MANAGED_OWNER_BINDING_DIR: lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked")
-						.root,
+			const blocked = Bun.spawnSync(
+				["bun", cliEntry, "--internal-managed-owner-supervisor", "--", process.execPath, "-e", unboundChild],
+				{
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...managedOwnerEnv,
+						GJC_TMUX_OWNER_GENERATION: "generation-cli-blocked",
+						GJC_MANAGED_OWNER_BINDING_DIR: lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked")
+							.root,
+					},
 				},
-			});
+			);
 			const blockedOutput = `${blocked.stdout.toString()}\n${blocked.stderr.toString()}`;
 			expect(blocked.exitCode, blockedOutput).toBe(75);
 			expect(blockedOutput).not.toContain("gjc/");

@@ -8,6 +8,7 @@ import {
 	isManagedOwnerBinding,
 	isManagedOwnerSigabrtReceipt,
 } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-binding";
+import { managedOwnerSupervisorChildArgv } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	closeExactTmuxOwner,
@@ -62,9 +63,11 @@ function startSupervisor(
 			recursive: true,
 			mode: 0o700,
 		});
+	// `bun -e` drops a literal `--` from its argv, so embed the supervisor CLI arguments.
+	const supervisorArgs = JSON.stringify(["--internal-managed-owner-supervisor", "--", ...command]);
 	const script = options.forceMissingNativeReferenceMarker
-		? `import { appendFileSync } from "node:fs"; import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; } return actualPid; } }); return child; }; try { await runManagedOwnerSupervisor(); } finally { Bun.spawn = originalSpawn; }`
-		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor();`;
+		? `import { appendFileSync } from "node:fs"; import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; } return actualPid; } }); return child; }; try { await runManagedOwnerSupervisor(${supervisorArgs}); } finally { Bun.spawn = originalSpawn; }`
+		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor(${supervisorArgs});`;
 	return Bun.spawn({
 		cmd: [process.execPath, "-e", script],
 		cwd: repoRoot,
@@ -77,7 +80,6 @@ function startSupervisor(
 			GJC_TMUX_OWNER_GENERATION: "generation-2681",
 			GJC_MANAGED_OWNER_RUN_ID: "run-2681",
 			GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(command),
 			...env,
 		},
 	});
@@ -168,6 +170,7 @@ describe("managed owner supervisor", () => {
 					"-e",
 					`import * as fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "SECRET-FAULT-CANARY");`,
 				];
+				const supervisorArgs = JSON.stringify(["--internal-managed-owner-supervisor", "--", ...command]);
 				const script = `import { spyOn } from "bun:test"; import * as fs from "node:fs/promises"; import * as natives from "@gajae-code/natives"; import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)};
 const fault = ${JSON.stringify(fault)}; let fired = false; const originalOpen = fs.open; const spies = [];
 if (fault === "reread") spies.push(spyOn(natives, "readOwnerOnlyFile").mockImplementation(() => { fired = true; return {ok: false, code: "read_failed"}; }));
@@ -178,7 +181,7 @@ else spies.push(spyOn(fs, "open").mockImplementation(async (...args) => {
  if ((fault === "file-sync" && staging) || (fault === "directory-sync" && pathname === ${JSON.stringify(root)})) spies.push(spyOn(handle, "sync").mockImplementation(async () => { fired = true; throw new Error("SECRET-FAULT-CANARY"); }));
  return handle;
 }));
-try { await runManagedOwnerSupervisor(); process.exitCode = 22; } catch { process.exitCode = 75; } finally { for (const spy of spies.reverse()) spy.mockRestore(); process.stdout.write(JSON.stringify({fired})); }`;
+try { await runManagedOwnerSupervisor(${supervisorArgs}); process.exitCode = 22; } catch { process.exitCode = 75; } finally { for (const spy of spies.reverse()) spy.mockRestore(); process.stdout.write(JSON.stringify({fired})); }`;
 				const child = Bun.spawn({
 					cmd: [process.execPath, "-e", script],
 					cwd: repoRoot,
@@ -192,7 +195,6 @@ try { await runManagedOwnerSupervisor(); process.exitCode = 22; } catch { proces
 						GJC_MANAGED_OWNER_RUN_ID: "run-2681",
 						GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
 						GJC_MANAGED_OWNER_REDACT_COMMAND: "1",
-						GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(command),
 					},
 				});
 				const [stdout, stderr, exit] = await Promise.all([
@@ -287,6 +289,29 @@ try { await runManagedOwnerSupervisor(); process.exitCode = 22; } catch { proces
 			}
 		},
 	);
+
+	it("delivers empty arguments to its child and rejects only an empty executable", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-empty-argument-"));
+		try {
+			const child = `process.exit(JSON.stringify(process.argv.slice(1)) === ${JSON.stringify(JSON.stringify(["", "tail"]))} ? 0 : 9)`;
+			const delivered = await runSupervisor(stateDir, [process.execPath, "-e", child, "", "tail"]);
+			expect(delivered.exitCode, delivered.stderr).toBe(0);
+			expect(() => managedOwnerSupervisorChildArgv(["--internal-managed-owner-supervisor", "--", ""])).toThrow(
+				"managed_owner_command_invalid",
+			);
+			expect(() => managedOwnerSupervisorChildArgv(["--internal-managed-owner-supervisor", "--"])).toThrow(
+				"managed_owner_command_invalid",
+			);
+			expect(() => managedOwnerSupervisorChildArgv(["--internal-managed-owner-supervisor", "gjc"])).toThrow(
+				"managed_owner_command_invalid",
+			);
+			expect(
+				managedOwnerSupervisorChildArgv(["--internal-managed-owner-supervisor", "--", "gjc", "", "--"]),
+			).toEqual(["gjc", "", "--"]);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
 
 	it("does not interpret numeric exit 134 as SIGABRT", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-numeric-abort-"));
@@ -387,7 +412,7 @@ try { await runManagedOwnerSupervisor(); process.exitCode = 22; } catch { proces
 			const command = [
 				process.execPath,
 				"-e",
-				`import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const canary = "OPAQUE-COMMAND-CANARY"; if (!process.env.GJC_MANAGED_OWNER_CHILD_TOKEN || process.env.GJC_MANAGED_OWNER_COMMAND_JSON || process.env.GJC_MANAGED_OWNER_REDACT_COMMAND) process.exit(19); if ((await admitManagedOwnerBeforeCli()).kind !== "supervised") process.exit(20);`,
+				`import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const canary = "OPAQUE-COMMAND-CANARY"; if (!process.env.GJC_MANAGED_OWNER_CHILD_TOKEN || process.env.GJC_MANAGED_OWNER_REDACT_COMMAND) process.exit(19); if ((await admitManagedOwnerBeforeCli()).kind !== "supervised") process.exit(20);`,
 			];
 			const result = await runSupervisor(stateDir, command, { GJC_MANAGED_OWNER_REDACT_COMMAND: "1" });
 			expect(result.exitCode, result.stderr).toBe(0);

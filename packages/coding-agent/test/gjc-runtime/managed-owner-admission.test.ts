@@ -32,7 +32,6 @@ const managedOwnerEnvironmentKeys = [
 	"GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID",
 	"GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION",
 	"GJC_MANAGED_OWNER_TRANSCRIPT_PATH",
-	"GJC_MANAGED_OWNER_COMMAND_JSON",
 	"GJC_MANAGED_OWNER_REDACT_COMMAND",
 ] as const;
 
@@ -276,8 +275,24 @@ describe("managed owner admission", () => {
 					.update(JSON.stringify(command.map(value => value.trim())))
 					.digest("hex");
 				expect(isManagedOwnerBinding({ ...binding, command_sha256: trimmedDigest })).toBe(false);
-				for (const invalid of ["", "\0", "before\0after", 1, null]) {
-					const invalidCommand = [command[0], command[1], invalid];
+				// Empty arguments are accepted CLI input (`gjc @prompt.txt ''`); only the
+				// executable must be nonempty.
+				const emptyArgument = [command[0], command[1], ""];
+				expect(
+					isManagedOwnerBinding({
+						...binding,
+						command: emptyArgument,
+						command_sha256: crypto.createHash("sha256").update(JSON.stringify(emptyArgument)).digest("hex"),
+					}),
+				).toBe(true);
+				for (const invalidCommand of [
+					[command[0], command[1], "\0"],
+					[command[0], command[1], "before\0after"],
+					[command[0], command[1], 1],
+					[command[0], command[1], null],
+					["", command[1], command[2]],
+					[],
+				]) {
 					expect(
 						isManagedOwnerBinding({
 							...binding,

@@ -21,6 +21,7 @@ import {
 	isValidOwnerVerdict,
 	lifecyclePaths,
 	type OwnerIntent,
+	type OwnerVerdict,
 	observeOwnerTerminal,
 	ownerProcessStartTime,
 	type PlanRequest,
@@ -216,6 +217,24 @@ describe("owner intent construction", () => {
 							};
 							expect(JSON.stringify(intent)).toBe(JSON.stringify(expected));
 							expect(await fs.readFile(paths.intentFile, "utf8")).toBe(`${JSON.stringify(expected)}\n`);
+							// The exact supervisor's delivery evidence for this intent.
+							if (mode === "cooperative_intent")
+								fsSync.writeFileSync(
+									paths.relayFile,
+									`${JSON.stringify({
+										schema_version: 1,
+										intent_id: intent.intent_id,
+										dispatch_id: intent.dispatch_id,
+										generation,
+										session_id: "session",
+										server_key: "socket",
+										child_token: "token",
+										supervisor_pid: 10,
+										supervisor_start_time: "start",
+										relayed_at: new Date().toISOString(),
+									})}\n`,
+									{ mode: 0o600 },
+								);
 							return {
 								schema_version: 1,
 								generation,
@@ -543,11 +562,13 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 				fsSync.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
 			write(path.join(paths.root, "child-token.binding.json"), binding);
 			let relays = 0;
+			let relayable = true;
 			const poll = () =>
 				consumeCooperativeOwnerIntent({
 					stateDir: state,
 					binding,
 					serverKey: "socket",
+					canRelay: () => relayable,
 					relay: () => {
 						const contender = new Database(paths.lockDatabaseFile);
 						try {
@@ -557,6 +578,7 @@ describe.skipIf(process.platform !== "darwin")("cooperative owner dispatch commi
 							contender.close();
 						}
 						relays += 1;
+						return true;
 					},
 				});
 			write(`${paths.intentFile}.staging`, intent);
@@ -655,9 +677,30 @@ await Bun.stdin.text(); db.exec("COMMIT"); db.close(); clearTimeout(timer);`,
 				}
 				expect(exited).toBe(0);
 			}
+			// A child that can no longer receive the relay leaves no delivery evidence.
+			relayable = false;
+			poll();
+			expect(relays).toBe(0);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			relayable = true;
 			poll();
 			expect(relays).toBe(1);
 			expect(readSecureOwnerJson(paths.intentFile)).toEqual(intent);
+			// Delivery evidence is durable before the relay and names the exact intent and supervisor.
+			expect(readSecureOwnerJson(paths.relayFile)).toMatchObject({
+				schema_version: 1,
+				intent_id: "intent",
+				dispatch_id: "dispatch",
+				generation: "generation",
+				session_id: "session",
+				server_key: "socket",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "provenance",
+			});
+			// A relay record is permanent history: no second delivery for this generation.
+			poll();
+			expect(relays).toBe(1);
 			await replaceOwnerGeneration(state, "session", "replacement");
 			poll();
 			expect(relays).toBe(1);
@@ -2269,6 +2312,320 @@ describe("tmux owner isolation", () => {
 					expires_at: "2026-01-01T00:00:00.000Z",
 				}),
 			).rejects.toThrow("owner_intent_invalid");
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+});
+
+describe.skipIf(process.platform !== "darwin")("cooperative intent delivery evidence", () => {
+	const ownerOnly = (file: string, value: unknown) =>
+		fsSync.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+	const relayRecord = (intent: OwnerIntent, generation: string) => ({
+		schema_version: 1,
+		intent_id: intent.intent_id,
+		dispatch_id: intent.dispatch_id,
+		generation,
+		session_id: "session",
+		server_key: "socket",
+		child_token: "token",
+		supervisor_pid: 10,
+		supervisor_start_time: "start",
+		relayed_at: new Date().toISOString(),
+	});
+	const supervisorIndex = (generation: string) => ({
+		schema_version: 1,
+		generation,
+		session_id: "session",
+		child_token: "token",
+		supervisor_pid: 10,
+		supervisor_start_time: "start",
+	});
+	const close = (
+		state: string,
+		generation: string,
+		dispatchId: string,
+		waitForVerdict: (intent: OwnerIntent) => Promise<OwnerVerdict | null>,
+	) =>
+		closeExactTmuxOwner(
+			{
+				stateDir: state,
+				sessionId: "session",
+				generation,
+				serverKey: "socket",
+				pid: 10,
+				startTime: "start",
+				dispatchId,
+				createdAt: new Date(Date.now() - 10).toISOString(),
+				expiresAt: new Date(Date.now() + 150).toISOString(),
+			},
+			{
+				readStartTime: async () => "start",
+				shutdown: {
+					kind: "cooperative_intent",
+					publishNoReplace: publishOwnerIntentNoReplace,
+					assertCooperativeOwner: () => {},
+				},
+				waitForVerdict,
+				cleanupSession: async () => {},
+			},
+		);
+	const expiredWait = async () => {
+		await Bun.sleep(200);
+		return null;
+	};
+
+	it("retires an expired intent the supervisor never relayed so a later close can rearm", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-rearm-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			// A stopped supervisor never consumes the first intent.
+			await expect(close(state, generation, "dispatch-1", expiredWait)).rejects.toThrow(
+				"owner_term_verdict_timeout",
+			);
+			const stale = readSecureOwnerJson(paths.intentFile) as OwnerIntent;
+			// The retry rearms instead of failing forever with owner_intent_replay.
+			let rearmed: OwnerIntent | undefined;
+			await expect(
+				close(state, generation, "dispatch-2", async intent => {
+					rearmed = intent;
+					return null;
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			expect(rearmed?.dispatch_id).toBe("dispatch-2");
+			expect(rearmed?.intent_id).not.toBe(stale.intent_id);
+			expect(fsSync.existsSync(path.join(paths.root, `intent-${generation}.${stale.intent_id}.undelivered`))).toBe(
+				true,
+			);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an expired intent that the supervisor relayed as permanent replay evidence", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-relayed-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					ownerOnly(paths.relayFile, relayRecord(intent, generation));
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			await expect(close(state, generation, "dispatch-2", expiredWait)).rejects.toThrow("owner_intent_replay");
+			expect(fsSync.existsSync(paths.intentFile)).toBe(true);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("does not retire an expired intent while its relay evidence is unreadable", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-uncertain-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					ownerOnly(paths.relayFile, { ...relayRecord(intent, generation), intent_id: "other" });
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			await expect(close(state, generation, "dispatch-2", expiredWait)).rejects.toThrow();
+			expect(fsSync.existsSync(paths.intentFile)).toBe(true);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("classifies a SIGTERM as operator shutdown only with the supervisor's relay of that intent", async () => {
+		for (const relayed of [false, true]) {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-classify-"));
+			try {
+				const generation = await replaceOwnerGeneration(state, "session", "generation");
+				const paths = lifecyclePaths(state, "session", generation);
+				ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+				const intent = await createOwnerIntent(state, {
+					generation,
+					session_id: "session",
+					server_key: "socket",
+					expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+					dispatch_id: "dispatch",
+					created_at: new Date(Date.now() - 1_000).toISOString(),
+					expires_at: new Date(Date.now() + 10_000).toISOString(),
+				});
+				if (relayed) ownerOnly(paths.relayFile, relayRecord(intent, generation));
+				// The child sidecar copies the pending intent's dispatch id after an
+				// unrelated SIGTERM; without relay evidence that is not an operator close.
+				const verdict = await observeOwnerTerminal({
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: "session",
+					owner_generation: generation,
+					state_dir: state,
+					socket_key: "socket",
+					observer: "sidecar",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: null,
+					exit_kind: "SIGTERM",
+					reason: "process_postmortem",
+					operator_dispatch_id: intent.dispatch_id,
+				});
+				expect(verdict.classification).toBe(relayed ? "expected_operator_shutdown" : "unexpected_owner_loss");
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it.each([
+		"declined",
+		"reread-fault",
+		"expired-before-signal",
+	] as const)("withdraws a relay record whose signal was not sent: %s", async fault => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-unsent-"));
+		const realRead = natives.readOwnerOnlyFile;
+		const nativeRead = spyOn(natives, "readOwnerOnlyFile");
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			const binding: ManagedOwnerOpaqueBinding = {
+				schema_version: 3,
+				binding_kind: "opaque",
+				generation,
+				session_id: "session",
+				run_id: "run",
+				endpoint_incarnation: "incarnation",
+				child_token: "token",
+				supervisor_pid: 10,
+				supervisor_start_time: "start",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+			};
+			ownerOnly(path.join(paths.root, "child-token.binding.json"), binding);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			const intent = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch",
+				created_at: new Date(Date.now() - 100).toISOString(),
+				expires_at: new Date(Date.now() + (fault === "expired-before-signal" ? 500 : 10_000)).toISOString(),
+			});
+			if (fault === "reread-fault")
+				nativeRead.mockImplementation((file, limit) =>
+					file === paths.relayPendingFile ? { ok: false, code: "read_failed" } : realRead(file, limit),
+				);
+			if (fault === "expired-before-signal")
+				// The supervisor stalls between publication and signal until the intent expires.
+				nativeRead.mockImplementation((file, limit) => {
+					if (file === paths.relayPendingFile)
+						while (Date.now() <= Date.parse(intent.expires_at)) Bun.sleepSync(10);
+					return realRead(file, limit);
+				});
+			let relays = 0;
+			consumeCooperativeOwnerIntent({
+				stateDir: state,
+				binding,
+				serverKey: "socket",
+				canRelay: () => true,
+				relay: () => {
+					relays += 1;
+					return false;
+				},
+			});
+			nativeRead.mockRestore();
+			expect(relays).toBe(fault === "declined" ? 1 : 0);
+			expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+			expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+			expect(fsSync.existsSync(`${paths.relayPendingFile}.${intent.intent_id}.unsent`)).toBe(true);
+			// An unrelated SIGTERM afterwards is owner loss, not an operator close.
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: intent.dispatch_id,
+			});
+			expect(verdict.classification).toBe("unexpected_owner_loss");
+		} finally {
+			nativeRead.mockRestore();
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("treats a pending relay record left by a crash as uncertain, never as delivery", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-crash-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const paths = lifecyclePaths(state, "session", generation);
+			ownerOnly(paths.supervisorIndexFile, supervisorIndex(generation));
+			let first: OwnerIntent | undefined;
+			// The supervisor published its pending record, then crashed before signaling.
+			await expect(
+				close(state, generation, "dispatch-1", async intent => {
+					first = intent;
+					ownerOnly(paths.relayPendingFile, relayRecord(intent, generation));
+					return await expiredWait();
+				}),
+			).rejects.toThrow("owner_term_verdict_timeout");
+			// Uncertain delivery is never retired or rearmed.
+			await expect(close(state, generation, "dispatch-2", expiredWait)).rejects.toThrow("owner_intent_replay");
+			expect(readSecureOwnerJson(paths.intentFile)).toEqual(first);
+			// And it never explains an unrelated SIGTERM.
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: new Date(Date.parse(first!.created_at) + 1).toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "SIGTERM",
+				reason: "process_postmortem",
+				operator_dispatch_id: first!.dispatch_id,
+			});
+			expect(verdict.classification).toBe("unexpected_owner_loss");
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses an operator-shutdown verdict for a cooperative close without relay evidence", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-accept-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const forged = (intent: OwnerIntent): OwnerVerdict => ({
+				schema_version: 1,
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: 0,
+				result: "owner_term_then_session_cleanup",
+				observer: "sidecar",
+				classification: "expected_operator_shutdown",
+				reason: "test",
+				intent_id: intent.intent_id,
+				dedupe_key: `owner-loss:session:${generation}`,
+			});
+			await expect(close(state, generation, "dispatch-1", async intent => forged(intent))).rejects.toThrow(
+				"owner_term_verdict_timeout",
+			);
 		} finally {
 			await fs.rm(state, { recursive: true, force: true });
 		}

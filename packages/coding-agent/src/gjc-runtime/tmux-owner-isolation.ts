@@ -20,8 +20,15 @@ import {
 	verifyOwnerOnlyPathSecurity,
 } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { managedDirectoryRoot, publishManagedFileNoReplaceSync } from "../session/internal/managed-session-storage";
 import { parseLinuxProcStartTime } from "./linux-proc";
-import { isManagedOwnerBinding, isManagedOwnerSigabrtReceipt, type ManagedOwnerBinding } from "./managed-owner-binding";
+import {
+	isManagedOwnerBinding,
+	isManagedOwnerRelayRecord,
+	isManagedOwnerSigabrtReceipt,
+	type ManagedOwnerBinding,
+	type ManagedOwnerRelayRecord,
+} from "./managed-owner-binding";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
 export const TMUX_OWNER_ISOLATION_MAX_LINE_BYTES = 16 * 1024;
@@ -975,6 +982,12 @@ export interface LifecyclePaths {
 	incidentFile: string;
 	lockDatabaseFile: string;
 	journalFile: string;
+	/** Darwin: names the one supervisor binding of this generation (no directory scan). */
+	supervisorIndexFile: string;
+	/** Darwin: durable proof that the exact supervisor delivered SIGTERM for one intent. */
+	relayFile: string;
+	/** Darwin: published before delivery; only a confirmed delivery renames it to `relayFile`. */
+	relayPendingFile: string;
 }
 export function lifecyclePaths(stateDir: string, sessionId: string, generation: string): LifecyclePaths {
 	const root = path.join(stateDir, sessionId, "owner-lifecycle");
@@ -990,6 +1003,9 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		incidentFile: path.join(root, `incident-${generation}.json`),
 		lockDatabaseFile: path.join(root, "owner-locks.sqlite"),
 		journalFile: path.join(root, `verdict-${generation}.journal`),
+		supervisorIndexFile: path.join(root, `supervisor-${generation}.json`),
+		relayFile: path.join(root, `relay-${generation}.json`),
+		relayPendingFile: path.join(root, `relay-${generation}.pending.json`),
 	};
 }
 
@@ -1544,7 +1560,7 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 			token,
 		});
 		const intent = await readJson<OwnerIntent>(paths.intentFile);
-		const expected = isExpectedIntent(intent, observation);
+		const expected = isExpectedIntent(intent, observation) && hasCooperativeRelayEvidence(paths, intent);
 		const verdict: OwnerVerdict = {
 			schema_version: 1,
 			generation: observation.owner_generation,
@@ -1702,6 +1718,29 @@ export function isValidOwnerIntent(intent: unknown, request?: ObserveTerminalReq
 
 function isExpectedIntent(intent: OwnerIntent | null, request: ObserveTerminalRequest): boolean {
 	return isValidOwnerIntent(intent, request);
+}
+
+/**
+ * A generation with a cooperative supervisor index (Darwin) has its intents
+ * published by the closer but delivered only by that exact supervisor, so a pending
+ * intent alone does not explain a SIGTERM: an unrelated signal can arrive while the
+ * intent is still unconsumed. Only the supervisor's relay record for this exact
+ * intent makes the shutdown expected. Without an index the closer itself delivers
+ * the signal after publishing the intent.
+ */
+function hasCooperativeRelayEvidence(paths: LifecyclePaths, intent: OwnerIntent | null): boolean {
+	try {
+		fsSync.lstatSync(paths.supervisorIndexFile);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return true;
+		return false;
+	}
+	if (!intent) return false;
+	try {
+		return readCooperativeRelayRecord(paths, intent) !== null;
+	} catch {
+		return false;
+	}
 }
 /** Accept only real UTC timestamps in the canonical evidence serialization. */
 export function isCanonicalUtcTimestamp(value: unknown): value is string {
@@ -1872,15 +1911,88 @@ function assertSecureGeneration(paths: LifecyclePaths, sessionId: string): void 
 }
 
 function assertNoIntentHistory(paths: LifecyclePaths, includeCanonical: boolean): void {
-	for (const suffix of [...(includeCanonical ? [""] : []), ".consumed", ".cancelled", ".expired", ".invalidated"]) {
+	const files = [
+		...(includeCanonical ? [paths.intentFile] : []),
+		...[".consumed", ".cancelled", ".expired", ".invalidated"].map(suffix => `${paths.intentFile}${suffix}`),
+		// One relay attempt per generation: pending or confirmed records are permanent history.
+		paths.relayPendingFile,
+		paths.relayFile,
+	];
+	for (const file of files) {
 		try {
-			fsSync.lstatSync(`${paths.intentFile}${suffix}`);
+			fsSync.lstatSync(file);
 		} catch (error) {
 			if (isCode(error, "ENOENT")) continue;
 			throw error;
 		}
 		throw new Error("owner_intent_replay");
 	}
+}
+
+/**
+ * Darwin relay evidence for exactly this intent, or null when none exists.
+ * An unreadable or mismatched record is never treated as absent.
+ */
+export function readCooperativeRelayRecord(paths: LifecyclePaths, intent: OwnerIntent): ManagedOwnerRelayRecord | null {
+	try {
+		fsSync.lstatSync(paths.relayFile);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return null;
+		throw error;
+	}
+	const record = readSecureOwnerJson(paths.relayFile);
+	if (
+		!isManagedOwnerRelayRecord(record) ||
+		record.intent_id !== intent.intent_id ||
+		record.dispatch_id !== intent.dispatch_id ||
+		record.generation !== intent.generation ||
+		record.session_id !== intent.session_id ||
+		record.server_key !== intent.server_key
+	)
+		throw new Error("owner_relay_evidence_mismatch");
+	return record;
+}
+
+/**
+ * Darwin: retire this generation's canonical intent when it is provably undelivered,
+ * so a later close can rearm. Runs under the generation lock that the supervisor also
+ * takes for its expiry check and relay-record publication. An intent that is expired,
+ * has no relay record and no verdict can therefore never be relayed: the supervisor
+ * refuses expired intents under the same lock, and the retired name is not the
+ * canonical intent it reads. Anything else stays as uncertain evidence.
+ */
+function retireUndeliveredCooperativeIntent(paths: LifecyclePaths, sessionId: string, serverKey: string): void {
+	try {
+		fsSync.lstatSync(paths.intentFile);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return;
+		throw error;
+	}
+	const intent = readSecureOwnerJson(paths.intentFile);
+	if (
+		!isValidOwnerIntent(intent) ||
+		!isCanonicalUtcTimestamp(intent.expires_at) ||
+		intent.generation !== paths.generation ||
+		intent.session_id !== sessionId ||
+		intent.server_key !== serverKey ||
+		Date.now() < Date.parse(intent.expires_at)
+	)
+		return;
+	if (readCooperativeRelayRecord(paths, intent)) return;
+	// A pending record without confirmation means delivery is uncertain (for example a
+	// supervisor crash between publication and signal): keep the intent.
+	for (const file of [paths.relayPendingFile, paths.verdictFile])
+		try {
+			fsSync.lstatSync(file);
+			return;
+		} catch (error) {
+			if (!isCode(error, "ENOENT")) throw error;
+		}
+	// The intent id is unique, so the retired name never collides.
+	fsSync.renameSync(
+		paths.intentFile,
+		path.join(paths.root, `intent-${paths.generation}.${intent.intent_id}.undelivered`),
+	);
 }
 
 function assertNoConflictingOwnerTerminal(paths: LifecyclePaths, sessionId: string): void {
@@ -1932,7 +2044,10 @@ export function consumeCooperativeOwnerIntent(input: {
 	stateDir: string;
 	binding: ManagedOwnerBinding;
 	serverKey: string;
-	relay(intent: OwnerIntent, observedAt: string): void;
+	/** Whether the exact child can still receive a relay right now. */
+	canRelay(): boolean;
+	/** Delivers SIGTERM; returns true only when the signal was actually sent. */
+	relay(intent: OwnerIntent, observedAt: string): boolean;
 }): void {
 	if (process.platform !== "darwin") return;
 	const binding = input.binding;
@@ -1959,7 +2074,44 @@ export function consumeCooperativeOwnerIntent(input: {
 			Date.now() >= Date.parse(intent.expires_at)
 		)
 			return;
-		input.relay(intent, now);
+		if (!input.canRelay()) return;
+		const relayRecord: ManagedOwnerRelayRecord = {
+			schema_version: 1,
+			intent_id: intent.intent_id,
+			dispatch_id: intent.dispatch_id,
+			generation: binding.generation,
+			session_id: binding.session_id,
+			server_key: input.serverKey,
+			child_token: binding.child_token,
+			supervisor_pid: binding.supervisor_pid,
+			supervisor_start_time: binding.supervisor_start_time,
+			relayed_at: now,
+		};
+		// Two phases under the generation lock, which observers also take before
+		// classifying. The pending record is durable before delivery so a crash
+		// leaves uncertain evidence (no retirement, no rearm); only a confirmed
+		// delivery renames it to the record an operator-shutdown verdict requires.
+		const bytes = Buffer.from(`${JSON.stringify(relayRecord)}\n`);
+		publishManagedFileNoReplaceSync(paths.relayPendingFile, bytes, managedDirectoryRoot(paths.root));
+		const recorded = readOwnerOnlyFileSettled(paths.relayPendingFile, 65536);
+		// Expiry is rechecked right before the signal: a supervisor that stalled during
+		// publication must not deliver after the closer has given up.
+		const delivered =
+			recorded.ok &&
+			!!recorded.data &&
+			bytes.equals(Buffer.from(recorded.data)) &&
+			Date.now() < Date.parse(intent.expires_at) &&
+			input.relay(intent, now);
+		fsSync.renameSync(
+			paths.relayPendingFile,
+			delivered ? paths.relayFile : `${paths.relayPendingFile}.${intent.intent_id}.unsent`,
+		);
+		const directory = fsSync.openSync(paths.root, "r");
+		try {
+			fsSync.fsyncSync(directory);
+		} finally {
+			fsSync.closeSync(directory);
+		}
 	} catch {
 		// Unavailable evidence and lock contention never authorize delivery.
 	} finally {
@@ -2017,6 +2169,8 @@ export async function closeExactTmuxOwner(
 			if (Date.now() >= Date.parse(intent.expires_at)) throw new Error("owner_term_verdict_timeout");
 		};
 		try {
+			assertSecureGeneration(paths, request.sessionId);
+			retireUndeliveredCooperativeIntent(paths, request.sessionId, request.serverKey);
 			assertOwned();
 			await shutdown.publishNoReplace(
 				paths.root,
@@ -2045,6 +2199,8 @@ export async function closeExactTmuxOwner(
 			verdict.classification !== "expected_operator_shutdown"
 		)
 			throw new Error("owner_term_verdict_timeout");
+		// Only the exact supervisor's relay of this intent makes the shutdown expected.
+		if (!readCooperativeRelayRecord(paths, intent)) throw new Error("owner_term_verdict_timeout");
 		await deps.cleanupSession();
 		return verdict;
 	}

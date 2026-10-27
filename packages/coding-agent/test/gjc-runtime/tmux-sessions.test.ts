@@ -945,7 +945,8 @@ describe("GJC tmux session management", () => {
 		expect(innerCommand).not.toContain("parent-session");
 		expect(innerCommand).not.toContain("untrusted-parent");
 		expect(innerCommand).toContain("BROKER_CHILD_ENV='enabled'");
-		expect(innerCommand).toContain('GJC_MANAGED_OWNER_COMMAND_JSON=\'["child-command","--safe"]\'');
+		expect(innerCommand).toContain("'--internal-managed-owner-supervisor' '--' 'child-command' '--safe'");
+		expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_COMMAND_JSON");
 		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
 	});
 
@@ -1043,7 +1044,7 @@ describe("GJC tmux session management", () => {
 		// so the CLI malloc guard cannot re-exec it below the pinned pane PID.
 		const paneCommand = executedArgv.at(-1);
 		expect(paneCommand).toStartWith("exec env -u MallocStackLogging -u MallocStackLoggingNoCompact ");
-		expect(paneCommand).toEndWith("'--internal-managed-owner-supervisor'");
+		expect(paneCommand).toEndWith("'--internal-managed-owner-supervisor' '--' 'child-command'");
 		expect(paneCommand).not.toContain("MallocStackLogging=");
 		expect(paneCommand).toContain("KEEP='yes'");
 		const cleanup = calls.find(
@@ -1876,6 +1877,9 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 					...(scenario === "complete" ? [] : ["--preload", preloadFile]),
 					cli,
 					"--internal-managed-owner-supervisor",
+					"--",
+					process.execPath,
+					childScript,
 				],
 				{
 					cwd: repoRoot,
@@ -1891,7 +1895,6 @@ spyOn(isolation, "observeOwnerTerminal").mockImplementation(async request => {
 						GJC_MANAGED_OWNER_RUN_ID: "close-run",
 						GJC_MANAGED_OWNER_INCARNATION: "close-incarnation",
 						GJC_MANAGED_OWNER_REDACT_COMMAND: "1",
-						GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, childScript]),
 					},
 				},
 			);
@@ -2164,13 +2167,13 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
   const expiry = setTimeout(() => {
     fs.writeFileSync(${JSON.stringify(expiredFile)}, "containment-only\\n");
     process.exit(91);
-  }, 30_000);
+  }, 60_000);
   process.on("SIGTERM", () => {
     fs.writeFileSync(${JSON.stringify(cleanupFile)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid }));
     clearTimeout(expiry);
     process.exit(0);
   });
-  fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid, admission: admission.kind, token: process.env.GJC_MANAGED_OWNER_CHILD_TOKEN }));
+  fs.writeFileSync(${JSON.stringify(readyFile)}, JSON.stringify({ pid: process.pid, parentPid: process.ppid, admission: admission.kind, token: process.env.GJC_MANAGED_OWNER_CHILD_TOKEN, argv: process.argv.slice(2) }));
 }
 `,
 				{ mode: 0o600 },
@@ -2197,8 +2200,9 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 				};
 			};
 			const launchContext = {
-				parsed: { messages: [], fileArgs: [], unknownFlags: new Map(), tmux: true } as Args,
-				rawArgs: ["--tmux"],
+				parsed: { messages: ["SECRET-PROMPT-CANARY"], fileArgs: [], unknownFlags: new Map(), tmux: true } as Args,
+				// An ordinary root prompt must reach the child but never the durable binding.
+				rawArgs: ["--tmux", "SECRET-PROMPT-CANARY"],
 				cwd: stateDir,
 				env: {
 					GJC_PSMUX_DETECTION: "off",
@@ -2326,8 +2330,36 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 					generation,
 					supervisor_pid: ownerPid,
 					child_token: ready.token,
+					binding_kind: "opaque",
 				});
+				expect(ready.argv).toContain("SECRET-PROMPT-CANARY");
+				let retiredIntent: string | undefined;
+				if (process.platform === "darwin") {
+					// A stopped supervisor lets the first close expire without delivery; once it
+					// resumes it must refuse the expired intent, and the retry must succeed.
+					const signalOwner = async (signal: string) =>
+						expect(await Bun.spawn(["/bin/kill", `-${signal}`, String(ownerPid)]).exited).toBe(0);
+					await signalOwner("STOP");
+					try {
+						await expect(
+							forceCloseGjcTmuxSession("root", { GJC_TMUX_COMMAND: "tmux" }, sessionId, stateFile),
+						).rejects.toThrow("owner_term_verdict_timeout");
+					} finally {
+						await signalOwner("CONT");
+					}
+					const expired = readSecureOwnerJson(paths.intentFile) as { intent_id: string };
+					// Give the resumed supervisor several poll cycles to see the expired intent.
+					await Bun.sleep(1_000);
+					expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
+					expect(fsSync.existsSync(paths.relayFile)).toBe(false);
+					expect(fsSync.existsSync(cleanupFile)).toBe(false);
+					expect(owner.exitCode).toBeNull();
+					retiredIntent = expired.intent_id;
+				}
 				await forceCloseGjcTmuxSession("root", { GJC_TMUX_COMMAND: "tmux" }, sessionId, stateFile);
+				for (const file of await fs.readdir(paths.root))
+					if ((await fs.stat(path.join(paths.root, file))).isFile())
+						expect(await fs.readFile(path.join(paths.root, file), "utf8")).not.toContain("SECRET-PROMPT-CANARY");
 				expect(await waitForOwnerExit(1_000)).toBe(true);
 				expect(await owner.exited, await stderr).toBe(0);
 				expect(await childProcess.waitForExit({ timeoutMs: 1_000 })).toBe(true);
@@ -2344,6 +2376,19 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 				expect(rawPidSignal).not.toHaveBeenCalled();
 				expect(calls.filter(cmd => cmd.includes("if-shell"))).toHaveLength(1);
 				if (process.platform === "darwin") {
+					// The expired attempt was retired, not replayed, and the retry was relayed.
+					expect(
+						fsSync.existsSync(path.join(paths.root, `intent-${generation}.${retiredIntent}.undelivered`)),
+					).toBe(true);
+					// The verdict is expected only because the exact supervisor recorded its relay.
+					const relayed = readSecureOwnerJson(paths.relayFile) as { intent_id: string };
+					expect(relayed.intent_id).not.toBe(retiredIntent);
+					expect(relayed).toMatchObject({
+						generation,
+						session_id: sessionId,
+						supervisor_pid: ownerPid,
+						child_token: ready.token,
+					});
 					// Relaunch the same pinned session over the real retained binding of the
 					// normally closed supervisor; it is history, not recovery evidence.
 					const relaunchCalls: string[][] = [];
@@ -2378,7 +2423,7 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 			}
 			if (failures.length > 0) throw new AggregateError(failures, "Root-launch managed close verification failed");
 		},
-		65_000,
+		110_000,
 	);
 
 	it("surfaces an exact compatibility cleanup failure after a matching SIGTERM verdict", async () => {
@@ -2762,9 +2807,22 @@ describe("cooperative supervisor binding discovery", () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cooperative-binding-"));
 		const root = lifecyclePaths(stateDir, "cooperative-session", "cooperative-generation").root;
 		await fs.mkdir(root, { recursive: true, mode: 0o700 });
-		const publish = () =>
-			fs.writeFile(path.join(root, "child-token.binding.json"), `${JSON.stringify(binding)}\n`, { mode: 0o600 });
-		return { stateDir, publish };
+		const index = {
+			schema_version: 1,
+			generation: "cooperative-generation",
+			session_id: "cooperative-session",
+			child_token: "token",
+			supervisor_pid: 4242,
+			supervisor_start_time: "darwin:4242:1",
+		};
+		const write = (name: string, value: unknown) =>
+			fs.writeFile(path.join(root, name), `${JSON.stringify(value)}\n`, { mode: 0o600 });
+		// The supervisor publishes its binding, then the generation's index naming it.
+		const publish = async () => {
+			await write("child-token.binding.json", binding);
+			await write("supervisor-cooperative-generation.json", index);
+		};
+		return { stateDir, root, index, write, publish };
 	};
 
 	it("waits for the same exact supervisor to publish its binding", async () => {
@@ -2835,9 +2893,9 @@ describe("cooperative supervisor binding discovery", () => {
 	});
 
 	it("does not retry untrusted binding evidence", async () => {
-		const { stateDir } = await fixture();
-		const root = lifecyclePaths(stateDir, "cooperative-session", "cooperative-generation").root;
-		await fs.writeFile(path.join(root, "child-token.binding.json"), "{}\n", { mode: 0o600 });
+		const { stateDir, index, write } = await fixture();
+		await write("supervisor-cooperative-generation.json", index);
+		await write("child-token.binding.json", {});
 		let polls = 0;
 		try {
 			await expect(
@@ -2851,6 +2909,37 @@ describe("cooperative supervisor binding discovery", () => {
 				}),
 			).rejects.toThrow("managed_owner_binding_untrusted");
 			expect(polls).toBe(0);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("finds the current binding regardless of retained earlier-generation history", async () => {
+		const { stateDir, root, index, write, publish } = await fixture();
+		try {
+			// A pinned session reuses one lifecycle root; earlier generations leave
+			// bindings, markers, consumed intents and verdicts behind.
+			for (let generation = 0; generation < 120; generation += 1) {
+				await write(`child-old-${generation}.binding.json`, { ...binding, child_token: `old-${generation}` });
+				await write(`generation-old-${generation}.published.json`, {});
+				await write(`intent-old-${generation}.json.consumed`, {});
+				await write(`verdict-old-${generation}.json`, {});
+			}
+			expect((await fs.readdir(root)).length).toBeGreaterThan(256);
+			await publish();
+			const deps = {
+				assertSameSupervisor: () => {},
+				sleep: async () => {},
+				now: () => new Date(0),
+				deadline: 1_000,
+			};
+			expect(await awaitCooperativeSupervisorBinding(identity(stateDir), deps)).toEqual(binding);
+			// An index naming another supervisor process is never this owner's binding.
+			await fs.rm(path.join(root, "supervisor-cooperative-generation.json"));
+			await write("supervisor-cooperative-generation.json", { ...index, supervisor_pid: 4243 });
+			await expect(awaitCooperativeSupervisorBinding(identity(stateDir), deps)).rejects.toThrow(
+				"managed_owner_binding_untrusted",
+			);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}

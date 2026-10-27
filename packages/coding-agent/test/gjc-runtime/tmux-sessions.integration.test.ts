@@ -127,7 +127,7 @@ setInterval(() => {}, 1_000);
 			`import { writeFile } from "node:fs/promises";
 import { runManagedOwnerSupervisor } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/gjc-runtime/managed-owner-supervisor.ts"))};
 try {
-	await runManagedOwnerSupervisor();
+	await runManagedOwnerSupervisor(process.argv.slice(2));
 } catch (error) {
 	await writeFile(${JSON.stringify(path.join(stateDir, "supervisor-error"))}, String(error));
 	throw error;
@@ -149,7 +149,6 @@ try {
 			GJC_COORDINATOR_SESSION_ID: sessionId,
 			GJC_MANAGED_OWNER_RUN_ID: runId,
 			GJC_MANAGED_OWNER_INCARNATION: incarnation,
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, childScript]),
 		};
 		isolatedServers.push({ env, stateDir, scopeName });
 		const created = Bun.spawnSync(
@@ -165,7 +164,7 @@ try {
 				"-d",
 				"-s",
 				sessionName,
-				`exec "${process.execPath}" "${supervisorScript}" 2>"${path.join(stateDir, "supervisor-stderr")}"`,
+				`exec "${process.execPath}" "${supervisorScript}" --internal-managed-owner-supervisor -- "${process.execPath}" "${childScript}" 2>"${path.join(stateDir, "supervisor-stderr")}"`,
 			],
 			{ stdout: "pipe", stderr: "pipe", env },
 		);

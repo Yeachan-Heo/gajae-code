@@ -15,13 +15,16 @@ import {
 	publishManagedFileNoReplace,
 } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
-import { isManagedOwnerBinding, type ManagedOwnerBinding } from "./managed-owner-binding";
 import {
-	MANAGED_OWNER_COMMAND_ENV,
+	isManagedOwnerBinding,
+	isManagedOwnerSupervisorIndex,
+	type ManagedOwnerBinding,
+} from "./managed-owner-binding";
+import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
-	MANAGED_OWNER_SUPERVISOR_ARG,
+	managedOwnerSupervisorInvocation,
 } from "./managed-owner-supervisor";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { GJC_DIR, GJC_SESSION_PREFIX, tmuxRuntimeSessionPath } from "./session-layout";
@@ -116,9 +119,8 @@ function providerIdentity(
 
 function managedOwnerSupervisorArgv(): string[] {
 	const entry = process.argv[1];
-	if (!entry || !/\.(?:[cm]?[jt]s)$/.test(entry) || /\.test\.[^.]+$/.test(entry))
-		return [process.execPath, MANAGED_OWNER_SUPERVISOR_ARG];
-	return [process.execPath, entry, MANAGED_OWNER_SUPERVISOR_ARG];
+	if (!entry || !/\.(?:[cm]?[jt]s)$/.test(entry) || /\.test\.[^.]+$/.test(entry)) return [process.execPath];
+	return [process.execPath, entry];
 }
 
 function validManagedLaunchSpec(spec: ManagedTmuxLaunchSpec, platform: NodeJS.Platform): boolean {
@@ -824,19 +826,17 @@ export function createGjcTmuxSession(
 	const command =
 		platform === "win32"
 			? buildWindowsPowerShellInnerCommand({
-					command: launch ? managedOwnerSupervisorArgv() : ["gjc"],
-					environment: {
-						...childEnvironment,
-						...(launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {}),
-					},
+					command: launch ? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(), launch.argv) : ["gjc"],
+					environment: childEnvironment,
 				})
 			: (() => {
-					const supervisorEnvironment = launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {};
-					const invocation = launch ? managedOwnerSupervisorArgv() : ["gjc"];
+					const invocation = launch
+						? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(), launch.argv)
+						: ["gjc"];
 					// The pane process must stay the exact supervisor; never let the CLI malloc
 					// guard re-exec it below the pane PID.
 					const unsetArgs = launch && platform === "darwin" ? `${macOSMallocEnvUnsetArgs().join(" ")} ` : "";
-					return `exec env ${unsetArgs}${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
+					return `exec env ${unsetArgs}${Object.entries(childEnvironment)
 						// An explicit spawn override must not re-add what the scrub removed.
 						.filter(([name]) => !unsetArgs || !hasMacOSMallocEnv({ [name]: "" }))
 						.map(([name, value]) => `${name}=${shellQuote(value)}`)
@@ -1879,38 +1879,38 @@ async function waitForExpectedVerdict(
 }
 
 function proveCooperativeSupervisorBinding(identity: ExactOwnerIdentity): ManagedOwnerBinding {
-	const root = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation).root;
-	if (!verifyOwnerOnlyPathSecurity(root, "directory").ok) throw new Error("managed_owner_binding_untrusted");
-	const directory = fsSync.opendirSync(root);
-	let binding: ManagedOwnerBinding | undefined;
+	// The generation's own index names its one binding, so retained history of
+	// earlier generations in the shared lifecycle root never bounds discovery.
+	const paths = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation);
+	if (!verifyOwnerOnlyPathSecurity(paths.root, "directory").ok) throw new Error("managed_owner_binding_untrusted");
 	try {
-		for (let count = 0; ; count += 1) {
-			const entry = directory.readSync();
-			if (!entry) break;
-			if (count >= 256) throw new Error("managed_owner_binding_discovery_limit");
-			const match = /^child-([A-Za-z0-9._-]+)\.binding\.json$/.exec(entry.name);
-			if (!match) {
-				if (entry.name.startsWith("child-") && entry.name.endsWith(".binding.json"))
-					throw new Error("managed_owner_binding_untrusted");
-				continue;
-			}
-			const value = readSecureOwnerJson(path.join(root, entry.name));
-			if (!isManagedOwnerBinding(value) || value.child_token !== match[1])
-				throw new Error("managed_owner_binding_untrusted");
-			if (
-				value.supervisor_pid !== identity.pid ||
-				value.supervisor_start_time !== identity.startTime ||
-				value.session_id !== identity.sessionId ||
-				value.generation !== identity.generation
-			)
-				continue;
-			if (binding) throw new Error("managed_owner_binding_ambiguous");
-			binding = value;
-		}
-	} finally {
-		directory.closeSync();
+		fsSync.lstatSync(paths.supervisorIndexFile);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("managed_owner_binding_unavailable");
+		throw error;
 	}
-	if (!binding || Date.parse(binding.created_at) > Date.now()) throw new Error("managed_owner_binding_unavailable");
+	const index = readSecureOwnerJson(paths.supervisorIndexFile);
+	if (
+		!isManagedOwnerSupervisorIndex(index) ||
+		index.generation !== identity.generation ||
+		index.session_id !== identity.sessionId ||
+		!/^[A-Za-z0-9._-]+$/.test(index.child_token)
+	)
+		throw new Error("managed_owner_binding_untrusted");
+	// One supervisor per generation: an index naming another process is not ours.
+	if (index.supervisor_pid !== identity.pid || index.supervisor_start_time !== identity.startTime)
+		throw new Error("managed_owner_binding_untrusted");
+	const binding = readSecureOwnerJson(path.join(paths.root, `child-${index.child_token}.binding.json`));
+	if (
+		!isManagedOwnerBinding(binding) ||
+		binding.child_token !== index.child_token ||
+		binding.supervisor_pid !== identity.pid ||
+		binding.supervisor_start_time !== identity.startTime ||
+		binding.session_id !== identity.sessionId ||
+		binding.generation !== identity.generation
+	)
+		throw new Error("managed_owner_binding_untrusted");
+	if (Date.parse(binding.created_at) > Date.now()) throw new Error("managed_owner_binding_unavailable");
 	return binding;
 }
 

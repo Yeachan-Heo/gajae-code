@@ -6,8 +6,10 @@ import { prepareManagedDirectoryRoot, publishManagedFileNoReplace } from "../ses
 import { readLinuxProcStartTime } from "./linux-proc";
 import {
 	isManagedOwnerBinding,
+	isManagedOwnerCommand,
 	type ManagedOwnerBinding,
 	type ManagedOwnerSigabrtReceipt,
+	type ManagedOwnerSupervisorIndex,
 	managedOwnerCommandDigest,
 } from "./managed-owner-binding";
 import { assertSafePathComponent } from "./session-layout";
@@ -23,12 +25,16 @@ import {
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 export const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
-export const MANAGED_OWNER_COMMAND_ENV = "GJC_MANAGED_OWNER_COMMAND_JSON";
 export const MANAGED_OWNER_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 export const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
 export const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 export const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
+/**
+ * Serialized child argv budget inside a recoverable binding. The binding's other
+ * fields stay under 1 KiB, so the whole record fits the 64 KiB owner-only reader.
+ */
+export const MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES = 63 * 1024;
 /** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
 export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
 
@@ -87,9 +93,8 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 	assertSafe();
 	const authority = prepareManagedDirectoryRoot(root);
 	const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
-	// Not an input limit in practice: a recoverable binding is its fixed fields (~540 B)
-	// plus the same command JSON the pane command carries in GJC_MANAGED_OWNER_COMMAND_JSON,
-	// and tmux refuses pane commands over ~16 KiB ("command too long") before this runs.
+	// Launchers check MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES before creating a
+	// session; this is the last fail-closed guard for the owner-only reader limit.
 	if (bytes.length > 65536) throw new Error("managed_owner_binding_too_large");
 	await publishManagedFileNoReplace(file, bytes, assertSafe, authority);
 	const persisted = readOwnerOnlyFileSettled(file, 65536);
@@ -97,30 +102,38 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 		throw new Error("managed_owner_durable_reread_failed");
 }
 
-function childCommand(): string[] {
-	const command = JSON.parse(requiredEnvironment(MANAGED_OWNER_COMMAND_ENV)) as unknown;
-	if (!Array.isArray(command) || command.length === 0 || command.some(value => typeof value !== "string" || !value))
-		throw new Error("managed_owner_command_invalid");
+/**
+ * Supervisor invocation: `<gjc> --internal-managed-owner-supervisor -- <child argv...>`.
+ *
+ * The child argv travels as ordinary shell-quoted arguments, never re-encoded (JSON
+ * escaping would double backslashes and quotes inside tmux's ~16 KiB command limit).
+ */
+export function managedOwnerSupervisorInvocation(
+	supervisorArgv: readonly string[],
+	childArgv: readonly string[],
+): string[] {
+	return [...supervisorArgv, MANAGED_OWNER_SUPERVISOR_ARG, "--", ...childArgv];
+}
+
+/** Child argv from the supervisor's CLI arguments (after the program entry). */
+export function managedOwnerSupervisorChildArgv(args: readonly string[]): string[] {
+	const command = args[0] === MANAGED_OWNER_SUPERVISOR_ARG && args[1] === "--" ? args.slice(2) : null;
+	if (!isManagedOwnerCommand(command)) throw new Error("managed_owner_command_invalid");
 	return command;
 }
 
-export function isManagedOwnerSupervisorArgv(args: readonly string[]): boolean {
-	return args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG;
-}
-
 /** Runs one exact child and publishes authority only for a directly observed Linux signal 6. */
-export async function runManagedOwnerSupervisor(): Promise<void> {
+export async function runManagedOwnerSupervisor(args: readonly string[]): Promise<void> {
 	try {
-		await superviseManagedOwner();
+		await superviseManagedOwner(managedOwnerSupervisorChildArgv(args));
 	} catch {
-		// Spawn and JSON errors can contain opaque command bytes.
+		// Spawn errors can contain opaque command bytes.
 		throw new Error("managed_owner_supervisor_failed");
 	}
 }
 
-async function superviseManagedOwner(): Promise<void> {
+async function superviseManagedOwner(command: string[]): Promise<void> {
 	const { root, stateDir, generation, sessionId, runId, incarnation } = lifecycleRoot();
-	const command = childCommand();
 	let sigtermPending = bootstrapSigtermPending;
 	const captureEarlySigterm = () => {
 		sigtermPending = true;
@@ -152,8 +165,18 @@ async function superviseManagedOwner(): Promise<void> {
 	};
 	if (!isManagedOwnerBinding(binding)) throw new Error("managed_owner_binding_invalid");
 	await writeDurableExclusive(path.join(root, `child-${childToken}.binding.json`), binding);
+	if (process.platform === "darwin") {
+		const index: ManagedOwnerSupervisorIndex = {
+			schema_version: 1,
+			generation,
+			session_id: sessionId,
+			child_token: childToken,
+			supervisor_pid: process.pid,
+			supervisor_start_time: supervisorStartTime,
+		};
+		await writeDurableExclusive(lifecyclePaths(stateDir, sessionId, generation).supervisorIndexFile, index);
+	}
 	const childEnvironment: NodeJS.ProcessEnv = { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken };
-	delete childEnvironment[MANAGED_OWNER_COMMAND_ENV];
 	delete childEnvironment[MANAGED_OWNER_REDACT_COMMAND_ENV];
 	const child = Bun.spawn({
 		cmd: command,
@@ -200,33 +223,36 @@ async function superviseManagedOwner(): Promise<void> {
 	let sigtermRelayed = false;
 	let relayedIntent: OwnerIntent | null = null;
 	let relayedAt: string | null = null;
-	const relayChild = (candidateIntent: OwnerIntent | null, observedAt: string) => {
-		if (childExited || sigtermRelayed) return;
+	// Only the direct parent may use its original spawn handle. External process
+	// references still have no identity-bound Darwin signal API.
+	const darwinChildRelayable = () =>
+		!childExited &&
+		!sigtermRelayed &&
+		child.exitCode === null &&
+		child.signalCode === null &&
+		childProcess.pid === child.pid &&
+		childProcess.incarnation === childStartTime &&
+		childProcess.ppid === process.pid;
+	const relayChild = (candidateIntent: OwnerIntent | null, observedAt: string): boolean => {
+		if (childExited || sigtermRelayed) return false;
 		try {
 			if (process.platform === "darwin") {
-				// Only the direct parent may use its original spawn handle. External
-				// process references still have no identity-bound Darwin signal API.
-				if (
-					child.exitCode !== null ||
-					child.signalCode !== null ||
-					childProcess.pid !== child.pid ||
-					childProcess.incarnation !== childStartTime ||
-					childProcess.ppid !== process.pid
-				)
-					return;
-				if (candidateIntent && Date.now() >= Date.parse(candidateIntent.expires_at)) return;
+				// Intent expiry was checked under the generation lock right before the
+				// relay record was published; once that record exists, deliver.
+				if (!darwinChildRelayable()) return false;
 				sigtermRelayed = true;
 				child.kill("SIGTERM");
 			} else {
-				if (!childProcess.signalRoot(15)) return;
+				if (!childProcess.signalRoot(15)) return false;
 				sigtermRelayed = true;
 			}
 		} catch {
 			// The child exited between intent capture and delivery.
-			return;
+			return false;
 		}
 		relayedAt = observedAt;
 		relayedIntent = candidateIntent;
+		return true;
 	};
 	const pollIntent = () => {
 		if (childExited || sigtermRelayed) return;
@@ -235,6 +261,7 @@ async function superviseManagedOwner(): Promise<void> {
 				stateDir,
 				binding,
 				serverKey: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				canRelay: darwinChildRelayable,
 				relay: (intent, observedAt) => relayChild(intent, observedAt),
 			});
 		} catch {
