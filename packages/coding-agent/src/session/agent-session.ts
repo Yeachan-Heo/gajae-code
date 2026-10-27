@@ -14087,6 +14087,9 @@ export class AgentSession {
 			preparationSignal,
 		);
 		assertPromptAdmission();
+		// Register a display entry for queued skill messages so the queue system can properly
+		// clean up when the message is removed or its admission fails (review P2).
+		let pendingDisplayTag: string | undefined;
 		const skillPromptMessage = {
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,
@@ -14103,6 +14106,17 @@ export class AgentSession {
 			cleanedArgs: activation.cleanedArgs || undefined,
 		});
 		assertPromptAdmission();
+		// Check if the message will be queued: if streaming or admission is already active.
+		const willBeQueued =
+			this.isStreaming ||
+			(this.#activeSessionAdmission?.kind === "prompt" || this.#sessionAdmissionQueue.some(e => e.kind === "prompt"));
+		if (willBeQueued) {
+			pendingDisplayTag = this.enqueueCustomMessageDisplay(
+				`/skill:${skill.name}${activation.cleanedArgs ? " " + activation.cleanedArgs : ""}`,
+				"followUp",
+			);
+			(skillPromptMessage.details as Record<string, unknown>).__pendingDisplayTag = pendingDisplayTag;
+		}
 		await this.promptCustomMessage(skillPromptMessage, {
 			...internalOptions,
 			...(promptAdmissionFence ? { promptPreflightGuard: assertPromptAdmission } : {}),
