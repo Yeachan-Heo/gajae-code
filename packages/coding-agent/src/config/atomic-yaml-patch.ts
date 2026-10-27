@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as nodeCrypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -145,7 +146,12 @@ type ReceiptChange = {
 	publicRevision: AtomicYamlPatchRevision;
 };
 
+// Descendant tasks retain this context after completion, so the lease must be
+// deactivated rather than treating every inherited path as permanently held.
+type QueueContext = { path: string; active: boolean; parent: QueueContext | undefined };
+
 const queues = new Map<string, Promise<void>>();
+const queueContext = new AsyncLocalStorage<QueueContext>();
 let nextReceiptRevision = 0;
 // Process-local authority shared by every queued writer, keyed by the canonical
 // file, not its lexical aliases. Unknown/cross-process writers remain hash-only:
@@ -1349,8 +1355,23 @@ export function enqueueAtomicYamlOperation<T>(
 	operation: (canonicalConfigPath: string, lexicalConfigPath: string) => Promise<T>,
 ): Promise<T> {
 	const canonicalPath = canonicalConfigPath(configPath);
+	const parent = queueContext.getStore();
+	for (let context = parent; context; context = context.parent) {
+		if (context.active && context.path === canonicalPath) {
+			return Promise.reject(new Error(`Cannot enqueue a reentrant atomic YAML operation for ${canonicalPath}.`));
+		}
+	}
 	const prior = queues.get(canonicalPath) ?? Promise.resolve();
-	const result = prior.catch(() => undefined).then(() => operation(canonicalPath, configPath));
+	const result = prior
+		.catch(() => undefined)
+		.then(async () => {
+			const context: QueueContext = { path: canonicalPath, active: true, parent };
+			try {
+				return await queueContext.run(context, () => operation(canonicalPath, configPath));
+			} finally {
+				context.active = false;
+			}
+		});
 	const completion = result.then(
 		() => undefined,
 		() => undefined,

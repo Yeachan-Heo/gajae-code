@@ -43,6 +43,151 @@ afterEach(async () => {
 });
 
 describe("atomic YAML patches", () => {
+	async function bounded<T>(promise: Promise<T>): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				promise,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(new Error("Atomic YAML operation timed out")), 1000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	for (const entry of [
+		"transaction",
+		"nested transaction",
+		"builder",
+		"patch supplier",
+		"update supplier",
+		"queue",
+	] as const) {
+		test(`rejects same-file reentry from ${entry} and permits subsequent writes`, async () => {
+			const configPath = await configPathForTest();
+			await Bun.write(configPath, "feature: old\n");
+			const nested = () => applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "nested" }]);
+			const run = (): Promise<unknown> => {
+				switch (entry) {
+					case "transaction":
+						return withAtomicYamlConfigTransaction(configPath, async () => bounded(nested()));
+					case "nested transaction":
+						return withAtomicYamlConfigTransaction(configPath, async () =>
+							bounded(withAtomicYamlConfigTransaction(configPath, async () => undefined)),
+						);
+					case "builder":
+						return applyAtomicYamlPatchesWithCurrent(configPath, async () => {
+							await bounded(nested());
+							return [];
+						});
+					case "patch supplier":
+						return reserveAtomicYamlPatchSlot(configPath, async () => {
+							await bounded(nested());
+							return [];
+						});
+					case "update supplier":
+						return reserveAtomicYamlUpdateSlot(configPath, async () => {
+							await bounded(nested());
+							return { apply: () => undefined };
+						});
+					case "queue":
+						return enqueueAtomicYamlOperation(configPath, async () => bounded(nested()));
+				}
+			};
+			await expect(bounded(run())).rejects.toThrow("reentrant atomic YAML operation");
+			await bounded(applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "after" }]));
+			expect(await readYaml(configPath)).toEqual({ feature: "after" });
+		});
+	}
+
+	test("rejects reentry through a lexical alias of the same canonical file", async () => {
+		const configPath = await configPathForTest();
+		const alias = path.join(path.dirname(configPath), "alias.yml");
+		await Bun.write(configPath, "feature: old\n");
+		await fs.symlink(configPath, alias);
+		await expect(
+			bounded(
+				withAtomicYamlConfigTransaction(configPath, async () => {
+					await bounded(applyAtomicYamlPatches(alias, [{ path: "feature", op: "set", value: "nested" }]));
+				}),
+			),
+		).rejects.toThrow("reentrant atomic YAML operation");
+		await bounded(applyAtomicYamlPatches(alias, [{ path: "feature", op: "set", value: "after" }]));
+		expect(await readYaml(configPath)).toEqual({ feature: "after" });
+	});
+
+	test("independent callers wait in FIFO order and make progress", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\n");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const first = enqueueAtomicYamlOperation(configPath, async () => {
+			order.push("first");
+			entered.resolve();
+			await bounded(release.promise);
+		});
+		await bounded(entered.promise);
+		const second = reserveAtomicYamlPatchSlot(configPath, () => {
+			order.push("second");
+			return [{ path: "feature", op: "set", value: "second" }];
+		});
+		const third = reserveAtomicYamlPatchSlot(configPath, () => {
+			order.push("third");
+			return [{ path: "feature", op: "set", value: "third" }];
+		});
+		try {
+			await Promise.resolve();
+			expect(order).toEqual(["first"]);
+		} finally {
+			release.resolve();
+		}
+		await bounded(Promise.all([first, second, third]));
+		expect(order).toEqual(["first", "second", "third"]);
+		expect(await readYaml(configPath)).toEqual({ feature: "third" });
+	});
+
+	test("allows a different-file nested write but rejects reentry into an active ancestor", async () => {
+		const first = await configPathForTest();
+		const second = await configPathForTest();
+		await Bun.write(first, "feature: old\n");
+		await Bun.write(second, "feature: old\n");
+		await bounded(
+			withAtomicYamlConfigTransaction(first, async () => {
+				await bounded(
+					withAtomicYamlConfigTransaction(second, async tx => {
+						await expect(
+							bounded(applyAtomicYamlPatches(first, [{ path: "feature", op: "set", value: "nested" }])),
+						).rejects.toThrow("reentrant atomic YAML operation");
+						await tx.applyPatches([{ path: "feature", op: "set", value: "different" }]);
+					}),
+				);
+			}),
+		);
+		expect(await readYaml(first)).toEqual({ feature: "old" });
+		expect(await readYaml(second)).toEqual({ feature: "different" });
+	});
+
+	test("allows inherited async contexts to write after their parent operation completes", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\n");
+		const release = Promise.withResolvers<void>();
+		let inherited: Promise<unknown> | undefined;
+		await bounded(
+			enqueueAtomicYamlOperation(configPath, async () => {
+				inherited = (async () => {
+					await bounded(release.promise);
+					return await applyAtomicYamlPatches(configPath, [{ path: "feature", op: "set", value: "after" }]);
+				})();
+			}),
+		);
+		release.resolve();
+		await bounded(inherited!);
+		expect(await readYaml(configPath)).toEqual({ feature: "after" });
+	});
+
 	for (const writer of ["direct", "supplier", "builder", "transaction", "combined"] as const) {
 		for (const iterator of ["empty", "fake", "throwing"] as const) {
 			test(`${writer} uses indexed patches instead of a ${iterator} iterator`, async () => {
