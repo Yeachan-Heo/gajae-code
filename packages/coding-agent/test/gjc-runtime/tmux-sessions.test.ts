@@ -950,6 +950,45 @@ describe("GJC tmux session management", () => {
 		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
 	});
 
+	it.skipIf(process.platform === "win32")(
+		"verifies a Broker launch from a symlinked workspace through its canonical lifecycle root",
+		async () => {
+			const root = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-symlinked-")));
+			fixtureDirectories.push(root);
+			const real = path.join(root, "real");
+			const cwd = path.join(root, "link");
+			await fs.mkdir(real);
+			await fs.symlink(real, cwd);
+			let plannedArgv: string[] | undefined;
+			__setCreateOwnerIsolationForTests({
+				execute: plan => {
+					if (!plan.ok) throw new Error("expected owner-isolation plan");
+					plannedArgv = plan.execution.argv;
+					return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+				},
+			});
+			// Lifecycle verification passes, so the launch reaches owner isolation.
+			expect(() =>
+				createGjcTmuxSession(
+					{ GJC_TMUX_COMMAND: "tmux" },
+					{
+						platform: process.platform === "linux" ? "linux" : "darwin",
+						launch: { childSessionId: "broker-child", cwd, argv: ["child-command"] },
+					},
+				),
+			).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+			// The child still runs in the workspace spelling the Broker authorized.
+			expect(plannedArgv?.[plannedArgv.indexOf("-c") + 1]).toBe(cwd);
+			const innerCommand = plannedArgv?.at(-1) ?? "";
+			const stateDir = /GJC_TMUX_OWNER_STATE_DIR='([^']+)'/.exec(innerCommand)?.[1];
+			expect(stateDir, innerCommand).toStartWith(`${real}${path.sep}`);
+			expect(/GJC_COORDINATOR_SESSION_STATE_FILE='([^']+)'/.exec(innerCommand)?.[1]).toStartWith(
+				`${real}${path.sep}`,
+			);
+			expect(fsSync.readdirSync(path.join(stateDir!, "broker-child", "owner-lifecycle"))).toEqual([]);
+		},
+	);
+
 	it("cleans the exact created session when managed proof rejects multiple pane PIDs", () => {
 		const cwd = path.join(os.tmpdir(), `gjc-managed-proof-cleanup-${crypto.randomUUID()}`);
 		const sessionName = "broker-child";

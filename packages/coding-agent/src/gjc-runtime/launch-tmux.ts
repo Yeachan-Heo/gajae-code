@@ -46,6 +46,7 @@ import {
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxSessionName,
 	buildGjcTmuxSessionSlug,
+	canonicalManagedStateFile,
 	GJC_DEFAULT_TMUX_SESSION,
 	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_COMMAND_ENV,
@@ -1129,18 +1130,12 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	// tmux launches with no GJC session context. Project dotenv pins are already
 	// removed from identityEnv.
 	const gjcSessionId = identityEnv.GJC_SESSION_ID?.trim() || sessionId;
-	// Supervised launches verify the owner lifecycle root with a no-follow walk. The
-	// derived path inherits a supported symlinked workspace anchor (an in-repository
-	// `.worktrees` bucket), so resolve that anchor once here; preparation,
-	// verification, the owner env and tmux metadata then share one canonical
-	// spelling, and no-follow checks still apply below it. An operator-pinned state
-	// file is used verbatim and must already be canonical.
-	const pinnedSessionStateFile = identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
-	const derivedSessionStateFile = (anchor: string) =>
-		tmuxRuntimeSessionPath(anchor, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+	const derivedStateFile = tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+	// Supervised launches verify their lifecycle root with no-follow walks, so a derived
+	// path through a symlinked workspace is named canonically; an operator pin is verbatim.
 	const sessionStateFile =
-		pinnedSessionStateFile ||
-		derivedSessionStateFile(platform === "linux" || platform === "darwin" ? canonicalWorkspaceAnchor(cwd) : cwd);
+		identityEnv[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
+		(platform === "linux" || platform === "darwin" ? canonicalManagedStateFile(derivedStateFile) : derivedStateFile);
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	// Stage only the one-shot channel descriptor (path + key id). The PKCS#8 key
 	// itself stays in memory until writeCoordinatorSidecarBootstrapFile runs
@@ -1235,15 +1230,6 @@ function assertRecoverableCommandFits(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	const childArgv = [...command, ...stripRootTmuxFlag(context.rawArgs)];
 	if (Buffer.byteLength(JSON.stringify(childArgv)) > MANAGED_OWNER_RECOVERABLE_COMMAND_MAX_BYTES)
 		throw new Error("managed_owner_command_too_large: pass a large prompt through a file (@file) instead");
-}
-
-/** The working directory with symlinks resolved; an unresolvable one fails closed later. */
-function canonicalWorkspaceAnchor(cwd: string): string {
-	try {
-		return fs.realpathSync(cwd);
-	} catch {
-		return cwd;
-	}
 }
 
 function trustedReplacementAuthority(

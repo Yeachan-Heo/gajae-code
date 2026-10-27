@@ -4129,6 +4129,62 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
+	it.skipIf(process.platform === "win32").each(["workspace", ".gjc"] as const)(
+		"derives a supervised lifecycle root canonically through a symlinked %s",
+		link => {
+			const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-symlinked-anchor-")));
+			try {
+				const real = path.join(root, "real");
+				fs.mkdirSync(real);
+				let cwd = real;
+				if (link === "workspace") {
+					cwd = path.join(root, "link");
+					fs.symlinkSync(real, cwd);
+				} else {
+					fs.mkdirSync(path.join(root, "gjc-store"));
+					fs.symlinkSync(path.join(root, "gjc-store"), path.join(real, ".gjc"));
+				}
+				const calls: string[][] = [];
+				const diagnostics: string[] = [];
+				launchDefaultTmuxIfNeeded({
+					parsed: args({ messages: ["hello"], tmux: true }),
+					rawArgs: ["--tmux", "hello"],
+					cwd,
+					// No operator pin: the state path is derived from the workspace.
+					env: {
+						GJC_COORDINATOR_SESSION_ID: "anchor-session",
+						GJC_SESSION_ID: "anchor-gjc-session",
+						GJC_COORDINATOR_SESSION_STATE_FILE: "",
+					},
+					argv: ["bun", "cli.ts"],
+					execPath: "/bin/bun",
+					platform: "linux",
+					tty: interactiveTty,
+					tmuxAvailable: true,
+					existingBranchSessionName: null,
+					diagnosticWriter: message => diagnostics.push(message),
+					spawnSync: (_command, spawnArgs) => {
+						calls.push(spawnArgs);
+						return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+					},
+				});
+				expect(diagnostics).toEqual([]);
+				const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
+				expect(innerCommand).toBeString();
+				const canonical = link === "workspace" ? real : path.join(root, "gjc-store");
+				const stateDir = /GJC_TMUX_OWNER_STATE_DIR='([^']+)'/.exec(innerCommand!)?.[1];
+				expect(stateDir, innerCommand).toStartWith(`${canonical}${path.sep}`);
+				const stateFile = /GJC_COORDINATOR_SESSION_STATE_FILE='([^']+)'/.exec(innerCommand!)?.[1];
+				expect(stateFile).toStartWith(`${canonical}${path.sep}`);
+				expect(fs.existsSync(path.join(stateDir!, "anchor-session", "owner-lifecycle", "generation.json"))).toBe(
+					true,
+				);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("exact-rolls back a spawned owner when generation publication loses its baseline", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-owner-generation-race-"));
 		try {

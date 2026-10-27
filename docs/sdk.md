@@ -1280,16 +1280,25 @@ orphaned children converge through ordinary close after
 `sdk.masterOrphanGraceMs`. Task text and master capability are transient
 dispatch inputs and never persist in any durable store, log, or output.
 
-Managed tmux startup on macOS and Linux publishes a private (`0600` file in a
-`0700` lifecycle root) child binding before the supervised child starts, for
-every launch. A Broker-redacted launch, and every macOS launch, publishes an
-opaque binding that carries neither the launch command nor a command digest, so
-prompts and flags such as `--api-key` never reach disk there; an ordinary Linux
-launch publishes a recoverable binding with its exact command and digest, which
-only Linux owner-loss recovery uses. The supervisor receives the child argv as
-its own arguments (`--internal-managed-owner-supervisor -- <argv...>`), shell
-quoted once in the pane command and never re-encoded, and accepts any argv with
-a nonempty executable; empty later arguments of a root `gjc --tmux` launch are
+Supervised managed tmux launches (Broker-spawned sessions and interactive root
+`gjc --tmux` launches, on macOS and Linux) publish a private (`0600` file in a
+`0700` lifecycle root) child binding before the supervised child starts.
+Launches that do not run the supervisor, such as `gjc session create` without
+a launch specification, start `gjc` directly and receive neither a binding nor
+exact CLI admission. The derived state path of a supervised launch names its
+workspace canonically (every existing ancestor resolved), so a workspace, an
+in-repository `.worktrees` bucket or a `.gjc` reached through a symlink passes
+the no-follow verification of the private lifecycle root, which still rejects
+any link inside managed storage; an operator-pinned
+`GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim. A Broker-redacted
+launch, and every macOS launch, publishes an opaque binding that carries
+neither the launch command nor a command digest, so prompts and flags such as
+`--api-key` never reach disk there; an ordinary Linux launch publishes a
+recoverable binding with its exact command and digest, which only Linux
+owner-loss recovery uses. The supervisor receives the child argv as its own
+arguments (`--internal-managed-owner-supervisor -- <argv...>`), shell quoted
+once in the pane command and never re-encoded, and accepts any argv with a
+nonempty executable; empty later arguments of a root `gjc --tmux` launch are
 passed through (a Broker launch spec still requires nonempty arguments). The CLI validates its
 exact session, generation, run, incarnation and child token through
 `readOwnerOnlyFile`, a bounded native read (at most 64 KiB) that keeps the
@@ -1307,12 +1316,6 @@ becomes six bytes), so a Linux launch whose serialized argv exceeds 63 KiB is
 refused with `managed_owner_command_too_large` before any tmux session exists,
 rather than failing in the supervisor; pass such input through a file.
 
-Supervised root `gjc --tmux` launches derive their lifecycle state from the
-resolved working directory (Broker launches keep their lexical spec `cwd`), so a worktree reached through a supported symlinked anchor (an
-in-repository `.worktrees` bucket) prepares and verifies the same canonical
-lifecycle root; no-follow checks still apply inside managed storage. An
-operator-pinned `GJC_COORDINATOR_SESSION_STATE_FILE` is used verbatim.
-
 Opaque bindings never grant crash-recovery authority. Recoverable predecessor
 bindings and SIGABRT receipts remain a separate Linux-only capability backed by
 recovery-fs; stale binding schemas are rejected rather than migrated.
@@ -1327,7 +1330,9 @@ retained private authority (always the case off Linux) it writes the bounded
 `managed_owner_admission_blocked: handoff_not_persisted` diagnostic.
 
 Source installations must rebuild the native addon (`bun run build:native`)
-when updating this admission boundary; compiled installations need a matching
+when updating this admission boundary; the native loader rejects any candidate
+addon, including a retained same-version variant, that lacks `readOwnerOnlyFile`
+and moves on to the next compatible one; compiled installations need a matching
 CLI/native build. Editing source or replacing files does not update a running
 Broker.
 
