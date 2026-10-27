@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,7 +23,7 @@ import {
 	type TelegramActivationMarkers,
 	telegramActivationIdentity,
 } from "../src/sdk/bus/notification-orchestration";
-import { DAEMON_GENERATION, DAEMON_VERSION, daemonPaths } from "../src/sdk/bus/telegram-daemon";
+import { DAEMON_GENERATION, DAEMON_VERSION, daemonPaths, type TelegramDaemonFs } from "../src/sdk/bus/telegram-daemon";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 const FOREIGN_TOKEN = "9876543210:ZYXWVutsrqponmlkjihgfedcba987654321";
@@ -165,7 +165,7 @@ describe("notification orchestration ownership", () => {
 
 	test("recycled live PID is absent during post-setup identity validation", async () => {
 		const agentDir = tempAgentDir();
-		writeLiveForeignOwner(agentDir, "linux:old-owner");
+		writeLiveForeignOwner(agentDir, "linux:12345");
 		const { writer: settings } = writer({ agentDir });
 
 		await expect(
@@ -173,9 +173,174 @@ describe("notification orchestration ownership", () => {
 				settings,
 				botToken: TOKEN,
 				chatId: "new-chat",
-				deps: { pidAlive: () => true, pidIncarnation: () => "linux:recycled-process" },
+				deps: { pidAlive: () => true, pidIncarnation: () => "linux:67890" },
 			}),
 		).resolves.toEqual({ status: "absent" });
+	});
+
+	test.each([
+		{ name: "dead", persisted: "linux:44444", observed: "linux:44444", alive: false, expected: "absent" },
+		{ name: "same", persisted: "linux:44444", observed: "linux:44444", alive: true, expected: "same" },
+		{ name: "foreign", persisted: "linux:44444", observed: "linux:44444", alive: true, expected: "foreign" },
+		{ name: "recycled", persisted: "linux:44444", observed: "linux:55555", alive: true, expected: "absent" },
+		{ name: "missing persisted", persisted: undefined, observed: "linux:44444", alive: true, expected: "unknown" },
+		{
+			name: "invalid persisted",
+			persisted: "linux:invalid",
+			observed: "linux:44444",
+			alive: true,
+			expected: "unknown",
+		},
+		{ name: "missing observed", persisted: "linux:44444", observed: undefined, alive: true, expected: "unknown" },
+		{
+			name: "invalid observed",
+			persisted: "linux:44444",
+			observed: "linux:invalid",
+			alive: true,
+			expected: "unknown",
+		},
+		{ name: "throwing observed", persisted: "linux:44444", observed: "throw", alive: true, expected: "unknown" },
+		{
+			name: "throwing liveness",
+			persisted: "linux:44444",
+			observed: "linux:44444",
+			alive: "throw",
+			expected: "unknown",
+		},
+	] as const)("classifies $name process evidence without exposing secrets", async scenario => {
+		const agentDir = tempAgentDir();
+		writeLiveForeignOwner(agentDir);
+		const statePath = daemonPaths(agentDir).state;
+		const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+		state.incarnation = scenario.persisted;
+		if (scenario.name === "same") {
+			state.tokenFingerprint = tokenFingerprint(TOKEN);
+			state.chatId = "new-chat";
+		}
+		fs.writeFileSync(statePath, JSON.stringify(state));
+		const { writer: settings } = writer({ agentDir });
+		const result = await proposedTelegramIdentity({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			chatDisplay: "approved-chat",
+			deps: {
+				pidAlive: () => {
+					if (scenario.alive === "throw") throw new Error(TOKEN);
+					return scenario.alive;
+				},
+				pidIncarnation: () => {
+					if (scenario.observed === "throw") throw new Error(tokenFingerprint(FOREIGN_TOKEN));
+					return scenario.observed;
+				},
+			},
+		});
+		expect(result.status).toBe(scenario.expected);
+		if (scenario.expected === "same") expect(result.owner).toMatchObject({ chatDisplay: "approved-chat" });
+		if (scenario.expected === "foreign") expect(result.owner).not.toHaveProperty("chatDisplay");
+		if (scenario.expected === "unknown" && scenario.alive !== "throw" && scenario.observed !== "throw") {
+			expect(result.owner).toEqual({ ownerId: "foreign-owner", pid: 44_444, generation: DAEMON_GENERATION });
+		}
+		for (const secret of [TOKEN, FOREIGN_TOKEN, tokenFingerprint(TOKEN), tokenFingerprint(FOREIGN_TOKEN)]) {
+			expect(JSON.stringify(result)).not.toContain(secret);
+		}
+	});
+
+	test.each([
+		"null",
+		"false",
+		"0",
+		'""',
+		"[]",
+		"{",
+		"{}",
+	])("malformed persisted state %s is unknown, not absent", async raw => {
+		const agentDir = tempAgentDir();
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, raw);
+		const { writer: settings } = writer({ agentDir });
+		expect(await proposedTelegramIdentity({ settings, botToken: TOKEN, chatId: "new-chat" })).toEqual({
+			status: "unknown",
+		});
+	});
+
+	test("never returns secrets embedded in untrusted owner metadata or display", async () => {
+		const agentDir = tempAgentDir();
+		writeLiveForeignOwner(agentDir);
+		const statePath = daemonPaths(agentDir).state;
+		const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+		state.ownerId = `owner-${tokenFingerprint(FOREIGN_TOKEN)}`;
+		fs.writeFileSync(statePath, JSON.stringify(state));
+		const { writer: settings } = writer({ agentDir });
+		const deps = { pidAlive: () => true, pidIncarnation: () => "linux:44444" };
+		expect(await proposedTelegramIdentity({ settings, botToken: TOKEN, chatId: "new-chat", deps })).toEqual({
+			status: "unknown",
+		});
+		state.ownerId = "owner";
+		state.tokenFingerprint = tokenFingerprint(TOKEN);
+		state.chatId = "new-chat";
+		fs.writeFileSync(statePath, JSON.stringify(state));
+		const result = await proposedTelegramIdentity({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			chatDisplay: TOKEN,
+			deps,
+		});
+		expect(result).toMatchObject({ status: "same", owner: { ownerId: "owner" } });
+		expect(result.owner).not.toHaveProperty("chatDisplay");
+	});
+
+	test("a missing state file is absent", async () => {
+		const { writer: settings } = writer({ agentDir: tempAgentDir() });
+		expect(await proposedTelegramIdentity({ settings, botToken: TOKEN, chatId: "new-chat" })).toEqual({
+			status: "absent",
+		});
+	});
+
+	test("an unreadable state file is unknown without exposing its error", async () => {
+		const { writer: settings } = writer({ agentDir: tempAgentDir() });
+		const fsImpl = {
+			...fs.promises,
+			readFile: async () => {
+				throw Object.assign(new Error(TOKEN), { code: "EACCES" });
+			},
+		} as unknown as TelegramDaemonFs;
+		const result = await proposedTelegramIdentity({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			deps: { fs: fsImpl },
+		});
+		expect(result).toEqual({ status: "unknown" });
+	});
+
+	test.each([
+		{ code: "ESRCH", expected: "absent" },
+		{ code: "EPERM", expected: "foreign" },
+		{ code: "EIO", expected: "unknown" },
+	] as const)("default liveness classifies $code correctly", async ({ code, expected }) => {
+		const agentDir = tempAgentDir();
+		writeLiveForeignOwner(agentDir);
+		const { writer: settings } = writer({ agentDir });
+		const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+			throw Object.assign(new Error(TOKEN), { code });
+		});
+		try {
+			const result = await proposedTelegramIdentity({
+				settings,
+				botToken: TOKEN,
+				chatId: "new-chat",
+				deps: { pidIncarnation: () => "linux:44444" },
+			});
+			expect(result.status).toBe(expected);
+			expect(kill).toHaveBeenCalledWith(44_444, 0);
+			expect(JSON.stringify(result)).not.toContain(TOKEN);
+			expect(JSON.stringify(result)).not.toContain(tokenFingerprint(FOREIGN_TOKEN));
+		} finally {
+			kill.mockRestore();
+		}
 	});
 
 	test("Save inactive preserves Discord while recording only a non-secret Telegram marker", async () => {
@@ -582,6 +747,125 @@ describe("notification orchestration blocked activation", () => {
 		if (result.status !== "blocked_identity") throw new Error("Expected blocked identity result.");
 		expect(await result.restore()).toEqual({ status: "conflict", paths: ["notifications.telegram.botToken"] });
 		expect(events).toEqual(["persist-blocked", "persist-blocked"]);
+	});
+
+	test("primary restore failure remains an error without exposing receipt or marker errors", async () => {
+		const activeReceipt = receipt({
+			restore: async () => {
+				throw new Error(TOKEN);
+			},
+		});
+		let writes = 0;
+		const settings: NotificationConfigurationWriter = {
+			getAgentDir: () => "/unused",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => activeReceipt,
+			commitAtomicBatchWithCurrent: async build => {
+				await build({ notifications: { telegram: {} } });
+				return activeReceipt;
+			},
+		};
+		const result = await saveTelegramConfiguration({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			saveInactive: false,
+			preflight: async () => ({ status: "same" }),
+			activation: {
+				marker: createTelegramActivationMarker({ botToken: TOKEN, chatId: "new-chat", state: "blocked" }),
+				persistInactive: async () => {
+					if (++writes === 2) throw new Error(tokenFingerprint(TOKEN));
+					return receipt();
+				},
+				clearInactive: async () => {},
+				reconnect: async () => "blocked_identity",
+				controller: {
+					enterBlockedRuntime: async () => {},
+					clearBlockedRuntime: async () => {},
+					reconcileCurrentSession: async () => {},
+				},
+			},
+		});
+		if (result.status !== "blocked_identity") throw new Error("Expected blocked activation.");
+		await expect(result.restore()).rejects.toThrow("Telegram configuration restore failed.");
+		expect(writes).toBe(2);
+	});
+
+	test.each([
+		"marker restore",
+		"marker retain",
+		"runtime fence",
+	] as const)("reports durable configuration restoration when %s fails", async failure => {
+		let configuration = "new";
+		let markerPresent = false;
+		let writes = 0;
+		let fences = 0;
+		let primaryRestores = 0;
+		const activeReceipt = receipt({
+			restore: async () => {
+				if (++primaryRestores !== 1) throw new Error("primary receipt consumed");
+				configuration = "previous";
+				return { status: "restored", receipt: receipt() };
+			},
+		});
+		const inactiveReceipt = receipt({
+			restore: async () => {
+				if (failure === "marker restore") throw new Error(TOKEN);
+				return { status: "conflict", paths: ["notifications.telegram.activation"] };
+			},
+		});
+		const settings: NotificationConfigurationWriter = {
+			getAgentDir: () => "/unused",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => activeReceipt,
+			commitAtomicBatchWithCurrent: async build => {
+				await build({ notifications: { telegram: {} } });
+				return activeReceipt;
+			},
+		};
+		const result = await saveTelegramConfiguration({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			saveInactive: false,
+			preflight: async () => ({ status: "same" }),
+			activation: {
+				marker: createTelegramActivationMarker({ botToken: TOKEN, chatId: "new-chat", state: "blocked" }),
+				persistInactive: async () => {
+					if (++writes === 2 && failure === "marker retain") {
+						markerPresent = false;
+						throw new Error(tokenFingerprint(TOKEN));
+					}
+					markerPresent = true;
+					return inactiveReceipt;
+				},
+				clearInactive: async () => {},
+				reconnect: async () => "blocked_identity",
+				controller: {
+					enterBlockedRuntime: async () => {
+						if (++fences === 2 && failure === "runtime fence") throw new Error(TOKEN);
+					},
+					clearBlockedRuntime: async () => {},
+					reconcileCurrentSession: async () => {},
+				},
+			},
+		});
+		if (result.status !== "blocked_identity") throw new Error("Expected blocked activation.");
+		const restored = await result.restore();
+		expect(restored).toEqual({
+			status: "restored",
+			runtimeFailed: true,
+			runtimeFenced: failure !== "runtime fence",
+			markerRestoreFailed: failure === "marker restore",
+			markerRetainFailed: failure === "marker retain",
+		});
+		expect(configuration).toBe("previous");
+		expect(primaryRestores).toBe(1);
+		expect(markerPresent).toBe(failure !== "marker retain");
+		expect(writes).toBe(2);
+		expect(fences).toBe(2);
+		expect(JSON.stringify(restored)).not.toContain(TOKEN);
+		expect(JSON.stringify(restored)).not.toContain(tokenFingerprint(TOKEN));
 	});
 
 	test("a marker-restore conflict reports restored configuration as still blocked", async () => {

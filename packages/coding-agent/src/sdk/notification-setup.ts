@@ -146,6 +146,11 @@ export function createNotificationsEditorOperations(
 		{ botToken?: string; appToken?: string }
 	>();
 	const sessionContext = () => ({ sessionManager: ctx.sessionManager });
+	const requireDurableConfig = () => {
+		if (!ctx.settings.canPersistDurableConfig()) {
+			throw new Error("Notification operations require writable durable settings.");
+		}
+	};
 	const notifyAfterDurableCommit = async (): Promise<void> => {
 		await ctx.notifyConfigChanged?.();
 	};
@@ -244,6 +249,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		sendTest: async provider => {
+			requireDurableConfig();
 			try {
 				const result = await services.sendNotificationTest({
 					settings: ctx.settings,
@@ -271,6 +277,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		recover: async () => {
+			requireDurableConfig();
 			try {
 				const result = await services.recoverNotifications({
 					settings: ctx.settings,
@@ -292,6 +299,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		reconnect: async () => {
+			requireDurableConfig();
 			try {
 				const result = await reconnect();
 				const controller = ctx.session.notificationSessionController;
@@ -308,6 +316,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		preflightProposedIdentity: async (input, signal) => {
+			requireDurableConfig();
 			const token = input.token.consume();
 			const unknownIdentity = { status: "unknown" as const };
 			if (!token.trim()) {
@@ -399,6 +408,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		commitConfigure: async draft => {
+			requireDurableConfig();
 			const prepared = drafts.get(draft);
 			if (!prepared || prepared.busy)
 				throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
@@ -533,6 +543,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		saveInactive: async draft => {
+			requireDurableConfig();
 			const prepared = drafts.get(draft);
 			if (!prepared || prepared.busy)
 				throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
@@ -544,13 +555,33 @@ export function createNotificationsEditorOperations(
 					botToken: token,
 					chatId: draft.chatId,
 				});
+				const failures: string[] = [];
+				let reconciliationFailed = false;
+				const controller = ctx.session.notificationSessionController;
+				if (controller) {
+					try {
+						const reconciliation = await controller.reconcileCurrentSession(sessionContext());
+						if (reconciliation.outcome === "failed") throw new Error("Reconciliation failed.");
+					} catch {
+						reconciliationFailed = true;
+						failures.push("current-session reconciliation failed");
+						try {
+							if (!(await controller.enterBlockedRuntime(sessionContext()))) throw new Error("Fencing failed.");
+						} catch {
+							failures.push("runtime fencing failed");
+						}
+					}
+				}
 				try {
 					await notifyAfterDurableCommit();
 				} catch {
+					failures.push("settings observer failed");
+				}
+				if (failures.length) {
 					return {
-						status: "observer_failed" as const,
+						status: reconciliationFailed ? ("reconciliation_failed" as const) : ("observer_failed" as const),
 						receipt: result.receipt,
-						message: "Telegram configuration was saved inactive, but the settings observer failed.",
+						message: `Telegram configuration was saved inactive, but ${failures.join(" and ")}.`,
 					};
 				}
 				return {
@@ -568,6 +599,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		prepareProviderConfiguration: async input => {
+			requireDurableConfig();
 			const cfg = services.getNotificationConfig(ctx.settings);
 			const consumeSecret = (action: typeof input.botToken): string | undefined => {
 				if (!action.value) return undefined;
@@ -650,6 +682,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		commitProviderConfiguration: async draft => {
+			requireDurableConfig();
 			const secrets = providerDrafts.get(draft);
 			if (!secrets) {
 				return {
@@ -735,6 +768,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		setProviderDesired: async (provider, enabled) => {
+			requireDurableConfig();
 			if (provider === "telegram" && enabled) {
 				const config = services.getNotificationConfig(ctx.settings);
 				if (services.getCurrentTelegramActivationMarker(config)) {
@@ -784,6 +818,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		removeProvider: async provider => {
+			requireDurableConfig();
 			if (provider === "telegram") {
 				return { message: "Use the Telegram removal action to preserve root-registration fencing." };
 			}
@@ -816,6 +851,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		enableGlobally: async () => {
+			requireDurableConfig();
 			const result = await setGlobalNotificationsEnabled({
 				settings: ctx.settings,
 				enabled: true,
@@ -840,6 +876,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		disableGlobally: async () => {
+			requireDurableConfig();
 			const result = await setGlobalNotificationsEnabled({
 				settings: ctx.settings,
 				enabled: false,
@@ -864,6 +901,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		removeTelegram: async () => {
+			requireDurableConfig();
 			const controller = ctx.session.notificationSessionController;
 			let runtimePrepared = false;
 			try {
@@ -915,6 +953,7 @@ export function createNotificationsEditorOperations(
 		setSessionLocal: async enabled => {
 			const controller = ctx.session.notificationSessionController;
 			if (!controller) return unavailableNotificationSessionResult();
+			requireDurableConfig();
 			try {
 				return await controller.setLocalEnabled(sessionContext(), enabled);
 			} catch (error) {
@@ -923,6 +962,7 @@ export function createNotificationsEditorOperations(
 		},
 
 		commitPreferences: async preferences => {
+			requireDurableConfig();
 			let daemonWasRunningForDisable = false;
 			try {
 				const before = services.getNotificationConfig(ctx.settings);
@@ -1006,6 +1046,7 @@ export function createNotificationsEditorOperations(
 		reconcileCurrentSession: async () => {
 			const controller = ctx.session.notificationSessionController;
 			if (!controller) return unavailableNotificationSessionResult();
+			requireDurableConfig();
 			try {
 				return await controller.reconcileCurrentSession(sessionContext());
 			} catch (error) {

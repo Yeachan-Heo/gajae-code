@@ -988,7 +988,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#selectedIndex = 0;
 				switch (result.status) {
 					case "restored":
-						this.#status = `${result.runtimeFailed || result.observerFailed ? "WARNING" : "OK"} — Previous Telegram configuration restored after the blocked activation.${result.runtimeFailed ? (result.runtimeFenced ? " Runtime reconciliation failed; the current runtime was fenced." : " Runtime reconciliation failed and the current runtime could not be fenced.") : ""}${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
+						this.#status = `${result.runtimeFailed || result.observerFailed ? "WARNING" : "OK"} — Previous Telegram configuration restored after the blocked activation.${result.runtimeFailed ? `${result.markerRestoreFailed ? " Inactive marker restore failed." : ""}${result.markerRetainFailed ? " Inactive marker retention failed; its state is unconfirmed." : ""}${result.markerRestoreFailed || result.markerRetainFailed ? "" : " Runtime reconciliation failed."}${result.runtimeFenced ? " The current runtime was fenced." : " The current runtime could not be fenced."}` : ""}${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
 						return;
 					case "conflict":
 						this.#status = `ERROR — Previous configuration was not restored because settings changed at: ${result.paths.join(", ")}. Saved configuration remains inactive.`;
@@ -1177,8 +1177,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#clearDrafts();
 				this.#mode = "home";
 				this.#selectedIndex = 0;
-				if (!(await this.#afterDurableMutation())) return;
-				this.#status = `${result.status === "observer_failed" ? "WARNING" : "OK"} — ${safeDetail(result.message, "Telegram configuration saved inactive; foreign daemon untouched.")}`;
+				if (!(await this.#refreshAfterOperation())) return;
+				this.#status = `${result.status === "saved_inactive" ? "OK" : "WARNING"} — ${safeDetail(result.message, "Telegram configuration saved inactive; foreign daemon untouched.")}`;
 			},
 			undefined,
 			() => this.#restartTelegramConfiguration(),

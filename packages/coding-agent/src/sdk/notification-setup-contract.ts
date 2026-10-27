@@ -131,7 +131,7 @@ export interface NotificationsMutationResult {
 
 export type NotificationsSaveInactiveResult =
 	| { status: "saved_inactive"; receipt: CasReceipt; message: string }
-	| { status: "observer_failed"; receipt: CasReceipt; message: string }
+	| { status: "observer_failed" | "reconciliation_failed"; receipt: CasReceipt; message: string }
 	| { status: "unavailable"; guidance: string };
 
 /**

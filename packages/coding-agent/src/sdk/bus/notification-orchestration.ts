@@ -66,7 +66,9 @@ function defaultPidAlive(pid: number): boolean {
 		process.kill(pid, 0);
 		return true;
 	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
+		if ((error as NodeJS.ErrnoException)?.code === "ESRCH") return false;
+		if ((error as NodeJS.ErrnoException)?.code === "EPERM") return true;
+		throw error;
 	}
 }
 
@@ -90,11 +92,18 @@ export async function proposedTelegramIdentity(
 
 	try {
 		const state = await readDaemonState(input.settings, input.deps?.fs);
-		if (!state) return { status: "absent" };
+		if (state === undefined) return { status: "absent" };
+		if (state === null || typeof state !== "object" || Array.isArray(state)) return { status: "unknown" };
 
+		const fingerprints = [tokenFingerprint(input.botToken), state.tokenFingerprint].filter(
+			(value): value is string => typeof value === "string" && value.length > 0,
+		);
+		const isSecretSafe = (value: string): boolean =>
+			!value.includes(input.botToken) && !fingerprints.some(fingerprint => value.includes(fingerprint));
 		const metadata =
 			typeof state.ownerId === "string" &&
 			state.ownerId.trim().length > 0 &&
+			isSecretSafe(state.ownerId) &&
 			validPositiveInteger(state.pid) &&
 			validGeneration(state.generation)
 				? {
@@ -117,18 +126,18 @@ export async function proposedTelegramIdentity(
 		const pidIncarnation = input.deps?.pidIncarnation ?? processIncarnation;
 		const persistedIncarnation = state.incarnation;
 		const currentIncarnation = pidIncarnation(metadata.pid);
-		if (
-			!isProcessIncarnation(persistedIncarnation) ||
-			!isProcessIncarnation(currentIncarnation) ||
-			persistedIncarnation !== currentIncarnation
-		) {
-			return { status: "absent" };
+		if (!isProcessIncarnation(persistedIncarnation) || !isProcessIncarnation(currentIncarnation)) {
+			return { status: "unknown", owner: metadata };
 		}
+		if (persistedIncarnation !== currentIncarnation) return { status: "absent" };
 
 		if (state.tokenFingerprint === tokenFingerprint(input.botToken) && state.chatId === input.chatId) {
 			return {
 				status: "same",
-				owner: input.chatDisplay === undefined ? metadata : { ...metadata, chatDisplay: input.chatDisplay },
+				owner:
+					input.chatDisplay === undefined || !isSecretSafe(input.chatDisplay)
+						? metadata
+						: { ...metadata, chatDisplay: input.chatDisplay },
 			};
 		}
 		return { status: "foreign", owner: metadata };
@@ -341,6 +350,8 @@ export type BlockedTelegramRestoreResult =
 			observerFailed?: boolean;
 			runtimeFailed: true;
 			runtimeFenced: boolean;
+			markerRestoreFailed?: boolean;
+			markerRetainFailed?: boolean;
 	  }
 	| { status: "conflict"; paths: readonly string[] }
 	| { status: "discarded" }
@@ -359,9 +370,13 @@ async function restoreBlockedConfiguration(input: {
 	let restored: CasRestoreResult;
 	try {
 		restored = await input.receipt.restore();
-	} catch (error) {
-		await retainBlockedMarker();
-		throw error;
+	} catch {
+		try {
+			await retainBlockedMarker();
+		} catch {
+			// No durable rollback was confirmed, regardless of marker retention.
+		}
+		throw new Error("Telegram configuration restore failed.");
 	}
 	if (restored.status === "conflict" || restored.status === "discarded") {
 		await retainBlockedMarker();
@@ -371,17 +386,29 @@ async function restoreBlockedConfiguration(input: {
 	// Keep the fail-closed marker durable until the configuration rollback has
 	// completed. Removing it first exposes the blocked identity between two CAS
 	// operations to other processes.
-	let inactiveRestored: CasRestoreResult;
+	let inactiveRestored: CasRestoreResult | undefined;
+	let markerRestoreFailed = false;
 	try {
 		inactiveRestored = await input.inactiveReceipt.restore();
-	} catch (error) {
-		await retainBlockedMarker();
-		throw error;
+	} catch {
+		markerRestoreFailed = true;
 	}
-	if (inactiveRestored.status === "conflict" || inactiveRestored.status === "discarded") {
-		await retainBlockedMarker();
-		await input.activation.controller.enterBlockedRuntime();
-		return { status: "still_blocked" };
+	if (!inactiveRestored || inactiveRestored.status === "conflict" || inactiveRestored.status === "discarded") {
+		let markerRetainFailed = false;
+		let runtimeFenced = false;
+		try {
+			await retainBlockedMarker();
+		} catch {
+			markerRetainFailed = true;
+		}
+		try {
+			await input.activation.controller.enterBlockedRuntime();
+			runtimeFenced = true;
+		} catch {
+			// The configuration was already restored; report the fencing failure.
+		}
+		if (!markerRestoreFailed && !markerRetainFailed && runtimeFenced) return { status: "still_blocked" };
+		return { status: "restored", runtimeFailed: true, runtimeFenced, markerRestoreFailed, markerRetainFailed };
 	}
 
 	let reconnect: TelegramDaemonReconnectOutcome | undefined;

@@ -355,6 +355,7 @@ function realAdapterFixture(inactive = false) {
 		return receipt;
 	};
 	const settings = {
+		canPersistDurableConfig: () => true,
 		getNotificationSettingsSnapshot: () => snapshot,
 		getAgentDir: () => "/unused-notification-editor-test",
 		commitAtomicBatch: persist,
@@ -822,7 +823,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(output).toContain("WARNING");
 		expect(output).toContain("Configuration was saved, but post-commit reconciliation or refresh failed.");
 	});
-	it("renders inactive-save observer failure without claiming success", async () => {
+	it("renders inactive-save reconciliation and observer failures without claiming runtime success", async () => {
 		const operations = new FakeNotificationsOperations();
 		operations.preflightProposedIdentity = async input => {
 			input.token.consume();
@@ -842,9 +843,10 @@ describe("NotificationsSettingsEditorComponent", () => {
 			};
 		};
 		operations.saveInactive = async () => ({
-			status: "observer_failed",
+			status: "reconciliation_failed",
 			receipt: {} as never,
-			message: "Telegram configuration was saved inactive, but the settings observer failed.",
+			message:
+				"Telegram configuration was saved inactive, but current-session reconciliation failed and settings observer failed.",
 		});
 		const component = new NotificationsSettingsEditorComponent(operations);
 		await flush();
@@ -856,7 +858,10 @@ describe("NotificationsSettingsEditorComponent", () => {
 		await flush();
 		const output = render(component, 240);
 		expect(output).toContain("WARNING");
-		expect(output).toContain("Telegram configuration was saved inactive, but the settings observer failed.");
+		expect(output).toContain(
+			"Telegram configuration was saved inactive, but current-session reconciliation failed and settings observer failed.",
+		);
+		expect(operations.reconcileCalls).toBe(0);
 	});
 	it("revokes an in-flight prepared provider draft when disposed", async () => {
 		const operations = new FakeNotificationsOperations();
