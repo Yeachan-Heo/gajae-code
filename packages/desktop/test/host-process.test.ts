@@ -113,6 +113,22 @@ test("real isolated host creates, persists and resumes sessions without provider
 		const jobs = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text: "/jobs" });
 		expect(jobs.consumed).toBe(true);
 		expect(jobs.output).toContain("No background jobs running");
+		// Session lifecycle is catalog-owned: these commands refuse instead of
+		// half-applying and leaving an unreopenable transcript.
+		await expect(host.request("command.run", { sessionId: session.id, text: "/move /tmp" })).rejects.toThrow(
+			"데스크톱 앱이 세션을 직접 관리",
+		);
+		await expect(host.request("command.run", { sessionId: session.id, text: "/session delete" })).rejects.toThrow(
+			"데스크톱 앱이 세션을 직접 관리",
+		);
+		// Unknown slash text is refused, never sent to a provider as a prompt.
+		const unknown = await host.request<DesktopCommandResult>("command.run", {
+			sessionId: session.id,
+			text: "/not-a-real-command",
+		});
+		expect(unknown.consumed).toBe(true);
+		expect(unknown.prompt).toBeUndefined();
+		expect(unknown.output).toContain("사용할 수 없습니다");
 		// Queue cancellation is only valid for an input this session still owns.
 		await expect(host.request("queue.cancel", { sessionId: session.id, queueId: "queued-missing" })).rejects.toThrow(
 			"Queued input not found",

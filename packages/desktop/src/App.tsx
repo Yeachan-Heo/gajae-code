@@ -85,6 +85,9 @@ export default function App() {
 	const closeDialog = useCallback(() => {
 		setDialog(null);
 	}, [setDialog]);
+	const filteredSettings = (settings ?? []).filter(setting =>
+		`${setting.path} ${setting.description ?? ""}`.toLowerCase().includes(settingFilter.toLowerCase()),
+	);
 	const settingsScope = `settings:${dialogOwner}:${dialogGeneration.current}`;
 	const toolsScope = `tools:${dialogOwner}:${dialogGeneration.current}`;
 	const authScope = `auth:${dialogOwner}:${dialogGeneration.current}`;
@@ -287,6 +290,7 @@ export default function App() {
 		const sessionId = dialogOwner || selected;
 		if (!sessionId || !text.trim()) return;
 		const generation = dialogGeneration.current;
+		setNotice("");
 		void run(`command:${sessionId}`, async () => {
 			const result = await request<DesktopCommandResult>("command.run", { sessionId, text });
 			if (dialogGeneration.current !== generation) return;
@@ -303,6 +307,9 @@ export default function App() {
 					.filter(Boolean)
 					.join("\n\n"),
 			);
+			// A forwarded prompt streams into the conversation; the modal would hide it
+			// and make a mid-run question unanswerable.
+			if (result.prompt) closeDialog();
 		});
 	};
 	const openHistory = () => {
@@ -817,30 +824,18 @@ export default function App() {
 											onChange={event => setSettingFilter(event.target.value)}
 										/>
 										<p className="muted">
-											{
-												settings.filter(setting =>
-													`${setting.path} ${setting.description ?? ""}`
-														.toLowerCase()
-														.includes(settingFilter.toLowerCase()),
-												).length
-											}
-											개 표시 / 전체 {settings.length}개
+											{filteredSettings.length}개 일치 / 전체 {settings.length}개
+											{filteredSettings.length > 200 && " · 처음 200개만 표시"}
 										</p>
-										{settings
-											.filter(setting =>
-												`${setting.path} ${setting.description ?? ""}`
-													.toLowerCase()
-													.includes(settingFilter.toLowerCase()),
-											)
-											.slice(0, 200)
-											.map(setting => (
-												<SettingField
-													key={`${setting.path}:${textOf(setting.value)}`}
-													setting={setting}
-													pending={!connected || pending[settingsScope]}
-													onSave={value => saveSetting(setting.path, value)}
-												/>
-											))}
+										{filteredSettings.length === 0 && <p>일치하는 설정이 없습니다.</p>}
+										{filteredSettings.slice(0, 200).map(setting => (
+											<SettingField
+												key={`${setting.path}:${textOf(setting.value)}`}
+												setting={setting}
+												pending={!connected || pending[settingsScope]}
+												onSave={value => saveSetting(setting.path, value)}
+											/>
+										))}
 									</>
 								)}
 							</section>

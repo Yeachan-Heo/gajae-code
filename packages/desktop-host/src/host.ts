@@ -65,6 +65,12 @@ const WITHHELD_SETTING = /token|secret|password|credential|apiKey|broker|oauth/i
 const TERMINAL_ONLY_SETTING =
 	/^(statusLine\.|theme\.|clipboard\.|ui\.|symbolPreset$|syntaxTheme|footer|header|editor\.)/i;
 const EDITABLE_SETTING_TYPES = new Set(["boolean", "number", "enum"]);
+/**
+ * Session lifecycle belongs to the desktop catalog: these builtins would rotate
+ * or relocate the transcript behind the catalog's back, leaving it unreopenable.
+ * They stay visibly unavailable instead of half-applying.
+ */
+const DESKTOP_OWNED_COMMANDS = new Set(["move", "session", "rename", "star", "unstar"]);
 
 export const CAPABILITIES: DesktopCapability[] = [
 	{ id: "sessions", label: "Independent SDK sessions and streaming", available: true },
@@ -461,7 +467,13 @@ export class DesktopHost {
 			projectId: metadata.projectId,
 			title: metadata.title,
 			starred: metadata.starred,
-			status: question ? "waiting" : live?.busy ? "running" : live?.error ? "error" : "idle",
+			status: question
+				? "waiting"
+				: live && (live.busy || live.sdk.isStreaming)
+					? "running"
+					: live?.error
+						? "error"
+						: "idle",
 			...(live?.sdk.model ? { model: `${live.sdk.model.provider}/${live.sdk.model.id}` } : {}),
 			messages: live
 				? [
@@ -915,6 +927,7 @@ export class DesktopHost {
 		}
 		if (method === "abort") {
 			this.#cancelQuestions(metadata.id);
+			live.queued.clear();
 			await live.sdk.abort();
 			this.#publish(live);
 			return null;
@@ -1099,6 +1112,13 @@ export class DesktopHost {
 	 */
 	async #command(metadata: SavedSession, text: string): Promise<DesktopCommandResult> {
 		const live = await this.#open(metadata);
+		const name = text.trimStart().replace(/^\/+/, "").split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+		if (live.busy || live.sdk.isStreaming)
+			throw new Error("실행 중에는 슬래시 명령을 실행할 수 없습니다. 끝난 뒤 다시 시도하세요.");
+		if (DESKTOP_OWNED_COMMANDS.has(name))
+			throw new Error(
+				`/${name}은(는) 데스크톱 앱이 세션을 직접 관리하므로 사용할 수 없습니다. 앱의 대화 메뉴를 사용하세요.`,
+			);
 		const chunks: string[] = [];
 		let written = 0;
 		let dropped = false;
@@ -1158,8 +1178,14 @@ export class DesktopHost {
 				...(dropped ? { outputTruncated: true } : {}),
 			};
 		} finally {
-			await this.#flushSession(live).catch(() => {});
-			await this.#syncTitle(live).catch(() => {});
+			try {
+				this.#rememberCredentials();
+				await this.#flushSession(live);
+				await this.#syncTitle(live);
+			} catch (error) {
+				live.error = this.#error(error);
+				this.#publish(live);
+			}
 		}
 	}
 	async #diff(projectId: string): Promise<DesktopDiff[]> {
