@@ -273,6 +273,8 @@ export async function waitForPinnedProcessExit(
 export interface CreateGjcTmuxSessionOptions {
 	platform?: NodeJS.Platform;
 	launch?: ManagedTmuxLaunchSpec;
+	/** @internal Select the actual CLI entrypoint in isolated managed-launch tests. */
+	supervisorArgvForTest?: readonly string[];
 }
 
 export type CreateOwnerIsolationTestDependencies = {
@@ -871,18 +873,15 @@ export function createGjcTmuxSession(
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
 	const executionEnv = { ...identityEnv, ...managedEnvironment };
 	const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+	const supervisorArgv = options.supervisorArgvForTest ?? managedOwnerSupervisorArgv(platform);
 	const command =
 		platform === "win32"
 			? buildWindowsPowerShellInnerCommand({
-					command: launch
-						? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(platform), launch.argv)
-						: ["gjc"],
+					command: launch ? managedOwnerSupervisorInvocation(supervisorArgv, launch.argv) : ["gjc"],
 					environment: childEnvironment,
 				})
 			: (() => {
-					const invocation = launch
-						? managedOwnerSupervisorInvocation(managedOwnerSupervisorArgv(platform), launch.argv)
-						: ["gjc"];
+					const invocation = launch ? managedOwnerSupervisorInvocation(supervisorArgv, launch.argv) : ["gjc"];
 					// The pane process must stay the exact supervisor; never let the CLI malloc
 					// guard re-exec it below the pane PID.
 					const unsetArgs = launch && platform === "darwin" ? `${macOSMallocEnvUnsetArgs().join(" ")} ` : "";
