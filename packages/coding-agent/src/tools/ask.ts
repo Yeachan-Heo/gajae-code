@@ -807,12 +807,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
-	readonly #baseDescription: string;
 	get description(): string {
-		const channelStatus = this.#hasAnswerChannel()
-			? "An interactive or remote answer channel is available for this session."
-			: "No interactive or remote answer channel is available in this session. Do not call this tool; use the non-interactive fallback.";
-		return `${this.#baseDescription}\n\n${channelStatus}`;
+		return prompt.render(askDescription, { answerChannelAvailable: this.#hasAnswerChannel() });
 	}
 	get parameters(): AskParametersSchema {
 		return selectAskParameters(this.session.getDeepInterviewAskStage?.());
@@ -829,9 +825,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	 */
 	readonly displaySafeEscapedArgFields = ["questions.question", "questions.options.label"] as const;
 	readonly loadMode = "discoverable";
-	constructor(private readonly session: ToolSession) {
-		this.#baseDescription = prompt.render(askDescription);
-	}
+	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): AskTool | null {
 		return session.hasUI || session.workflowGateEligible || session.getWorkflowGateEmitter?.()
