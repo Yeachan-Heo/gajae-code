@@ -10,7 +10,9 @@ import {
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
 	atomicYamlPathHash,
+	deleteByPath,
 	reserveAtomicYamlUpdateSlot,
+	setByPath,
 	withAtomicYamlConfigTransaction,
 } from "../../src/config/atomic-yaml-patch";
 import { FileLockAcquireError, FileLockTestHooks } from "../../src/config/file-lock";
@@ -36,6 +38,74 @@ afterEach(async () => {
 });
 
 describe("atomic YAML patches", () => {
+	test("rejects unsafe patch and precondition segments before writing any sibling", async () => {
+		const configPath = await configPathForTest();
+		const before = "feature:\n  keep: true\n";
+		await Bun.write(configPath, before);
+		const marker = "gjcAtomicPathMarker";
+		const original = Object.getOwnPropertyDescriptor(Object.prototype, marker);
+		try {
+			for (const segment of ["__proto__", "constructor", "prototype"]) {
+				for (const op of ["set", "unset"] as const) {
+					const unsafe: AtomicYamlPatch =
+						op === "set"
+							? { path: `feature.${segment}.${marker}`, op, value: "private-patch-value" }
+							: { path: `feature.${segment}.${marker}`, op };
+					try {
+						applyAtomicYamlPatches(configPath, [{ path: "feature.keep", op: "set", value: false }, unsafe]);
+						throw new Error("Expected unsafe path rejection");
+					} catch (error) {
+						expect(String(error)).toContain("safe dotted path");
+						expect(String(error)).not.toContain("private-patch-value");
+					}
+					expect(() =>
+						applyAtomicYamlPatches(configPath, [
+							{
+								path: "feature.keep",
+								op: "set",
+								value: false,
+								expected: { path: `feature.${segment}.${marker}`, hash: "hash" },
+							},
+						]),
+					).toThrow("preconditions");
+					expect(await Bun.file(configPath).text()).toBe(before);
+					expect(Object.getOwnPropertyDescriptor(Object.prototype, marker)).toEqual(original);
+				}
+			}
+		} finally {
+			if (original) Object.defineProperty(Object.prototype, marker, original);
+			else delete (Object.prototype as Record<string, unknown>)[marker];
+		}
+	});
+
+	test("direct path helpers reject unsafe segments and ignore inherited properties", () => {
+		const inherited = { branch: { keep: true } };
+		const root = Object.create(inherited) as Record<string, unknown>;
+		const marker = "gjcAtomicPathMarker";
+		const original = Object.getOwnPropertyDescriptor(Object.prototype, marker);
+		try {
+			for (const segment of ["__proto__", "constructor", "prototype"]) {
+				const segments = ["branch", segment, marker];
+				expect(() => setByPath(root, segments, true)).toThrow("safe dotted path");
+				expect(() => deleteByPath(root, segments)).toThrow("safe dotted path");
+				expect(() => atomicYamlPathHash(root, segments.join("."))).toThrow("safe dotted path");
+				expect(Object.getOwnPropertyDescriptor(Object.prototype, marker)).toEqual(original);
+			}
+			expect(atomicYamlPathHash(root, "branch.keep")).toBe(atomicYamlPathHash({}, "branch.keep"));
+			deleteByPath(root, ["branch", "keep"]);
+			expect(inherited.branch.keep).toBe(true);
+			setByPath(root, ["branch", "added"], 1);
+			expect(root.branch).toEqual({ added: 1 });
+			expect(inherited.branch).toEqual({ keep: true });
+			setByPath(root, ["toString", "value"], 1);
+			expect(Object.getOwnPropertyDescriptor(root, "toString")?.value as unknown).toEqual({ value: 1 });
+			expect(() => setByPath({ alias: Object.prototype }, ["alias", marker], true)).toThrow("Object.prototype");
+			expect(() => deleteByPath({ alias: Object.prototype }, ["alias", marker])).toThrow("Object.prototype");
+		} finally {
+			if (original) Object.defineProperty(Object.prototype, marker, original);
+			else delete (Object.prototype as Record<string, unknown>)[marker];
+		}
+	});
 	test("rejects ancestor and descendant batches without consuming prior receipt ownership", async () => {
 		const configPath = await configPathForTest();
 		const prior = await applyAtomicYamlPatches(configPath, [

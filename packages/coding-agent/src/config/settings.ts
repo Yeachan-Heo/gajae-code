@@ -54,6 +54,7 @@ import {
 	type CasReceipt,
 	deleteByPath,
 	enqueueAtomicYamlOperation,
+	isSafeAtomicYamlPath,
 	reserveAtomicYamlUpdateSlot,
 	setByPath,
 	withAtomicYamlConfigTransaction,
@@ -333,8 +334,9 @@ function isNotificationSettingsPath(path: string): boolean {
 
 function isAtomicSettingsPath(path: string): boolean {
 	return (
-		Object.hasOwn(SETTINGS_SCHEMA, path) ||
-		(path.startsWith("modelRoles.") && path.split(".").every(segment => segment.length > 0))
+		typeof path === "string" &&
+		isSafeAtomicYamlPath(path.split(".")) &&
+		(Object.hasOwn(SETTINGS_SCHEMA, path) || path.startsWith("modelRoles."))
 	);
 }
 
@@ -421,6 +423,7 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 		if (current === null || current === undefined || typeof current !== "object") {
 			return undefined;
 		}
+		if (!Object.hasOwn(current, segment)) return undefined;
 		current = (current as Record<string, unknown>)[segment];
 	}
 	return current;

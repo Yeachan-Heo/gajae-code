@@ -282,24 +282,43 @@ function resolveAbsentThroughAncestors(target: string): string | null {
 	}
 }
 
+const UNSAFE_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Whether every segment is a non-empty, safe property name. */
+export function isSafeAtomicYamlPath(segments: readonly string[]): boolean {
+	return (
+		segments.length > 0 &&
+		segments.every(segment => typeof segment === "string" && segment.length > 0 && !UNSAFE_PATH_SEGMENTS.has(segment))
+	);
+}
+
+function assertSafePath(segments: readonly string[]): void {
+	if (!isSafeAtomicYamlPath(segments))
+		throw new Error("Atomic YAML paths require non-empty, safe dotted path segments.");
+}
+
+function assertNotObjectPrototype(value: Record<string, unknown>): void {
+	if (value === Object.prototype) throw new Error("Atomic YAML paths cannot mutate Object.prototype.");
+}
+
 function assertPatch(patch: AtomicYamlPatch): void {
 	if (
 		!patch ||
 		typeof patch.path !== "string" ||
 		patch.path.length === 0 ||
-		patch.path.split(".").some(part => !part)
+		!isSafeAtomicYamlPath(patch.path.split("."))
 	) {
-		throw new Error("Atomic YAML patches require a non-empty dotted path.");
+		throw new Error("Atomic YAML patches require a non-empty, safe dotted path.");
 	}
 	if (
 		patch.expected &&
 		(typeof patch.expected.path !== "string" ||
 			patch.expected.path.length === 0 ||
-			patch.expected.path.split(".").some(part => !part) ||
+			!isSafeAtomicYamlPath(patch.expected.path.split(".")) ||
 			typeof patch.expected.hash !== "string" ||
 			patch.expected.hash.length === 0)
 	) {
-		throw new Error("Atomic YAML patch preconditions require a non-empty dotted path and hash.");
+		throw new Error("Atomic YAML patch preconditions require a non-empty, safe dotted path and hash.");
 	}
 	if (patch.op === "set") {
 		if (patch.value === undefined) {
@@ -333,9 +352,11 @@ function record(value: unknown): Record<string, unknown> | undefined {
 }
 
 function stateAtPath(value: Record<string, unknown>, segments: readonly string[]): PathState {
+	assertSafePath(segments);
 	let current: Record<string, unknown> = value;
 	for (let index = 0; index < segments.length - 1; index++) {
-		const next = record(current[segments[index]!]);
+		const segment = segments[index]!;
+		const next = Object.hasOwn(current, segment) ? record(current[segment]) : undefined;
 		if (!next) return { exists: false, value: undefined };
 		current = next;
 	}
@@ -345,24 +366,37 @@ function stateAtPath(value: Record<string, unknown>, segments: readonly string[]
 
 /** Set a dotted YAML path, creating object intermediates as needed. */
 export function setByPath(value: Record<string, unknown>, segments: readonly string[], nextValue: unknown): void {
+	assertSafePath(segments);
 	let current = value;
 	for (let index = 0; index < segments.length - 1; index++) {
+		assertNotObjectPrototype(current);
 		const segment = segments[index]!;
-		const next = record(current[segment]);
-		if (!next) current[segment] = {};
+		const next = Object.hasOwn(current, segment) ? record(current[segment]) : undefined;
+		if (!next) {
+			Object.defineProperty(current, segment, { value: {}, writable: true, enumerable: true, configurable: true });
+		}
 		current = current[segment] as Record<string, unknown>;
 	}
-	current[segments[segments.length - 1]!] = nextValue;
+	assertNotObjectPrototype(current);
+	Object.defineProperty(current, segments[segments.length - 1]!, {
+		value: nextValue,
+		writable: true,
+		enumerable: true,
+		configurable: true,
+	});
 }
 
 /** Delete a dotted YAML path without disturbing sibling keys or parent objects. */
 export function deleteByPath(value: Record<string, unknown>, segments: readonly string[]): void {
+	assertSafePath(segments);
 	let current = value;
 	for (let index = 0; index < segments.length - 1; index++) {
-		const next = record(current[segments[index]!]);
+		const segment = segments[index]!;
+		const next = Object.hasOwn(current, segment) ? record(current[segment]) : undefined;
 		if (!next) return;
 		current = next;
 	}
+	assertNotObjectPrototype(current);
 	delete current[segments[segments.length - 1]!];
 }
 
