@@ -3702,7 +3702,10 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("publishes one generation and propagates its lifecycle metadata to the managed child", () => {
+	it.each([
+		"linux",
+		"darwin",
+	] as const)("publishes one generation and execs the managed owner supervisor as the pane process on %s", platform => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-owner-generation-"));
 		try {
 			const sessionId = "managed-owner-session";
@@ -3721,7 +3724,7 @@ describe("tmux owner isolation launch gate", () => {
 				},
 				argv: ["bun", "cli.ts"],
 				execPath: "/bin/bun",
-				platform: "linux",
+				platform,
 				tty: interactiveTty,
 				tmuxAvailable: true,
 				existingBranchSessionName: null,
@@ -3742,7 +3745,13 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_STATE_DIR='${root}'`);
 			expect(innerCommand).toContain("GJC_TMUX_OWNER_SERVER_KEY='tmux'");
 			expect(innerCommand).not.toContain("managed-private-pkcs8-der-base64");
-			expect(innerCommand).toStartWith("exec env GJC_TMUX_LAUNCHED=1");
+			// Darwin scrubs the malloc environment so the CLI guard never re-execs the
+			// supervisor below the pane PID.
+			expect(innerCommand).toStartWith(
+				platform === "darwin"
+					? "exec env -u MallocStackLogging -u MallocStackLoggingNoCompact GJC_TMUX_LAUNCHED=1"
+					: "exec env GJC_TMUX_LAUNCHED=1",
+			);
 			expect(innerCommand).toMatch(
 				/GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL='http:\/\/127\.0\.0\.1:\d+\/bootstrap\/[0-9a-f-]{36}'/i,
 			);
@@ -3751,6 +3760,12 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
 			expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
 			expect(innerCommand).not.toContain("tmux-exit.json");
+			// `exec` keeps the pane PID equal to the supervisor PID that managed close pins.
+			const entry = path.join(root, "cli.ts");
+			expect(innerCommand).toEndWith(` '/bin/bun' '${entry}' '--internal-managed-owner-supervisor'`);
+			expect(innerCommand).toContain(
+				`GJC_MANAGED_OWNER_COMMAND_JSON='${JSON.stringify(["/bin/bun", entry, "hello"])}'`,
+			);
 			expect(
 				calls.some(call => call.includes("@gjc-owner-generation") && call.at(-1) === generation.generation),
 			).toBe(true);
@@ -3759,6 +3774,80 @@ describe("tmux owner isolation launch gate", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it.skipIf(process.platform === "linux" || process.platform === "win32")(
+		"relaunches a pinned macOS root session after its supervised predecessor exited normally",
+		() => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-darwin-relaunch-"));
+			try {
+				const sessionId = "pinned-root-session";
+				const launch = () => {
+					const calls: string[][] = [];
+					const diagnostics: string[] = [];
+					let serverCreated = false;
+					launchDefaultTmuxIfNeeded({
+						parsed: args({ tmux: true }),
+						rawArgs: ["--tmux"],
+						cwd: root,
+						env: {
+							GJC_COORDINATOR_SESSION_ID: sessionId,
+							GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+							GJC_TMUX_SESSION: "pinned",
+							GJC_PSMUX_DETECTION: "off",
+							GJC_TMUX_COMMAND: "tmux",
+						},
+						argv: ["bun", "cli.ts"],
+						execPath: "/bin/bun",
+						platform: "darwin",
+						tty: interactiveTty,
+						tmuxAvailable: true,
+						existingBranchSessionName: null,
+						currentBranch: "",
+						diagnosticWriter: message => diagnostics.push(message),
+						ownerIsolationProbe: {
+							readCallerCgroup: () => null,
+							probeServer: () => {
+								if (!serverCreated) {
+									serverCreated = true;
+									return { state: "absent" };
+								}
+								return {
+									state: "safe",
+									pid: 123,
+									startTime: "42",
+									cgroup: { classification: "not_applicable" },
+								};
+							},
+							recordAttempt: () => {},
+						},
+						spawnSync: (_command, spawnArgs) => {
+							calls.push(spawnArgs);
+							return { exitCode: 0, stdout: spawnArgs[0] === "display-message" ? "$0\tpinned" : "$0" };
+						},
+					});
+					return { calls, diagnostics };
+				};
+				const first = launch();
+				expect(first.diagnostics).toEqual([]);
+				const generationFile = path.join(root, sessionId, "owner-lifecycle", "generation.json");
+				const firstGeneration = JSON.parse(fs.readFileSync(generationFile, "utf8")).generation as string;
+				// The supervisor of a normally exited owner leaves its binding and no receipt.
+				fs.writeFileSync(
+					path.join(lifecyclePaths(root, sessionId, firstGeneration).root, "child-token.binding.json"),
+					"{}\n",
+					{ mode: 0o600 },
+				);
+				const second = launch();
+				expect(second.diagnostics).toEqual([]);
+				const innerCommand = second.calls.find(call => call[0] === "new-session")?.at(-1);
+				expect(innerCommand).toContain("--internal-managed-owner-supervisor");
+				expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
+				expect(JSON.parse(fs.readFileSync(generationFile, "utf8")).generation).not.toBe(firstGeneration);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it.each([
 		"valid",
