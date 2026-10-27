@@ -2387,4 +2387,5 @@ function assertTaskKeys(value: Record<string, unknown>): void {
 }
 
 if (import.meta.main) {
-	await}
+	await main();
+}
