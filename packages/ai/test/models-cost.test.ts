@@ -736,7 +736,51 @@ describe("calculateCost", () => {
 
 		// 200K input @ $4 + 1K output @ $20 + 72K cacheRead @ $0.40
 		expect(threshold.cost.total).toBeCloseTo(0.8488, 8);
-		// same request one cache-write token past the threshold, at 2x/1.5x rates
-		expect(aboveThreshold.cost.total).toBeCloseTo(1.68761, 8);
+		// above 272K: 200K @ $10 + 1K @ $45 + 72K @ $1 + 1 @ $12.5
+		expect(aboveThreshold.cost.total).toBeCloseTo(2.1170125, 8);
+	});
+
+	it("switches OpenRouter GPT-6 Sol batch pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openrouter", "openai/gpt-6-sol:batch");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		// 200K input @ $0.3/M + 1K output @ $1.5/M + 72K cacheRead @ $0.03/M
+		expect(threshold.cost.total).toBeCloseTo(0.06366, 7);
+		// above 272K threshold: 200K @ $0.6/M + 1K @ $2.25/M + 72K @ $0.06/M + 1 @ $0.75/M
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.12657075, 7);
+	});
+
+	it("switches OpenRouter GPT-5.6 Luna batch pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openrouter", "openai/gpt-5.6-luna:batch");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		// 200K input @ $0.03/M + 1K output @ $0.1875/M + 72K cacheRead @ $0.003/M
+		expect(threshold.cost.total).toBeCloseTo(0.0064035, 7);
+		// above 272K threshold: 200K @ $0.06/M + 1K @ $0.2813/M + 72K @ $0.006/M + 1 @ $0.0938/M
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.012713394, 7);
 	});
 });

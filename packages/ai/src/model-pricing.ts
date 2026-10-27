@@ -95,6 +95,131 @@ const OPENAI_GPT_5_6_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
 	],
 ]);
 
+// OpenRouter batch variant pricing derived from OpenRouter API pricing.
+// Batch models use lower rates than their non-batch counterparts.
+const OPENROUTER_BATCH_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
+	[
+		"openai/gpt-6-astra:batch",
+		{
+			cost: { input: 1.5, output: 5.625, cacheRead: 0.15, cacheWrite: 1.40625 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 3, output: 8.4375, cacheRead: 0.3, cacheWrite: 2.8125 },
+			},
+		},
+	],
+	[
+		"openai/gpt-6-astra-pro:batch",
+		{
+			cost: { input: 1.5, output: 5.625, cacheRead: 0.15, cacheWrite: 1.40625 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 3, output: 8.4375, cacheRead: 0.3, cacheWrite: 2.8125 },
+			},
+		},
+	],
+	[
+		"openai/gpt-6-sol:batch",
+		{
+			cost: { input: 0.3, output: 1.5, cacheRead: 0.03, cacheWrite: 0.375 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.6, output: 2.25, cacheRead: 0.06, cacheWrite: 0.75 },
+			},
+		},
+	],
+	[
+		"openai/gpt-6-sol-pro:batch",
+		{
+			cost: { input: 0.3, output: 1.5, cacheRead: 0.03, cacheWrite: 0.375 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.6, output: 2.25, cacheRead: 0.06, cacheWrite: 0.75 },
+			},
+		},
+	],
+	[
+		"openai/gpt-6-luna:batch",
+		{
+			cost: { input: 0.015, output: 0.0938, cacheRead: 0.0015, cacheWrite: 0.0234 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.03, output: 0.1406, cacheRead: 0.003, cacheWrite: 0.0469 },
+			},
+		},
+	],
+	[
+		"openai/gpt-6-luna-pro:batch",
+		{
+			cost: { input: 0.015, output: 0.0938, cacheRead: 0.0015, cacheWrite: 0.0234 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.03, output: 0.1406, cacheRead: 0.003, cacheWrite: 0.0469 },
+			},
+		},
+	],
+	[
+		"openai/gpt-5.6-sol:batch",
+		{
+			cost: { input: 0.15, output: 0.75, cacheRead: 0.015, cacheWrite: 0.1875 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.3, output: 1.125, cacheRead: 0.03, cacheWrite: 0.375 },
+			},
+		},
+	],
+	[
+		"openai/gpt-5.6-sol-pro:batch",
+		{
+			cost: { input: 0.15, output: 0.75, cacheRead: 0.015, cacheWrite: 0.1875 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.3, output: 1.125, cacheRead: 0.03, cacheWrite: 0.375 },
+			},
+		},
+	],
+	[
+		"openai/gpt-5.6-luna:batch",
+		{
+			cost: { input: 0.03, output: 0.1875, cacheRead: 0.003, cacheWrite: 0.0469 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.06, output: 0.2813, cacheRead: 0.006, cacheWrite: 0.0938 },
+			},
+		},
+	],
+	[
+		"openai/gpt-5.6-luna-pro:batch",
+		{
+			cost: { input: 0.03, output: 0.1875, cacheRead: 0.003, cacheWrite: 0.0469 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.06, output: 0.2813, cacheRead: 0.006, cacheWrite: 0.0938 },
+			},
+		},
+	],
+	[
+		"openai/gpt-5.6-terra:batch",
+		{
+			cost: { input: 0.3, output: 1.875, cacheRead: 0.03, cacheWrite: 0.375 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.6, output: 2.8125, cacheRead: 0.06, cacheWrite: 0.75 },
+			},
+		},
+	],
+	[
+		"openai/gpt-5.6-terra-pro:batch",
+		{
+			cost: { input: 0.3, output: 1.875, cacheRead: 0.03, cacheWrite: 0.375 },
+			longContextPricing: {
+				threshold: LONG_CONTEXT_THRESHOLD,
+				cost: { input: 0.6, output: 2.8125, cacheRead: 0.06, cacheWrite: 0.75 },
+			},
+		},
+	],
+]);
+
 export function getOpenAIModelCost<TApi extends Api>(model: Model<TApi>, inputTokens: number): ModelCost | undefined {
 	if (model.provider !== "openai" && model.provider !== "openai-codex" && model.provider !== "openrouter") {
 		return undefined;
@@ -205,7 +330,30 @@ export function applyOpenAIModelPricing<TApi extends Api>(model: Model<TApi>): v
 			threshold: pricing.longContextPricing.threshold,
 			cost: { ...pricing.longContextPricing.cost },
 		};
+		return;
 	}
-	// For OpenRouter models with openai/* IDs, long-context pricing should already
-	// be set in models.json. This function is a no-op for OpenRouter in that case.
+	// For OpenRouter models with openai/* IDs, apply long-context pricing from bundled tables.
+	// Batch variants get both base cost and long-context pricing overrides.
+	const batchPricing = OPENROUTER_BATCH_PRICING.get(model.id);
+	if (batchPricing) {
+		model.cost = { ...batchPricing.cost };
+		model.longContextPricing = {
+			threshold: batchPricing.longContextPricing.threshold,
+			cost: { ...batchPricing.longContextPricing.cost },
+		};
+		return;
+	}
+	// Non-batch OpenRouter models: only apply long-context pricing tier, not base cost override.
+	// OpenRouter publishes accurate base rates via their API; we add the missing tier.
+	const modelIdMatch = model.id.match(/^[^/]+\/([^:]+)$/);
+	if (modelIdMatch) {
+		const baseModelId = modelIdMatch[1];
+		const basePricing = OPENAI_GPT_5_6_PRICING.get(baseModelId);
+		if (basePricing && !model.longContextPricing) {
+			model.longContextPricing = {
+				threshold: basePricing.longContextPricing.threshold,
+				cost: { ...basePricing.longContextPricing.cost },
+			};
+		}
+	}
 }
