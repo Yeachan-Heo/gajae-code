@@ -757,6 +757,75 @@ describe("Broker spawn flow driver", () => {
 		});
 	}
 
+	it.each([
+		["fails, then its substrate is gone", "fail", "gone", true],
+		["throws, then its substrate is gone", "throw", "gone", true],
+		["refuses an already gone substrate", "refuse_gone", "gone", true],
+		["fails while its substrate stays live", "fail", "verified", false],
+		["fails and its substrate is replaced", "fail", "mismatch", false],
+	] as const)("releases an unowned managed substrate whose close %s only on proven absence", async (_case, close, after, released) => {
+		const agentDir = await temp();
+		let verdict: "verified" | "mismatch" | "gone" = "verified";
+		let closes = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "tmux" as const,
+						providerIdentity: "unowned-release-provider",
+						nativeSessionId: "$8",
+						pid: 996,
+						processIncarnation: "inc-996",
+						ownerGeneration: 3,
+					},
+				}),
+				// The host gives up at its readiness cutoff while its owner stays unresolved.
+				resolveLifecycleOwner: async () => ({ ok: false, code: "owner_deadline" }),
+				verify: async () => verdict,
+				close: async () => {
+					closes += 1;
+					// The supervisor exits on its own while the exact close runs.
+					verdict = after;
+					if (close === "throw") throw new Error("gjc_tmux_owner_unverifiable:child");
+					return { ok: false, code: close === "refuse_gone" ? "substrate_gone" : "substrate_close_failed" };
+				},
+			},
+			spawnPromptLayer: spawnPromptLayerFake,
+		});
+		await broker.start();
+		try {
+			const response = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				`unowned-release-${close}-${after}`,
+			);
+			expect(closes).toBe(1);
+			const claim = await latestClaim(agentDir);
+			if (released) {
+				expect(response).toMatchObject({
+					ok: false,
+					error: { code: "spawn_failed", details: { code: "lifecycle_owner_unresolved" } },
+				});
+				expect(claim).toMatchObject({
+					state: "pre_send_rejected",
+					failure: { code: "lifecycle_owner_unresolved" },
+				});
+			} else {
+				expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(claim).toMatchObject({
+					state: "uncertain",
+					failure: { code: "child_registration_release_unproven" },
+				});
+			}
+		} finally {
+			await broker.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("fences every effect behind a durable transition and dispatches exactly once", async () => {
 		const agentDir = await temp();
 		const observed: {
@@ -1031,9 +1100,10 @@ describe("Broker spawn flow driver", () => {
 					},
 				}),
 				resolveLifecycleOwner: resolveFakeLifecycleOwner,
+				// Live through the failed close and its absence re-check; gone by the retry.
 				verify: async () => {
 					verifyCalls += 1;
-					return verifyCalls === 1 ? ("verified" as const) : ("gone" as const);
+					return verifyCalls <= 2 ? ("verified" as const) : ("gone" as const);
 				},
 				close: async () => {
 					closeCalls += 1;
@@ -1050,7 +1120,7 @@ describe("Broker spawn flow driver", () => {
 		try {
 			const first = await broker.handleRequest("session.spawn", spawnInput(), "retry-registration-key");
 			expect(first).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
-			expect(verifyCalls).toBe(1);
+			expect(verifyCalls).toBe(2);
 			expect(closeCalls).toBe(1);
 			expect(await latestClaim(agentDir)).toMatchObject({
 				state: "uncertain",
@@ -1062,7 +1132,7 @@ describe("Broker spawn flow driver", () => {
 				ok: false,
 				error: { code: "spawn_failed", details: { code: "child_registration_reconciled_failed" } },
 			});
-			expect(verifyCalls).toBe(2);
+			expect(verifyCalls).toBe(3);
 			expect(closeCalls).toBe(1);
 		} finally {
 			await broker.stop();

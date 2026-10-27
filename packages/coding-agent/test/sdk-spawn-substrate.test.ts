@@ -751,44 +751,6 @@ describe("Broker spawn substrate provider", () => {
 		expect(await provider.close(launched.proof)).toEqual({ ok: true });
 	});
 
-	it("releases a managed substrate that exits on its own while its exact close fails", async () => {
-		let live = true;
-		let closeCalls = 0;
-		const provider = createSpawnSubstrateProvider(
-			managedDependencies({
-				processIncarnation: pid => (live && pid === 701 ? "darwin:701" : undefined),
-				isProcessGone: () => !live,
-				sleep: async () => {},
-				closeManaged: async () => {
-					closeCalls++;
-					// The host reached its readiness cutoff and its supervisor exited first.
-					live = false;
-					throw new Error("gjc_tmux_owner_unverifiable:managed-child");
-				},
-			}),
-		);
-		expect(await provider.close(substrateProof())).toEqual({ ok: true });
-		expect(closeCalls).toBe(1);
-	});
-
-	it.each([
-		["stays live", "verified"],
-		["is replaced", "mismatch"],
-	] as const)("keeps a failed managed close unresolved when the substrate %s", async (_case, after) => {
-		let closed = false;
-		const provider = createSpawnSubstrateProvider(
-			managedDependencies({
-				verifyManaged: () => (closed ? after : "verified"),
-				sleep: async () => {},
-				closeManaged: async () => {
-					closed = true;
-					throw new Error("managed close failed");
-				},
-			}),
-		);
-		expect(await provider.close(substrateProof())).toEqual({ ok: false, code: "substrate_close_failed" });
-	});
-
 	it("closes only the requested exact sibling proof", async () => {
 		const first = managedProof();
 		const sibling = managedProof({
