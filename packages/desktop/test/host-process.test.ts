@@ -109,6 +109,10 @@ test("real isolated host creates, persists and resumes sessions without provider
 		expect(tools.consumed).toBe(true);
 		expect(tools.output).toContain("read");
 		expect(tools.prompt).toBeUndefined();
+		// Job observation reaches the app through the same dispatcher.
+		const jobs = await host.request<DesktopCommandResult>("command.run", { sessionId: session.id, text: "/jobs" });
+		expect(jobs.consumed).toBe(true);
+		expect(jobs.output).toContain("No background jobs running");
 		const history = await host.request<DesktopHistory>("history.get", { sessionId: session.id, limit: 50 });
 		expect(history.sessionId).toBe(session.id);
 		expect(history.total).toBeGreaterThanOrEqual(0);
