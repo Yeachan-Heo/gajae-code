@@ -2665,8 +2665,10 @@ export async function closeExactTmuxOwner(
 			} catch {
 				return giveUp();
 			}
+			// The caller's verdict wait owns the deadline on its monotonic clock, and the
+			// relay was authorized inside the intent window; a wall-clock step during the
+			// child's cleanup must not reject a timely verdict.
 			if (
-				Date.now() >= Date.parse(intent.expires_at) ||
 				!isValidOwnerVerdict(verdict) ||
 				verdict.intent_id !== intent.intent_id ||
 				verdict.generation !== request.generation ||
