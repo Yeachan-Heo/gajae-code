@@ -49,6 +49,7 @@ import {
 	AtomicYamlRetargetError,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
+	assertNonOverlappingAtomicYamlPatches,
 	atomicYamlPathHash,
 	type CasReceipt,
 	deleteByPath,
@@ -1323,6 +1324,7 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
 		this.#assertDurableConfigWritable();
+		assertNonOverlappingAtomicYamlPatches(patches);
 		if (!this.#persist || !this.#configPath) {
 			const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 			const changes = new Map<
@@ -1494,6 +1496,7 @@ export class Settings implements NotificationSettingsReader {
 			this.#configPath,
 			async current => {
 				const patches = await buildPatches(structuredClone(current));
+				assertNonOverlappingAtomicYamlPatches(patches);
 				const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
 					if (!isAtomicSettingsPath(patch.path)) {
 						throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);

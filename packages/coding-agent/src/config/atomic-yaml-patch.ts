@@ -312,6 +312,22 @@ function assertPatch(patch: AtomicYamlPatch): void {
 	}
 }
 
+/** Ancestor/descendant paths cannot share one independently restorable receipt. */
+export function assertNonOverlappingAtomicYamlPatches(patches: readonly { path: string }[]): void {
+	const paths = new Set(patches.map(patch => patch.path));
+	for (const patchPath of paths) {
+		const segments = patchPath.split(".");
+		segments.pop();
+		while (segments.length > 0) {
+			const ancestor = segments.join(".");
+			if (paths.has(ancestor)) {
+				throw new TypeError(`Atomic YAML batches cannot contain overlapping paths: ${ancestor} and ${patchPath}.`);
+			}
+			segments.pop();
+		}
+	}
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
@@ -919,6 +935,7 @@ async function applyPatchesUnderLock(
 	lexicalConfigPath?: string,
 ): Promise<CasReceipt> {
 	if (patches.length === 0) return createReceipt(configPath, [], options);
+	assertNonOverlappingAtomicYamlPatches(patches);
 
 	for (const patch of patches) {
 		if (!patch.expected) continue;

@@ -96,7 +96,11 @@ not certify durable persistence. For a disk-backed atomic change, use
 also update live sampling. Synchronous `onChanged` applicators (the `"apply"`
 phase) finish before hooks and ordinary observers run. A failing subscriber
 is logged by setting path without hiding the commit receipt or
-preventing other observers from receiving the change.
+preventing other observers from receiving the change. Atomic batches reject
+ancestor/descendant path mixtures (for example `modelRoles` together with
+`modelRoles.default`) before applying any patch: their restore scopes overlap.
+Write one parent value or disjoint leaf paths instead. Repeated writes to the
+same exact path retain ordered last-write semantics.
 
 Ordinary saves also publish effective changes adopted from another scoped owner's
 on-disk edits. Overlapping writes through the shared in-process YAML writer fence
@@ -127,9 +131,16 @@ package root. They are trusted embedding compositions, not new managed operation
   function-hook context and emits `session_start`; it is not a repeated UI setter.
   `subscribe()`/`snapshot()` expose bounded pending requests; replies require the
   matching session, connection and request IDs. Reconnect rotates responder
-  authority while preserving pending requests. Register `service.dispose()` with
-  `session.registerToolSessionCleanup`, and dispose before switching session
-  identity. Terminal factories and unsupported dialog callbacks fail explicitly.
+  authority while preserving pending requests. The host **must call
+  `service.dispose()` before awaiting `session.dispose()`**, and before switching
+  session identity. This settles pending requests and immediately refuses new UI
+  requests with `disposed`, including requests from `session_shutdown` handlers
+  after the renderer has gone away. Also register
+  `session.registerToolSessionCleanup(() => service.dispose())` as an idempotent
+  safety net only: registered cleanup runs after awaited shutdown handlers and
+  cannot unblock a handler waiting for a renderer reply. Host shutdown ordering is:
+  `service.dispose(); await session.dispose();`.
+  Terminal factories and unsupported dialog callbacks fail explicitly.
   A reply, including a workflow-approval reply, grants no execution permission.
 - **Owned jobs:** `result.jobObservation` lazily returns one session-owned view,
   captured from the factory's actual manager and agent owner. It never borrows the

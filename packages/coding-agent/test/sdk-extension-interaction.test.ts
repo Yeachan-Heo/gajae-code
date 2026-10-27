@@ -100,6 +100,39 @@ describe("portable extension interactions", () => {
 		service.dispose();
 	});
 
+	it("settles only the validated request when an address getter changes its target", async () => {
+		for (const action of ["respond", "cancel"] as const) {
+			const { service, connectionId } = fixture();
+			try {
+				const first = service.request({ kind: "input", title: "Validated" });
+				const second = service.request({ kind: "confirm", title: "Other", message: "Proceed?" });
+				const [firstRequest, secondRequest] = service.snapshot().pending;
+				let reads = 0;
+				const address: ExtensionInteractionAddress = {
+					sessionId: firstRequest!.sessionId,
+					connectionId,
+					get requestId() {
+						return reads++ === 0 ? firstRequest!.requestId : secondRequest!.requestId;
+					},
+				};
+				if (action === "respond") {
+					expect(service.respond(address, "answer")).toEqual({ grantsExecutionPermission: false });
+				} else {
+					service.cancel(address);
+				}
+				expect(reads).toBe(1);
+				expect(service.snapshot().pending.map(request => request.requestId)).toEqual([secondRequest!.requestId]);
+				expect(await first).toEqual(
+					action === "respond" ? { status: "answered", value: "answer" } : { status: "cancelled", reason: "user" },
+				);
+				service.dispose();
+				expect(await second).toEqual({ status: "cancelled", reason: "disposed" });
+			} finally {
+				service.dispose();
+			}
+		}
+	});
+
 	it("makes cancellation observable and refuses stale answers", async () => {
 		const { service, address } = fixture();
 		const request = service.request({ kind: "input", title: "Name" });

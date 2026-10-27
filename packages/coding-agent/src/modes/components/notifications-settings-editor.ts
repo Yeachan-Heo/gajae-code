@@ -817,6 +817,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		work: () => Promise<T>,
 		complete: (result: T) => Promise<void> | void,
 		disposeResult?: (result: T) => Promise<void> | void,
+		failed?: () => void,
 	): void {
 		if (this.#guarded || this.#disposed) return;
 		this.#guarded = true;
@@ -831,7 +832,9 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				await complete(result);
 			} catch {
 				if (!this.#disposed) {
-					this.#status = "ERROR — Notification action failed safely. Retry when ready; no credential is shown.";
+					if (failed) failed();
+					else
+						this.#status = "ERROR — Notification action failed safely. Retry when ready; no credential is shown.";
 				}
 			} finally {
 				if (!this.#disposed) this.#guarded = false;
@@ -904,14 +907,22 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		}
 		this.#runGuarded(
 			`Saving ${draft.provider} configuration.`,
-			() => this.operations.commitProviderConfiguration(draft),
-			async result => {
+			() => {
 				this.#providerPrepared = undefined;
-				if (!(await this.#afterDurableMutation())) return;
+				return this.operations.commitProviderConfiguration(draft);
+			},
+			async result => {
+				if (!result.receipt && result.outcome === "failed") {
+					this.#restartProviderConfiguration();
+					return;
+				}
 				this.#mode = "provider-actions";
 				this.#selectedIndex = 0;
+				if (!(await this.#afterDurableMutation())) return;
 				this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Provider configuration updated.")}`;
 			},
+			undefined,
+			() => this.#restartProviderConfiguration(),
 		);
 	}
 
@@ -1089,6 +1100,20 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		);
 	}
 
+	#restartProviderConfiguration(): void {
+		this.#startProviderForm();
+		this.#status =
+			"ERROR — Provider configuration was not saved. Re-enter secret actions and replacement secrets to prepare a fresh draft.";
+	}
+
+	#restartTelegramConfiguration(): void {
+		this.#clearDrafts();
+		this.#mode = "chat-entry";
+		this.#selectedIndex = 0;
+		this.#status =
+			"ERROR — Telegram configuration was not saved. Re-enter the chat ID and bot token for a fresh setup preflight; the previous draft cannot be retried.";
+	}
+
 	#commitConfiguration(): void {
 		const draft = this.#prepared;
 		if (!draft) {
@@ -1098,9 +1123,14 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		}
 		this.#runGuarded(
 			"Saving Telegram configuration.",
-			() => this.operations.commitConfigure(draft),
+			() => {
+				this.#prepared = undefined;
+				return this.operations.commitConfigure(draft);
+			},
 			async result => {
 				this.#clearDrafts();
+				this.#mode = "home";
+				this.#selectedIndex = 0;
 				if (result.status === "blocked_identity") {
 					this.#blockedCommit = result;
 					this.#confirmation = "blocked_identity";
@@ -1125,6 +1155,8 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#selectedIndex = 0;
 				this.#status = `OK — ${safeDetail(result.message, "Telegram configuration saved and reconciled.")}`;
 			},
+			undefined,
+			() => this.#restartTelegramConfiguration(),
 		);
 	}
 
@@ -1133,20 +1165,24 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		if (!draft) return;
 		this.#runGuarded(
 			"Saving Telegram configuration inactive for later.",
-			() => this.operations.saveInactive(draft),
+			() => {
+				this.#prepared = undefined;
+				return this.operations.saveInactive(draft);
+			},
 			async result => {
 				if (result.status === "unavailable") {
-					this.#mode = "review";
-					this.#status = `WARNING — ${safeDetail(result.guidance, "Save inactive is unavailable while another adapter is globally enabled.")}`;
+					this.#restartTelegramConfiguration();
+					this.#status = `WARNING — ${safeDetail(result.guidance, "Save inactive is unavailable while another adapter is globally enabled.")} Re-enter the chat ID and bot token for a fresh setup preflight.`;
 					return;
 				}
-				if (!(await this.#afterDurableMutation())) return;
-
 				this.#clearDrafts();
 				this.#mode = "home";
 				this.#selectedIndex = 0;
+				if (!(await this.#afterDurableMutation())) return;
 				this.#status = `${result.status === "observer_failed" ? "WARNING" : "OK"} — ${safeDetail(result.message, "Telegram configuration saved inactive; foreign daemon untouched.")}`;
 			},
+			undefined,
+			() => this.#restartTelegramConfiguration(),
 		);
 	}
 

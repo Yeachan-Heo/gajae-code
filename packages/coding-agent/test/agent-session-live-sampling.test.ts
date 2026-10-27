@@ -8,7 +8,12 @@ import { getDefaultTabWidth, setDefaultTabWidth, TempDir } from "@gajae-code/uti
 import { enqueueAtomicYamlOperation } from "../src/config/atomic-yaml-patch";
 import { KeybindingsManager } from "../src/config/keybindings";
 import { ModelRegistry } from "../src/config/model-registry";
-import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "../src/config/settings";
+import {
+	onAppendOnlyModeChanged,
+	resetSettingsForTest,
+	Settings,
+	type SettingsAtomicPatch,
+} from "../src/config/settings";
 import { SettingsSelectorComponent } from "../src/modes/components/settings-selector";
 import { initTheme } from "../src/modes/theme/theme";
 import { AgentSession } from "../src/session/agent-session";
@@ -262,6 +267,39 @@ describe("AgentSession live sampling settings", () => {
 			expect(settings.getModelRole("smol")).toBe("other/model");
 			if (durable) expect((await Settings.loadReadonly(scope)).getModelRole("smol")).toBe("other/model");
 		});
+	}
+
+	for (const durable of [false, true]) {
+		for (const withCurrent of [false, true]) {
+			it(`rejects overlapping atomic paths before publication (${durable ? "disk" : "memory"}, ${withCurrent ? "current" : "direct"})`, async () => {
+				const scope = { cwd: tempDir.path(), agentDir: path.join(tempDir.path(), "agent") };
+				settings = durable ? await Settings.loadForScope(scope) : Settings.isolated();
+				settings.setModelRole("default", "before/model");
+				await settings.flushOrThrow();
+				const before = structuredClone(settings.get("modelRoles"));
+				const configPath = settings.getGlobalConfigPath();
+				const diskBefore = configPath ? { path: configPath, text: await Bun.file(configPath).text() } : undefined;
+				const changes: string[] = [];
+				const unsubscribe = settings.onChanged(settingPath => changes.push(settingPath));
+				const patches: SettingsAtomicPatch[] = [
+					{ path: "modelRoles", op: "set", value: { default: "after/model", smol: "new/model" } },
+					{ path: "modelRoles.default", op: "set", value: "final/model" },
+				];
+				try {
+					for (const ordered of [patches, [...patches].reverse()]) {
+						const commit = withCurrent
+							? settings.commitAtomicBatchWithCurrent(() => ordered)
+							: settings.commitAtomicBatch(ordered);
+						await expect(commit).rejects.toThrow("overlapping paths");
+						expect(settings.get("modelRoles")).toEqual(before);
+						expect(changes).toEqual([]);
+						if (diskBefore) expect(await Bun.file(diskBefore.path).text()).toBe(diskBefore.text);
+					}
+				} finally {
+					unsubscribe();
+				}
+			});
+		}
 	}
 
 	it("keeps live sampling after bounded child cleanup", async () => {

@@ -36,6 +36,35 @@ afterEach(async () => {
 });
 
 describe("atomic YAML patches", () => {
+	test("rejects ancestor and descendant batches without consuming prior receipt ownership", async () => {
+		const configPath = await configPathForTest();
+		const prior = await applyAtomicYamlPatches(configPath, [
+			{ path: "feature", op: "set", value: { enabled: false } },
+		]);
+		const before = await Bun.file(configPath).text();
+		const patches: AtomicYamlPatch[] = [
+			{ path: "feature", op: "set", value: { enabled: true, other: "new" } },
+			{ path: "feature.enabled", op: "set", value: false },
+		];
+		for (const ordered of [patches, [...patches].reverse()]) {
+			await expect(applyAtomicYamlPatches(configPath, ordered)).rejects.toThrow("overlapping paths");
+			expect(await Bun.file(configPath).text()).toBe(before);
+		}
+		expect((await prior.restore()).status).toBe("restored");
+		expect(await readYaml(configPath)).toEqual({});
+	});
+
+	test("retains ordered same-path writes in a restorable batch", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature:\n  enabled: false\n");
+		const receipt = await applyAtomicYamlPatches(configPath, [
+			{ path: "feature.enabled", op: "set", value: false },
+			{ path: "feature.enabled", op: "set", value: true },
+		]);
+		expect(await readYaml(configPath)).toEqual({ feature: { enabled: true } });
+		expect((await receipt.restore()).status).toBe("restored");
+		expect(await readYaml(configPath)).toEqual({ feature: { enabled: false } });
+	});
 	for (const writer of ["patch", "update"] as const) {
 		for (const values of [[true], [false, true]]) {
 			test(`fences receipt ownership through a symlink with ${writer} writes ${values.join("/")}`, async () => {

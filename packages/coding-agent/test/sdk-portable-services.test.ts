@@ -21,8 +21,11 @@ async function fixture(extensions: ExtensionFactory[] = [], parentTaskPrefix?: s
 	const priorManager = AsyncJobManager.instance();
 	let auth: AuthStorage | undefined;
 	let result: CreateAgentSessionResult | undefined;
+	let interaction: ExtensionInteractionService | undefined;
 	const dispose = async () => {
 		try {
+			// Host-owned shutdown ordering: late session cleanup cannot unblock shutdown handlers.
+			interaction?.dispose();
 			await result?.session.dispose();
 		} finally {
 			AsyncJobManager.setInstance(priorManager);
@@ -59,7 +62,10 @@ async function fixture(extensions: ExtensionFactory[] = [], parentTaskPrefix?: s
 			skipPythonPreflight: true,
 			deferOptionalModelRefresh: true,
 		});
-		return { result, owner, dispose };
+		interaction = new ExtensionInteractionService(result.session.sessionManager.getSessionId());
+		const bridge = interaction;
+		result.session.registerToolSessionCleanup(() => bridge.dispose());
+		return { result, owner, interaction, dispose };
 	} catch (error) {
 		await dispose();
 		throw error;
@@ -100,10 +106,9 @@ describe("portable services through the real SDK factory", () => {
 		};
 		const env = await fixture([extension]);
 		const { session } = env.result;
-		const interaction = new ExtensionInteractionService(session.sessionManager.getSessionId());
+		const { interaction } = env;
 		let initialization: Promise<void> | undefined;
 		try {
-			session.registerToolSessionCleanup(() => interaction.dispose());
 			const { connectionId } = interaction.connect();
 			env.result.setToolUIContext(interaction.ui, true);
 			expect(contextCwd).toBeUndefined();
@@ -125,7 +130,8 @@ describe("portable services through the real SDK factory", () => {
 			await initialization;
 			expect(answer).toBe("portable response");
 			expect(errors).toEqual([]);
-			const pending = interaction.ui.input("Cancelled on session cleanup");
+			const pending = interaction.ui.input("Cancelled before session shutdown");
+			interaction.dispose();
 			await session.dispose();
 			expect(await pending).toBeUndefined();
 			expect(interaction.snapshot().disposed).toBe(true);
@@ -136,6 +142,54 @@ describe("portable services through the real SDK factory", () => {
 			} finally {
 				await env.dispose();
 			}
+		}
+	});
+
+	it("disposes portable UI before real shutdown handlers without waiting for renderer replies", async () => {
+		const shutdownErrors: unknown[] = [];
+		const runtimeErrors: unknown[] = [];
+		let shutdownFinished = false;
+		const extension: ExtensionFactory = api => {
+			api.on("session_shutdown", async (_event, ctx) => {
+				for (const request of [
+					() => ctx.ui.confirm("Shutdown", "Continue?"),
+					() => ctx.ui.input("Shutdown note"),
+				]) {
+					try {
+						await request();
+					} catch (error) {
+						shutdownErrors.push(error);
+					}
+				}
+				shutdownFinished = true;
+			});
+		};
+		const env = await fixture([extension]);
+		const { interaction, result } = env;
+		try {
+			const { connectionId } = interaction.connect();
+			result.setToolUIContext(interaction.ui, true);
+			await initializeExtensions(result.session, {
+				uiContext: interaction.ui,
+				reportSendError: (_action, error) => runtimeErrors.push(error),
+				reportRuntimeError: error => runtimeErrors.push(error),
+			});
+			const pendingInput = interaction.ui.input("Pending before shutdown");
+			const pendingConfirm = interaction.ui.confirm("Pending confirmation", "Continue?");
+			interaction.disconnect(connectionId);
+			interaction.dispose();
+			await result.session.dispose();
+			expect(await pendingInput).toBeUndefined();
+			expect(await pendingConfirm).toBe(false);
+			expect(shutdownFinished).toBe(true);
+			expect(shutdownErrors).toEqual([
+				expect.objectContaining({ code: "disposed" }),
+				expect.objectContaining({ code: "disposed" }),
+			]);
+			expect(runtimeErrors).toEqual([]);
+			expect(interaction.snapshot()).toMatchObject({ disposed: true, connected: false, pending: [] });
+		} finally {
+			await env.dispose();
 		}
 	});
 

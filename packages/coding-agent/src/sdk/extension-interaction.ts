@@ -102,7 +102,9 @@ interface PendingInteraction {
 
 /**
  * A host-owned bridge, not an execution authorization provider. Keep connection IDs private
- * to the admitted renderer. Dispose on session switch; never rebind an instance to a session.
+ * to the admitted renderer. Hosts must dispose before awaiting session.dispose(), so shutdown
+ * handlers cannot wait for a departed renderer. Registered session cleanup is only an idempotent
+ * safety net. Dispose on session switch; never rebind an instance to a session.
  * Hosts install `ui` using the existing extension/hook/tool UI initialization hooks.
  */
 export class ExtensionInteractionService {
@@ -289,13 +291,13 @@ export class ExtensionInteractionService {
 		) {
 			throw new ExtensionInteractionError("invalid-result", "Response does not match the pending interaction");
 		}
-		this.#finish(address.requestId, { status: "answered", value });
+		this.#finish(item.request.requestId, { status: "answered", value });
 		return { grantsExecutionPermission: false };
 	}
 
 	cancel(address: ExtensionInteractionAddress): void {
-		this.#lookup(address);
-		this.#finish(address.requestId, { status: "cancelled", reason: "user" });
+		const item = this.#lookup(address);
+		this.#finish(item.request.requestId, { status: "cancelled", reason: "user" });
 	}
 
 	notify(message: string, type: "info" | "warning" | "error" = "info"): void {
