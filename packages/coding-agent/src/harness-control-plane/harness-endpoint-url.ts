@@ -4,7 +4,7 @@ const HARNESS_ENDPOINT_URL_MAX = 2048;
 /**
  * True when `raw` is a loopback `ws:` or `wss:` URL with no userinfo, query, hash,
  * or extra path. Parsing follows the same URL rules the SDK client uses to dial,
- * including surrounding whitespace and numeric loopback hosts. An over-long string
+ * including surrounding whitespace, a trailing DNS dot, and numeric loopback hosts. An over-long string
  * is rejected before parsing.
  */
 export function isHarnessLoopbackEndpointUrl(raw: string): boolean {
@@ -16,7 +16,10 @@ export function isHarnessLoopbackEndpointUrl(raw: string): boolean {
 		return false;
 	}
 	if (url.protocol !== "ws:" && url.protocol !== "wss:") return false;
-	const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	const host = url.hostname
+		.toLowerCase()
+		.replace(/^\[|\]$/g, "")
+		.replace(/\.$/, "");
 	if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") return false;
 	if (url.username !== "" || url.password !== "") return false;
 	if (url.search !== "" || url.hash !== "") return false;

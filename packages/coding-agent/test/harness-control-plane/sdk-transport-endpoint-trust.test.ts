@@ -143,6 +143,9 @@ describe("harness owner discovery trust", () => {
 			" ws://127.0.0.1:9 ",
 			"ws://2130706433:9",
 			"wss://127.0.0.1:9",
+			"wss://127.0.0.1",
+			"ws://localhost.:9",
+			"ws://127.0.0.1.:9",
 		]) {
 			const attached = await dial(
 				{ version: 1, sessionId: "session-a", url, token: "kept-token", pid: process.pid },

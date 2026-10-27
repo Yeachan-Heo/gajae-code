@@ -17,6 +17,11 @@ describe("harness discovery url", () => {
 			"ws://127.0.0.1",
 			" wss://127.0.0.1:9 ",
 			"ws://2130706433:9",
+			"ws://localhost.:9",
+			"ws://LOCALHOST.:9",
+			"ws://127.0.0.1.:9",
+			"wss://127.0.0.1",
+			"wss://localhost",
 		]) {
 			expect(isHarnessLoopbackEndpointUrl(raw)).toBe(true);
 		}
@@ -67,7 +72,10 @@ describe("harness discovery url", () => {
 				expect(isHarnessLoopbackEndpointUrl(raw)).toBe(allowed);
 				if (!allowed) return;
 				const url = new URL(raw);
-				const parsed = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+				const parsed = url.hostname
+					.toLowerCase()
+					.replace(/^\[|\]$/g, "")
+					.replace(/\.$/, "");
 				expect(url.protocol === "ws:" || url.protocol === "wss:").toBe(true);
 				expect(parsed === "127.0.0.1" || parsed === "localhost" || parsed === "::1").toBe(true);
 				expect(url.username).toBe("");
