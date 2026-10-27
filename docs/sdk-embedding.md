@@ -71,6 +71,33 @@ If omitted, it resolves:
 - LSP integration (enabled by default)
 - `eventBus`: new `EventBus()` unless supplied
 
+### Live sampling settings
+
+Changes to `session.settings` for `temperature`, `topP`, `topK`, `minP`,
+`presencePenalty`, and `repetitionPenalty` update the live session's sampling
+options for subsequent provider requests. The TUI uses this same settings
+observation path; no TUI controller call is needed. Negative sentinel values
+omit the option from provider requests, and `unset` reapplies the effective
+project/runtime/default value. Changing a global value does not bypass a
+higher-priority override.
+
+```ts
+session.settings.set("temperature", 0.4);
+await session.settings.flushOrThrow(); // observe background persistence failure
+```
+
+`set` applies effective state synchronously and schedules a save; it is not a
+durability receipt. The existing managed `config.patch` response likewise does
+not certify durable persistence. For a disk-backed atomic change, use
+`Settings.commitAtomicBatch`; its successful commit and CAS-protected restore
+also update live sampling. Atomic observers run after the complete state is
+applied; a failing observer is logged without hiding the commit receipt or
+preventing other observers from receiving the change.
+
+`Settings.isolated()` remains memory-only. Check
+`canPersistDurableConfig()` before describing an atomic result as durable.
+This contract covers sampling, not every setting's live/reload/restart behavior.
+
 ### Required vs optional inputs
 
 Typically you must provide only what you want to control:

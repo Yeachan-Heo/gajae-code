@@ -4109,6 +4109,7 @@ export class AgentSession {
 		);
 	}
 	#unregisterSessionMemorySettings?: () => void;
+	#unregisterSamplingSettings?: () => void;
 	#unregisterDelegationHintSettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
@@ -5818,6 +5819,20 @@ export class AgentSession {
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
 			if (settingPath === "sessionMemory.mode") {
 				this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
+			}
+		});
+		this.#unregisterSamplingSettings = this.settings.onChanged(settingPath => {
+			switch (settingPath) {
+				case "temperature":
+				case "topP":
+				case "topK":
+				case "minP":
+				case "presencePenalty":
+				case "repetitionPenalty": {
+					const value = this.settings.get(settingPath);
+					this.agent[settingPath] = value >= 0 ? value : undefined;
+					break;
+				}
 			}
 		});
 		this.memoryBackend = config.memoryBackend ?? createMemoryBackendService(this.settings);
@@ -11506,6 +11521,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterSamplingSettings?.();
+		this.#unregisterSamplingSettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
@@ -11624,6 +11641,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterSamplingSettings?.();
+		this.#unregisterSamplingSettings = undefined;
 		this.#unregisterDelegationHintSettings?.();
 		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([

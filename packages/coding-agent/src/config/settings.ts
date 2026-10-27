@@ -864,6 +864,20 @@ export class Settings implements NotificationSettingsReader {
 		return () => this.#changeListeners.delete(listener);
 	}
 
+	#notifyAtomicSettingsChanged(paths: Iterable<string>): void {
+		for (const settingPath of paths) {
+			for (const listener of this.#changeListeners) {
+				try {
+					listener(settingPath as SettingPath);
+				} catch {
+					// The commit already happened. An observer must not hide its receipt
+					// or prevent other sessions from seeing the committed state.
+					logger.warn("Settings observer failed after atomic mutation", { path: settingPath });
+				}
+			}
+		}
+	}
+
 	/** The resolved global config.yml path, or null for in-memory settings. */
 	getGlobalConfigPath(): string | null {
 		return this.#configPath;
@@ -1330,6 +1344,7 @@ export class Settings implements NotificationSettingsReader {
 				notificationValidationGuard,
 				patches.map(patch => patch.path),
 			);
+			this.#notifyAtomicSettingsChanged(changes.keys());
 			let discarded = false;
 			let receipt: CasReceipt;
 			receipt = {
@@ -1365,6 +1380,7 @@ export class Settings implements NotificationSettingsReader {
 					if (restoreNotificationValidationState) {
 						this.#restoreNotificationValidationState(notificationValidationGuard.state);
 					}
+					this.#notifyAtomicSettingsChanged(changes.keys());
 					return { status: "restored", receipt } as const;
 				},
 			};
@@ -6338,6 +6354,7 @@ export class Settings implements NotificationSettingsReader {
 			const hook = SETTING_HOOKS[settingPath];
 			if (hook) hook(this.get(settingPath), previous.get(settingPath)!);
 		}
+		this.#notifyAtomicSettingsChanged(applicable.map(patch => patch.path));
 		return applicable.some(patch => isNotificationSettingsPath(patch.path));
 	}
 
