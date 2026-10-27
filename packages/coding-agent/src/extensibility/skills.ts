@@ -463,6 +463,35 @@ function buildInlineSkillInvocationArgs<TSkill extends Pick<Skill, "name">>(
 	return pieces.join("");
 }
 
+/**
+ * Check if a given position in text is inside an inline code span (backtick-delimited).
+ * Handles escaped backticks correctly.
+ */
+function isPositionInsideInlineCode(text: string, position: number): boolean {
+	let openDelimiterPosition: number | null = null;
+
+	for (let i = 0; i < position && i < text.length; ) {
+		if (text[i] !== "`") {
+			i += 1;
+			continue;
+		}
+
+		let runEnd = i + 1;
+		while (text[runEnd] === "`") runEnd += 1;
+		if (runEnd - i !== 1) {
+			i = runEnd;
+			continue;
+		}
+
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		if (backslashCount % 2 === 0) openDelimiterPosition = openDelimiterPosition === null ? i : null;
+		i = runEnd;
+	}
+
+	return openDelimiterPosition !== null;
+}
+
 export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 	text: string,
 	skillsByCommandName: ReadonlyMap<string, TSkill>,
@@ -486,6 +515,8 @@ export function parseSkillInvocations<TSkill extends Pick<Skill, "name">>(
 		if (!skill) continue;
 		const leading = match[1] ?? "";
 		const index = (match.index ?? 0) + leading.length;
+		// Skip matches inside inline code spans to avoid invoking skills in backtick-delimited text
+		if (isPositionInsideInlineCode(trimmedText, index)) continue;
 		matches.push({
 			index,
 			end: index + commandName.length + 1,

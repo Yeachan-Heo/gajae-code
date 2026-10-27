@@ -122,6 +122,22 @@ describe("parseSkillInvocations", () => {
 		expect(parseSkillInvocations("path/skill:alpha is just a path", skillsByCommandName)).toEqual([]);
 		expect(parseSkillInvocations("https://example.test/skill:alpha is a URL", skillsByCommandName)).toEqual([]);
 	});
+
+	it("does not invoke skill commands inside inline code spans (issue #7314)", () => {
+		// Skill command inside backticks should not be invoked
+		expect(parseSkillInvocations("Run this command: `/skill:alpha code`", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("Example: `just /skill:alpha run it`", skillsByCommandName)).toEqual([]);
+
+		// Multiple backtick pairs; only matches outside backticks should be invoked
+		expect(parseSkillInvocations("Run `/skill:alpha` or use /skill:beta instead", skillsByCommandName)).toEqual([
+			{ commandName: "skill:beta", args: "Run `/skill:alpha` or use instead", skill: beta },
+		]);
+
+		// Escaped backticks should not affect matching
+		expect(parseSkillInvocations("Escaped \\`backtick\\` and /skill:alpha should work", skillsByCommandName)).toEqual(
+			[{ commandName: "skill:alpha", args: "Escaped \\`backtick\\` and should work", skill: alpha }],
+		);
+	});
 });
 
 describe("skills", () => {
