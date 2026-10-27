@@ -69,8 +69,47 @@ test("preserves ordinary text, brackets, and status icon styling", () => {
 
 	expect(rendered).toContain("Find");
 	expect(rendered).toContain("src/**/*.ts");
-	expect(rendered).toContain("[12 files]");
+	expect(rendered).toContain("12 files");
+	expect(rendered).toContain(theme.format.bracketLeft);
+	expect(rendered).toContain(theme.format.bracketRight);
 	expect(rendered).toContain("15ms");
+});
+
+test("preserves caller-provided SGR styles in description and meta", () => {
+	const styledMeta = theme.fg("error", "1 failed");
+	const styledDesc = theme.fg("accent", "src/tools/write.ts");
+
+	const rendered = renderStatusLine(
+		{
+			title: "Job",
+			description: styledDesc,
+			meta: [styledMeta, "3 passed"],
+		},
+		theme,
+	);
+
+	expect(rendered).toContain(styledMeta);
+	expect(rendered).toContain(styledDesc);
+	expect(rendered).toContain("3 passed");
+});
+
+test("strips injected controls embedded inside caller-styled text", () => {
+	const maliciousPath = "src/evil\x1b]52;c;payload\x07\x1b[2Jfile.ts";
+	const styledDesc = theme.fg("accent", maliciousPath);
+
+	const rendered = renderStatusLine(
+		{
+			title: "Write",
+			description: styledDesc,
+		},
+		theme,
+	);
+
+	expect(rendered).not.toContain("\x1b]52;");
+	expect(rendered).not.toContain("payload");
+	expect(rendered).not.toContain("\x1b[2J");
+	expect(rendered).toContain("src/evilfile.ts");
+	expect(rendered).toContain(theme.fg("accent", "src/evilfile.ts"));
 });
 
 test("property: status line strips arbitrary terminal controls, fc.property seed 71291, numRuns 64", () => {
