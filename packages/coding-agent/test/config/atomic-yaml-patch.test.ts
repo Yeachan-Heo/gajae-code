@@ -17,6 +17,7 @@ import {
 	enqueueAtomicYamlOperation,
 	reserveAtomicYamlPatchSlot,
 	reserveAtomicYamlUpdateSlot,
+	reserveDeferredSettingsSave,
 	setByPath,
 	withAtomicYamlConfigTransaction,
 } from "../../src/config/atomic-yaml-patch";
@@ -116,6 +117,39 @@ describe("atomic YAML patches", () => {
 		).rejects.toThrow("reentrant atomic YAML operation");
 		await bounded(applyAtomicYamlPatches(alias, [{ path: "feature", op: "set", value: "after" }]));
 		expect(await readYaml(configPath)).toEqual({ feature: "after" });
+	});
+
+	test("deferred settings admission preserves the caller lease and gives the update its own lease", async () => {
+		const configPath = await configPathForTest();
+		await Bun.write(configPath, "feature: old\n");
+		const completion = Promise.withResolvers<void>();
+		let ran = false;
+		await bounded(
+			enqueueAtomicYamlOperation(configPath, async () => {
+				reserveDeferredSettingsSave(
+					configPath,
+					async () => {
+						ran = true;
+						await expect(bounded(applyAtomicYamlPatches(configPath, []))).rejects.toThrow(
+							"reentrant atomic YAML operation",
+						);
+						return {
+							apply: current => {
+								current.feature = "deferred";
+							},
+						};
+					},
+					completion,
+				);
+				expect(ran).toBe(false);
+				await expect(bounded(applyAtomicYamlPatches(configPath, []))).rejects.toThrow(
+					"reentrant atomic YAML operation",
+				);
+			}),
+		);
+		await bounded(completion.promise);
+		expect(ran).toBe(true);
+		expect(await readYaml(configPath)).toEqual({ feature: "deferred" });
 	});
 
 	test("independent callers wait in FIFO order and make progress", async () => {

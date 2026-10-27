@@ -50,13 +50,14 @@ import {
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
 	assertAtomicYamlSetAncestors,
+	assertNoActiveAtomicYamlOperation,
 	assertNonOverlappingAtomicYamlPatches,
 	atomicYamlPathHash,
 	type CasReceipt,
 	deleteByPath,
 	enqueueAtomicYamlOperation,
 	isSafeAtomicYamlPath,
-	reserveAtomicYamlUpdateSlot,
+	reserveDeferredSettingsSave,
 	setByPath,
 	withAtomicYamlConfigTransaction,
 } from "./atomic-yaml-patch";
@@ -1712,6 +1713,7 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Flush a reserved debounced save without allowing it to be overtaken. */
 	async flush(): Promise<void> {
+		if (this.#persist && this.#configPath) assertNoActiveAtomicYamlOperation(this.#configPath);
 		this.#releasePendingSaveSlot();
 		if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 		this.#releasePendingSaveSlot();
@@ -1747,6 +1749,7 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Like {@link flush}, but reports a durable save failure to the caller. */
 	async flushOrThrow(): Promise<void> {
+		if (this.#persist && this.#configPath) assertNoActiveAtomicYamlOperation(this.#configPath);
 		this.#releasePendingSaveSlot();
 		if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 		this.#releasePendingSaveSlot();
@@ -6373,48 +6376,54 @@ export class Settings implements NotificationSettingsReader {
 
 		let captured: SettingsPatch[] = [];
 		let durableBeforeWrite: RawSettings | undefined;
-		const save = reserveAtomicYamlUpdateSlot(this.#configPath, async () => {
-			await slot.wait;
-			slot.captured = true;
-			if (this.#pendingSaveSlot === slot) this.#pendingSaveSlot = undefined;
-			captured = this.#pendingPatchesInGenerationOrder();
-			return {
-				apply: current => {
-					this.#migrateRawSettings(current);
-					const migrationFingerprint = this.#legacyFallbackMigrationGlobalFingerprint;
-					this.#legacyFallbackMigrationGlobalFingerprint = undefined;
-					if (migrationFingerprint !== undefined && YAML.stringify(current, null, 2) !== migrationFingerprint) {
-						this.#global = structuredClone(current);
-						this.#rebuildMerged();
-						if (getByPath(current, ["retry", "fallbackChains"]) !== undefined) {
-							this.#migrateRetryFallbackChains();
-							captured = this.#pendingPatchesInGenerationOrder();
-						} else {
-							for (const patch of captured) {
-								if (!patch.legacyFallbackMigration) continue;
-								const key = settingsPatchStorageKey(patch);
-								if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
+		const completion = Promise.withResolvers<{ shouldWrite: boolean }>();
+		reserveDeferredSettingsSave(
+			this.#configPath,
+			async () => {
+				await slot.wait;
+				slot.captured = true;
+				if (this.#pendingSaveSlot === slot) this.#pendingSaveSlot = undefined;
+				captured = this.#pendingPatchesInGenerationOrder();
+				return {
+					apply: current => {
+						this.#migrateRawSettings(current);
+						const migrationFingerprint = this.#legacyFallbackMigrationGlobalFingerprint;
+						this.#legacyFallbackMigrationGlobalFingerprint = undefined;
+						if (migrationFingerprint !== undefined && YAML.stringify(current, null, 2) !== migrationFingerprint) {
+							this.#global = structuredClone(current);
+							this.#rebuildMerged();
+							if (getByPath(current, ["retry", "fallbackChains"]) !== undefined) {
+								this.#migrateRetryFallbackChains();
+								captured = this.#pendingPatchesInGenerationOrder();
+							} else {
+								for (const patch of captured) {
+									if (!patch.legacyFallbackMigration) continue;
+									const key = settingsPatchStorageKey(patch);
+									if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
+								}
+								captured = captured.filter(patch => !patch.legacyFallbackMigration);
 							}
-							captured = captured.filter(patch => !patch.legacyFallbackMigration);
 						}
-					}
-					this.#fenceNotificationValidationForExternalDurableDelta(current, captured);
-					durableBeforeWrite = structuredClone(current);
-					for (const patch of captured) applySettingsPatch(current, patch);
-					return { shouldWrite: captured.length > 0 };
-				},
-				shouldWrite: result => result.shouldWrite,
-				mutationPaths: () => captured.map(settingsPatchKey),
-				committed: current => {
-					for (const patch of captured) {
-						const key = settingsPatchStorageKey(patch);
-						if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
-					}
-					this.#captureRawNotificationConfig(current);
-					this.#replaceGlobalWithDurable(current);
-				},
-			};
-		})
+						this.#fenceNotificationValidationForExternalDurableDelta(current, captured);
+						durableBeforeWrite = structuredClone(current);
+						for (const patch of captured) applySettingsPatch(current, patch);
+						return { shouldWrite: captured.length > 0 };
+					},
+					shouldWrite: result => result.shouldWrite,
+					mutationPaths: () => captured.map(settingsPatchKey),
+					committed: current => {
+						for (const patch of captured) {
+							const key = settingsPatchStorageKey(patch);
+							if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
+						}
+						this.#captureRawNotificationConfig(current);
+						this.#replaceGlobalWithDurable(current);
+					},
+				};
+			},
+			completion,
+		);
+		const save = completion.promise
 			.then(() => undefined)
 			.catch(async error => {
 				logger.warn("Settings: background save failed", { error: String(error) });

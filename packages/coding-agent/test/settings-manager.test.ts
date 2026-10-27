@@ -366,6 +366,41 @@ describe("Settings", () => {
 		}
 	}
 
+	for (const method of ["flush", "flushOrThrow"] as const) {
+		it(`rejects reentrant ${method} but persists the deferred write`, async () => {
+			const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			try {
+				const commit = settings.commitAtomicBatchWithCurrent(async () => {
+					settings.set("temperature", 0.6);
+					await expect(settings[method]()).rejects.toThrow("reentrant atomic YAML operation");
+					entered.resolve();
+					await release.promise;
+					return [{ path: "temperature", op: "set", value: 0.1 }];
+				});
+				const result = commit.then(
+					() => ({ error: undefined }),
+					error => ({ error }),
+				);
+				await entered.promise;
+				const flush = settings.flush();
+				release.resolve();
+				const [outcome] = await Promise.all([result, flush]);
+				expect(String(outcome.error)).toContain("changed");
+				expect(settings.getGlobal("temperature")).toBe(0.6);
+				const durable = YAML.parse(await Bun.file(settings.getGlobalConfigPath()!).text()) as Record<
+					string,
+					unknown
+				>;
+				expect(durable.temperature).toBe(0.6);
+			} finally {
+				release.resolve();
+				await settings.close();
+			}
+		});
+	}
+
 	it("does not log setting override values when initialization options differ", async () => {
 		const initialSecret = "initial-settings-secret";
 		const requestedSecret = "requested-settings-secret";

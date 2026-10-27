@@ -1345,6 +1345,18 @@ export function withAtomicYamlConfigTransaction<T>(
 	});
 }
 
+function assertNoActiveCanonicalYamlOperation(canonicalPath: string): void {
+	for (let context = queueContext.getStore(); context; context = context.parent) {
+		if (context.active && context.path === canonicalPath) {
+			throw new Error(`Cannot enqueue a reentrant atomic YAML operation for ${canonicalPath}.`);
+		}
+	}
+}
+
+export function assertNoActiveAtomicYamlOperation(configPath: string): void {
+	assertNoActiveCanonicalYamlOperation(canonicalConfigPath(configPath));
+}
+
 /**
  * Reserve a FIFO operation for a config file immediately. The patch supplier runs
  * only when this operation reaches the front of the in-process queue, which lets
@@ -1355,12 +1367,12 @@ export function enqueueAtomicYamlOperation<T>(
 	operation: (canonicalConfigPath: string, lexicalConfigPath: string) => Promise<T>,
 ): Promise<T> {
 	const canonicalPath = canonicalConfigPath(configPath);
-	const parent = queueContext.getStore();
-	for (let context = parent; context; context = context.parent) {
-		if (context.active && context.path === canonicalPath) {
-			return Promise.reject(new Error(`Cannot enqueue a reentrant atomic YAML operation for ${canonicalPath}.`));
-		}
+	try {
+		assertNoActiveCanonicalYamlOperation(canonicalPath);
+	} catch (error) {
+		return Promise.reject(error);
 	}
+	const parent = queueContext.getStore();
 	const prior = queues.get(canonicalPath) ?? Promise.resolve();
 	const result = prior
 		.catch(() => undefined)
@@ -1448,6 +1460,23 @@ export function reserveAtomicYamlUpdateSlot<T>(
 			await atomicUpdate.committed?.(current, result);
 			return result;
 		});
+	});
+}
+
+/**
+ * Reserve the Settings debounce slot without inheriting the caller's queue lease.
+ * This is fire-and-forget admission: completion is delivered to Settings rather
+ * than returned to the caller that may currently hold the same file's queue.
+ * The update itself still runs under a fresh queue lease and lock.
+ * @internal
+ */
+export function reserveDeferredSettingsSave<T>(
+	configPath: string,
+	update: () => Promise<AtomicYamlUpdate<T>> | AtomicYamlUpdate<T>,
+	completion: Pick<PromiseWithResolvers<T>, "resolve" | "reject">,
+): void {
+	queueContext.exit(() => {
+		void reserveAtomicYamlUpdateSlot(configPath, update).then(completion.resolve, completion.reject);
 	});
 }
 
