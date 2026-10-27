@@ -988,14 +988,13 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#selectedIndex = 0;
 				switch (result.status) {
 					case "restored":
-						this.#status = "OK — Previous Telegram configuration restored after the blocked activation.";
+						this.#status = `${result.runtimeFailed || result.observerFailed ? "WARNING" : "OK"} — Previous Telegram configuration restored after the blocked activation.${result.runtimeFailed ? (result.runtimeFenced ? " Runtime reconciliation failed; the current runtime was fenced." : " Runtime reconciliation failed and the current runtime could not be fenced.") : ""}${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
 						return;
 					case "conflict":
 						this.#status = `ERROR — Previous configuration was not restored because settings changed at: ${result.paths.join(", ")}. Saved configuration remains inactive.`;
 						return;
 					case "still_blocked":
-						this.#status =
-							"ERROR — Previous configuration restored, but activation remains blocked by a foreign daemon. Current session remains inactive.";
+						this.#status = `ERROR — Previous configuration restored, but activation remains blocked by a foreign daemon. Current session remains inactive.${result.observerFailed ? " Warning: the settings observer failed after the restore." : ""}`;
 						return;
 					case "discarded":
 						this.#status =
@@ -1197,7 +1196,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#preferencesDraft = undefined;
 				this.#mode = "home";
 				this.#selectedIndex = 0;
-				this.#status = `OK — ${safeDetail(result.message, "Notification preferences saved atomically.")}`;
+				this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Notification preferences saved atomically.")}`;
 			},
 		);
 	}

@@ -169,9 +169,12 @@ package root. They are trusted embedding compositions, not new managed operation
   CAS and saved-but-activation-failed outcomes. Keep prepared objects in the
   trusted host: they are frozen, instance-bound, one-shot authority, not arbitrary
   renderer JSON. Forward only display data and bind renderer actions to the
-  retained object. Discard prepared configuration on cancellation; prepare a fresh
-  draft after a commit attempt, including a failed attempt. Forged, copied,
-  foreign, discarded or replayed provider drafts return `invalid_draft` without
+  retained object. A Telegram draft whose preflight reports a foreign or unknown
+  daemon cannot be activated; it may be saved inactive or discarded. Active commit
+  rechecks identity before writing, but does not lock out external daemon changes.
+  Completed restore outcomes separately report observer and runtime failures. Discard
+  prepared configuration on cancellation; prepare a fresh draft after a consumed
+  commit attempt. Forged, copied, foreign, discarded or replayed provider drafts return `invalid_draft` without
   saving bindings. Secret inputs use the one-way `NotificationSetupSecretValue`
   contract; do not serialize credentials into renderer state or generic queries.
 

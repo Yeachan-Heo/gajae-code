@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { CasReceipt } from "@gajae-code/coding-agent/config/atomic-yaml-patch";
-import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings, type SettingsAtomicPatch } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import {
@@ -280,6 +280,279 @@ beforeEach(async () => {
 });
 
 describe("notification settings controller adapter", () => {
+	it.each([
+		"foreign",
+		"unknown",
+	] as const)("rejects %s activation without consuming the inactive draft", async identityStatus => {
+		const commitAtomicBatch = vi.fn(async () => receipt());
+		let inactivePatches: unknown;
+		const commitAtomicBatchWithCurrent = vi.fn(async (build: (current: object) => unknown) => {
+			inactivePatches = await build({ notifications: { telegram: {} } });
+			return receipt();
+		});
+		const reconnect = vi.fn(async () => "attached" as const);
+		const settings = {
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch,
+			commitAtomicBatchWithCurrent,
+		} as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+			},
+			{
+				resolveTelegramSetupPreflight: async () => ({ status: "safe" }) as never,
+				runTelegramSetup: async () => ({
+					ok: true,
+					chatId: "chat",
+					tokenFingerprint: "fp",
+					threadedMode: "enabled",
+					threadedLabel: "verified",
+					pairingSource: "provided",
+				}),
+				proposedTelegramIdentity: async () => ({ status: identityStatus }),
+				ensureTelegramDaemonRunningDetailed: reconnect,
+			},
+		);
+		const result = await operations.preflightProposedIdentity(
+			{ token: secret(), chatId: "chat", richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
+			new AbortController().signal,
+		);
+		if (!result.draft) throw new Error("Expected a prepared draft.");
+		result.identity.status = "same";
+		await expect(operations.commitConfigure({ ...result.draft })).rejects.toThrow("draft expired");
+		await expect(operations.commitConfigure(result.draft)).rejects.toThrow("blocked");
+		expect(commitAtomicBatch).not.toHaveBeenCalled();
+		expect(commitAtomicBatchWithCurrent).not.toHaveBeenCalled();
+		expect(reconnect).not.toHaveBeenCalled();
+		expect(await operations.saveInactive(result.draft)).toMatchObject({ status: "saved_inactive" });
+		expect(inactivePatches).toEqual(
+			expect.arrayContaining([
+				{ path: "notifications.telegram.enabled", op: "set", value: false },
+				{ path: "notifications.telegram.botToken", op: "set", value: TOKEN },
+			]),
+		);
+		await expect(operations.saveInactive(result.draft)).rejects.toThrow("draft expired");
+		await expect(operations.commitConfigure(result.draft)).rejects.toThrow("draft expired");
+		expect(commitAtomicBatchWithCurrent).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["foreign", "unknown"] as const)("revalidates a safe draft when identity becomes %s", async status => {
+		let current: "same" | "foreign" | "unknown" = "same";
+		const commitAtomicBatch = vi.fn(async () => receipt());
+		const reconnect = vi.fn(async () => "attached" as const);
+		const settings = { getNotificationSettingsSnapshot: () => snapshot(), commitAtomicBatch } as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+			},
+			{
+				resolveTelegramSetupPreflight: async () => ({ status: "safe" }) as never,
+				runTelegramSetup: async () => ({
+					ok: true,
+					chatId: "chat",
+					tokenFingerprint: "fp",
+					threadedMode: "enabled",
+					threadedLabel: "verified",
+					pairingSource: "provided",
+				}),
+				proposedTelegramIdentity: async () => ({ status: current }),
+				ensureTelegramDaemonRunningDetailed: reconnect,
+			},
+		);
+		const result = await operations.preflightProposedIdentity(
+			{ token: secret(), chatId: "chat", richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
+			new AbortController().signal,
+		);
+		if (!result.draft) throw new Error("Expected a prepared draft.");
+		current = status;
+		await expect(operations.commitConfigure(result.draft)).rejects.toThrow("blocked");
+		expect(commitAtomicBatch).not.toHaveBeenCalled();
+		expect(reconnect).not.toHaveBeenCalled();
+		operations.discardConfigureDraft(result.draft);
+		await expect(operations.commitConfigure(result.draft)).rejects.toThrow("draft expired");
+	});
+
+	it("does not consume a draft twice or commit after discard during identity revalidation", async () => {
+		const gate = deferred<{ status: "same" }>();
+		let calls = 0;
+		const commitAtomicBatch = vi.fn(async () => receipt());
+		const settings = { getNotificationSettingsSnapshot: () => snapshot(), commitAtomicBatch } as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+			},
+			{
+				resolveTelegramSetupPreflight: async () => ({ status: "safe" }) as never,
+				runTelegramSetup: async () => ({
+					ok: true,
+					chatId: "chat",
+					tokenFingerprint: "fp",
+					threadedMode: "enabled",
+					threadedLabel: "verified",
+					pairingSource: "provided",
+				}),
+				proposedTelegramIdentity: async () => (++calls === 1 ? { status: "same" } : await gate.promise),
+			},
+		);
+		const preflight = await operations.preflightProposedIdentity(
+			{ token: secret(), chatId: "chat", richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
+			new AbortController().signal,
+		);
+		if (!preflight.draft) throw new Error("Expected a prepared draft.");
+		const pending = operations.commitConfigure(preflight.draft);
+		await expect(operations.commitConfigure(preflight.draft)).rejects.toThrow("draft expired");
+		await expect(operations.saveInactive(preflight.draft)).rejects.toThrow("draft expired");
+		operations.discardConfigureDraft(preflight.draft);
+		gate.resolve({ status: "same" });
+		await expect(pending).rejects.toThrow("draft expired");
+		expect(commitAtomicBatch).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		"restored",
+		"still_blocked",
+	] as const)("preserves %s restore and classifies a subsequent observer failure", async outcome => {
+		const initial = snapshot();
+		const current = structuredClone(initial);
+		const parentAt = (keys: readonly string[]): Record<string, unknown> => {
+			let target = current as unknown as Record<string, unknown>;
+			for (const key of keys.slice(0, -1)) {
+				const child = target[key];
+				if (!child || typeof child !== "object" || Array.isArray(child)) target[key] = {};
+				target = target[key] as Record<string, unknown>;
+			}
+			return target;
+		};
+		const commit = async (patches: readonly { path: string; op: string; value?: unknown }[]) => {
+			const previous = patches.map(patch => {
+				const keys = patch.path.split(".").slice(1);
+				const target = parentAt(keys);
+				const key = keys[keys.length - 1]!;
+				const value = structuredClone(target[key]);
+				if (patch.op === "unset") delete target[key];
+				else target[key] = structuredClone(patch.value);
+				return { keys, value };
+			});
+			return {
+				revisions: [],
+				discard: () => {},
+				restore: async () => {
+					for (const { keys, value } of previous) {
+						const target = parentAt(keys);
+						const key = keys[keys.length - 1]!;
+						if (value === undefined) delete target[key];
+						else target[key] = value;
+					}
+					return { status: "restored" as const, receipt: receipt() };
+				},
+			};
+		};
+		const settings = {
+			getNotificationSettingsSnapshot: () => structuredClone(current),
+			commitAtomicBatch: commit,
+			commitAtomicBatchWithCurrent: async (
+				build: (raw: object) => Promise<readonly SettingsAtomicPatch[]> | readonly SettingsAtomicPatch[],
+			) => commit(await build({ notifications: current })),
+		} as unknown as Settings;
+		let notifications = 0;
+		let reconnects = 0;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+				notifyConfigChanged: () => {
+					if (++notifications === 2) throw new Error(TOKEN);
+				},
+			},
+			{
+				resolveTelegramSetupPreflight: async () => ({ status: "safe" }) as never,
+				runTelegramSetup: async () => ({
+					ok: true,
+					chatId: "chat",
+					tokenFingerprint: "fp",
+					threadedMode: "enabled",
+					threadedLabel: "verified",
+					pairingSource: "provided",
+				}),
+				proposedTelegramIdentity: async () => ({ status: "same" }),
+				ensureTelegramDaemonRunningDetailed: async () =>
+					++reconnects === 1 || outcome === "still_blocked" ? "blocked_identity" : "attached",
+			},
+		);
+		const preflight = await operations.preflightProposedIdentity(
+			{ token: secret(), chatId: "chat", richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
+			new AbortController().signal,
+		);
+		if (!preflight.draft) throw new Error("Expected a prepared draft.");
+		const committed = await operations.commitConfigure(preflight.draft);
+		if (committed.status !== "blocked_identity") throw new Error("Expected blocked activation.");
+		expect(current.telegram.botToken).toBe(TOKEN);
+		expect(Object.values(current.telegram.activation ?? {})).toHaveLength(1);
+		const restored = await committed.restore();
+		expect(restored).toMatchObject({ status: outcome, observerFailed: true });
+		if (restored.status !== "restored" && restored.status !== "still_blocked")
+			throw new Error("Unexpected restore outcome.");
+		expect(restored.observerFailed).toBe(true);
+		expect(JSON.stringify(restored)).not.toContain(TOKEN);
+		expect(current.telegram.botToken).toBe(initial.telegram.botToken);
+		expect(current.telegram.chatId).toBe(initial.telegram.chatId);
+		expect(Object.values(current.telegram.activation ?? {})).toHaveLength(0);
+		expect(notifications).toBe(2);
+	});
+	it("propagates an actual restore failure without calling the observer again", async () => {
+		const notify = vi.fn(async () => {});
+		const settings = {
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => receipt(),
+		} as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: { notificationSessionController: undefined },
+				sessionManager: { getCwd: () => "/unused", getSessionId: () => "session" },
+				notifyConfigChanged: notify,
+			},
+			{
+				resolveTelegramSetupPreflight: async () => ({ status: "safe" }) as never,
+				runTelegramSetup: async () => ({
+					ok: true,
+					chatId: "chat",
+					tokenFingerprint: "fp",
+					threadedMode: "enabled",
+					threadedLabel: "verified",
+					pairingSource: "provided",
+				}),
+				proposedTelegramIdentity: async () => ({ status: "same" }),
+				reconcileCommittedTelegramConfiguration: async input => ({
+					status: "blocked_identity",
+					receipt: input.receipt,
+					message: "blocked",
+					retainCommitted: () => {},
+					restore: async () => {
+						throw new Error("restore failed");
+					},
+				}),
+			},
+		);
+		const preflight = await operations.preflightProposedIdentity(
+			{ token: secret(), chatId: "chat", richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
+			new AbortController().signal,
+		);
+		if (!preflight.draft) throw new Error("Expected a prepared draft.");
+		const committed = await operations.commitConfigure(preflight.draft);
+		if (committed.status !== "blocked_identity") throw new Error("Expected blocked activation.");
+		await expect(committed.restore()).rejects.toThrow("restore failed");
+		expect(notify).toHaveBeenCalledTimes(1);
+	});
+
 	it("rejects forged, foreign, discarded, and replayed provider drafts without side effects", async () => {
 		const commitAtomicBatch = vi.fn(async () => receipt());
 		const settings = {
@@ -742,7 +1015,7 @@ describe("notification settings controller adapter", () => {
 		const operations = createNotificationsEditorOperations(
 			{
 				settings,
-				session: {},
+				session: { notificationSessionController: undefined },
 				sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
 			} as unknown as NotificationsEditorAdapterContext,
 			{
@@ -785,7 +1058,7 @@ describe("notification settings controller adapter", () => {
 		const operations = createNotificationsEditorOperations(
 			{
 				settings,
-				session: {},
+				session: { notificationSessionController: undefined },
 				sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
 			} as unknown as NotificationsEditorAdapterContext,
 			{
@@ -837,7 +1110,7 @@ describe("notification settings controller adapter", () => {
 		const operations = createNotificationsEditorOperations(
 			{
 				settings,
-				session: {},
+				session: { notificationSessionController: undefined },
 				sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
 			} as unknown as NotificationsEditorAdapterContext,
 			{ getCurrentTelegramActivationMarker: () => marker },
@@ -976,6 +1249,126 @@ describe("notification settings controller adapter", () => {
 });
 
 describe("notification settings selector lifecycle", () => {
+	it.each([
+		"restored",
+		"still_blocked",
+	] as const)("shows the %s outcome and the restore observer warning", async outcome => {
+		const draft = {
+			chatId: "chat",
+			tokenMask: "masked",
+			richEnabled: true,
+			richDraftEnabled: false,
+			streamingEnabled: true,
+		};
+		const base = selectorOperations({
+			preflight: async () => ({ status: "ready", identity: { status: "same" }, message: "ready", draft }),
+		});
+		const component = selector({
+			...base,
+			commitConfigure: async () => ({
+				status: "blocked_identity",
+				receipt: receipt(),
+				message: "blocked",
+				retainCommitted: () => {},
+				restore: async () =>
+					outcome === "restored"
+						? { status: "restored", reconnect: "attached", observerFailed: true }
+						: { status: "still_blocked", observerFailed: true },
+			}),
+		});
+		selectNotifications(component);
+		await flush();
+		component.handleInput("\n");
+		component.handleInput("\n");
+		component.handleInput("\n");
+		component.handleInput("chat");
+		component.handleInput("\n");
+		component.handleInput(TOKEN);
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		expect(component.render(120).join("\n")).toContain("Restore previous configuration");
+		component.handleInput("\n");
+		await flush();
+		const display = component.render(200).join("\n");
+		expect(display).toContain(
+			outcome === "restored" ? "Previous Telegram configuration restored" : "activation remains blocked",
+		);
+		expect(display).toContain("settings observer failed after the restore");
+		expect(display).not.toContain(TOKEN);
+		component.dispose();
+	});
+
+	it.each([
+		"settings observer failed",
+		"Telegram daemon restart failed",
+	])("shows preference %s as a warning", async failure => {
+		const component = selector(
+			selectorOperations({
+				commitPreferences: async () => ({
+					receipt: receipt(),
+					outcome: "degraded",
+					message: `Notification preferences saved, but ${failure}.`,
+				}),
+			}),
+		);
+		selectNotifications(component);
+		await flush();
+		activateActionWithDescription(component, "Draft safe scalar preferences, then save them atomically.");
+		activateActionWithDescription(component, "Atomically persist this preference draft.");
+		await flush();
+		const display = component.render(200).join("\n");
+		expect(display).toContain("  WARNING");
+		expect(display).toContain("Notification preferences saved");
+		expect(display).toContain(failure);
+		expect(display).not.toContain("  OK");
+		component.dispose();
+	});
+
+	it.each([true, false])("shows restored runtime failure and fencing status (fenced=%s)", async runtimeFenced => {
+		const draft = {
+			chatId: "chat",
+			tokenMask: "masked",
+			richEnabled: true,
+			richDraftEnabled: false,
+			streamingEnabled: true,
+		};
+		const base = selectorOperations({
+			preflight: async () => ({ status: "ready", identity: { status: "same" }, message: "ready", draft }),
+		});
+		const component = selector({
+			...base,
+			commitConfigure: async () => ({
+				status: "blocked_identity",
+				receipt: receipt(),
+				message: "blocked",
+				retainCommitted: () => {},
+				restore: async () => ({ status: "restored", runtimeFailed: true, runtimeFenced, observerFailed: true }),
+			}),
+		});
+		selectNotifications(component);
+		await flush();
+		component.handleInput("\n");
+		component.handleInput("\n");
+		component.handleInput("\n");
+		component.handleInput("chat");
+		component.handleInput("\n");
+		component.handleInput(TOKEN);
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		component.handleInput("\n");
+		await flush();
+		const display = component.render(300).join("\n");
+		expect(display).toContain("  WARNING");
+		expect(display).toContain("Previous Telegram configuration restored");
+		expect(display).toContain(runtimeFenced ? "current runtime was fenced" : "current runtime could not be fenced");
+		expect(display).toContain("settings observer failed after the restore");
+		component.dispose();
+	});
+
 	it("disposes a cancellable notification editor when switching tabs", async () => {
 		const pairing = deferred<NotificationsPreflightResult>();
 		let pairingSignal: AbortSignal | undefined;

@@ -126,6 +126,19 @@ function writeLiveForeignOwner(agentDir: string, incarnation = "linux:44444"): v
 }
 
 describe("notification orchestration ownership", () => {
+	test.each(["foreign", "unknown"] as const)("%s identity cancels by default without writes", async status => {
+		const { writer: settings, commits } = writer();
+		const result = await saveTelegramConfiguration({
+			settings,
+			botToken: TOKEN,
+			chatId: "new-chat",
+			saveInactive: false,
+			preflight: async () => ({ status }),
+		});
+		expect(result).toMatchObject({ status: "cancelled", preflight: { status } });
+		expect(commits).toEqual([]);
+		expect(JSON.stringify(result)).not.toContain(TOKEN);
+	});
 	test("foreign preflight cancels before commit without serializing either token", async () => {
 		const agentDir = tempAgentDir();
 		writeLiveForeignOwner(agentDir);
@@ -246,6 +259,84 @@ describe("notification orchestration ownership", () => {
 });
 
 describe("notification orchestration blocked activation", () => {
+	test.each([
+		"reconnect",
+		"clear",
+		"reconcile",
+	] as const)("reports durable restore when post-restore %s fails and fences the runtime", async failingStep => {
+		for (const fenceFails of [false, true]) {
+			let configuration = "new";
+			let markerPresent = false;
+			let blocked = false;
+			let reconnects = 0;
+			let fences = 0;
+			const activeReceipt = receipt({
+				restore: async () => {
+					configuration = "previous";
+					return { status: "restored", receipt: receipt() };
+				},
+			});
+			const inactiveReceipt = receipt({
+				restore: async () => {
+					markerPresent = false;
+					return { status: "restored", receipt: receipt() };
+				},
+			});
+			const settings: NotificationConfigurationWriter = {
+				getAgentDir: () => "/unused",
+				getNotificationSettingsSnapshot: () => snapshot(),
+				commitAtomicBatch: async () => activeReceipt,
+				commitAtomicBatchWithCurrent: async build => {
+					await build({ notifications: { telegram: {} } });
+					return activeReceipt;
+				},
+			};
+			const marker = createTelegramActivationMarker({ botToken: TOKEN, chatId: "new-chat", state: "blocked" });
+			const result = await saveTelegramConfiguration({
+				settings,
+				botToken: TOKEN,
+				chatId: "new-chat",
+				saveInactive: false,
+				preflight: async () => ({ status: "same" }),
+				activation: {
+					marker,
+					persistInactive: async () => {
+						markerPresent = true;
+						return inactiveReceipt;
+					},
+					clearInactive: async () => {},
+					reconnect: async () => {
+						if (++reconnects === 1) return "blocked_identity";
+						if (failingStep === "reconnect") throw new Error(TOKEN);
+						return "attached";
+					},
+					controller: {
+						enterBlockedRuntime: async () => {
+							if (++fences === 2 && fenceFails) throw new Error(TOKEN);
+							blocked = true;
+						},
+						clearBlockedRuntime: async () => {
+							blocked = false;
+							if (failingStep === "clear") throw new Error(TOKEN);
+						},
+						reconcileCurrentSession: async () => {
+							if (failingStep === "reconcile") throw new Error(TOKEN);
+						},
+					},
+				},
+			});
+			if (result.status !== "blocked_identity") throw new Error("Expected blocked activation.");
+			expect(markerPresent).toBe(true);
+			const restored = await result.restore();
+			expect(restored).toMatchObject({ status: "restored", runtimeFailed: true, runtimeFenced: !fenceFails });
+			expect(JSON.stringify(restored)).not.toContain(TOKEN);
+			expect(configuration).toBe("previous");
+			expect(markerPresent).toBe(false);
+			expect(fences).toBe(2);
+			if (!fenceFails) expect(blocked).toBe(true);
+		}
+	});
+
 	test("blocked identity keeps its marker until configuration rollback is complete", async () => {
 		const events: string[] = [];
 		const commits: SettingsAtomicPatch[][] = [];

@@ -334,10 +334,17 @@ export type PostCommitTelegramActivationResult =
 	  };
 
 export type BlockedTelegramRestoreResult =
-	| { status: "restored"; reconnect: TelegramDaemonReconnectOutcome }
+	| { status: "restored"; reconnect: TelegramDaemonReconnectOutcome; observerFailed?: boolean; runtimeFailed?: false }
+	| {
+			status: "restored";
+			reconnect?: TelegramDaemonReconnectOutcome;
+			observerFailed?: boolean;
+			runtimeFailed: true;
+			runtimeFenced: boolean;
+	  }
 	| { status: "conflict"; paths: readonly string[] }
 	| { status: "discarded" }
-	| { status: "still_blocked" };
+	| { status: "still_blocked"; observerFailed?: boolean };
 
 async function restoreBlockedConfiguration(input: {
 	receipt: SettingsAtomicReceipt;
@@ -377,14 +384,31 @@ async function restoreBlockedConfiguration(input: {
 		return { status: "still_blocked" };
 	}
 
-	const reconnect = await input.activation.reconnect();
-	if (reconnect === "blocked_identity") {
-		await input.activation.controller.enterBlockedRuntime();
-		return { status: "still_blocked" };
+	let reconnect: TelegramDaemonReconnectOutcome | undefined;
+	try {
+		reconnect = await input.activation.reconnect();
+		if (reconnect === "blocked_identity") {
+			await input.activation.controller.enterBlockedRuntime();
+			return { status: "still_blocked" };
+		}
+		await input.activation.controller.clearBlockedRuntime();
+		await input.activation.controller.reconcileCurrentSession();
+		return { status: "restored", reconnect };
+	} catch {
+		let runtimeFenced = false;
+		try {
+			await input.activation.controller.enterBlockedRuntime();
+			runtimeFenced = true;
+		} catch {
+			// The durable rollback still succeeded even when runtime fencing fails.
+		}
+		return {
+			status: "restored",
+			...(reconnect === undefined ? {} : { reconnect }),
+			runtimeFailed: true,
+			runtimeFenced,
+		};
 	}
-	await input.activation.controller.clearBlockedRuntime();
-	await input.activation.controller.reconcileCurrentSession();
-	return { status: "restored", reconnect };
 }
 
 /**

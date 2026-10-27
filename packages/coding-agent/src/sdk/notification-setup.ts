@@ -12,6 +12,7 @@ import {
 	type NotificationProvider,
 } from "./bus/config";
 import {
+	type BlockedTelegramRestoreResult,
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
 	mutateNotificationProvider,
@@ -136,7 +137,10 @@ export function createNotificationsEditorOperations(
 	overrides: Partial<NotificationsEditorOperationDependencies> = {},
 ): NotificationsEditorOperations {
 	const services = { ...notificationEditorOperationDependencies, ...overrides };
-	const drafts = new WeakMap<PreparedTelegramConfiguration, string>();
+	const drafts = new WeakMap<
+		PreparedTelegramConfiguration,
+		{ token: string; activationAllowed: boolean; busy: boolean }
+	>();
 	const providerDrafts = new WeakMap<
 		PreparedNotificationProviderConfiguration,
 		{ botToken?: string; appToken?: string }
@@ -359,7 +363,11 @@ export function createNotificationsEditorOperations(
 					streamingEnabled: input.streamingEnabled,
 				};
 				Object.freeze(draft);
-				drafts.set(draft, token);
+				drafts.set(draft, {
+					token,
+					activationAllowed: identity.status === "absent" || identity.status === "same",
+					busy: false,
+				});
 				const pairingMessage =
 					setup.pairingSource === "discovered"
 						? "Telegram private chat discovered and validated."
@@ -391,8 +399,30 @@ export function createNotificationsEditorOperations(
 		},
 
 		commitConfigure: async draft => {
-			const token = drafts.get(draft);
-			if (!token) throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+			const prepared = drafts.get(draft);
+			if (!prepared || prepared.busy)
+				throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+			if (!prepared.activationAllowed)
+				throw new Error("Telegram activation is blocked by the current daemon identity. Save inactive or cancel.");
+			prepared.busy = true;
+			const { token } = prepared;
+			try {
+				const identity = await services.proposedTelegramIdentity({
+					settings: ctx.settings,
+					botToken: token,
+					chatId: draft.chatId,
+				});
+				if (drafts.get(draft) !== prepared)
+					throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+				if (identity.status !== "absent" && identity.status !== "same") {
+					throw new Error(
+						"Telegram activation is blocked by the current daemon identity. Save inactive or cancel.",
+					);
+				}
+			} catch (error) {
+				prepared.busy = false;
+				throw notificationOperationError(services, error, token);
+			}
 			drafts.delete(draft);
 			let receipt: SettingsAtomicReceipt | undefined;
 			try {
@@ -450,9 +480,18 @@ export function createNotificationsEditorOperations(
 							token,
 						),
 						restore: async () => {
-							const restored = await activation.restore();
+							let restored: BlockedTelegramRestoreResult;
+							try {
+								restored = await activation.restore();
+							} catch (error) {
+								throw notificationOperationError(services, error, token);
+							}
 							if (restored.status === "restored" || restored.status === "still_blocked") {
-								await notifyAfterDurableCommit();
+								try {
+									await notifyAfterDurableCommit();
+								} catch {
+									return { ...restored, observerFailed: true as const };
+								}
 							}
 							return restored;
 						},
@@ -494,8 +533,10 @@ export function createNotificationsEditorOperations(
 		},
 
 		saveInactive: async draft => {
-			const token = drafts.get(draft);
-			if (!token) throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+			const prepared = drafts.get(draft);
+			if (!prepared || prepared.busy)
+				throw new Error("The Telegram setup draft expired. Re-enter the masked bot token.");
+			const { token } = prepared;
 			drafts.delete(draft);
 			try {
 				const result = await services.saveTelegramInactive({
