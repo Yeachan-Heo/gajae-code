@@ -164,7 +164,10 @@ package root. They are trusted embedding compositions, not new managed operation
   and a manually disposed view is not silently recreated.
 - **Local notification setup:** `createNotificationsEditorOperations` accepts
   `{ settings, session, sessionManager }` and reuses the same service as the TUI.
-  `preflightProposedIdentity`/`commitConfigure` and
+  Mutation and runtime operations require writable durable Settings; memory-only
+  Settings cannot configure or start an external notification daemon. Inactive
+  saves reconcile the current session and report reconciliation failures separately
+  from successful persistence. `preflightProposedIdentity`/`commitConfigure` and
   `prepareProviderConfiguration`/`commitProviderConfiguration` retain preflight,
   CAS and saved-but-activation-failed outcomes. Keep prepared objects in the
   trusted host: they are frozen, instance-bound, one-shot authority, not arbitrary
