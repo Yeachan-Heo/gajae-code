@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import packageJson from "../package.json" with { type: "json" };
-import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
+import { AcpAgent, acpPromptPayload, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
@@ -103,6 +103,18 @@ test("ACP advertised skill commands require one complete canonical text block", 
 		name: "not-advertised",
 		args: "",
 	});
+	const inlineText = "Review the proposal /skill:deep-interview clarify alternatives";
+	const inlineBlocks = [{ type: "text" as const, text: inlineText }];
+	expect(acpSkillInvocation(inlineBlocks)).toBeUndefined();
+	const advertisedSkills = new Map([["skill:deep-interview", { name: "deep-interview" }]]);
+	expect(acpSkillInvocation(inlineBlocks, advertisedSkills)).toEqual({
+		name: "deep-interview",
+		args: "Review the proposal clarify alternatives",
+	});
+	const unknownInline = [{ type: "text" as const, text: "Keep /skill:missing exactly as typed" }];
+	expect(acpSkillInvocation(unknownInline, advertisedSkills)).toBeUndefined();
+	expect(acpPromptPayload(unknownInline).text).toBe("Keep /skill:missing exactly as typed");
+	expect(acpPromptPayload(inlineBlocks).text).toBe(inlineText);
 });
 test("production ACP routes zero-session SDK globals through the broker adapter", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-production-"));
@@ -639,7 +651,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								frame.operation === "turn.prompt"
 									? { ...currentPromptCorrelation(), accepted: true }
 									: frame.operation === "skill.invoke"
-										? { commandId: "skill-command", turnId: "skill-turn", accepted: true }
+										? {
+												commandId: `skill-command-${skillInputs.length}`,
+												turnId: `skill-turn-${skillInputs.length}`,
+												accepted: true,
+											}
 										: frame.operation === "turn.abort"
 											? abortAcknowledged
 												? (() => {
@@ -882,12 +898,34 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		JSON.stringify({
 			type: "agent_end",
 			sessionId: created.sessionId,
-			commandId: "skill-command",
-			turnId: "skill-turn",
+			commandId: "skill-command-1",
+			turnId: "skill-turn-1",
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 		}),
 	);
 	await expect(bounded(skillPrompt, "ACP skill prompt completion")).resolves.toMatchObject({ stopReason: "end_turn" });
+	const inlineSkillPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "Review the proposal /skill:deep-interview clarify alternatives" }],
+	});
+	await waitFor(() => skillInputs.length === 2 && promptSocket !== undefined, "ACP inline skill invocation");
+	expect(skillInputs[1]).toMatchObject({
+		name: "deep-interview",
+		args: "Review the proposal clarify alternatives",
+	});
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "skill-command-2",
+			turnId: "skill-turn-2",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	await expect(bounded(inlineSkillPrompt, "ACP inline skill completion")).resolves.toMatchObject({
+		stopReason: "end_turn",
+	});
+	expect(promptInputs).toHaveLength(0);
 	holdSkillPreflight = true;
 	const preflightCancelledSkill = agent.prompt({
 		sessionId: created.sessionId,
@@ -1550,5 +1588,27 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			}),
 		]),
 	);
+	const unknownInlineText = "Keep /skill:missing exactly as typed";
+	const promptCountBeforeUnknownSkill = promptInputs.length;
+	const unknownInlinePrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: unknownInlineText }],
+	});
+	await waitFor(
+		() => promptInputs.length === promptCountBeforeUnknownSkill + 1 && promptSocket !== undefined,
+		"unknown ACP inline skill remains a text prompt",
+	);
+	expect(promptInputs.at(-1)).toMatchObject({ text: unknownInlineText });
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			...currentPromptCorrelation(),
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	await expect(bounded(unknownInlinePrompt, "unknown inline skill prompt completion")).resolves.toMatchObject({
+		stopReason: "end_turn",
+	});
 	controller.abort();
 }, 30_000);
