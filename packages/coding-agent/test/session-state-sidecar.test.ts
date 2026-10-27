@@ -2243,6 +2243,106 @@ describe("coordinator runtime state sidecar", () => {
 		});
 	});
 
+	it.skipIf(process.platform !== "darwin").each([
+		["waits for an in-flight relay", true],
+		["fails on plain contention", false],
+	] as const)(
+		"finalizes a signaled child whose supervisor still holds the relay lock: %s",
+		async (_case, inFlight) => {
+			const root = await tempRoot();
+			const stateFile = path.join(root, "state.json");
+			const sessionId = "relay-lock-session";
+			const generation = await replaceOwnerGeneration(root, sessionId, "relay-lock-generation");
+			const paths = lifecyclePaths(root, sessionId, generation);
+			const intent = await createOwnerIntent(root, {
+				generation,
+				session_id: sessionId,
+				server_key: "opaque-owner",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "operator-dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 60_000).toISOString(),
+			});
+			const supervisor = { child_token: "token", supervisor_pid: 10, supervisor_start_time: "start" };
+			await fs.writeFile(
+				paths.supervisorIndexFile,
+				`${JSON.stringify({ schema_version: 1, generation, session_id: sessionId, ...supervisor })}\n`,
+				{ mode: 0o600 },
+			);
+			const record = {
+				schema_version: 1,
+				intent_id: intent.intent_id,
+				dispatch_id: intent.dispatch_id,
+				generation,
+				session_id: sessionId,
+				server_key: "opaque-owner",
+				...supervisor,
+				relayed_at: new Date().toISOString(),
+			};
+			if (inFlight) await fs.writeFile(paths.relayPendingFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			await Bun.write(
+				stateFile,
+				JSON.stringify({
+					schema_version: 1,
+					session_id: sessionId,
+					state: "running",
+					cwd: root,
+					workdir: root,
+					session_file: null,
+				}),
+			);
+			// The supervisor holds the generation lock across signal delivery and the
+			// confirmed record's slow durable publication, well past the 250 ms base budget.
+			const holder = Bun.spawn({
+				cmd: [
+					process.execPath,
+					"-e",
+					`import { Database } from "bun:sqlite"; import * as fs from "node:fs";
+const env = process.env; const db = new Database(env.LOCK_DB); db.exec("BEGIN IMMEDIATE");
+process.stdout.write("locked\\n");
+setTimeout(() => {
+	if (env.RELAY_FILE) { fs.writeFileSync(env.RELAY_FILE, env.RELAY_BYTES, { mode: 0o600, flag: "wx" }); fs.unlinkSync(env.PENDING_FILE); }
+	db.exec("COMMIT"); db.close(); process.exit(0);
+}, 700);`,
+				],
+				env: {
+					...process.env,
+					LOCK_DB: paths.lockDatabaseFile,
+					PENDING_FILE: paths.relayPendingFile,
+					...(inFlight ? { RELAY_FILE: paths.relayFile, RELAY_BYTES: `${JSON.stringify(record)}\n` } : {}),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			try {
+				const reader = holder.stdout.getReader();
+				try {
+					expect(new TextDecoder().decode((await reader.read()).value)).toBe("locked\n");
+				} finally {
+					reader.releaseLock();
+				}
+				await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+					sessionId,
+					cwd: root,
+					sessionFile: null,
+					ownerTerminal: { generation, stateDir: root, socketKey: "opaque-owner" },
+				});
+			} finally {
+				expect(await holder.exited).toBe(0);
+			}
+			const payload = await readPayload(stateFile);
+			if (inFlight) {
+				expect(payload).toMatchObject({ state: "completed" });
+				expect(await readJson(paths.verdictFile)).toMatchObject({ classification: "expected_operator_shutdown" });
+			} else {
+				expect(payload).toMatchObject({ state: "errored", error: { code: "owner_verdict_unavailable" } });
+				expect(fsSync.existsSync(paths.verdictFile)).toBeFalse();
+			}
+		},
+	);
+
 	it("does not overwrite richer terminal launch_error evidence during postmortem", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");

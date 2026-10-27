@@ -27,7 +27,6 @@ import {
 	isValidOwnerIntent,
 	lifecyclePaths,
 	type ObserveTerminalRequest,
-	type OwnerIntent,
 	type OwnerVerdict,
 	observeOwnerTerminal,
 	type TerminalSignal,
@@ -2958,11 +2957,16 @@ async function operatorDispatchIdForOwner(
 		const intent = JSON.parse(
 			await Bun.file(lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile).text(),
 		) as unknown;
-		if (!isValidOwnerIntent(intent)) return undefined;
-		const dispatchId = owner.operatorDispatchId ?? intent.dispatch_id;
-		return isValidOwnerIntent(intent as OwnerIntent, { ...request, operator_dispatch_id: dispatchId })
-			? dispatchId
-			: undefined;
+		if (
+			!isValidOwnerIntent(intent) ||
+			intent.generation !== request.owner_generation ||
+			intent.session_id !== request.session_id ||
+			intent.server_key !== request.socket_key
+		)
+			return undefined;
+		// Timing is not judged here: the verdict decides whether this intent explains
+		// the observation, including a timely relay that a stopped child handled late.
+		return owner.operatorDispatchId ?? intent.dispatch_id;
 	} catch {
 		return undefined;
 	}

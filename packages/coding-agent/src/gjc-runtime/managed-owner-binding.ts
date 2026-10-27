@@ -185,9 +185,10 @@ export function isManagedOwnerSupervisorIndex(value: unknown): value is ManagedO
 /**
  * Darwin: published no-replace by the exact supervisor, under the generation lock,
  * as `relay-<generation>.pending.json` before it relays SIGTERM for one cooperative
- * intent, and renamed to `relay-<generation>.json` only after the signal was sent.
- * Only the confirmed record proves delivery: an operator-shutdown verdict requires
- * it. A pending record without confirmation is uncertain and blocks retirement; an
+ * intent. Only after the signal was sent does it publish `relay-<generation>.json`,
+ * whose `relayed_at` was sampled immediately before delivery, and remove the
+ * pending record. Only the confirmed record proves delivery: an operator-shutdown
+ * verdict requires it, and never for an observation earlier than `relayed_at`. A pending record without confirmation is uncertain and blocks retirement; an
  * expired intent with neither was provably never delivered and may be retired.
  */
 export interface ManagedOwnerRelayRecord {

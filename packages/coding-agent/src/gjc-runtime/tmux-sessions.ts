@@ -1955,7 +1955,6 @@ function proveCooperativeSupervisorBinding(identity: ExactOwnerIdentity): Manage
 		binding.generation !== identity.generation
 	)
 		throw new Error("managed_owner_binding_untrusted");
-	if (Date.parse(binding.created_at) > Date.now()) throw new Error("managed_owner_binding_unavailable");
 	return binding;
 }
 
@@ -1963,9 +1962,10 @@ function proveCooperativeSupervisorBinding(identity: ExactOwnerIdentity): Manage
  * @internal Bounded discovery of the exact supervisor's binding.
  *
  * The launch proof can return before the supervisor durably publishes its binding.
- * Only an absent binding, or one whose `created_at` is still in the future (clock
- * skew), is retried, and only while the same exact supervisor stays live; untrusted,
- * ambiguous, or changed evidence still fails closed immediately.
+ * Only an absent binding is retried, and only while the same exact supervisor stays
+ * live; untrusted, ambiguous, or changed evidence still fails closed immediately. The
+ * binding's wall-clock `created_at` is not a gate, so a clock rollback after launch
+ * never blocks closing a live owner.
  */
 export async function awaitCooperativeSupervisorBinding(
 	identity: ExactOwnerIdentity,

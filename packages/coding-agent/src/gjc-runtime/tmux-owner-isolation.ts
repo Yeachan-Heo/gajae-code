@@ -20,6 +20,7 @@ import {
 	verifyOwnerOnlyPathSecurity,
 } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
+import { observeProcessIncarnation, type ProcessIncarnationObservation } from "../sdk/broker/process-incarnation";
 import { parseLinuxProcStartTime } from "./linux-proc";
 import {
 	isManagedOwnerBinding,
@@ -1162,6 +1163,7 @@ export function resolveManagedOwnerPredecessorSync(
 	stateDir: string,
 	sessionId: string,
 	baseline: OwnerGenerationBaseline,
+	observe: (pid: number) => ProcessIncarnationObservation = observeProcessIncarnation,
 ): ManagedOwnerPredecessorEvidence | undefined {
 	if (baseline.state === "absent") return undefined;
 	const root = lifecyclePaths(stateDir, sessionId, baseline.generation).root;
@@ -1183,8 +1185,14 @@ export function resolveManagedOwnerPredecessorSync(
 	}
 	if (bindings.size === 0 && receipts.size === 0) return undefined;
 	// SIGABRT receipts are a Linux-only capability. Elsewhere a prior generation's
-	// child binding without a receipt is ordinary history, not partial recovery evidence.
-	if (receipts.size === 0 && process.platform !== "linux") return undefined;
+	// child binding without a receipt is ordinary history, but only once its exact
+	// supervisor has positively exited: replacing a live supervisor's generation would
+	// fence that owner out of its own close.
+	if (receipts.size === 0 && process.platform !== "linux") {
+		for (const token of bindings)
+			assertPredecessorSupervisorExited(root, baseline.generation, sessionId, token, observe);
+		return undefined;
+	}
 	const tokens = [...bindings].filter(token => receipts.has(token));
 	if (tokens.length !== 1 || receipts.size !== 1) throw new Error("managed_owner_replacement_evidence_ambiguous");
 	const predecessorToken = tokens[0]!;
@@ -1213,6 +1221,33 @@ export function resolveManagedOwnerPredecessorSync(
 	} finally {
 		authority.close();
 	}
+}
+
+function assertPredecessorSupervisorExited(
+	root: string,
+	generation: string,
+	sessionId: string,
+	token: string,
+	observe: (pid: number) => ProcessIncarnationObservation,
+): void {
+	if (!/^[A-Za-z0-9._-]+$/.test(token)) throw new Error("managed_owner_replacement_evidence_untrusted");
+	const binding = readSecureOwnerJson(path.join(root, `child-${token}.binding.json`));
+	if (
+		!isManagedOwnerBinding(binding) ||
+		binding.generation !== generation ||
+		binding.session_id !== sessionId ||
+		binding.child_token !== token
+	)
+		throw new Error("managed_owner_replacement_evidence_untrusted");
+	const supervisor = observe(binding.supervisor_pid);
+	if (supervisor.status === "absent") return;
+	if (supervisor.status === "present" && supervisor.incarnation !== binding.supervisor_start_time) return;
+	// A live or unobservable predecessor supervisor still owns its generation.
+	throw new Error(
+		supervisor.status === "present"
+			? "managed_owner_predecessor_live"
+			: "managed_owner_replacement_evidence_unavailable",
+	);
 }
 
 export async function captureOwnerGenerationBaseline(
@@ -1395,6 +1430,13 @@ export async function createOwnerIntent(
 }
 
 const VERDICT_LOCK_WAIT_TIMEOUT_MS = 250;
+/**
+ * Darwin: a supervisor holds the generation lock across one relay (pending record,
+ * signal, confirmed record, directory sync). A signaled child's observer that finds
+ * that relay in flight waits for it to settle instead of failing on transient
+ * contention; the bound stays inside the default postmortem cleanup deadline.
+ */
+const RELAY_SETTLE_WAIT_TIMEOUT_MS = 3_000;
 const GENERATION_LOCK_WAIT_TIMEOUT_MS = 7_000;
 
 interface LiveSqliteLock {
@@ -1542,13 +1584,15 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 	if (!isObserveTerminalRequest(request)) throw new Error("terminal_observation_invalid");
 	const paths = lifecyclePaths(request.state_dir, request.session_id, request.owner_generation);
 	let observation = normalizeTerminalObservation(request);
-	const deadline = Date.now() + VERDICT_LOCK_WAIT_TIMEOUT_MS;
+	const started = Date.now();
+	let deadline = started + VERDICT_LOCK_WAIT_TIMEOUT_MS;
 	let token: string | null = null;
 	while (!token) {
 		const current = await readJson<{ generation?: string }>(paths.generationFile);
 		if (current?.generation !== request.owner_generation) throw new Error("generation_mismatch");
 		token = await acquireVerdictLock(paths, request.socket_key);
 		if (token) break;
+		if (Date.now() >= deadline && relayInFlight(paths)) deadline = started + RELAY_SETTLE_WAIT_TIMEOUT_MS;
 		if (Date.now() >= deadline) throw new Error("verdict_lock_contended");
 		await Bun.sleep(Math.min(10, Math.max(0, deadline - Date.now())));
 	}
@@ -1578,7 +1622,7 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 			token,
 		});
 		const intent = await readJson<OwnerIntent>(paths.intentFile);
-		const expected = isExpectedIntent(intent, observation) && hasCooperativeRelayEvidence(paths, intent);
+		const expected = isExpectedOwnerTerminal(paths, intent, observation);
 		const verdict: OwnerVerdict = {
 			schema_version: 1,
 			generation: observation.owner_generation,
@@ -1734,28 +1778,53 @@ export function isValidOwnerIntent(intent: unknown, request?: ObserveTerminalReq
 	);
 }
 
-function isExpectedIntent(intent: OwnerIntent | null, request: ObserveTerminalRequest): boolean {
-	return isValidOwnerIntent(intent, request);
-}
-
 /**
- * A generation with a cooperative supervisor index (Darwin) has its intents
- * published by the closer but delivered only by that exact supervisor, so a pending
- * intent alone does not explain a SIGTERM: an unrelated signal can arrive while the
- * intent is still unconsumed. Only the supervisor's relay record for this exact
- * intent makes the shutdown expected. Without an index a Linux closer itself
- * delivers the signal after publishing the intent; a Darwin closer never does.
+ * Whether a terminal observation is the expected result of this exact intent.
+ *
+ * Without a cooperative supervisor index (Linux) the closer itself delivers SIGTERM
+ * right after publishing the intent, so the intent must be live at observation.
+ *
+ * With an index (Darwin) only the exact supervisor delivers, and a pending intent
+ * alone does not explain a SIGTERM: an unrelated signal can arrive while it is still
+ * unconsumed. The supervisor's confirmed relay record must exist for this intent, its
+ * `relayed_at` (sampled immediately before delivery) must fall inside the intent's
+ * window, and the observation must not precede it, so an earlier unrelated signal
+ * is never attributed to a later relay. A timely relay still explains an observation
+ * made after expiry, for example by a child that was stopped and handled the signal
+ * late. A Darwin closer never signals, so a missing index is never evidence there.
  */
-function hasCooperativeRelayEvidence(paths: LifecyclePaths, intent: OwnerIntent | null): boolean {
+function isExpectedOwnerTerminal(
+	paths: LifecyclePaths,
+	intent: OwnerIntent | null,
+	request: ObserveTerminalRequest,
+): boolean {
 	try {
 		fsSync.lstatSync(paths.supervisorIndexFile);
 	} catch (error) {
-		if (isCode(error, "ENOENT")) return process.platform !== "darwin";
+		if (isCode(error, "ENOENT") && process.platform !== "darwin") return isValidOwnerIntent(intent, request);
 		return false;
 	}
-	if (!intent) return false;
+	if (!isValidOwnerIntent(intent)) return false;
+	let relay: ManagedOwnerRelayRecord | null;
 	try {
-		return readCooperativeRelayRecord(paths, intent) !== null;
+		relay = readCooperativeRelayRecord(paths, intent);
+	} catch {
+		return false;
+	}
+	if (!relay || !isCanonicalUtcTimestamp(relay.relayed_at)) return false;
+	const observedAt = Date.parse(request.observed_at);
+	return (
+		Number.isFinite(observedAt) &&
+		observedAt >= Date.parse(relay.relayed_at) &&
+		isValidOwnerIntent(intent, { ...request, observed_at: relay.relayed_at })
+	);
+}
+
+/** A Darwin supervisor has published its pending relay record and not yet settled it. */
+function relayInFlight(paths: LifecyclePaths): boolean {
+	try {
+		fsSync.lstatSync(paths.relayPendingFile);
+		return true;
 	} catch {
 		return false;
 	}
@@ -1979,7 +2048,12 @@ export function readCooperativeRelayRecord(paths: LifecyclePaths, intent: OwnerI
  * refuses expired intents under the same lock, and the retired name is not the
  * canonical intent it reads. Anything else stays as uncertain evidence.
  */
-function retireUndeliveredCooperativeIntent(paths: LifecyclePaths, sessionId: string, serverKey: string): void {
+function retireUndeliveredCooperativeIntent(
+	paths: LifecyclePaths,
+	sessionId: string,
+	serverKey: string,
+	closerGaveUp = false,
+): void {
 	try {
 		fsSync.lstatSync(paths.intentFile);
 	} catch (error) {
@@ -1993,7 +2067,7 @@ function retireUndeliveredCooperativeIntent(paths: LifecyclePaths, sessionId: st
 		intent.generation !== paths.generation ||
 		intent.session_id !== sessionId ||
 		intent.server_key !== serverKey ||
-		Date.now() < Date.parse(intent.expires_at)
+		(!closerGaveUp && Date.now() < Date.parse(intent.expires_at))
 	)
 		return;
 	if (readCooperativeRelayRecord(paths, intent)) return;
@@ -2011,6 +2085,36 @@ function retireUndeliveredCooperativeIntent(paths: LifecyclePaths, sessionId: st
 		paths.intentFile,
 		path.join(paths.root, `intent-${paths.generation}.${intent.intent_id}.undelivered`),
 	);
+}
+
+/**
+ * Darwin: a closer that gave up retires its own intent at once when it is provably
+ * undelivered (no pending or confirmed relay, no verdict), under the generation lock
+ * the supervisor takes before relaying. Expiry then no longer depends on the wall
+ * clock: a stalled supervisor resumed after a clock rollback finds no canonical
+ * intent to relay. Contention or uncertain delivery leaves the intent in place.
+ */
+function retireAbandonedCooperativeIntent(
+	paths: LifecyclePaths,
+	sessionId: string,
+	serverKey: string,
+	intent: OwnerIntent,
+): void {
+	const db = acquireSqliteLockSync(paths, 250, true);
+	if (!db) return;
+	try {
+		if (JSON.stringify(readSecureOwnerJson(paths.intentFile)) !== JSON.stringify(intent)) return;
+		retireUndeliveredCooperativeIntent(paths, sessionId, serverKey, true);
+	} catch {
+		// Unavailable evidence keeps the intent as uncertain history.
+	} finally {
+		try {
+			db.exec("COMMIT");
+		} catch {
+		} finally {
+			db.close();
+		}
+	}
 }
 
 function assertNoConflictingOwnerTerminal(paths: LifecyclePaths, sessionId: string): void {
@@ -2093,7 +2197,6 @@ export function consumeCooperativeOwnerIntent(input: {
 			intent.session_id !== binding.session_id ||
 			intent.generation !== binding.generation ||
 			intent.server_key !== input.serverKey ||
-			Date.parse(intent.created_at) < Date.parse(binding.created_at) ||
 			Date.parse(intent.created_at) > Date.parse(now) ||
 			Date.now() >= Date.parse(intent.expires_at)
 		)
@@ -2114,22 +2217,28 @@ export function consumeCooperativeOwnerIntent(input: {
 		// Two phases under the generation lock, which observers also take before
 		// classifying. The pending record is durable before delivery so a crash
 		// leaves uncertain evidence (no retirement, no rearm); only a confirmed
-		// delivery renames it to the record an operator-shutdown verdict requires.
+		// delivery publishes the record an operator-shutdown verdict requires.
 		const bytes = Buffer.from(`${JSON.stringify(relayRecord)}\n`);
 		input.publishNoReplace(paths.relayPendingFile, bytes);
 		const recorded = readOwnerOnlyFileSettled(paths.relayPendingFile, 65536);
-		// Expiry is rechecked right before the signal: a supervisor that stalled during
-		// publication must not deliver after the closer has given up.
+		// The confirmed `relayed_at` is sampled after the pending record is durable and
+		// immediately before delivery, so an observation earlier than it cannot be this
+		// relay's. Expiry is checked on that same instant: a supervisor that stalled
+		// during publication must not deliver after the closer has given up.
+		const signaledAt = new Date();
 		const delivered =
 			recorded.ok &&
 			!!recorded.data &&
 			bytes.equals(Buffer.from(recorded.data)) &&
-			Date.now() < Date.parse(intent.expires_at) &&
-			input.relay(intent, now);
-		fsSync.renameSync(
-			paths.relayPendingFile,
-			delivered ? paths.relayFile : `${paths.relayPendingFile}.${intent.intent_id}.unsent`,
-		);
+			signaledAt.getTime() < Date.parse(intent.expires_at) &&
+			input.relay(intent, signaledAt.toISOString());
+		if (delivered) {
+			input.publishNoReplace(
+				paths.relayFile,
+				Buffer.from(`${JSON.stringify({ ...relayRecord, relayed_at: signaledAt.toISOString() })}\n`),
+			);
+			fsSync.unlinkSync(paths.relayPendingFile);
+		} else fsSync.renameSync(paths.relayPendingFile, `${paths.relayPendingFile}.${intent.intent_id}.unsent`);
 		const directory = fsSync.openSync(paths.root, "r");
 		try {
 			fsSync.fsyncSync(directory);
@@ -2212,7 +2321,16 @@ export async function closeExactTmuxOwner(
 				db.close();
 			}
 		}
-		const verdict = await deps.waitForVerdict(intent);
+		const giveUp = (): never => {
+			retireAbandonedCooperativeIntent(paths, request.sessionId, request.serverKey, intent);
+			throw new Error("owner_term_verdict_timeout");
+		};
+		let verdict: OwnerVerdict | null;
+		try {
+			verdict = await deps.waitForVerdict(intent);
+		} catch {
+			return giveUp();
+		}
 		if (
 			Date.now() >= Date.parse(intent.expires_at) ||
 			!isValidOwnerVerdict(verdict) ||
@@ -2222,9 +2340,9 @@ export async function closeExactTmuxOwner(
 			verdict.server_key !== request.serverKey ||
 			verdict.classification !== "expected_operator_shutdown"
 		)
-			throw new Error("owner_term_verdict_timeout");
+			return giveUp();
 		// Only the exact supervisor's relay of this intent makes the shutdown expected.
-		if (!readCooperativeRelayRecord(paths, intent)) throw new Error("owner_term_verdict_timeout");
+		if (!readCooperativeRelayRecord(paths, intent)) return giveUp();
 		await deps.cleanupSession();
 		return verdict;
 	}

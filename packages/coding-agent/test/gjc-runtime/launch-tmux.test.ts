@@ -42,6 +42,7 @@ import {
 	removeGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import { postmortem } from "@gajae-code/utils";
+import { observeProcessIncarnation } from "../../src/sdk/broker/process-incarnation";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -3895,9 +3896,9 @@ describe("tmux owner isolation launch gate", () => {
 		},
 	);
 
-	it.skipIf(process.platform === "linux" || process.platform === "win32")(
-		"relaunches a pinned macOS root session after its supervised predecessor exited normally",
-		() => {
+	it.skipIf(process.platform === "linux" || process.platform === "win32").each(["exited", "live"] as const)(
+		"relaunches a pinned macOS root session only after its supervised predecessor exited (%s supervisor)",
+		predecessor => {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-darwin-relaunch-"));
 			try {
 				const sessionId = "pinned-root-session";
@@ -3952,12 +3953,36 @@ describe("tmux owner isolation launch gate", () => {
 				const generationFile = path.join(root, sessionId, "owner-lifecycle", "generation.json");
 				const firstGeneration = JSON.parse(fs.readFileSync(generationFile, "utf8")).generation as string;
 				// The supervisor of a normally exited owner leaves its binding and no receipt.
+				const exited = Bun.spawnSync(["/usr/bin/true"]).pid;
+				const live = observeProcessIncarnation(process.pid);
+				if (live.status !== "present") throw new Error("test process is unobservable");
+				const supervisor =
+					predecessor === "exited"
+						? { supervisor_pid: exited, supervisor_start_time: "exited-supervisor" }
+						: { supervisor_pid: process.pid, supervisor_start_time: live.incarnation };
 				fs.writeFileSync(
 					path.join(lifecyclePaths(root, sessionId, firstGeneration).root, "child-token.binding.json"),
-					"{}\n",
+					`${JSON.stringify({
+						schema_version: 3,
+						binding_kind: "opaque",
+						generation: firstGeneration,
+						session_id: sessionId,
+						run_id: "run",
+						endpoint_incarnation: "incarnation",
+						child_token: "token",
+						...supervisor,
+						created_at: new Date().toISOString(),
+					})}\n`,
 					{ mode: 0o600 },
 				);
 				const second = launch();
+				if (predecessor === "live") {
+					// A live supervisor still owns its generation; it is never replaced.
+					expect(second.diagnostics.join("\n")).toContain("managed_owner_predecessor_live");
+					expect(second.calls.some(call => call[0] === "new-session")).toBeFalse();
+					expect(JSON.parse(fs.readFileSync(generationFile, "utf8")).generation).toBe(firstGeneration);
+					return;
+				}
 				expect(second.diagnostics).toEqual([]);
 				const innerCommand = second.calls.find(call => call[0] === "new-session")?.at(-1);
 				expect(innerCommand).toContain("--internal-managed-owner-supervisor");

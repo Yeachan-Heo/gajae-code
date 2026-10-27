@@ -2479,8 +2479,8 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 				expect(ready.argv).toContain("SECRET-PROMPT-CANARY");
 				let retiredIntent: string | undefined;
 				if (process.platform === "darwin") {
-					// A stopped supervisor lets the first close expire without delivery; once it
-					// resumes it must refuse the expired intent, and the retry must succeed.
+					// A stopped supervisor lets the first close time out without delivery; once it
+					// resumes it must not relay that attempt, and the retry must succeed.
 					const signalOwner = async (signal: string) =>
 						expect(await Bun.spawn(["/bin/kill", `-${signal}`, String(ownerPid)]).exited).toBe(0);
 					await signalOwner("STOP");
@@ -2491,8 +2491,13 @@ if (process.argv.includes("--internal-managed-owner-supervisor")) {
 					} finally {
 						await signalOwner("CONT");
 					}
-					const expired = readSecureOwnerJson(paths.intentFile) as { intent_id: string };
-					// Give the resumed supervisor several poll cycles to see the expired intent.
+					// The closer that gave up retired its undelivered intent at once, so the
+					// resumed supervisor finds nothing to relay.
+					expect(fsSync.existsSync(paths.intentFile)).toBe(false);
+					const retired = (await fs.readdir(paths.root)).filter(entry => entry.endsWith(".undelivered"));
+					expect(retired).toHaveLength(1);
+					const expired = { intent_id: retired[0]!.slice(`intent-${generation}.`.length, -".undelivered".length) };
+					// Give the resumed supervisor several poll cycles.
 					await Bun.sleep(1_000);
 					expect(fsSync.existsSync(paths.relayPendingFile)).toBe(false);
 					expect(fsSync.existsSync(paths.relayFile)).toBe(false);
@@ -3084,6 +3089,30 @@ describe("cooperative supervisor binding discovery", () => {
 				}),
 			).rejects.toThrow("managed_owner_binding_unavailable");
 			expect(nowMs).toBe(1_200);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns a live binding whose creation time is ahead of a rolled-back clock", async () => {
+		const { stateDir, index, write } = await fixture();
+		await write("child-token.binding.json", {
+			...binding,
+			created_at: new Date(Date.now() + 3_600_000).toISOString(),
+		});
+		await write("supervisor-cooperative-generation.json", index);
+		let polls = 0;
+		try {
+			const discovered = await awaitCooperativeSupervisorBinding(identity(stateDir), {
+				assertSameSupervisor: () => {},
+				sleep: async () => {
+					polls += 1;
+				},
+				now: () => new Date(0),
+				deadline: 1_000,
+			});
+			expect(discovered.child_token).toBe("token");
+			expect(polls).toBe(0);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
