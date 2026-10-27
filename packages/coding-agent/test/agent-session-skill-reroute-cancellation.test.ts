@@ -168,6 +168,67 @@ test.serial("loads a skill referenced inline in ordinary prompt text", async () 
 	expect(session.resolvePromptSkillInvocation("preserve /skill:unknown literally")).toBeUndefined();
 });
 
+test.serial("preserves follow-up delivery options when an inline skill reroutes during streaming", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-follow-up-reroute-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const activeTurnStarted = Promise.withResolvers<void>();
+	const activeTurnRelease = Promise.withResolvers<void>();
+	const mock = createMockModel({
+		responses: [
+			async () => {
+				activeTurnStarted.resolve();
+				await activeTurnRelease.promise;
+				return { content: ["active turn complete"] };
+			},
+			{ content: ["skill follow-up complete"] },
+		],
+	});
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		streamFn: mock.stream,
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry,
+		skills: [
+			{
+				name: "fixture-skill",
+				description: "Fixture skill",
+				filePath: "/tmp/fixture-skill/SKILL.md",
+				baseDir: "/tmp/fixture-skill",
+				source: "test",
+				content: "Fixture skill body",
+			},
+		],
+	});
+	const activePrompt = session.prompt("active turn");
+	try {
+		await activeTurnStarted.promise;
+		const promptCustomMessage = vi.spyOn(session, "promptCustomMessage");
+		await session.prompt("Please handle /skill:fixture-skill this way", {
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+
+		expect(promptCustomMessage.mock.calls[0]?.[1]).toMatchObject({
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Fixture skill body");
+		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
+	} finally {
+		activeTurnRelease.resolve();
+		await activePrompt;
+		await session.waitForIdle();
+	}
+});
+
 test.serial("keeps SDK ownership when an internal skill invocation becomes a custom prompt", async () => {
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-skill-sdk-owner-"));
 	const skillPath = path.join(tempDir, "SKILL.md");
