@@ -247,18 +247,34 @@ export class ExtensionInteractionService {
 		if (!["interaction", "workflow-approval"].includes(purpose)) {
 			throw new ExtensionInteractionError("invalid-request", "Interactions cannot grant execution permission");
 		}
+		let timeout: number | undefined;
+		let signal: AbortSignal | undefined;
+		let onTimeout: (() => void) | undefined;
+		let aborted = false;
+		const abortedGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!;
+		try {
+			// Each caller-controlled option is read exactly once, before the final admission check.
+			timeout = options.timeout;
+			signal = options.signal;
+			onTimeout = options.onTimeout;
+			if (signal !== undefined) aborted = abortedGetter.call(signal);
+		} catch {
+			throw new ExtensionInteractionError("invalid-request", "Invalid interaction options");
+		}
 		if (
-			options.timeout !== undefined &&
-			(!Number.isFinite(options.timeout) || options.timeout < 0 || options.timeout > 2_147_483_647)
+			timeout !== undefined &&
+			(typeof timeout !== "number" || !Number.isFinite(timeout) || timeout < 0 || timeout > 2_147_483_647)
 		) {
 			throw new ExtensionInteractionError("invalid-request", "Timeout must be a finite nonnegative timer duration");
 		}
-		if (options.signal?.aborted) return Promise.resolve({ status: "cancelled", reason: "aborted" });
+		if (onTimeout !== undefined && typeof onTimeout !== "function")
+			throw new ExtensionInteractionError("invalid-request", "Invalid interaction options");
+		this.#assertAvailable();
+		if (aborted) return Promise.resolve({ status: "cancelled", reason: "aborted" });
 		if (this.#pending.size >= EXTENSION_INTERACTION_LIMITS.pending)
 			throw new ExtensionInteractionError("capacity-exceeded", "Too many pending interactions");
 		const requestId = crypto.randomUUID();
 		const { promise, resolve, reject } = Promise.withResolvers<ExtensionInteractionResult>();
-		const signal = options.signal;
 		const abort = () => this.#finish(requestId, { status: "cancelled", reason: "aborted" });
 		let timer: Timer | undefined;
 		const item: PendingInteraction = {
@@ -267,15 +283,42 @@ export class ExtensionInteractionService {
 			reject,
 			cleanup: () => {
 				if (timer !== undefined) clearTimeout(timer);
-				signal?.removeEventListener("abort", abort);
+				if (signal) EventTarget.prototype.removeEventListener.call(signal, "abort", abort);
 			},
 		};
 		this.#pending.set(requestId, item);
-		signal?.addEventListener("abort", abort, { once: true });
-		if (options.timeout !== undefined) {
+		if (signal) {
+			// Use native EventTarget methods rather than caller-overridden signal methods.
+			try {
+				EventTarget.prototype.addEventListener.call(signal, "abort", abort, { once: true });
+			} catch {
+				const removed = this.#pending.delete(requestId);
+				EventTarget.prototype.removeEventListener.call(signal, "abort", abort);
+				if (removed) this.#changed();
+				throw new ExtensionInteractionError("invalid-request", "Invalid interaction signal");
+			}
+			if (!this.#pending.has(requestId)) {
+				// Settlement can reenter while a host wraps registration, before it actually attaches.
+				EventTarget.prototype.removeEventListener.call(signal, "abort", abort);
+				return promise;
+			}
+			if (abortedGetter.call(signal)) {
+				abort();
+				return promise;
+			}
+			try {
+				this.#assertAvailable();
+			} catch (error) {
+				this.#pending.delete(requestId);
+				item.cleanup();
+				this.#changed();
+				throw error;
+			}
+		}
+		if (timeout !== undefined) {
 			timer = setTimeout(() => {
-				this.#finish(requestId, { status: "cancelled", reason: "timeout" }, options.onTimeout);
-			}, options.timeout);
+				this.#finish(requestId, { status: "cancelled", reason: "timeout" }, onTimeout);
+			}, timeout);
 		}
 		this.#changed();
 		return promise;

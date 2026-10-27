@@ -357,7 +357,7 @@ describe("portable extension interactions", () => {
 		for (const finish of ["response", "cancel", "timeout", "dispose"] as const) {
 			const { service, address } = fixture();
 			const controller = new AbortController();
-			const remove = spyOn(controller.signal, "removeEventListener");
+			const remove = spyOn(EventTarget.prototype, "removeEventListener");
 			try {
 				const pending = service.request(
 					{ kind: "input", title: finish },
@@ -490,6 +490,207 @@ describe("portable extension interactions", () => {
 		expect(service.snapshot().pending.every(request => request.payload.title === "inner")).toBe(true);
 		service.dispose();
 		await Promise.all(pending);
+	});
+
+	it("snapshots options before admission and rejects accessor failures without exposing them", async () => {
+		for (const key of ["timeout", "signal", "onTimeout"] as const) {
+			for (const action of ["dispose", "disconnect", "throw"] as const) {
+				const { service, connectionId } = fixture();
+				let reads = 0;
+				const options = {
+					get [key]() {
+						reads++;
+						if (action === "dispose") service.dispose();
+						if (action === "disconnect") service.disconnect(connectionId);
+						if (action === "throw") throw new Error("private option error");
+						return undefined;
+					},
+				};
+				try {
+					service.request({ kind: "input", title: "outer" }, options);
+					throw new Error("Expected admission failure");
+				} catch (error) {
+					expect(error).toBeInstanceOf(ExtensionInteractionError);
+					expect((error as ExtensionInteractionError).code).toBe(
+						action === "throw" ? "invalid-request" : action === "dispose" ? "disposed" : "unavailable",
+					);
+					expect((error as Error).message).not.toContain("private option error");
+				}
+				expect(reads).toBe(1);
+				expect(service.snapshot().pending).toEqual([]);
+				service.dispose();
+			}
+		}
+
+		const { service, address } = fixture();
+		const controller = new AbortController();
+		let timeoutReads = 0;
+		let signalReads = 0;
+		let callbackReads = 0;
+		let callbacks = 0;
+		const pending = service.request(
+			{ kind: "input", title: "snapshot" },
+			{
+				get timeout() {
+					return timeoutReads++ === 0 ? 60_000 : 0;
+				},
+				get signal() {
+					return signalReads++ === 0 ? controller.signal : new AbortController().signal;
+				},
+				get onTimeout() {
+					callbackReads++;
+					return () => callbacks++;
+				},
+			},
+		);
+		expect([timeoutReads, signalReads, callbackReads]).toEqual([1, 1, 1]);
+		service.respond(address(), "done");
+		expect(await pending).toEqual({ status: "answered", value: "done" });
+		controller.abort();
+		expect(callbacks).toBe(0);
+		let timeoutCallbackReads = 0;
+		const timed = service.request(
+			{ kind: "input", title: "timeout snapshot" },
+			{
+				timeout: 0,
+				get onTimeout() {
+					timeoutCallbackReads++;
+					return timeoutCallbackReads === 1
+						? () => callbacks++
+						: () => {
+								throw new Error("changed callback");
+							};
+				},
+			},
+		);
+		expect(await timed).toEqual({ status: "cancelled", reason: "timeout" });
+		expect(timeoutCallbackReads).toBe(1);
+		expect(callbacks).toBe(1);
+		expect(service.snapshot().pending).toEqual([]);
+		const overridden = new AbortController();
+		overridden.signal.addEventListener = () => {
+			throw new Error("private add");
+		};
+		overridden.signal.removeEventListener = () => {
+			throw new Error("private remove");
+		};
+		const cancellable = service.request({ kind: "input", title: "native signal" }, { signal: overridden.signal });
+		overridden.abort();
+		expect(await cancellable).toEqual({ status: "cancelled", reason: "aborted" });
+		const lateAbort = new AbortController();
+		expect(
+			await service.request(
+				{ kind: "input", title: "pre-aborted" },
+				{
+					signal: lateAbort.signal,
+					get onTimeout() {
+						lateAbort.abort();
+						return undefined;
+					},
+				},
+			),
+		).toEqual({ status: "cancelled", reason: "aborted" });
+		errorCode(
+			() =>
+				service.request(
+					{ kind: "input", title: "invalid signal" },
+					{
+						signal: {} as AbortSignal,
+					},
+				),
+			"invalid-request",
+		);
+		expect(service.snapshot().pending).toEqual([]);
+		service.dispose();
+	});
+
+	it("rechecks capacity after an options getter reenters admission", async () => {
+		const { service } = fixture();
+		const pending: Promise<unknown>[] = [];
+		let reads = 0;
+		errorCode(
+			() =>
+				service.request(
+					{ kind: "input", title: "outer" },
+					{
+						get timeout() {
+							reads++;
+							for (let i = 0; i < EXTENSION_INTERACTION_LIMITS.pending; i++)
+								pending.push(service.request({ kind: "input", title: "inner" }));
+							return undefined;
+						},
+					},
+				),
+			"capacity-exceeded",
+		);
+		expect(reads).toBe(1);
+		expect(service.snapshot().pending).toHaveLength(EXTENSION_INTERACTION_LIMITS.pending);
+		service.dispose();
+		expect(await Promise.all(pending)).toEqual(
+			Array.from({ length: EXTENSION_INTERACTION_LIMITS.pending }, () => ({
+				status: "cancelled",
+				reason: "disposed",
+			})),
+		);
+	});
+
+	it("handles abort and disposal during signal registration without leaving listeners or timers", async () => {
+		for (const action of ["abort", "dispose", "disconnect"] as const) {
+			const { service, connectionId } = fixture();
+			const controller = new AbortController();
+			const add = EventTarget.prototype.addEventListener;
+			const remove = spyOn(EventTarget.prototype, "removeEventListener");
+			const register = spyOn(EventTarget.prototype, "addEventListener").mockImplementation(function (
+				this: EventTarget,
+				type,
+				listener,
+				options,
+			) {
+				if (this === controller.signal && type === "abort") {
+					if (action === "abort") controller.abort();
+					if (action === "dispose") service.dispose();
+					if (action === "disconnect") service.disconnect(connectionId);
+				}
+				return add.call(this, type, listener, options);
+			});
+			let timeouts = 0;
+			try {
+				if (action === "disconnect") {
+					errorCode(
+						() =>
+							service.request(
+								{ kind: "input", title: action },
+								{
+									signal: controller.signal,
+									timeout: 0,
+									onTimeout: () => timeouts++,
+								},
+							),
+						"unavailable",
+					);
+				} else {
+					const pending = service.request(
+						{ kind: "input", title: action },
+						{
+							signal: controller.signal,
+							timeout: 0,
+							onTimeout: () => timeouts++,
+						},
+					);
+					expect(await pending).toEqual({
+						status: "cancelled",
+						reason: action === "abort" ? "aborted" : "disposed",
+					});
+				}
+				expect(service.snapshot().pending).toEqual([]);
+				expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+				expect(timeouts).toBe(0);
+			} finally {
+				register.mockRestore();
+				remove.mockRestore();
+				service.dispose();
+			}
+		}
 	});
 
 	it("validates malformed payloads and timeout boundaries before creating pending work", () => {
