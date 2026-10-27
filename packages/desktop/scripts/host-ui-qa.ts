@@ -30,6 +30,9 @@ const allowed = new Set<DesktopMethod>([
 	"goal.operate",
 	"session.export",
 	"session.fork",
+	// Allowed so the failure path is exercised: the isolated QA home has no
+	// provider credentials, so a prompt fails before any network call.
+	"prompt",
 	"auth.providers",
 	"auth.state",
 	"tools.list",
