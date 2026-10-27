@@ -4,7 +4,7 @@ const HARNESS_ENDPOINT_URL_MAX = 2048;
 /**
  * True when `raw` is a loopback `ws:` or `wss:` URL with no userinfo, query, hash,
  * or extra path. Parsing follows the same URL rules the SDK client uses to dial,
- * including surrounding whitespace, a trailing DNS dot, and numeric loopback hosts. An over-long string
+ * including surrounding whitespace, a trailing DNS dot, and 127.0.0.0/8 hosts. An over-long string
  * is rejected before parsing.
  */
 export function isHarnessLoopbackEndpointUrl(raw: string): boolean {
@@ -20,7 +20,12 @@ export function isHarnessLoopbackEndpointUrl(raw: string): boolean {
 		.toLowerCase()
 		.replace(/^\[|\]$/g, "")
 		.replace(/\.$/, "");
-	if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") return false;
+	const parts = host.split(".");
+	const ipv4Loopback =
+		parts.length === 4 &&
+		parts.every(part => /^[0-9]{1,3}$/.test(part) && Number(part) <= 255) &&
+		Number(parts[0]) === 127;
+	if (host !== "localhost" && host !== "::1" && !ipv4Loopback) return false;
 	if (url.username !== "" || url.password !== "") return false;
 	if (url.search !== "" || url.hash !== "") return false;
 	// An empty "?" or "#" is dropped from search/hash but still makes the WebSocket URL invalid.

@@ -17,6 +17,9 @@ describe("harness discovery url", () => {
 			"ws://127.0.0.1",
 			" wss://127.0.0.1:9 ",
 			"ws://2130706433:9",
+			"ws://127.0.0.2:9",
+			"ws://127.1.2.3:9",
+			"ws://2130706434:9",
 			"ws://localhost.:9",
 			"ws://LOCALHOST.:9",
 			"ws://127.0.0.1.:9",
@@ -49,7 +52,7 @@ describe("harness discovery url", () => {
 	});
 
 	it("property: harness loopback endpoint url, seed 619452, 64 inputs", () => {
-		const host = fc.constantFrom("127.0.0.1", "localhost", "LOCALHOST", "[::1]");
+		const host = fc.constantFrom("127.0.0.1", "127.0.0.2", "127.1.2.3", "localhost", "LOCALHOST", "[::1]");
 		const port = fc.integer({ min: 1, max: 65535 });
 		const scheme = fc.constantFrom("ws", "wss");
 		fc.assert(
@@ -71,6 +74,14 @@ describe("harness discovery url", () => {
 			}),
 			{ seed: SEED, numRuns: RUNS },
 		);
+		const octet = fc.integer({ min: 0, max: 255 });
+		fc.assert(
+			fc.property(octet, octet, octet, port, (a, b, c, chosenPort) => {
+				expect(isHarnessLoopbackEndpointUrl(`ws://127.${a}.${b}.${c}:${chosenPort}`)).toBe(true);
+				expect(isHarnessLoopbackEndpointUrl(`wss://127.${a}.${b}.${c}:${chosenPort}/steal`)).toBe(false);
+			}),
+			{ seed: SEED, numRuns: RUNS },
+		);
 		fc.assert(
 			fc.property(fc.string({ maxLength: 180 }), raw => {
 				const allowed = isHarnessLoopbackEndpointUrl(raw);
@@ -81,8 +92,13 @@ describe("harness discovery url", () => {
 					.toLowerCase()
 					.replace(/^\[|\]$/g, "")
 					.replace(/\.$/, "");
+				const v4 = parsed.split(".");
+				const ipv4Loopback =
+					v4.length === 4 &&
+					v4.every(part => /^[0-9]{1,3}$/.test(part) && Number(part) <= 255) &&
+					Number(v4[0]) === 127;
 				expect(url.protocol === "ws:" || url.protocol === "wss:").toBe(true);
-				expect(parsed === "127.0.0.1" || parsed === "localhost" || parsed === "::1").toBe(true);
+				expect(ipv4Loopback || parsed === "localhost" || parsed === "::1").toBe(true);
 				expect(url.username).toBe("");
 				expect(url.password).toBe("");
 				expect(url.search).toBe("");
