@@ -1,12 +1,18 @@
-import { afterEach, beforeAll, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import fc from "fast-check";
-import { settings } from "../../src/config/settings";
+import { resetSettingsForTest, Settings, settings } from "../../src/config/settings";
 import { initTheme, theme } from "../../src/modes/theme/theme";
 import { fileHyperlink } from "../../src/tui/hyperlink";
 import { renderStatusLine } from "../../src/tui/status-line";
 
 beforeAll(async () => {
 	await initTheme();
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
+});
+
+afterAll(() => {
+	resetSettingsForTest();
 });
 
 afterEach(() => {
