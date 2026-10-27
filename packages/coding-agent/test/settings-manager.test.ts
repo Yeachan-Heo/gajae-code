@@ -8,6 +8,7 @@ import {
 	onAppendOnlyModeChanged,
 	resetSettingsForTest,
 	Settings,
+	type SettingsAtomicPatch,
 	SettingsGlobalConfigReloadError,
 } from "@gajae-code/coding-agent/config/settings";
 import { resolveImageRoleModel } from "@gajae-code/coding-agent/tools/image-gen";
@@ -328,6 +329,42 @@ describe("Settings", () => {
 			await settings.close();
 		}
 	});
+
+	for (const durable of [false, true]) {
+		for (const builder of [false, true]) {
+			it(`validates caller-owned arrays without dispatching custom methods (${durable ? "disk" : "memory"}, ${builder ? "builder" : "direct"})`, async () => {
+				const settings = durable ? await Settings.loadForScope({ cwd: projectDir, agentDir }) : Settings.isolated();
+				try {
+					await settings.commitAtomicBatch([{ path: "temperature", op: "set", value: 0.2 }]);
+					const patches: SettingsAtomicPatch[] = [
+						{ path: "temperature", op: "set", value: 0.8 },
+						{ path: "unknown.path", op: "set", value: "secret" } as unknown as SettingsAtomicPatch,
+					];
+					let dispatches = 0;
+					Object.defineProperty(patches, "map", {
+						value: () => {
+							dispatches++;
+							return [];
+						},
+					});
+					Object.defineProperty(patches, Symbol.iterator, {
+						value: () => {
+							dispatches++;
+							throw new Error("unexpected iterator");
+						},
+					});
+					const pending = builder
+						? settings.commitAtomicBatchWithCurrent(() => patches)
+						: settings.commitAtomicBatch(patches);
+					await expect(pending).rejects.toThrow("Unknown setting path");
+					expect(dispatches).toBe(0);
+					expect(settings.get("temperature")).toBe(0.2);
+				} finally {
+					await settings.close();
+				}
+			});
+		}
+	}
 
 	it("does not log setting override values when initialization options differ", async () => {
 		const initialSecret = "initial-settings-secret";

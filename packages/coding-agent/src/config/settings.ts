@@ -342,20 +342,60 @@ function isAtomicSettingsPath(path: string): boolean {
 }
 
 function stageAtomicSettingsPatches(patches: readonly SettingsAtomicPatch[]): SettingsAtomicPatch[] {
-	return patches.map(patch => {
-		const path = patch.path;
-		const op = patch.op;
-		if (!isAtomicSettingsPath(path)) {
-			throw new Error(`Unknown setting path for atomic batch: ${path}`);
+	if (!Array.isArray(patches)) throw new TypeError("Settings atomic patches must be an array.");
+	const staged: SettingsAtomicPatch[] = [];
+	let length: number;
+	try {
+		length = patches.length;
+	} catch {
+		throw new TypeError("Could not read settings atomic patches.");
+	}
+	if (!Number.isInteger(length) || length < 0 || length > 0xffffffff) {
+		throw new TypeError("Invalid settings atomic patches array length.");
+	}
+	for (let index = 0; index < length; index++) {
+		let patch: SettingsAtomicPatch;
+		let path: SettingsAtomicPatch["path"];
+		let op: SettingsAtomicPatch["op"];
+		try {
+			if (!Object.hasOwn(patches, index)) throw new TypeError();
+			patch = patches[index];
+			if (patch === null || typeof patch !== "object" || Array.isArray(patch)) throw new TypeError();
+			path = patch.path;
+			op = patch.op;
+		} catch {
+			throw new TypeError("Could not read settings atomic patch.");
 		}
-		if (op === "unset") return { path, op };
+		if (!isAtomicSettingsPath(path)) {
+			throw new Error(
+				typeof path === "string"
+					? `Unknown setting path for atomic batch: ${path}`
+					: "Unknown setting path for atomic batch.",
+			);
+		}
+		if (op === "unset") {
+			staged.push({ path, op });
+			continue;
+		}
 		if (op !== "set") throw new TypeError("Unknown settings atomic patch operation.");
-		const value = (patch as Extract<SettingsAtomicPatch, { op: "set" }>).value;
+		let value: unknown;
+		try {
+			value = (patch as Extract<SettingsAtomicPatch, { op: "set" }>).value;
+			if (value !== undefined) value = structuredClone(value);
+		} catch {
+			throw new TypeError("Could not read or clone settings atomic patch value.");
+		}
 		if (value === undefined) {
 			throw new TypeError(`Settings set patch for ${path} cannot carry undefined; use unset instead.`);
 		}
-		return { path, op, value: structuredClone(value) };
-	});
+		staged.push({ path, op, value });
+	}
+	try {
+		if (patches.length !== length) throw new TypeError();
+	} catch {
+		throw new TypeError("Settings atomic patches array changed while staging.");
+	}
+	return staged;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
