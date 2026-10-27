@@ -300,6 +300,15 @@ async function runNonPipeUnhandledRejection(): Promise<void> {
 	await Bun.sleep(2_000);
 }
 
+async function runOperatorGuidanceUnhandledRejection(): Promise<void> {
+	const error = Object.assign(new Error("fixture: typed operator fatal"), {
+		code: "fixture_operator_fatal",
+		operatorMessage: "fixture: operator guidance for the fatal",
+	});
+	void Promise.reject(error);
+	await Bun.sleep(2_000);
+}
+
 async function runConsecutiveSignalsShareCleanup(): Promise<void> {
 	let count = 0;
 	postmortem.register("fixture-consecutive-signals", async reason => {
@@ -456,6 +465,9 @@ switch (scenario) {
 		break;
 	case "non-pipe-unhandled-rejection":
 		await runNonPipeUnhandledRejection();
+		break;
+	case "operator-guidance-unhandled-rejection":
+		await runOperatorGuidanceUnhandledRejection();
 		break;
 	default:
 		throw new Error(`unknown postmortem fixture scenario: ${scenario ?? "(missing)"}`);

@@ -77,6 +77,103 @@ it.each([
 	}
 });
 
+it("keeps the successor's transcript and resumes it after a rejected append", async () => {
+	const root = await makeRoot();
+	const agentDir = path.join(root, "agent");
+	const destination = SessionManager.managedDestination(root, agentDir);
+	const manager = SessionManager.create(root, destination);
+	let sessionFile: string | undefined;
+	try {
+		manager.appendMessage({ role: "user", content: "kept-before-resume", timestamp: 1 });
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Missing transcript");
+		sessionFile = file;
+
+		// A second process resumes the same transcript and appends through its own
+		// writer. Reproduces the concurrent-writer condition behind the original
+		// `managed_append_identity_mismatch` crash without touching the filesystem
+		// outside the store's own append path.
+		const successor = await SessionManager.open(file, destination);
+		try {
+			successor.appendMessage({ role: "user", content: "appended-by-successor", timestamp: 2 });
+			await successor.flush();
+		} finally {
+			await successor.close();
+		}
+		const winnerBytes = await Bun.file(file).text();
+
+		expect(() => manager.appendMessage({ role: "user", content: "rejected-loser", timestamp: 3 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+		expect(manager.getAppendIdentityMismatch()).toBeInstanceOf(ManagedAppendIdentityMismatchError);
+		// The fence is pre-write: the loser wrote no bytes and the winner's records stay.
+		expect(await Bun.file(file).text()).toBe(winnerBytes);
+		expect(await manager.closeStrict()).toEqual({ kind: "closed" });
+	} finally {
+		await manager.close().catch(() => {});
+	}
+
+	// Resume path: a fresh process reads every record the winner persisted.
+	if (!sessionFile) throw new Error("Missing transcript");
+	const resumed = await SessionManager.open(sessionFile, destination);
+	try {
+		const userTexts = resumed
+			.getEntries()
+			.flatMap(entry =>
+				entry.type === "message" && entry.message.role === "user" ? [String(entry.message.content)] : [],
+			);
+		expect(userTexts).toEqual(["kept-before-resume", "appended-by-successor"]);
+	} finally {
+		await resumed.close();
+	}
+});
+
+it("warns the operator once when the managed append fence rejects", async () => {
+	const root = await makeRoot();
+	const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));
+	const auth = await AuthStorage.create(path.join(root, "auth.db"));
+	const session = new AgentSession({
+		agent: new Agent(),
+		sessionManager: manager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: new ModelRegistry(auth, path.join(root, "models.yml")),
+	});
+	const notices: { level: string; message: string; source?: string }[] = [];
+	session.subscribe(event => {
+		if (event.type === "notice") notices.push({ level: event.level, message: event.message, source: event.source });
+	});
+	try {
+		manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		await manager.ensureOnDisk();
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Missing transcript");
+		const winner = await Bun.file(file).text();
+		await Bun.write(`${file}.successor`, winner);
+		await fs.rename(`${file}.successor`, file);
+
+		// Every later append fails against the same sticky error; the operator is
+		// told once instead of the session running on without a transcript.
+		expect(() => manager.appendMessage({ role: "user", content: "loser-1", timestamp: 2 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+		expect(() => manager.appendMessage({ role: "user", content: "loser-2", timestamp: 3 })).toThrow(
+			ManagedAppendIdentityMismatchError,
+		);
+		await Bun.sleep(10);
+		expect(notices).toEqual([
+			{
+				level: "error",
+				message: new ManagedAppendIdentityMismatchError("session.jsonl").operatorMessage,
+				source: "session-persistence",
+			},
+		]);
+	} finally {
+		await session.dispose();
+		auth.close();
+	}
+});
+
 it("retains close_unknown for a genuine managed append I/O failure", async () => {
 	const root = await makeRoot();
 	const manager = SessionManager.create(root, SessionManager.managedDestination(root, path.join(root, "agent")));

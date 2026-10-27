@@ -170,4 +170,27 @@ describe("ActionRegistry", () => {
 		expect(await registry.execute("app.exit")).toBe(false);
 		expect(errors).toEqual(["Action app.exit execution failed: root cause"]);
 	});
+
+	it("prefers operator guidance over the internal code when a typed error carries it", async () => {
+		const errors: string[] = [];
+		const registry = new ActionRegistry({ context: undefined, showError: error => errors.push(error) });
+		registry.register({
+			id: "app.suspend",
+			title: "Suspend",
+			category: "Test",
+			domains: ["global"],
+			availability: () => true,
+			execute: () => {
+				throw Object.assign(new Error("managed_append_identity_mismatch"), {
+					code: "managed_append_identity_mismatch",
+					operatorMessage: "Session was resumed by another process; this resume did not run.",
+				});
+			},
+		});
+
+		expect(await registry.execute("app.suspend")).toBe(false);
+		expect(errors).toEqual([
+			"Action app.suspend execution failed: Session was resumed by another process; this resume did not run.",
+		]);
+	});
 });

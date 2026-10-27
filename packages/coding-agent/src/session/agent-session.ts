@@ -5812,6 +5812,7 @@ export class AgentSession {
 		});
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
+		this.#installPersistErrorObserver();
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
@@ -7511,6 +7512,22 @@ export class AgentSession {
 	 */
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void {
 		this.#emit({ type: "notice", level, message, source });
+	}
+
+	/**
+	 * Warn the operator when the transcript stops accepting writes. The append
+	 * fence rejects pre-write, so a managed ownership loss otherwise leaves the
+	 * session running with no persisted record and no visible reason.
+	 */
+	#installPersistErrorObserver(): void {
+		this.sessionManager.setPersistErrorObserver(error => {
+			// Structural check: this callback can run before the error class binding is
+			// usable in every entry path, and the typed code is the published contract.
+			const rejection = error as { code?: unknown; operatorMessage?: unknown };
+			if (rejection.code !== "managed_append_identity_mismatch") return;
+			if (typeof rejection.operatorMessage !== "string") return;
+			this.emitNotice("error", rejection.operatorMessage, "session-persistence");
+		});
 	}
 
 	#queuedExtensionEvents: Promise<void> = Promise.resolve();
@@ -19338,12 +19355,16 @@ export class AgentSession {
 					if (exactRetirement && !exactRetirement.canCommit())
 						throw new Error("Exact MCP control retirement changed before session adoption");
 					this.sessionManager = forkedManager;
+					this.#installPersistErrorObserver();
 					adopted = true;
 					await exactRetirement?.commit();
 					this.#commitSessionTransition();
 				} catch (error) {
 					await exactRetirement?.abort();
-					if (adopted) this.sessionManager = previousManager;
+					if (adopted) {
+						this.sessionManager = previousManager;
+						this.#installPersistErrorObserver();
+					}
 					const forkedFile = forkedManager.getSessionFile();
 					const cleanupErrors: unknown[] = [];
 					try {

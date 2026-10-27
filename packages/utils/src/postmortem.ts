@@ -423,6 +423,26 @@ function fatalErrorForLog(fatal: FatalDiagnostic): Error {
 // Worker thread: exit only (workers use self.addEventListener for exceptions)
 let inspectorOpened = false;
 
+/**
+ * Operator-facing guidance carried by a typed error. A fatal record keeps the
+ * raw diagnostic; this is additive so the user learns what to do next instead
+ * of only seeing an internal error code.
+ */
+function operatorGuidance(reason: unknown): string | undefined {
+	if (reason === null || typeof reason !== "object") return undefined;
+	let value: unknown;
+	try {
+		value = (reason as { operatorMessage?: unknown }).operatorMessage;
+	} catch {
+		return undefined;
+	}
+	if (typeof value !== "string") return undefined;
+	const trimmed = redactCrashSecrets(value)
+		.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+		.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function formatFatalError(label: string, fatal: FatalDiagnostic): string {
 	const stackLines = fatal.stack.split("\n").slice(1);
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
@@ -735,6 +755,8 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	// crash record. Cleanup (which may itself hang or fail) runs afterwards.
 	const crashLogPath = recordFatalCrash(label, reason);
 	safeStderrWrite(formatFatalError(label, fatal));
+	const guidance = operatorGuidance(reason);
+	if (guidance) safeStderrWrite(`${guidance}\n`);
 	if (crashLogPath) safeStderrWrite(`[${label}] crash recorded at ${crashLogPath}\n`);
 	if (!quietShutdownStarted) {
 		const err = fatalErrorForLog(fatal);

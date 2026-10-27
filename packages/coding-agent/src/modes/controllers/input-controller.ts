@@ -20,6 +20,7 @@ import {
 } from "../../modes/types";
 import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
+import { operatorFacingMessage } from "../../session/operator-message";
 import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, pasteFromClipboard, readImageFromClipboard } from "../../utils/clipboard";
@@ -1006,7 +1007,7 @@ export class InputController {
 	}
 
 	#reportSubmissionError(error: unknown): void {
-		this.ctx.showError(error instanceof Error ? error.message : String(error));
+		this.ctx.showError(operatorFacingMessage(error));
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {

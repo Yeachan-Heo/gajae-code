@@ -7793,6 +7793,10 @@ export class SessionManager {
 	#persistError: Error | undefined;
 	#closeRetryOriginError: Error | undefined;
 	#persistErrorReported = false;
+	/** One-shot observer for the first persistence error (the operator-facing session surface). */
+	#persistErrorObserver: ((error: Error) => void) | undefined;
+	/** One-shot latch so the operator hears about the first lost-transcript cause only. */
+	#persistenceLossNotified = false;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
@@ -12718,6 +12722,32 @@ export class SessionManager {
 	getAppendIdentityMismatch(): ManagedAppendIdentityMismatchError | undefined {
 		return this.#persistError instanceof ManagedAppendIdentityMismatchError ? this.#persistError : undefined;
 	}
+
+	/**
+	 * Observe the first persistence error of this manager so the owning session can
+	 * warn the operator instead of silently running without a transcript. Replacing
+	 * the observer detaches the previous one; the manager never retains the caller.
+	 */
+	setPersistErrorObserver(observer: ((error: Error) => void) | undefined): void {
+		this.#persistErrorObserver = observer;
+	}
+	/**
+	 * The transcript can no longer take writes. The first problem of the manager's
+	 * lifetime is reported exactly once, whether it arrived as a recorded
+	 * persistence error or as a pre-write ownership loss (which leaves the
+	 * transcript untouched and is therefore not stored as `#persistError`).
+	 */
+	#notifyPersistErrorObserver(error: Error): void {
+		if (this.#persistenceLossNotified) return;
+		this.#persistenceLossNotified = true;
+		try {
+			this.#persistErrorObserver?.(error);
+		} catch (observerError) {
+			logger.warn("Session persistence error observer failed", {
+				error: observerError instanceof Error ? observerError.message : String(observerError),
+			});
+		}
+	}
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
 		if (!this.#persistError) this.#persistError = normalized;
@@ -12728,6 +12758,7 @@ export class SessionManager {
 				error: normalized.message,
 				stack: normalized.stack,
 			});
+			this.#notifyPersistErrorObserver(normalized);
 		}
 		return normalized;
 	}
@@ -19214,8 +19245,12 @@ export class SessionManager {
 			if (sidecarAppendCharge > 0) activeRuntime?.accountant.release(sidecarAppendCharge);
 			if (sidecarTailCharge > 0) activeRuntime?.tailCache.release(sidecarTailCharge);
 			// The pre-write fence is an expected ownership loss, not an uncertain
-			// append. Preserve its type after rolling back the rejected entry.
-			if (error instanceof ManagedAppendIdentityMismatchError) throw error;
+			// append. Preserve its type after rolling back the rejected entry and tell
+			// the operator once: the session keeps running without a transcript.
+			if (error instanceof ManagedAppendIdentityMismatchError) {
+				this.#notifyPersistErrorObserver(error);
+				throw error;
+			}
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,

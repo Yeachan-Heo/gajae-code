@@ -86,6 +86,7 @@ import {
 import type { AgentSession } from "./session/agent-session";
 import { ManagedAppendIdentityMismatchError } from "./session/internal/managed-session-storage";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
+import { operatorFacingMessage } from "./session/operator-message";
 import { setPrimaryControlSurface } from "./session/primary-control-surface";
 import {
 	type ResumeSessionIdentity,
@@ -412,20 +413,19 @@ export async function submitInteractiveInput(
 				agentEnd.promise.then(() => ({ type: "agent_end" as const })),
 			]);
 			if (result.type === "error") {
-				const errorMessage = result.error instanceof Error ? result.error.message : "Unknown error occurred";
-				mode.showError(errorMessage);
+				mode.showError(
+					result.error instanceof Error ? operatorFacingMessage(result.error) : "Unknown error occurred",
+				);
 			} else if (result.type === "agent_end") {
 				void prompt.catch((error: unknown) => {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					mode.showError(errorMessage);
+					mode.showError(error instanceof Error ? operatorFacingMessage(error) : "Unknown error occurred");
 				});
 			}
 		} finally {
 			agentEnd.dispose();
 		}
 	} catch (error: unknown) {
-		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-		mode.showError(errorMessage);
+		mode.showError(error instanceof Error ? operatorFacingMessage(error) : "Unknown error occurred");
 	} finally {
 		mode.finishPendingSubmission(input);
 		await mode.checkShutdownRequested();

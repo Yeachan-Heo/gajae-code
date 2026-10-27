@@ -973,7 +973,7 @@ describe("InputController keybinding setup", () => {
 
 		await expect(editor.onSubmit?.("steer while taken over")).resolves.toBeUndefined();
 
-		expect(ctx.showError).toHaveBeenCalledWith(mismatch.message);
+		expect(ctx.showError).toHaveBeenCalledWith(mismatch.operatorMessage);
 		expect(ctx.locallySubmittedUserSignatures.has("steer while taken over\u00000")).toBe(false);
 	});
 

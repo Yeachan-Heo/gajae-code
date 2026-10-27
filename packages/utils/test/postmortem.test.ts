@@ -336,6 +336,17 @@ describe("postmortem process stdout EPIPE policy", () => {
 		expectOrdinaryFatal(exception, "Uncaught Exception", "fixture: genuine fatal error");
 		expectOrdinaryFatal(rejection, "Unhandled Rejection", "fixture: genuine rejected fatal error");
 	}, 15_000);
+
+	it("prints operator guidance from a typed fatal after the raw diagnostic", async () => {
+		const result = await runScenario("operator-guidance-unhandled-rejection");
+
+		expectOrdinaryFatal(result, "Unhandled Rejection", "fixture: typed operator fatal");
+		expect(result.stderr).toContain("fixture: operator guidance for the fatal");
+		// The raw diagnostic stays: guidance is additive, never a replacement.
+		expect(result.stderr.indexOf("fixture: typed operator fatal")).toBeLessThan(
+			result.stderr.indexOf("fixture: operator guidance for the fatal"),
+		);
+	}, 15_000);
 });
 
 describe("postmortem process stdout closed-stream family (EIO/EBADF, issue #3810)", () => {

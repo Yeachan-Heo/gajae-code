@@ -1,4 +1,5 @@
 import type { AppKeybinding } from "../config/keybindings";
+import { operatorFacingMessage } from "../session/operator-message";
 
 export type FocusDomain = "composer" | "selector" | "overlay" | "global";
 
@@ -109,7 +110,7 @@ export class ActionRegistry<Context> {
 	}
 
 	#reportError(id: AppKeybinding, phase: "availability" | "execution", error: unknown): void {
-		const cause = error instanceof Error ? error.message : String(error);
+		const cause = operatorFacingMessage(error);
 		try {
 			this.options.showError(`Action ${id} ${phase} failed: ${cause}`);
 		} catch {
