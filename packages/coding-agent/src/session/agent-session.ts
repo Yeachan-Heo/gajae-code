@@ -17015,7 +17015,7 @@ export class AgentSession {
 				// survive; a continuation produced by the aborted turn's own machinery
 				// (preview/plan reminder) is dropped with its removal disposition
 				// rather than leaking into an unrelated later turn.
-				const independentOfTurn = appMessage.attribution === "user" || options.origin === "external";
+				const independentOfTurn = appMessage.attribution === "user" || options?.origin === "external";
 				if (this.#isTurnContinuationBlocked() && !independentOfTurn) {
 					const displayTag = readPendingDisplayTag(appMessage.details);
 					if (displayTag !== undefined) {
@@ -17060,7 +17060,7 @@ export class AgentSession {
 				return;
 			}
 
-			const independentOfTurn = appMessage.attribution === "user" || options.origin === "external";
+			const independentOfTurn = appMessage.attribution === "user" || options?.origin === "external";
 			await this.#queueFollowUpAfterReservation(appMessage, this.#getCustomMessageTextContent(appMessage), {
 				forceOneAtATime: options?.followUpQueuePolicy === "sequential",
 				createDisplayEntry: false,
