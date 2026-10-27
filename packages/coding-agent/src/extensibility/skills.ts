@@ -515,21 +515,28 @@ function isPositionInsideInlineCode(text: string, position: number): boolean {
 			continue;
 		}
 
-		// Handle inline code spans (backticks not at line start)
-		if (!isAtLineStart) {
-			if (delimiterStack.length > 0) {
-				const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
-				if (!openIsAtLineStart && openLength === runLength) {
-					// Closing inline code span with matching length
-					delimiterStack.pop();
-					i = runEnd;
-					continue;
-				}
-			}
-
-			// Opening inline code span
-			delimiterStack.push([runLength, false]);
+		// Handle inline code spans (all backticks except 3+ at line start)
+		// Don't open new inline spans inside fenced blocks
+		const insideFence = delimiterStack.length > 0 && delimiterStack[delimiterStack.length - 1]?.[1];
+		if (insideFence) {
+			// Inside a fenced block, skip non-fence backticks
+			i = runEnd;
+			continue;
 		}
+
+		// Check for closing inline code span with matching length
+		if (delimiterStack.length > 0) {
+			const [openLength, openIsAtLineStart] = delimiterStack[delimiterStack.length - 1]!;
+			if (!openIsAtLineStart && openLength === runLength) {
+				// Closing inline code span with matching length
+				delimiterStack.pop();
+				i = runEnd;
+				continue;
+			}
+		}
+
+		// Opening inline code span (not a fence opener)
+		delimiterStack.push([runLength, false]);
 
 		i = runEnd;
 	}
