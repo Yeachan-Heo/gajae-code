@@ -1479,7 +1479,10 @@ admission has no owner-only binding reader, so a psmux child could never
 register; Windows `session.spawn` therefore selects the headless substrate
 before launch, the same substrate used when no multiplexer is installed. An
 owner that cannot be resolved fails as `lifecycle_owner_unresolved` once the
-substrate release is proven, and stays `terminal_uncertain` while it is not. Editing source or replacing files does not
+substrate release is proven, and stays `terminal_uncertain` while it is not. A
+substrate that exits on its own while its exact close runs (a host that gave up
+at its readiness cutoff) counts as released once its exact proof reports it
+gone; a live or replaced substrate does not. Editing source or replacing files does not
 update a running Broker; verify a fresh isolated runtime before a separately
 controlled Broker replacement.
 
