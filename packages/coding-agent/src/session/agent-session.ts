@@ -13993,7 +13993,14 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunCapability"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "onSkillPrepared"
+			| "preflightSignal"
+			| "sdkRunCapability"
+			| "streamingBehavior"
+			| "followUpQueuePolicy"
+			| "steerQueuePolicy"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		const internalOptions = {
@@ -14900,24 +14907,30 @@ export class AgentSession {
 		if (expandPromptTemplates) {
 			const invocation = this.resolvePromptSkillInvocation(text, options?.images);
 			if (invocation) {
+				const skillOptions: Pick<
+					PromptOptions,
+					| "onPreflightAccepted"
+					| "onPreflightAcceptCommit"
+					| "preflightSignal"
+					| "sdkRunCapability"
+					| "streamingBehavior"
+					| "followUpQueuePolicy"
+					| "steerQueuePolicy"
+				> = {
+					...(options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
+					...(options?.onPreflightAcceptCommit ? { onPreflightAcceptCommit: options.onPreflightAcceptCommit } : {}),
+					...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
+					...(options?.sdkRunCapability !== undefined ? { sdkRunCapability: options.sdkRunCapability } : {}),
+					...(options?.streamingBehavior !== undefined ? { streamingBehavior: options.streamingBehavior } : {}),
+					...(options?.followUpQueuePolicy !== undefined
+						? { followUpQueuePolicy: options.followUpQueuePolicy }
+						: {}),
+					...(options?.steerQueuePolicy !== undefined ? { steerQueuePolicy: options.steerQueuePolicy } : {}),
+				};
 				await this.invokeSkill(
 					invocation.skill.name,
 					invocation.args,
-					options?.onPreflightAccepted ||
-						options?.onPreflightAcceptCommit ||
-						options?.preflightSignal ||
-						internalOptions?.sdkRunToken
-						? {
-								...(options?.onPreflightAccepted
-									? { onPreflightAccepted: options.onPreflightAccepted }
-									: {}),
-								...(options?.onPreflightAcceptCommit
-									? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
-									: {}),
-								...(options?.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
-								...(options?.sdkRunCapability ? { sdkRunCapability: options.sdkRunCapability } : {}),
-							}
-						: undefined,
+					Object.keys(skillOptions).length > 0 || internalOptions?.sdkRunToken ? skillOptions : undefined,
 				);
 				return;
 			}
