@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type {
+	DesktopAuthProvider,
 	DesktopDiff,
 	DesktopFrame,
 	DesktopMethod,
@@ -30,6 +31,9 @@ test("real isolated host creates, persists and resumes sessions without provider
 					...Bun.env,
 					...(binary ? { PATH: "/usr/bin:/bin" } : {}),
 					GJC_DESKTOP_DATA_DIR: dataAlias,
+					GH_TOKEN: "desktop-isolation-sentinel",
+					HF_TOKEN: "desktop-isolation-sentinel",
+					AWS_BEARER_TOKEN_KIRO: "desktop-isolation-sentinel",
 				},
 				stdin: "pipe",
 				stdout: "pipe",
@@ -75,6 +79,15 @@ test("real isolated host creates, persists and resumes sessions without provider
 		const initial = await host.request<DesktopSnapshot>("bootstrap");
 		expect(initial.sessions).toEqual([]);
 		expect(initial.projects).toEqual([]);
+
+		const providers = await host.request<DesktopAuthProvider[]>("auth.providers");
+		expect(providers.some(provider => provider.id === "openai-codex")).toBe(true);
+		expect(providers.find(provider => provider.id === "github-copilot")?.configured).toBe(false);
+		expect(providers.find(provider => provider.id === "kiro")?.configured).toBe(false);
+		expect(await host.request("auth.state")).toBeNull();
+		await expect(host.request("auth.login", { provider: "not-a-provider" })).rejects.toThrow(
+			"Unknown authorization provider",
+		);
 		await host.request("project.open", { path: project });
 		const snapshot = await host.request<DesktopSnapshot>("bootstrap");
 		expect(snapshot.projects[0]?.path).toBe(await fs.realpath(project));

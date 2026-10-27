@@ -19,6 +19,8 @@ const allowed = new Set<DesktopMethod>([
 	"session.rename",
 	"session.star",
 	"settings.get",
+	"auth.providers",
+	"auth.state",
 	"tools.list",
 	"diff.get",
 	"shutdown",

@@ -9,6 +9,7 @@ import type {
 } from "../../desktop-host/src/protocol";
 import { request, selectProject, subscribe } from "./bridge";
 import { Button, Composer, ErrorBanner, Message, Modal, QuestionCard, SessionRow, SettingField } from "./components";
+import { OAuthSettings } from "./OAuthSettings";
 import "./styles.css";
 
 type Dialog = "settings" | "commands" | "rename" | "delete" | "tools" | "goal" | "result" | null;
@@ -638,6 +639,7 @@ export default function App() {
 									))}
 								</select>
 							</section>
+							<OAuthSettings key={dialogGeneration.current} connected={connected} />
 							<form
 								onSubmit={event => {
 									event.preventDefault();

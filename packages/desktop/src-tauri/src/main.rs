@@ -12,6 +12,7 @@ use std::{
 use serde_json::{Value, json};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 	process::{Child, ChildStdin, Command},
@@ -102,7 +103,7 @@ async fn read_frames(stdout: tokio::process::ChildStdout, app: tauri::AppHandle)
 				Ok(value)
 					if matches!(
 						value.get("type").and_then(Value::as_str),
-						Some("response" | "snapshot" | "session" | "fatal")
+						Some("response" | "snapshot" | "session" | "auth" | "fatal")
 					) =>
 				{
 					value
@@ -276,6 +277,11 @@ async fn engine_request(
 			| "settings.get"
 			| "settings.set"
 			| "auth.setKey"
+			| "auth.providers"
+			| "auth.login"
+			| "auth.state"
+			| "auth.answer"
+			| "auth.cancel"
 			| "question.answer"
 			| "diff.get"
 			| "tools.list"
@@ -305,6 +311,36 @@ async fn engine_request(
 	response.await.map_err(|_| {
 		"Engine transport stopped before confirming the write; request outcome is unknown".to_string()
 	})?
+}
+
+fn validate_auth_url(value: &str) -> Result<tauri::Url, String> {
+	if value.len() > 8192 || value.chars().any(char::is_control) {
+		return Err("Invalid authorization URL".into());
+	}
+	let url = tauri::Url::parse(value).map_err(|_| "Invalid authorization URL".to_string())?;
+	if url.scheme() != "https"
+		|| url.host_str().is_none()
+		|| !url.username().is_empty()
+		|| url.password().is_some()
+	{
+		return Err("Authorization requires an HTTPS URL without user information".into());
+	}
+	Ok(url)
+}
+
+#[tauri::command]
+async fn open_auth_url(
+	window: tauri::WebviewWindow,
+	app: tauri::AppHandle,
+	url: String,
+) -> Result<(), String> {
+	if window.label() != "main" {
+		return Err("Only the main window may open authorization URLs".into());
+	}
+	let url = validate_auth_url(&url)?;
+	app.opener()
+		.open_url(url.as_str(), None::<&str>)
+		.map_err(|_| "Cannot open authorization browser".to_string())
 }
 
 #[tauri::command]
@@ -340,10 +376,75 @@ async fn select_project(
 		.map_err(|_| "Folder dialog closed without a result".to_string())?
 }
 
+#[cfg(test)]
+mod tests {
+	use super::validate_auth_url;
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn shutdown_delivers_protocol_frame_and_reaps_child() {
+		let mut child = super::Command::new("/bin/sh")
+			.arg("-c")
+			.arg(
+				r#"IFS= read -r line; case "$line" in *'"method":"shutdown"'*) exit 0;; *) exit 9;; esac"#,
+			)
+			.stdin(super::Stdio::piped())
+			.stdout(super::Stdio::null())
+			.stderr(super::Stdio::null())
+			.kill_on_drop(true)
+			.spawn()
+			.unwrap();
+		let mut stdin = child.stdin.take().unwrap();
+		super::stop_child(&mut child, &mut stdin).await;
+		assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(0));
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn shutdown_kills_and_reaps_unresponsive_child() {
+		let mut child = super::Command::new("/bin/sleep")
+			.arg("60")
+			.stdin(super::Stdio::piped())
+			.stdout(super::Stdio::null())
+			.stderr(super::Stdio::null())
+			.kill_on_drop(true)
+			.spawn()
+			.unwrap();
+		let mut stdin = child.stdin.take().unwrap();
+		super::stop_child(&mut child, &mut stdin).await;
+		assert!(!child.try_wait().unwrap().unwrap().success());
+	}
+
+	#[test]
+	fn permits_https_provider_authorization_parameters() {
+		let url = validate_auth_url("https://auth.example.com/authorize?state=opaque&redirect_uri=http%3A%2F%2Flocalhost%3A1455").unwrap();
+		assert_eq!(url.scheme(), "https");
+		assert_eq!(url.host_str(), Some("auth.example.com"));
+		assert!(url.query().unwrap().contains("state=opaque"));
+	}
+
+	#[test]
+	fn rejects_non_web_schemes_credentials_and_controls() {
+		for value in [
+			"http://example.com",
+			"file:///etc/passwd",
+			"javascript:alert(1)",
+			"data:text/html,test",
+			"https://user:secret@example.com/",
+			"https://example.com/\nnext",
+			"not-a-url",
+		] {
+			assert!(validate_auth_url(value).is_err(), "accepted {value}");
+		}
+		assert!(validate_auth_url(&format!("https://example.com/{}", "x".repeat(8192))).is_err());
+	}
+}
+
 fn main() {
 	let app = tauri::Builder::default()
 		.plugin(tauri_plugin_dialog::init())
-		.invoke_handler(tauri::generate_handler![engine_request, select_project])
+		.plugin(tauri_plugin_opener::init())
+		.invoke_handler(tauri::generate_handler![engine_request, select_project, open_auth_url])
 		.setup(|app| {
 			let (requests, receiver) = mpsc::channel(8);
 			let (shutdown, shutdown_receiver) = watch::channel(false);

@@ -32,6 +32,12 @@ Review pane alongside conversation at >=1100px, drawer below. Sidebar collapses 
 
 App-owned data isolated from CLI. Initial target macOS 15+ arm64 (WebView must support Promise.withResolvers). Closing last window hides app while tasks continue; explicit Quit cancels/disposes owned work. #7322 owns upstream parity; consume public SDK, never private endpoints or terminal controllers. Expose unavailable capabilities truthfully pending upstream implementation.
 
+## Account authorization
+
+The app uses public AuthStorage login callbacks with a single app-owned authorization flow. Provider selection, an explicit HTTPS-only system-browser action, optional code prompts, cancellation and reopening settings are supported. Prompt answers are never persisted in frontend storage. Cancellation does not undo credentials a provider already saved; an uncooperative provider may require Quit and relaunch before another login. This is not proof of a completed real-provider login.
+
+Before the SDK captures environment state, the sidecar retains only OS launch essentials and the app data-root override. Inherited provider keys/tokens, routing/proxy overrides, CLI broker and configuration roots are not imported. App roots are then established explicitly. Credentials use app-isolated SDK storage, not a new Keychain implementation. This isolation is not an execution sandbox for SDK tools.
+
 ## Verification
 
 Fresh current-branch screenshots for implemented surfaces/states/breakpoints and scroll boundaries, CJK wrapping inspection, independent review. Compilation is not evidence of signed standalone distribution, real-provider login or full TUI parity.

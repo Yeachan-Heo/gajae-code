@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isolateEnvironment } from "../src/environment-policy";
 import { projectMessages, requiredString, validateQuestionAnswer } from "../src/host";
 import type { DesktopFrame, DesktopQuestion, DesktopRequest } from "../src/protocol";
 import { MAX_FRAME_BYTES, parseRequest } from "../src/protocol";
@@ -9,6 +10,32 @@ const encode = (value: unknown) => new TextEncoder().encode(`${JSON.stringify(va
 const request = (id: string, method: DesktopRequest["method"]): DesktopRequest => ({ id, method, params: {} });
 
 describe("desktop protocol validation", () => {
+	test("keeps OS launch essentials without inherited provider credentials or routing", () => {
+		const environment: Record<string, string | undefined> = {
+			PATH: "/usr/bin",
+			LANG: "ko_KR.UTF-8",
+			LC_ALL: "ko_KR.UTF-8",
+			GJC_DESKTOP_DATA_DIR: "/tmp/app",
+			GH_TOKEN: "github-secret",
+			HF_TOKEN: "hf-secret",
+			AWS_BEARER_TOKEN_KIRO: "kiro-secret",
+			OPENAI_API_KEY: "openai-secret",
+			ANTHROPIC_OAUTH_TOKEN: "oauth-secret",
+			OPENAI_BASE_URL: "https://inherited.example",
+			HTTPS_PROXY: "http://inherited.example",
+			GJC_AUTH_BROKER_URL: "http://localhost:1234",
+			GJC_AUTH_BROKER_TOKEN: "broker-secret",
+			GJC_CONFIG_DIR: "/user/cli-config",
+			AWS_SHARED_CREDENTIALS_FILE: "/user/credentials",
+		};
+		isolateEnvironment(environment);
+		expect(environment).toEqual({
+			PATH: "/usr/bin",
+			LANG: "ko_KR.UTF-8",
+			LC_ALL: "ko_KR.UTF-8",
+			GJC_DESKTOP_DATA_DIR: "/tmp/app",
+		});
+	});
 	test("question ownership and value validation preserve cancellation semantics", () => {
 		const sessionId = "00000000-0000-4000-8000-000000000001";
 		const question: DesktopQuestion = {
@@ -79,6 +106,30 @@ describe("desktop protocol validation", () => {
 });
 
 describe("concurrent JSONL transport", () => {
+	test("admits authorization answers and cancellation when ordinary request capacity is exhausted", async () => {
+		const blocked = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		const frames: DesktopFrame[] = [];
+		const host: ProtocolHost = {
+			async handle(command) {
+				calls.push(command.method);
+				if (command.method === "prompt") await blocked.promise;
+			},
+			async close() {
+				calls.push("close");
+				blocked.resolve();
+			},
+		};
+		async function* input() {
+			for (let index = 0; index < 128; index++) yield encode(request(`prompt-${index}`, "prompt"));
+			yield encode(request("overflow", "bootstrap"));
+			yield encode(request("answer", "auth.answer"));
+			yield encode(request("cancel", "auth.cancel"));
+		}
+		await serveProtocol(input(), host, frame => frames.push(frame));
+		expect(calls.slice(-3)).toEqual(["auth.answer", "auth.cancel", "close"]);
+		expect(frames).toEqual([{ type: "response", id: "overflow", ok: false, error: "Too many concurrent requests" }]);
+	});
 	test("delivers question answers and abort while prompt is unresolved", async () => {
 		const prompt = Promise.withResolvers<void>();
 		const answered = Promise.withResolvers<void>();

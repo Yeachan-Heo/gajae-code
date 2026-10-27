@@ -34,6 +34,8 @@ export async function serveProtocol(
 			pending.size >= 128 &&
 			request.method !== "abort" &&
 			request.method !== "question.answer" &&
+			request.method !== "auth.answer" &&
+			request.method !== "auth.cancel" &&
 			request.method !== "shutdown"
 		) {
 			emit({ type: "response", id: request.id, ok: false, error: "Too many concurrent requests" });

@@ -9,10 +9,11 @@
 	},
 	"scripts": {
 		"start": "bun src/index.ts",
-		"test": "bun test test/host.test.ts",
+		"test": "bun test test/host.test.ts test/oauth.test.ts",
 		"check": "tsc -p tsconfig.json --noEmit"
 	},
 	"dependencies": {
+		"@gajae-code/ai": "workspace:*",
 		"@gajae-code/coding-agent": "workspace:*",
 		"@gajae-code/utils": "workspace:*"
 	},

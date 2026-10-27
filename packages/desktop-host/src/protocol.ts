@@ -18,6 +18,11 @@ export const DESKTOP_METHODS = [
 	"settings.get",
 	"settings.set",
 	"auth.setKey",
+	"auth.providers",
+	"auth.login",
+	"auth.state",
+	"auth.answer",
+	"auth.cancel",
 	"question.answer",
 	"diff.get",
 	"tools.list",
@@ -101,11 +106,26 @@ export interface DesktopDiff {
 	status: string;
 	patch: string;
 }
+export interface DesktopAuthProvider {
+	id: string;
+	name: string;
+	configured?: boolean;
+}
+export interface DesktopAuthState {
+	id: string;
+	provider: string;
+	status: "authorizing" | "waiting" | "complete" | "cancelled" | "error";
+	url?: string;
+	instructions?: string;
+	prompt?: { id: string; message: string; placeholder?: string; allowEmpty?: boolean };
+	error?: string;
+}
 export type DesktopFrame =
 	| { type: "response"; id: string; ok: true; result: unknown }
 	| { type: "response"; id: string; ok: false; error: string }
 	| { type: "snapshot"; snapshot: DesktopSnapshot }
 	| { type: "session"; session: DesktopSession }
+	| { type: "auth"; auth: DesktopAuthState }
 	| { type: "fatal"; error: string };
 
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;

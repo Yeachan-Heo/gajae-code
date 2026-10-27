@@ -16,6 +16,8 @@ import type { AgentSession } from "@gajae-code/coding-agent/session/agent-sessio
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { setAgentDir } from "@gajae-code/utils";
+import { isolateEnvironment } from "./environment-policy";
+import { DesktopOAuthController } from "./oauth";
 import type {
 	DesktopCapability,
 	DesktopDiff,
@@ -60,9 +62,8 @@ export const CAPABILITIES: DesktopCapability[] = [
 	},
 	{
 		id: "oauth",
-		label: "OAuth account login",
-		available: false,
-		reason: "This host supports explicit API keys only; no desktop OAuth lifecycle is implemented.",
+		label: "App-owned account authorization",
+		available: true,
 	},
 ];
 
@@ -183,6 +184,7 @@ export class DesktopHost {
 	#opening = new Map<string, Promise<LiveSession>>();
 	#questions = new Map<string, PendingQuestion>();
 	#auth?: AuthStorage;
+	#oauth?: DesktopOAuthController;
 	#registry?: ModelRegistry;
 	#settings?: Settings;
 	#init?: Promise<void>;
@@ -222,6 +224,7 @@ export class DesktopHost {
 		this.#dataDir = await fs.realpath(this.#dataDir);
 		await fs.chmod(this.dataDir, 0o700);
 		// The entrypoint's environment module isolates import-time discovery first.
+		isolateEnvironment(process.env);
 		process.env.HOME = path.join(this.dataDir, "home");
 		process.env.USERPROFILE = process.env.HOME;
 		process.env.GJC_CODING_AGENT_DIR = this.agentDir;
@@ -233,14 +236,7 @@ export class DesktopHost {
 		process.env.XDG_STATE_HOME = path.join(this.dataDir, "state");
 		process.env.XDG_CACHE_HOME = path.join(this.dataDir, "cache");
 		process.env.GJC_LOG_DIR = path.join(this.dataDir, "logs");
-		for (const key of Object.keys(process.env)) {
-			if (
-				/(API_KEY|AUTH_TOKEN|ACCESS_TOKEN|SECRET_ACCESS_KEY|AUTH_BROKER|GOOGLE_APPLICATION_CREDENTIALS|AWS_PROFILE|AWS_SHARED_CREDENTIALS_FILE)/i.test(
-					key,
-				)
-			)
-				delete process.env[key];
-		}
+
 		await fs.mkdir(process.env.HOME, { recursive: true, mode: 0o700 });
 		setAgentDir(this.agentDir);
 		const catalogFile = Bun.file(path.join(this.dataDir, "catalog.json"));
@@ -285,14 +281,32 @@ export class DesktopHost {
 		this.#auth = await AuthStorage.create(path.join(this.agentDir, "agent.db"), {
 			configValueResolver: async value => value,
 		});
-		for (const entries of Object.values(this.#auth.getAll())) {
-			for (const credential of Array.isArray(entries) ? entries : [entries]) {
-				if (credential.type === "api_key" && credential.key) this.#secrets.add(credential.key);
-			}
-		}
+		this.#rememberCredentials();
 		this.#registry = new ModelRegistry(this.#auth, path.join(this.agentDir, "models.yml"), this.#settings, {
 			agentDir: this.agentDir,
 		});
+		this.#oauth = new DesktopOAuthController({
+			service: this.#auth,
+			emit: auth => this.#emit({ type: "auth", auth }),
+			redact: text => this.#redact(text),
+			onStored: async () => {
+				this.#rememberCredentials();
+				if (this.#closed) return;
+				await this.#registry!.refresh("offline");
+				this.#publishSnapshot();
+			},
+		});
+	}
+	#rememberCredentials(): void {
+		for (const entries of Object.values(this.#auth!.getAll())) {
+			for (const credential of Array.isArray(entries) ? entries : [entries]) {
+				if (credential.type === "api_key" && credential.key) this.#secrets.add(credential.key);
+				if (credential.type === "oauth") {
+					if (credential.access) this.#secrets.add(credential.access);
+					if (credential.refresh) this.#secrets.add(credential.refresh);
+				}
+			}
+		}
 	}
 	#sessionPath(relative: string): string {
 		const root = path.join(this.dataDir, "sessions");
@@ -639,6 +653,18 @@ export class DesktopHost {
 			await this.close();
 			return null;
 		}
+		if (method === "auth.providers")
+			return this.#oauth!.providers().map(provider => ({
+				...provider,
+				configured: this.#auth!.hasAuth(provider.id),
+			}));
+		if (method === "auth.state") return this.#oauth!.state();
+		if (method === "auth.login") return this.#oauth!.login(requiredString(params, "provider", 100));
+		if (method === "auth.cancel") return this.#oauth!.cancel(identifier(params, "flowId"));
+		if (method === "auth.answer") {
+			if (typeof params.value !== "string") throw new Error("Invalid authorization answer");
+			return this.#oauth!.answer(identifier(params, "flowId"), identifier(params, "promptId"), params.value);
+		}
 		if (method === "project.open") {
 			const resolved = await fs.realpath(requiredString(params, "path"));
 			if (!(await fs.stat(resolved)).isDirectory()) throw new Error("Project must be a directory");
@@ -677,6 +703,8 @@ export class DesktopHost {
 			return null;
 		}
 		if (method === "auth.setKey") {
+			if (this.#oauth!.isActive())
+				throw new Error("Wait for account authorization to finish before saving an API key");
 			const provider = requiredString(params, "provider", 100);
 			const key = requiredString(params, "key", 16_384);
 			this.#secrets.add(key);
@@ -938,6 +966,9 @@ export class DesktopHost {
 	async #close(): Promise<void> {
 		this.#closed = true;
 		if (this.#init) await this.#init.catch(() => {});
+		const authorizationClose = this.#oauth?.close();
+		// Attach a handler immediately while unrelated session cleanup drains.
+		void authorizationClose?.catch(() => {});
 		this.#cancelQuestions();
 		await Promise.allSettled([...this.#opening.values()]);
 		this.#cancelQuestions();
@@ -961,9 +992,15 @@ export class DesktopHost {
 		);
 		this.#live.clear();
 		await attempt(() => this.#saving);
+		let authorizationJoined = false;
+		await attempt(async () => {
+			await authorizationClose;
+			authorizationJoined = true;
+		});
 		await attempt(() => this.#registry?.dispose());
 		await attempt(() => this.#settings?.close());
-		await attempt(() => this.#auth?.close());
+		// Never close storage while a provider can still be persisting credentials.
+		if (authorizationJoined) await attempt(() => this.#auth?.close());
 		if (failures.length) throw new Error("Desktop shutdown failed to clean up all SDK resources");
 	}
 }
