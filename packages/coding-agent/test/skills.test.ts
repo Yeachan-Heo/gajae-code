@@ -41,9 +41,11 @@ function makeSkill(name: string): Skill {
 describe("parseSkillInvocations", () => {
 	const alpha = makeSkill("alpha");
 	const beta = makeSkill("beta");
+	const gamma = makeSkill("gamma");
 	const skillsByCommandName = new Map([
 		["skill:alpha", alpha],
 		["skill:beta", beta],
+		["skill:gamma", gamma],
 		["alpha", alpha],
 	]);
 
@@ -137,6 +139,32 @@ describe("parseSkillInvocations", () => {
 		expect(parseSkillInvocations("Escaped \\`backtick\\` and /skill:alpha should work", skillsByCommandName)).toEqual(
 			[{ commandName: "skill:alpha", args: "Escaped \\`backtick\\` and should work", skill: alpha }],
 		);
+
+		// Multi-backtick inline code spans should not invoke skills
+		expect(parseSkillInvocations("Use ``/skill:alpha`` as literal", skillsByCommandName)).toEqual([]);
+		expect(parseSkillInvocations("Example: ```/skill:alpha``` with three backticks", skillsByCommandName)).toEqual(
+			[],
+		);
+
+		// Multi-backtick code spans with text outside should only invoke outside skills
+		expect(parseSkillInvocations("Example ``/skill:alpha`` and /skill:beta works", skillsByCommandName)).toEqual([
+			{ commandName: "skill:beta", args: "Example ``/skill:alpha`` and works", skill: beta },
+		]);
+
+		// Fenced code blocks should not invoke skills
+		expect(
+			parseSkillInvocations("Example:\n```\n/skill:alpha do it\n```\nplease explain", skillsByCommandName),
+		).toEqual([]);
+
+		// Fenced block with skill before and after
+		const fencedBlockTest = parseSkillInvocations(
+			"/skill:alpha start\n```\n/skill:beta\n```\n/skill:gamma done",
+			skillsByCommandName,
+		);
+		// Should find /skill:alpha and /skill:gamma, but not /skill:beta (inside fenced block)
+		expect(fencedBlockTest.length).toBe(2);
+		expect(fencedBlockTest[0]?.commandName).toBe("skill:alpha");
+		expect(fencedBlockTest[1]?.commandName).toBe("skill:gamma");
 	});
 });
 
