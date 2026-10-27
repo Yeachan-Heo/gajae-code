@@ -1099,45 +1099,45 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 			.flatMap(entry => (entry.type === "ttsr_injection" ? entry.injectedRules : []));
 	}
 
-	it.each(["always", "never"] as const)(
-		"settles AST rules before the real write executes (%s)",
-		async interruptMode => {
-			const { session, triggered, ttsrManager, modelMessages } = createSession(
-				[new WriteTool(createToolSession())],
-				[[writeCall("write-1", "a.ts", "const foo = 1;\nexport default foo;\n")]],
-				[defaultExportRule({ scope: ["tool:write(*.ts)"] })],
-				{ interruptMode },
-			);
-			await run(session, "write it");
+	it.each([
+		"always",
+		"never",
+	] as const)("settles AST rules before the real write executes (%s)", async interruptMode => {
+		const { session, triggered, ttsrManager, modelMessages } = createSession(
+			[new WriteTool(createToolSession())],
+			[[writeCall("write-1", "a.ts", "const foo = 1;\nexport default foo;\n")]],
+			[defaultExportRule({ scope: ["tool:write(*.ts)"] })],
+			{ interruptMode },
+		);
+		await run(session, "write it");
 
-			expect(triggered).toEqual([["named-exports"]]);
-			expect(ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
-			expect(injectedNames(session)).toEqual(["named-exports"]);
-			expect(modelMessages).toHaveLength(2);
-			expect(JSON.stringify(modelMessages[1])).toContain(RULE_CONTENT);
-			const calls = modelMessages[1].flatMap(message =>
-				message.role === "assistant"
-					? message.content.filter(block => block.type === "toolCall").map(block => block.id)
-					: [],
+		expect(triggered).toEqual([["named-exports"]]);
+		expect(ttsrManager.getInjectedRuleNames()).toEqual(["named-exports"]);
+		expect(injectedNames(session)).toEqual(["named-exports"]);
+		expect(modelMessages).toHaveLength(2);
+		expect(JSON.stringify(modelMessages[1])).toContain(RULE_CONTENT);
+		const calls = modelMessages[1].flatMap(message =>
+			message.role === "assistant"
+				? message.content.filter(block => block.type === "toolCall").map(block => block.id)
+				: [],
+		);
+		const results = modelMessages[1].filter(message => message.role === "toolResult");
+		expect(calls).toEqual(["write-1"]);
+		expect(results).toHaveLength(1);
+		for (const id of calls) expect(results.filter(result => result.toolCallId === id)).toHaveLength(1);
+		expect(fs.existsSync(path.join(tempDir, "a.ts"))).toBe(interruptMode === "never");
+		if (interruptMode === "never") {
+			expect(toolResultText(session, "write-1")).toContain(RULE_CONTENT);
+			expect(await Bun.file(path.join(tempDir, "a.ts")).text()).toContain("export default foo;");
+		} else {
+			const aborted = session.agent.state.messages.find(
+				message => message.role === "assistant" && message.stopReason === "aborted",
 			);
-			const results = modelMessages[1].filter(message => message.role === "toolResult");
-			expect(calls).toEqual(["write-1"]);
-			expect(results).toHaveLength(1);
-			for (const id of calls) expect(results.filter(result => result.toolCallId === id)).toHaveLength(1);
-			expect(fs.existsSync(path.join(tempDir, "a.ts"))).toBe(interruptMode === "never");
-			if (interruptMode === "never") {
-				expect(toolResultText(session, "write-1")).toContain(RULE_CONTENT);
-				expect(await Bun.file(path.join(tempDir, "a.ts")).text()).toContain("export default foo;");
-			} else {
-				const aborted = session.agent.state.messages.find(
-					message => message.role === "assistant" && message.stopReason === "aborted",
-				);
-				expect(aborted?.role === "assistant" ? aborted.errorMessage : undefined).toBe(
-					"TTSR matched rule: named-exports",
-				);
-			}
-		},
-	);
+			expect(aborted?.role === "assistant" ? aborted.errorMessage : undefined).toBe(
+				"TTSR matched rule: named-exports",
+			);
+		}
+	});
 
 	it("leaves a non-matching write untouched", async () => {
 		const { session, triggered, ttsrManager } = createSession(
@@ -1378,35 +1378,35 @@ describe("TTSR astCondition in the AgentSession tool path", () => {
 		}
 	});
 
-	it.each(["materialized", "deferred"] as const)(
-		"blocks a matching write dispatched through a %s production tool facade",
-		async state => {
-			const toolSession = createToolSession();
-			// The agent annotates advertised schemas in place; give this facade its own
-			// copy so the shared builtin descriptor stays pristine for other tests.
-			const builtin = BUILTIN_TOOL_DESCRIPTORS.write!;
-			const descriptor = {
-				...builtin,
-				metadata: { ...builtin.metadata, parameters: cloneSchema(builtin.metadata.parameters) },
-			};
-			const facade =
-				state === "materialized"
-					? new LazyAgentTool(descriptor, new WriteTool(toolSession), undefined, toolSession)
-					: new LazyAgentTool(descriptor, undefined, () => new WriteTool(toolSession), toolSession);
-			const { session, triggered, modelMessages } = createSession(
-				[facade],
-				[[writeCall("write-1", "a.ts", "export default 1;\n")]],
-				[defaultExportRule()],
-				{ interruptMode: "always" },
-			);
-			await run(session, "write it");
+	it.each([
+		"materialized",
+		"deferred",
+	] as const)("blocks a matching write dispatched through a %s production tool facade", async state => {
+		const toolSession = createToolSession();
+		// The agent annotates advertised schemas in place; give this facade its own
+		// copy so the shared builtin descriptor stays pristine for other tests.
+		const builtin = BUILTIN_TOOL_DESCRIPTORS.write!;
+		const descriptor = {
+			...builtin,
+			metadata: { ...builtin.metadata, parameters: cloneSchema(builtin.metadata.parameters) },
+		};
+		const facade =
+			state === "materialized"
+				? new LazyAgentTool(descriptor, new WriteTool(toolSession), undefined, toolSession)
+				: new LazyAgentTool(descriptor, undefined, () => new WriteTool(toolSession), toolSession);
+		const { session, triggered, modelMessages } = createSession(
+			[facade],
+			[[writeCall("write-1", "a.ts", "export default 1;\n")]],
+			[defaultExportRule()],
+			{ interruptMode: "always" },
+		);
+		await run(session, "write it");
 
-			expect(triggered).toEqual([["named-exports"]]);
-			expect(fs.existsSync(path.join(tempDir, "a.ts"))).toBe(false);
-			expect(JSON.stringify(modelMessages[1])).toContain(RULE_CONTENT);
-			expect(injectedNames(session)).toEqual(["named-exports"]);
-		},
-	);
+		expect(triggered).toEqual([["named-exports"]]);
+		expect(fs.existsSync(path.join(tempDir, "a.ts"))).toBe(false);
+		expect(JSON.stringify(modelMessages[1])).toContain(RULE_CONTENT);
+		expect(injectedNames(session)).toEqual(["named-exports"]);
+	});
 
 	it("evaluates an edit call that arrives under its apply_patch wire name", async () => {
 		const { session, triggered, modelMessages } = createSession(

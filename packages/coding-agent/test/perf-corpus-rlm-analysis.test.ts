@@ -1038,33 +1038,32 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		]),
 	];
 
-	test.each(privateRunnerCases)(
-		"rejects a host-private runner %s before admission",
-		async (name, mutate, expectedMessage) => {
-			const input = path.join(temporaryRoot, `private-runner-${name}-input`);
-			const output = path.join(temporaryRoot, `private-runner-${name}-output`);
-			await writeCorpus(input, () => 100_000, ["short-01"]);
-			let runtimeControlIdentity = "";
-			await mutateReport(input, "short-01.json", report => {
-				mutate(report.runner);
-				report.runner.runtimeControlIdentity = memoryRuntimeControlIdentity(report.runner);
-				runtimeControlIdentity = report.runner.runtimeControlIdentity;
-			});
-			await mutateLedger(input, ledger => {
-				const attempt = (ledger.attempts as JsonObject[]).find(item => item.reportFilename === "short-01.json");
-				if (!attempt) throw new Error("short-01 ledger attempt unavailable");
-				attempt.runtimeControlIdentity = runtimeControlIdentity;
-			});
+	test.each(
+		privateRunnerCases,
+	)("rejects a host-private runner %s before admission", async (name, mutate, expectedMessage) => {
+		const input = path.join(temporaryRoot, `private-runner-${name}-input`);
+		const output = path.join(temporaryRoot, `private-runner-${name}-output`);
+		await writeCorpus(input, () => 100_000, ["short-01"]);
+		let runtimeControlIdentity = "";
+		await mutateReport(input, "short-01.json", report => {
+			mutate(report.runner);
+			report.runner.runtimeControlIdentity = memoryRuntimeControlIdentity(report.runner);
+			runtimeControlIdentity = report.runner.runtimeControlIdentity;
+		});
+		await mutateLedger(input, ledger => {
+			const attempt = (ledger.attempts as JsonObject[]).find(item => item.reportFilename === "short-01.json");
+			if (!attempt) throw new Error("short-01 ledger attempt unavailable");
+			attempt.runtimeControlIdentity = runtimeControlIdentity;
+		});
 
-			expect(invoke(input, output).exitCode).toBe(0);
-			const result = await readResult(output);
-			expect(result.diagnostics.validationErrors).toContainEqual(
-				expect.objectContaining({ filename: "short-01.json", message: expect.stringContaining(expectedMessage) }),
-			);
-			expect(result.admission.short.invalidBlocks).toBe(1);
-			expect(result.admissionTraceability.some(item => item.attemptId === "short-01")).toBe(false);
-		},
-	);
+		expect(invoke(input, output).exitCode).toBe(0);
+		const result = await readResult(output);
+		expect(result.diagnostics.validationErrors).toContainEqual(
+			expect.objectContaining({ filename: "short-01.json", message: expect.stringContaining(expectedMessage) }),
+		);
+		expect(result.admission.short.invalidBlocks).toBe(1);
+		expect(result.admissionTraceability.some(item => item.attemptId === "short-01")).toBe(false);
+	});
 
 	test("fails closed when Git checkout provenance is unavailable", () => {
 		const spawnSync = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {

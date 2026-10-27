@@ -75,37 +75,38 @@ describe("formatIrcMessageBlock", () => {
 		expect(formatIrcMessageBlock(parsed).time).toBe(localTime(parsed.timestamp));
 	});
 
-	it.each(["incoming", "autoreply", "relay"] as const)(
-		"renders exact formatter content in inline and sidebar %s surfaces",
-		kind => {
-			const parsed = {
-				...message(kind, "first\tline\nsecond line"),
-				from: "alice\r\n[IRC] forged\u202e👩🏽‍💻",
-				to: "channel\t\u2066target",
-			};
-			const chatContainer = new Container();
-			const helpers = new UiHelpers({ chatContainer } as InteractiveModeContext);
-			helpers.addRebuiltIrcObservationToChat(parsed);
-			const inline = Bun.stripANSI(chatContainer.render(120).join("\n"));
+	it.each([
+		"incoming",
+		"autoreply",
+		"relay",
+	] as const)("renders exact formatter content in inline and sidebar %s surfaces", kind => {
+		const parsed = {
+			...message(kind, "first\tline\nsecond line"),
+			from: "alice\r\n[IRC] forged\u202e👩🏽‍💻",
+			to: "channel\t\u2066target",
+		};
+		const chatContainer = new Container();
+		const helpers = new UiHelpers({ chatContainer } as InteractiveModeContext);
+		helpers.addRebuiltIrcObservationToChat(parsed);
+		const inline = Bun.stripANSI(chatContainer.render(120).join("\n"));
 
-			const ledger = new IrcObservationLedger();
-			ledger.observe(parsed, false);
-			const split = new IrcSplitViewComponent(new Container(), ledger, theme);
-			split.setVisible(true);
-			const sidebar = Bun.stripANSI(split.render(200).join("\n"));
-			const block = formatIrcMessageBlock(parsed);
-			const header = `[IRC] ${block.sender} → ${block.recipient} · ${block.time}`;
+		const ledger = new IrcObservationLedger();
+		ledger.observe(parsed, false);
+		const split = new IrcSplitViewComponent(new Container(), ledger, theme);
+		split.setVisible(true);
+		const sidebar = Bun.stripANSI(split.render(200).join("\n"));
+		const block = formatIrcMessageBlock(parsed);
+		const header = `[IRC] ${block.sender} → ${block.recipient} · ${block.time}`;
 
-			for (const content of [block.sender, block.recipient, block.time, ...block.bodyLines]) {
-				expect(inline).toContain(content);
-				expect(sidebar).toContain(content);
-			}
-			expect(inline).toContain(header);
-			expect(inline.match(/ → /g)).toHaveLength(1);
-			expect(inline.match(/ · /g)).toHaveLength(1);
-			expect(inline).not.toContain("\n[IRC] forged");
-		},
-	);
+		for (const content of [block.sender, block.recipient, block.time, ...block.bodyLines]) {
+			expect(inline).toContain(content);
+			expect(sidebar).toContain(content);
+		}
+		expect(inline).toContain(header);
+		expect(inline.match(/ → /g)).toHaveLength(1);
+		expect(inline.match(/ · /g)).toHaveLength(1);
+		expect(inline).not.toContain("\n[IRC] forged");
+	});
 
 	it("uses a placeholder time for finite timestamps outside Date's range", () => {
 		expect(formatIrcMessageBlock({ ...message("incoming", "hello"), timestamp: Number.MAX_VALUE }).time).toBe(

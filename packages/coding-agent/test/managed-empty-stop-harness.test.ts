@@ -107,25 +107,21 @@ describe("managed empty-stop harness local contracts (no connected scenarios)", 
 		expect(() => assertExecutedScenarios(count)).toThrow("Zero scenarios executed");
 	});
 
-	test.each(["invalid-scenario", ""])(
-		"rejects CLI selection %j with zero executions",
-		async selection => {
-			// Invalid selection never constructs a session or binds a server.
-			const child = Bun.spawn(
-				[process.execPath, path.resolve(import.meta.dir, "../scripts/verify-managed-empty-stop.ts"), selection],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
-			const [exit, stdout, stderr] = await Promise.all([
-				child.exited,
-				new Response(child.stdout).text(),
-				new Response(child.stderr).text(),
-			]);
-			expect(exit).toBe(1);
-			expect(stdout).toContain("executed 0 scenario(s)");
-			expect(stderr).toContain("Unknown scenario");
-		},
-		15_000,
-	);
+	test.each(["invalid-scenario", ""])("rejects CLI selection %j with zero executions", async selection => {
+		// Invalid selection never constructs a session or binds a server.
+		const child = Bun.spawn(
+			[process.execPath, path.resolve(import.meta.dir, "../scripts/verify-managed-empty-stop.ts"), selection],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		const [exit, stdout, stderr] = await Promise.all([
+			child.exited,
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+		]);
+		expect(exit).toBe(1);
+		expect(stdout).toContain("executed 0 scenario(s)");
+		expect(stderr).toContain("Unknown scenario");
+	}, 15_000);
 
 	test.each(["0", "30200", "30219"])("accepts isolated port %s", value => {
 		expect(parseHarnessPort(value)).toBe(Number(value));

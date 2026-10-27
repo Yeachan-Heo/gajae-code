@@ -87,12 +87,16 @@ describe("shortenModelId", () => {
 		expect(shortenModelId(input)).toBe(expected);
 	});
 
-	it.each(["", "   ", "20250929", "anthropic/", "claude-", "-20250929"])(
-		"never returns an empty label for %p",
-		input => {
-			expect(shortenModelId(input).length).toBeGreaterThan(0);
-		},
-	);
+	it.each([
+		"",
+		"   ",
+		"20250929",
+		"anthropic/",
+		"claude-",
+		"-20250929",
+	])("never returns an empty label for %p", input => {
+		expect(shortenModelId(input).length).toBeGreaterThan(0);
+	});
 
 	it("falls back to a stable label when the id is missing", () => {
 		expect(shortenModelId(undefined)).toBe("no-model");

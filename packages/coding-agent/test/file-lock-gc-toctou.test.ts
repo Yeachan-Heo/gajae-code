@@ -1117,15 +1117,16 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		},
 	);
 
-	test.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
-		"rejects invalid orphan-transition adoption age %s",
-		async orphanTransitionAgeMs => {
-			const lockedFile = path.join(await makeTemp(), "invalid-transition-age.json");
-			await expect(withFileLock(lockedFile, async () => undefined, { orphanTransitionAgeMs })).rejects.toThrow(
-				"orphanTransitionAgeMs must be a finite, non-negative number",
-			);
-		},
-	);
+	test.each([
+		-1,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+	])("rejects invalid orphan-transition adoption age %s", async orphanTransitionAgeMs => {
+		const lockedFile = path.join(await makeTemp(), "invalid-transition-age.json");
+		await expect(withFileLock(lockedFile, async () => undefined, { orphanTransitionAgeMs })).rejects.toThrow(
+			"orphanTransitionAgeMs must be a finite, non-negative number",
+		);
+	});
 
 	test.skipIf(process.platform === "win32")(
 		"reclaims a young orphan transition within a longer acquisition budget",
@@ -1174,38 +1175,37 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		["contradictory not-found", _detachedPath => ({ ok: true, code: "not_found" })],
 		["non-boolean success", _detachedPath => ({ ok: 1 })],
 	];
-	test.each(invalidOrphanAdoptionReceipts)(
-		"keeps an aged empty transition when adoption returns %s",
-		async (_label, makeReceipt) => {
-			const lockedFile = path.join(await makeTemp(), "state.json");
-			const lockDir = `${lockedFile}.lock`;
-			const detachedPath = `${lockDir}.removing`;
-			await fs.mkdir(detachedPath);
-			const old = new Date(Date.now() - 120_000);
-			await fs.utimes(detachedPath, old, old);
-			let exactRemoveCalls = 0;
-			FileLockTestHooks.nativeQuarantineBindings = () => ({
-				snapshotDirectoryTree,
-				exactRemoveDirectoryTree: target => {
-					exactRemoveCalls++;
-					return makeReceipt(target) as NativeExactUnlinkResult;
-				},
-			});
+	test.each(
+		invalidOrphanAdoptionReceipts,
+	)("keeps an aged empty transition when adoption returns %s", async (_label, makeReceipt) => {
+		const lockedFile = path.join(await makeTemp(), "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const detachedPath = `${lockDir}.removing`;
+		await fs.mkdir(detachedPath);
+		const old = new Date(Date.now() - 120_000);
+		await fs.utimes(detachedPath, old, old);
+		let exactRemoveCalls = 0;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: target => {
+				exactRemoveCalls++;
+				return makeReceipt(target) as NativeExactUnlinkResult;
+			},
+		});
 
-			const failure = await withFileLock(lockedFile, async () => undefined, {
-				retries: 1,
-				retryDelayMs: 1,
-			}).catch(error => error);
-			expect(failure).toMatchObject({
-				code: "orphan_transition",
-				reason: "orphan_transition",
-				orphanPath: detachedPath,
-				attempts: 1,
-			});
-			expect(exactRemoveCalls).toBe(1);
-			expect(await fs.exists(detachedPath)).toBe(true);
-		},
-	);
+		const failure = await withFileLock(lockedFile, async () => undefined, {
+			retries: 1,
+			retryDelayMs: 1,
+		}).catch(error => error);
+		expect(failure).toMatchObject({
+			code: "orphan_transition",
+			reason: "orphan_transition",
+			orphanPath: detachedPath,
+			attempts: 1,
+		});
+		expect(exactRemoveCalls).toBe(1);
+		expect(await fs.exists(detachedPath)).toBe(true);
+	});
 
 	test.skipIf(process.platform === "win32")(
 		"keeps an aged scrubbed transition when native cleanup lacks durable payload proof",

@@ -690,39 +690,40 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await Bun.file(stateFile).text()).toBe(evidence);
 	});
 
-	it.each(["state", "ready_for_input", "live"])(
-		"names structurally invalid marker field %s without echoing its text",
-		async field => {
-			const root = await tempRoot();
-			const stateFile = path.join(root, "invalid-field.json");
-			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "invalid-field";
-			const evidence = JSON.stringify({
-				schema_version: 1,
-				session_id: "invalid-field",
-				state: "completed",
-				ready_for_input: true,
-				live: false,
-				[field]: "untrusted-marker-text\x1b[2J",
-			});
-			await Bun.write(stateFile, evidence);
-			const failure = await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
-				sessionId: "invalid-field",
-				cwd: root,
-				sessionFile: null,
-			}).catch((error: unknown) => error);
-			expect(failure).toBeInstanceOf(Error);
-			expect((failure as Error).name).toBe("PreviousRuntimeStateReadError");
-			const message = (failure as Error).message;
-			// The failing field is named and the offending bytes are pinned by digest...
-			expect(message).toContain(`Existing runtime state marker violates the lifecycle contract: ${field} `);
-			expect(message).toMatch(/payload sha256 [a-f0-9]{64}/);
-			// ...while the marker's own text never reaches an operator-visible diagnostic.
-			expect(message).not.toContain("untrusted-marker-text");
-			expect(message).not.toContain("\x1b");
-			expect(await Bun.file(stateFile).text()).toBe(evidence);
-		},
-	);
+	it.each([
+		"state",
+		"ready_for_input",
+		"live",
+	])("names structurally invalid marker field %s without echoing its text", async field => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "invalid-field.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "invalid-field";
+		const evidence = JSON.stringify({
+			schema_version: 1,
+			session_id: "invalid-field",
+			state: "completed",
+			ready_for_input: true,
+			live: false,
+			[field]: "untrusted-marker-text\x1b[2J",
+		});
+		await Bun.write(stateFile, evidence);
+		const failure = await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
+			sessionId: "invalid-field",
+			cwd: root,
+			sessionFile: null,
+		}).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).name).toBe("PreviousRuntimeStateReadError");
+		const message = (failure as Error).message;
+		// The failing field is named and the offending bytes are pinned by digest...
+		expect(message).toContain(`Existing runtime state marker violates the lifecycle contract: ${field} `);
+		expect(message).toMatch(/payload sha256 [a-f0-9]{64}/);
+		// ...while the marker's own text never reaches an operator-visible diagnostic.
+		expect(message).not.toContain("untrusted-marker-text");
+		expect(message).not.toContain("\x1b");
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+	});
 
 	it("binds a shape refusal to the exact marker bytes by digest", async () => {
 		const root = await tempRoot();
@@ -4019,45 +4020,42 @@ describe("coordinator runtime state sidecar", () => {
 		["ready_for_input", false, false, "ready_for_input must be true when state is ready_for_input (received false)"],
 		["running", false, false, "live must be true when state is running (received false)"],
 		["completed", false, true, "live must be false when state is completed (received true)"],
-	] as const)(
-		"diagnoses contradictory lifecycle fields: %s / ready=%s / live=%s",
-		async (state, ready, live, detail) => {
-			const root = await tempRoot();
-			const sessionId = "contradictory-marker";
-			const stateFile = path.join(sessionRuntimeDir(root, sessionId), "runtime-state.json");
-			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
-			// Like a pre-4351 marker carried from Windows: a readable payload must still
-			// pass lifecycle validation before foreign-workspace adoption is considered.
-			const evidence = `${JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				state,
-				ready_for_input: ready,
-				cwd: "D:\\work\\project",
-				workdir: "D:\\work\\project",
-				session_file: null,
-				live,
-				updated_at: "2026-08-11T00:00:00.000Z",
-			})}\n`;
-			await Bun.write(stateFile, evidence);
-			const context = { sessionId, cwd: root, sessionFile: null };
-			const prefix = `Existing runtime state marker violates the lifecycle contract: ${detail}`;
+	] as const)("diagnoses contradictory lifecycle fields: %s / ready=%s / live=%s", async (state, ready, live, detail) => {
+		const root = await tempRoot();
+		const sessionId = "contradictory-marker";
+		const stateFile = path.join(sessionRuntimeDir(root, sessionId), "runtime-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		// Like a pre-4351 marker carried from Windows: a readable payload must still
+		// pass lifecycle validation before foreign-workspace adoption is considered.
+		const evidence = `${JSON.stringify({
+			schema_version: 1,
+			session_id: sessionId,
+			state,
+			ready_for_input: ready,
+			cwd: "D:\\work\\project",
+			workdir: "D:\\work\\project",
+			session_file: null,
+			live,
+			updated_at: "2026-08-11T00:00:00.000Z",
+		})}\n`;
+		await Bun.write(stateFile, evidence);
+		const context = { sessionId, cwd: root, sessionFile: null };
+		const prefix = `Existing runtime state marker violates the lifecycle contract: ${detail}`;
 
-			const failure = await expectRefusal(
-				persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), context),
-			);
-			expect(failure.message).toContain(prefix);
-			expect(failure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
-			expect(await Bun.file(stateFile).text()).toBe(evidence);
-			const postmortemFailure = await expectRefusal(
-				persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
-			);
-			expect(postmortemFailure.message).toContain(prefix);
-			expect(postmortemFailure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
-			expect(await Bun.file(stateFile).text()).toBe(evidence);
-		},
-	);
+		const failure = await expectRefusal(
+			persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), context),
+		);
+		expect(failure.message).toContain(prefix);
+		expect(failure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+		const postmortemFailure = await expectRefusal(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
+		);
+		expect(postmortemFailure.message).toContain(prefix);
+		expect(postmortemFailure.message).toMatch(/payload sha256 [a-f0-9]{64}; refusing to overwrite\.$/);
+		expect(await Bun.file(stateFile).text()).toBe(evidence);
+	});
 });
 
 describe("coordinator runtime tool activity", () => {

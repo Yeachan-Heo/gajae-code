@@ -356,37 +356,36 @@ describe("empty .gjc-delete-* latch", () => {
 		] as const
 	).filter(([, platform]) => platform !== "darwin" || process.platform !== "win32");
 
-	it.each(pathBracketedPlatforms)(
-		"Test 1 %s authority: root replacement fails closed",
-		async (_label, platform, prefix) => {
-			const dir = await tempRoot(`gjc-scan-${prefix}-root-race-`);
-			const replacement = `${dir}-replacement`;
-			tempDirs.push(replacement);
-			ProjectionScanTestHooks.platform = platform;
-			await fs.writeFile(path.join(dir, "original.json"), JSON.stringify({ session_id: "original" }));
+	it.each(
+		pathBracketedPlatforms,
+	)("Test 1 %s authority: root replacement fails closed", async (_label, platform, prefix) => {
+		const dir = await tempRoot(`gjc-scan-${prefix}-root-race-`);
+		const replacement = `${dir}-replacement`;
+		tempDirs.push(replacement);
+		ProjectionScanTestHooks.platform = platform;
+		await fs.writeFile(path.join(dir, "original.json"), JSON.stringify({ session_id: "original" }));
 
-			const realReaddir = fs.readdir;
-			const readdirSpy = spyOn(fs, "readdir");
-			readdirSpy.mockImplementation((async (target: PathLike) => {
-				const entries = await realReaddir(target);
-				if (String(target) === dir) {
-					await fs.rename(dir, replacement);
-					await fs.mkdir(dir);
-					await fs.writeFile(path.join(dir, "foreign.json"), JSON.stringify({ session_id: "foreign" }));
-				}
-				return entries;
-			}) as unknown as typeof fs.readdir);
-			try {
-				const scan = await listCoordinatorJsonFiles(dir);
-				expect(scan.values).toEqual([]);
-				expect(scan.raced).toBe(1);
-				expect(scan.incomplete).toBe(true);
-				expect(scan.capped).toBe(true);
-			} finally {
-				readdirSpy.mockRestore();
+		const realReaddir = fs.readdir;
+		const readdirSpy = spyOn(fs, "readdir");
+		readdirSpy.mockImplementation((async (target: PathLike) => {
+			const entries = await realReaddir(target);
+			if (String(target) === dir) {
+				await fs.rename(dir, replacement);
+				await fs.mkdir(dir);
+				await fs.writeFile(path.join(dir, "foreign.json"), JSON.stringify({ session_id: "foreign" }));
 			}
-		},
-	);
+			return entries;
+		}) as unknown as typeof fs.readdir);
+		try {
+			const scan = await listCoordinatorJsonFiles(dir);
+			expect(scan.values).toEqual([]);
+			expect(scan.raced).toBe(1);
+			expect(scan.incomplete).toBe(true);
+			expect(scan.capped).toBe(true);
+		} finally {
+			readdirSpy.mockRestore();
+		}
+	});
 
 	it("Test 1 Windows authority: candidate replacement fails closed before parsing", async () => {
 		const dir = await tempRoot("gjc-scan-win-candidate-race-");

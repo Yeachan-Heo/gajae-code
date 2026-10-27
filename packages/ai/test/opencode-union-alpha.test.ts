@@ -95,23 +95,23 @@ describe("OpenCode Union Alpha", () => {
 			expect(getBundledModel(provider, id)).toMatchObject({ ...metadata, provider, baseUrl });
 		});
 
-		test.each(["https://relay.example.test/custom/v1", "  https://relay.example.test/custom/v1///  "])(
-			`${provider} preserves configured origin %s while selecting the Messages base`,
-			async customBaseUrl => {
-				const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
-					Object.assign(async () => Response.json({ data: [{ id }] }), {
-						preconnect: globalThis.fetch.preconnect,
-					}),
-				);
-				const options = managerOptions({ apiKey: "test-key", baseUrl: customBaseUrl });
-				const dynamic = await options.fetchDynamicModels?.();
-				expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://relay.example.test/custom/v1/models");
-				expect(dynamic?.find(model => model.id === id)).toMatchObject({
-					...metadata,
-					baseUrl: "https://relay.example.test/custom",
-				});
-			},
-		);
+		test.each([
+			"https://relay.example.test/custom/v1",
+			"  https://relay.example.test/custom/v1///  ",
+		])(`${provider} preserves configured origin %s while selecting the Messages base`, async customBaseUrl => {
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+				Object.assign(async () => Response.json({ data: [{ id }] }), {
+					preconnect: globalThis.fetch.preconnect,
+				}),
+			);
+			const options = managerOptions({ apiKey: "test-key", baseUrl: customBaseUrl });
+			const dynamic = await options.fetchDynamicModels?.();
+			expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://relay.example.test/custom/v1/models");
+			expect(dynamic?.find(model => model.id === id)).toMatchObject({
+				...metadata,
+				baseUrl: "https://relay.example.test/custom",
+			});
+		});
 
 		test(`${provider} keeps Anthropic routing through id-only discovery and cache reuse`, async () => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "union-alpha-"));
@@ -139,55 +139,55 @@ describe("OpenCode Union Alpha", () => {
 			}
 		});
 
-		test.each(["offline", "online-if-uncached"] as const)(
-			`${provider} repairs pre-catalogue discovery cache during %s`,
-			async strategy => {
-				const directory = await fs.mkdtemp(path.join(os.tmpdir(), "union-alpha-cache-"));
-				try {
-					const cacheDbPath = path.join(directory, "models.db");
-					const now = 1_700_000_000_000;
-					const placeholder: Model = {
-						id,
-						name: id,
-						provider,
-						api: "openai-completions",
-						baseUrl: `${baseUrl}/v1`,
-						reasoning: false,
-						input: ["text"],
-						cost: metadata.cost,
-						contextWindow: UNK_CONTEXT_WINDOW,
-						maxTokens: UNK_MAX_TOKENS,
-					};
-					const provenance = "same-credential-and-endpoint";
-					writeModelCache(
-						provider,
-						now,
-						[placeholder],
-						true,
-						Bun.hash(JSON.stringify([placeholder])).toString(36),
+		test.each([
+			"offline",
+			"online-if-uncached",
+		] as const)(`${provider} repairs pre-catalogue discovery cache during %s`, async strategy => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "union-alpha-cache-"));
+			try {
+				const cacheDbPath = path.join(directory, "models.db");
+				const now = 1_700_000_000_000;
+				const placeholder: Model = {
+					id,
+					name: id,
+					provider,
+					api: "openai-completions",
+					baseUrl: `${baseUrl}/v1`,
+					reasoning: false,
+					input: ["text"],
+					cost: metadata.cost,
+					contextWindow: UNK_CONTEXT_WINDOW,
+					maxTokens: UNK_MAX_TOKENS,
+				};
+				const provenance = "same-credential-and-endpoint";
+				writeModelCache(
+					provider,
+					now,
+					[placeholder],
+					true,
+					Bun.hash(JSON.stringify([placeholder])).toString(36),
+					cacheDbPath,
+					[id],
+					provenance,
+				);
+				const fetchDynamicModels = vi.fn(async () => null);
+				const result = await resolveProviderModels(
+					{
+						providerId: provider,
+						staticModels: [getBundledModel(provider, id)],
+						fetchDynamicModels,
 						cacheDbPath,
-						[id],
-						provenance,
-					);
-					const fetchDynamicModels = vi.fn(async () => null);
-					const result = await resolveProviderModels(
-						{
-							providerId: provider,
-							staticModels: [getBundledModel(provider, id)],
-							fetchDynamicModels,
-							cacheDbPath,
-							now: () => now,
-							cacheDynamicModelProvenance: provenance,
-						},
-						strategy,
-					);
-					expect(result.models.find(model => model.id === id)).toMatchObject({ ...metadata, provider, baseUrl });
-					expect(fetchDynamicModels).not.toHaveBeenCalled();
-				} finally {
-					await fs.rm(directory, { recursive: true, force: true });
-				}
-			},
-		);
+						now: () => now,
+						cacheDynamicModelProvenance: provenance,
+					},
+					strategy,
+				);
+				expect(result.models.find(model => model.id === id)).toMatchObject({ ...metadata, provider, baseUrl });
+				expect(fetchDynamicModels).not.toHaveBeenCalled();
+			} finally {
+				await fs.rm(directory, { recursive: true, force: true });
+			}
+		});
 
 		test(`${provider} preserves nearby mixed-protocol routes on a custom discovery endpoint`, async () => {
 			const neighbors =

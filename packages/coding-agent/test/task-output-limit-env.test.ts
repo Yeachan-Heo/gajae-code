@@ -102,35 +102,41 @@ describe("task output limit environment parsing", () => {
 		).toEqual({ bytes: 32_000, lines: 125 });
 	});
 
-	it.each(["agent", "config-root", "home"] as const)(
-		"honors task output limits from the %s dotenv file managed by utils",
-		async location => {
-			expect(
-				await readTaskOutputLimits(
-					{},
-					{
-						dotenv: {
-							location,
-							values: {
-								GJC_TASK_MAX_OUTPUT_BYTES: "64000",
-								GJC_TASK_MAX_OUTPUT_LINES: "250",
-							},
+	it.each([
+		"agent",
+		"config-root",
+		"home",
+	] as const)("honors task output limits from the %s dotenv file managed by utils", async location => {
+		expect(
+			await readTaskOutputLimits(
+				{},
+				{
+					dotenv: {
+						location,
+						values: {
+							GJC_TASK_MAX_OUTPUT_BYTES: "64000",
+							GJC_TASK_MAX_OUTPUT_LINES: "250",
 						},
 					},
-				),
-			).toEqual({ bytes: 64_000, lines: 250 });
-		},
-	);
+				},
+			),
+		).toEqual({ bytes: 64_000, lines: 250 });
+	});
 
-	it.each(["500000oops", "1.5", "1e3", " 12 ", "0", "-1", "9007199254740992"])(
-		"falls back for invalid or inexact override %j",
-		async value => {
-			expect(
-				await readTaskOutputLimits({
-					GJC_TASK_MAX_OUTPUT_BYTES: value,
-					GJC_TASK_MAX_OUTPUT_LINES: value,
-				}),
-			).toEqual(defaults);
-		},
-	);
+	it.each([
+		"500000oops",
+		"1.5",
+		"1e3",
+		" 12 ",
+		"0",
+		"-1",
+		"9007199254740992",
+	])("falls back for invalid or inexact override %j", async value => {
+		expect(
+			await readTaskOutputLimits({
+				GJC_TASK_MAX_OUTPUT_BYTES: value,
+				GJC_TASK_MAX_OUTPUT_LINES: value,
+			}),
+		).toEqual(defaults);
+	});
 });

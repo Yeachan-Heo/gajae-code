@@ -842,20 +842,17 @@ describe("startup model-profile credential recovery eligibility", () => {
 		["image-only startup", true, true, "", [], undefined, false],
 		["automatic resume continuation", true, true, undefined, [], "continue-tail", false],
 		["idle resume picker selection", true, true, undefined, [], "open-idle", true],
-	] as const)(
-		"%s",
-		(_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction, expected) => {
-			expect(
-				isStartupModelProfileCredentialRecoveryEligible({
-					isInteractive,
-					hasInteractiveTerminal,
-					initialMessage,
-					initialMessages,
-					resumeAction,
-				}),
-			).toBe(expected);
-		},
-	);
+	] as const)("%s", (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction, expected) => {
+		expect(
+			isStartupModelProfileCredentialRecoveryEligible({
+				isInteractive,
+				hasInteractiveTerminal,
+				initialMessage,
+				initialMessages,
+				resumeAction,
+			}),
+		).toBe(expected);
+	});
 });
 
 test("interactive resume keeps a session open when its default profile requires an unavailable pin", async () => {
@@ -1535,35 +1532,32 @@ test.each([
 	["direct --continue", true, true, undefined, [], undefined, { continue: true }],
 	["direct --resume <id>", true, true, undefined, [], undefined, { resume: "session-1" }],
 	["--fork", true, true, undefined, [], undefined, { fork: "session-1" }],
-] as const)(
-	"stale default stays fatal for %s",
-	async (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction, parsedArgs) => {
-		const exit = new Error("exit 1");
-		const exitSpy = spyOn(process, "exit").mockImplementation((() => {
-			throw exit;
-		}) as never);
-		const stderrSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as never);
-		try {
-			await expect(
-				applyStartupModelProfilesForRoot({
-					session: fakeSession(),
-					settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
-					modelRegistry: fakeRegistry([]) as never,
-					parsedArgs,
-					isInteractive,
-					hasInteractiveTerminal,
-					initialMessage,
-					initialMessages,
-					resumeAction,
-				}),
-			).rejects.toBe(exit);
-			expect(exitSpy).toHaveBeenCalledWith(1);
-		} finally {
-			stderrSpy.mockRestore();
-			exitSpy.mockRestore();
-		}
-	},
-);
+] as const)("stale default stays fatal for %s", async (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction, parsedArgs) => {
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesForRoot({
+				session: fakeSession(),
+				settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
+				modelRegistry: fakeRegistry([]) as never,
+				parsedArgs,
+				isInteractive,
+				hasInteractiveTerminal,
+				initialMessage,
+				initialMessages,
+				resumeAction,
+			}),
+		).rejects.toBe(exit);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
 
 test("registry errors are not mistaken for a stale default", async () => {
 	const exit = new Error("exit 1");
@@ -1797,49 +1791,46 @@ test.each([
 	["positional or slash input", true, true, undefined, ["do work"], undefined],
 	["image-only input", true, true, "", [], undefined],
 	["automatic resume continuation", true, true, undefined, [], "continue-tail"],
-] as const)(
-	"root startup keeps %s credential failures fatal",
-	async (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction) => {
-		const session = fakeSession();
-		const settings = Settings.isolated({ "modelProfile.default": "codex-medium" });
-		const registry = {
-			...fakeRegistry([
-				{
-					name: "codex-medium",
-					requiredProviders: ["openai-codex"],
-					modelMapping: { default: "openai-codex/default:high" },
-					source: "user",
-				},
-			]),
-			getApiKeyForProvider: async () => undefined,
-		} as never;
-		const exit = new Error("exit 1");
-		const exitSpy = spyOn(process, "exit").mockImplementation((() => {
-			throw exit;
-		}) as never);
-		const stderrSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as never);
-		try {
-			await expect(
-				applyStartupModelProfilesForRoot({
-					session,
-					settings,
-					modelRegistry: registry,
-					parsedArgs: {},
-					startupModel: undefined,
-					startupThinkingLevel: undefined,
-					isInteractive,
-					hasInteractiveTerminal,
-					initialMessage,
-					initialMessages,
-					resumeAction,
-				}),
-			).rejects.toBe(exit);
-		} finally {
-			stderrSpy.mockRestore();
-			exitSpy.mockRestore();
-		}
-	},
-);
+] as const)("root startup keeps %s credential failures fatal", async (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction) => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "codex-medium" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "codex-medium",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/default:high" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async () => undefined,
+	} as never;
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesForRoot({
+				session,
+				settings,
+				modelRegistry: registry,
+				parsedArgs: {},
+				startupModel: undefined,
+				startupThinkingLevel: undefined,
+				isInteractive,
+				hasInteractiveTerminal,
+				initialMessage,
+				initialMessages,
+				resumeAction,
+			}),
+		).rejects.toBe(exit);
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
 
 test("recoverable blocked default still applies healthy --mpreset and explicit CLI override", async () => {
 	const explicitModel = model("cli-provider", "explicit");

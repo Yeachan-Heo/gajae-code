@@ -322,100 +322,99 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		expect(parentManager?.getConnectedServers()).toEqual([]);
 	}, 30_000);
 
-	test.each(["gjc-plugins", "custom"])(
-		"does not treat caller-owned MCP tools with %s provider and a source path as mandatory",
-		async provider => {
-			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-forged-"));
-			tempDirs.push(cwd);
-			const r = await installGjcBundle({ cwd }, "project", mcpBundle);
-			expect(r.ok).toBe(true);
-			const { configs } = await buildPluginMcpConfigs({ cwd });
-			const callerManager = new MCPManager(cwd);
-			const callerSourcePath = path.join(cwd, "caller-owned-mcp-config.json");
-			fs.writeFileSync(callerSourcePath, "{}");
-			const sources = {
-				domain_docs: {
-					provider,
-					providerName: "Caller-owned manager",
-					path: callerSourcePath,
-					level: "project" as const,
-				},
-			};
-			const connected = await callerManager.connectServers(configs, sources as never);
-			expect(connected.errors.size).toBe(0);
-			expect(callerManager.getTools().map(tool => tool.name)).toContain("mcp__domain_docs_lookup");
-			const lateToolName = "mcp__domain_docs_late_lookup";
-			const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
-			let childSession: AgentSession | undefined;
-			let awaitLateCatalogSync = false;
-			const lateCatalogSynced = Promise.withResolvers<void>();
-			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
-				this: AgentSession,
-				previousNames,
-				nextTools,
-				options,
-			) {
-				await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
-				if (this === childSession && awaitLateCatalogSync && nextTools.some(tool => tool.name === lateToolName)) {
-					awaitLateCatalogSync = false;
-					lateCatalogSynced.resolve();
-				}
-			});
-
-			const child = await createAgentSession({
-				cwd,
-				agentDir: cwd,
-				sessionManager: SessionManager.inMemory(cwd),
-				settings: Settings.isolated(),
-				model: getBundledModel("openai", "gpt-4o-mini"),
-				disableExtensionDiscovery: true,
-				extensions: [],
-				skills: [],
-				contextFiles: [],
-				promptTemplates: [],
-				slashCommands: [],
-				enableMCP: false,
-				enableLsp: false,
-				parentTaskPrefix: "0-Forged",
-				mcpManager: callerManager,
-			});
-			childSession = child.session;
-			try {
-				expect(child.session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
-				expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
-				expect(callerManager.isConnectionSetSealed()).toBe(false);
-				await child.session.setActiveToolsByName(["mcp__domain_docs_lookup"]);
-				expect(child.session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
-				await child.session.setActiveToolsByName([]);
-				expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
-				expect(child.mcpManager).toBe(callerManager);
-
-				const listTools = vi
-					.spyOn(mcpClient, "listTools")
-					.mockResolvedValue([{ name: "late_lookup", inputSchema: { type: "object", properties: {} } }]);
-				awaitLateCatalogSync = true;
-				await callerManager.refreshServerTools("domain_docs");
-				await lateCatalogSynced.promise;
-				const deadline = Date.now() + 5_000;
-				while (!child.session.getAllToolNames().includes(lateToolName)) {
-					if (Date.now() >= deadline) throw new Error("late caller-owned MCP tool did not reach child");
-					await Bun.sleep(1);
-				}
-				expect(listTools).toHaveBeenCalledTimes(1);
-				expect(child.session.getAllToolNames()).not.toContain("mcp__domain_docs_lookup");
-				expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
-				expect(child.session.getSelectedMCPToolNames()).not.toContain(lateToolName);
-				await child.session.setActiveToolsByName([lateToolName]);
-				expect(child.session.getActiveToolNames()).toContain(lateToolName);
-				await child.session.setActiveToolsByName([]);
-				expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
-			} finally {
-				await child.session.dispose();
+	test.each([
+		"gjc-plugins",
+		"custom",
+	])("does not treat caller-owned MCP tools with %s provider and a source path as mandatory", async provider => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-forged-"));
+		tempDirs.push(cwd);
+		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
+		expect(r.ok).toBe(true);
+		const { configs } = await buildPluginMcpConfigs({ cwd });
+		const callerManager = new MCPManager(cwd);
+		const callerSourcePath = path.join(cwd, "caller-owned-mcp-config.json");
+		fs.writeFileSync(callerSourcePath, "{}");
+		const sources = {
+			domain_docs: {
+				provider,
+				providerName: "Caller-owned manager",
+				path: callerSourcePath,
+				level: "project" as const,
+			},
+		};
+		const connected = await callerManager.connectServers(configs, sources as never);
+		expect(connected.errors.size).toBe(0);
+		expect(callerManager.getTools().map(tool => tool.name)).toContain("mcp__domain_docs_lookup");
+		const lateToolName = "mcp__domain_docs_late_lookup";
+		const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+		let childSession: AgentSession | undefined;
+		let awaitLateCatalogSync = false;
+		const lateCatalogSynced = Promise.withResolvers<void>();
+		vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+			this: AgentSession,
+			previousNames,
+			nextTools,
+			options,
+		) {
+			await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
+			if (this === childSession && awaitLateCatalogSync && nextTools.some(tool => tool.name === lateToolName)) {
+				awaitLateCatalogSync = false;
+				lateCatalogSynced.resolve();
 			}
-			expect(callerManager.getConnectedServers()).toContain("domain_docs");
-			await callerManager.disconnectAll();
-			expect(callerManager.getConnectedServers()).toEqual([]);
-		},
-		30_000,
-	);
+		});
+
+		const child = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			parentTaskPrefix: "0-Forged",
+			mcpManager: callerManager,
+		});
+		childSession = child.session;
+		try {
+			expect(child.session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
+			expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
+			expect(callerManager.isConnectionSetSealed()).toBe(false);
+			await child.session.setActiveToolsByName(["mcp__domain_docs_lookup"]);
+			expect(child.session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+			await child.session.setActiveToolsByName([]);
+			expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
+			expect(child.mcpManager).toBe(callerManager);
+
+			const listTools = vi
+				.spyOn(mcpClient, "listTools")
+				.mockResolvedValue([{ name: "late_lookup", inputSchema: { type: "object", properties: {} } }]);
+			awaitLateCatalogSync = true;
+			await callerManager.refreshServerTools("domain_docs");
+			await lateCatalogSynced.promise;
+			const deadline = Date.now() + 5_000;
+			while (!child.session.getAllToolNames().includes(lateToolName)) {
+				if (Date.now() >= deadline) throw new Error("late caller-owned MCP tool did not reach child");
+				await Bun.sleep(1);
+			}
+			expect(listTools).toHaveBeenCalledTimes(1);
+			expect(child.session.getAllToolNames()).not.toContain("mcp__domain_docs_lookup");
+			expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
+			expect(child.session.getSelectedMCPToolNames()).not.toContain(lateToolName);
+			await child.session.setActiveToolsByName([lateToolName]);
+			expect(child.session.getActiveToolNames()).toContain(lateToolName);
+			await child.session.setActiveToolsByName([]);
+			expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
+		} finally {
+			await child.session.dispose();
+		}
+		expect(callerManager.getConnectedServers()).toContain("domain_docs");
+		await callerManager.disconnectAll();
+		expect(callerManager.getConnectedServers()).toEqual([]);
+	}, 30_000);
 });

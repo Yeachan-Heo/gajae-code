@@ -58,14 +58,16 @@ describe("config directory name containment", () => {
 		expect(resolved.startsWith(`${os.homedir()}${path.sep}`)).toBe(true);
 	});
 
-	it.each(["../escape", "../../tmp/evil", ".gjc/../../tmp/evil", "a/b/../../../../tmp/evil"])(
-		"rejects the escaping name %p and falls back to the default",
-		value => {
-			setOnly("GJC_CONFIG_DIR", value);
-			expect(getConfigDirName()).toBe(CONFIG_DIR_NAME);
-			expect(userAgentDirUnderHome().startsWith(`${os.homedir()}${path.sep}`)).toBe(true);
-		},
-	);
+	it.each([
+		"../escape",
+		"../../tmp/evil",
+		".gjc/../../tmp/evil",
+		"a/b/../../../../tmp/evil",
+	])("rejects the escaping name %p and falls back to the default", value => {
+		setOnly("GJC_CONFIG_DIR", value);
+		expect(getConfigDirName()).toBe(CONFIG_DIR_NAME);
+		expect(userAgentDirUnderHome().startsWith(`${os.homedir()}${path.sep}`)).toBe(true);
+	});
 
 	it("rejects an escaping legacy PI_CONFIG_DIR name too", () => {
 		setOnly("PI_CONFIG_DIR", "../../tmp/evil");

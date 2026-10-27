@@ -325,19 +325,19 @@ test("never reclaims a live owner with signed file IDs", async () => {
 	expect(await Bun.file(path.join(fixture.lock, "info")).text()).toBe(owner);
 });
 
-test.each([-(1n << 63n) - 1n, 1n << 64n])(
-	"rejects out-of-range stat identity %s without modulo aliasing",
-	async ino => {
-		const previousLstat = fs.lstat;
-		const fixture = await signedIdentityFixture("root");
-		vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
-			const stat = await previousLstat(target, options);
-			return String(target) === fixture.lock && typeof stat.ino === "bigint"
-				? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino })
-				: stat;
-		}) as typeof fs.lstat);
-		await expect(readFileLockObservationForGc(fixture.lock)).rejects.toThrow("file_lock_identity_out_of_range");
-		expect(fixture.remove).not.toHaveBeenCalled();
-		expect(await fs.exists(fixture.lock)).toBe(true);
-	},
-);
+test.each([
+	-(1n << 63n) - 1n,
+	1n << 64n,
+])("rejects out-of-range stat identity %s without modulo aliasing", async ino => {
+	const previousLstat = fs.lstat;
+	const fixture = await signedIdentityFixture("root");
+	vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
+		const stat = await previousLstat(target, options);
+		return String(target) === fixture.lock && typeof stat.ino === "bigint"
+			? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino })
+			: stat;
+	}) as typeof fs.lstat);
+	await expect(readFileLockObservationForGc(fixture.lock)).rejects.toThrow("file_lock_identity_out_of_range");
+	expect(fixture.remove).not.toHaveBeenCalled();
+	expect(await fs.exists(fixture.lock)).toBe(true);
+});

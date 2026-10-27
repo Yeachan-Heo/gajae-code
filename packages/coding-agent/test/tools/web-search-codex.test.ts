@@ -408,25 +408,25 @@ describe("searchCodex model selection", () => {
 		expect(models).toEqual(["gpt-6.1-sol", "gpt-6-luna"]);
 	});
 
-	it.each(["GJC_OPENAI_CODE_WEB_SEARCH_MODEL", "PI_CODEX_WEB_SEARCH_MODEL"])(
-		"does not retry an explicit %s override on unsupported-model 400",
-		async name => {
-			const discovery = mockDiscovery(null);
-			process.env[name] = " custom-model ";
-			const models: string[] = [];
-			using _hook = hookFetch((_url, init) => {
-				models.push(JSON.parse(init?.body as string).model);
-				return new Response("Model is not supported", { status: 400 });
-			});
+	it.each([
+		"GJC_OPENAI_CODE_WEB_SEARCH_MODEL",
+		"PI_CODEX_WEB_SEARCH_MODEL",
+	])("does not retry an explicit %s override on unsupported-model 400", async name => {
+		const discovery = mockDiscovery(null);
+		process.env[name] = " custom-model ";
+		const models: string[] = [];
+		using _hook = hookFetch((_url, init) => {
+			models.push(JSON.parse(init?.body as string).model);
+			return new Response("Model is not supported", { status: 400 });
+		});
 
-			await expect(searchCodex(makeSearchParams("explicit unsupported model"))).rejects.toMatchObject({
-				provider: "codex",
-				status: 400,
-			});
-			expect(models).toEqual(["custom-model"]);
-			expect(discovery).not.toHaveBeenCalled();
-		},
-	);
+		await expect(searchCodex(makeSearchParams("explicit unsupported model"))).rejects.toMatchObject({
+			provider: "codex",
+			status: 400,
+		});
+		expect(models).toEqual(["custom-model"]);
+		expect(discovery).not.toHaveBeenCalled();
+	});
 
 	it.each([
 		{ status: 400, message: "Unsupported tool: web_search" },

@@ -201,13 +201,15 @@ describe("MCP list pagination limits", () => {
 	});
 
 	for (const endpoint of endpoints.slice(1)) {
-		test.each([null, {}, { [endpoint.key]: {} }, { [endpoint.key]: [], nextCursor: 1 }])(
-			`${endpoint.method} rejects malformed envelope %#`,
-			async malformed => {
-				const connection = createMockConnection(endpoint.capabilities, transport([malformed]));
-				await expect(endpoint.list(connection)).rejects.toBeInstanceOf(MCPExpectedFailure);
-				expect(endpoint.cache(connection)).toBeUndefined();
-			},
-		);
+		test.each([
+			null,
+			{},
+			{ [endpoint.key]: {} },
+			{ [endpoint.key]: [], nextCursor: 1 },
+		])(`${endpoint.method} rejects malformed envelope %#`, async malformed => {
+			const connection = createMockConnection(endpoint.capabilities, transport([malformed]));
+			await expect(endpoint.list(connection)).rejects.toBeInstanceOf(MCPExpectedFailure);
+			expect(endpoint.cache(connection)).toBeUndefined();
+		});
 	}
 });

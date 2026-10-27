@@ -327,31 +327,31 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-plus");
 	});
 
-	test.each(["gpt-5.6-sol", "gpt-5.3-codex-spark"])(
-		"skips exhausted Pro usage for %s without a plan filter",
-		async modelId => {
-			if (!authStorage) throw new Error("test setup failed");
-			await authStorage.set("openai-codex", [
-				{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },
-				{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
-			]);
-			for (const [accountId, planType, usedFraction] of [
-				["acct-pro", "pro", 1],
-				["acct-plus", "plus", 0.05],
-			] as const) {
-				const report = createCodexUsageReport({
-					accountId,
-					primary: { usedFraction, resetInMs: 30 * 60 * 1000 },
-					secondary: { usedFraction, resetInMs: 6 * 24 * 60 * 60 * 1000 },
-				});
-				report.metadata = { ...report.metadata, planType };
-				usageByAccount.set(accountId, report);
-			}
-			await expect(
-				authStorage.getApiKey("openai-codex", `session-exhausted-pro-${modelId}`, { modelId }),
-			).resolves.toBe("api-acct-plus");
-		},
-	);
+	test.each([
+		"gpt-5.6-sol",
+		"gpt-5.3-codex-spark",
+	])("skips exhausted Pro usage for %s without a plan filter", async modelId => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+		]);
+		for (const [accountId, planType, usedFraction] of [
+			["acct-pro", "pro", 1],
+			["acct-plus", "plus", 0.05],
+		] as const) {
+			const report = createCodexUsageReport({
+				accountId,
+				primary: { usedFraction, resetInMs: 30 * 60 * 1000 },
+				secondary: { usedFraction, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+			});
+			report.metadata = { ...report.metadata, planType };
+			usageByAccount.set(accountId, report);
+		}
+		await expect(
+			authStorage.getApiKey("openai-codex", `session-exhausted-pro-${modelId}`, { modelId }),
+		).resolves.toBe("api-acct-plus");
+	});
 
 	test.each([
 		{ label: "Free", planType: "free" },

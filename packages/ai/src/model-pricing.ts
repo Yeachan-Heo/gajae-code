@@ -96,22 +96,14 @@ const OPENAI_GPT_5_6_PRICING: ReadonlyMap<string, TieredPricing> = new Map([
 ]);
 
 export function getOpenAIModelCost<TApi extends Api>(model: Model<TApi>, inputTokens: number): ModelCost | undefined {
-	if (model.provider !== "openai" && model.provider !== "openai-codex" && model.provider !== "openrouter") {
+	if (model.provider !== "openai" && model.provider !== "openai-codex") {
 		return undefined;
 	}
-	// For direct OpenAI/openai-codex, use the bundled pricing table.
-	if (model.provider !== "openrouter") {
-		const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
-		if (!pricing) {
-			return undefined;
-		}
-		return inputTokens > pricing.longContextPricing.threshold ? pricing.longContextPricing.cost : pricing.cost;
-	}
-	// For OpenRouter, check if the model has bundled long-context pricing.
-	if (!model.longContextPricing) {
+	const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
+	if (!pricing) {
 		return undefined;
 	}
-	return inputTokens > model.longContextPricing.threshold ? model.longContextPricing.cost : model.cost;
+	return inputTokens > pricing.longContextPricing.threshold ? pricing.longContextPricing.cost : pricing.cost;
 }
 
 const BEDROCK_HAIKU_5_5_ID = /^(?:(?:au|eu|global|jp|us).)?anthropic.claude-haiku-5-5$/;
@@ -190,33 +182,17 @@ export function applyAnthropicModelPricing<TApi extends Api>(model: Model<TApi>)
 	if (pricing) model.longContextPricing = pricing;
 }
 
-export function applyOpenAIModelPricing<TApi extends Api>(
-	model: Model<TApi>,
-	discoveredLongContextPricing?: Map<string, LongContextPricing>,
-): void {
-	if (model.provider !== "openai" && model.provider !== "openai-codex" && model.provider !== "openrouter") {
+export function applyOpenAIModelPricing<TApi extends Api>(model: Model<TApi>): void {
+	if (model.provider !== "openai" && model.provider !== "openai-codex") {
 		return;
 	}
-	// For direct OpenAI/openai-codex, use the bundled pricing table.
-	if (model.provider !== "openrouter") {
-		const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
-		if (!pricing) {
-			return;
-		}
-		model.cost = { ...pricing.cost };
-		model.longContextPricing = {
-			threshold: pricing.longContextPricing.threshold,
-			cost: { ...pricing.longContextPricing.cost },
-		};
+	const pricing = OPENAI_GPT_5_6_PRICING.get(model.id);
+	if (!pricing) {
 		return;
 	}
-	// For OpenRouter models, preserve discovered pricing (including long-context tier from pricing.overrides).
-	// Discovery already set the correct base cost and longContextPricing from the OpenRouter API.
-	const discovered = discoveredLongContextPricing?.get(model.id);
-	if (discovered) {
-		model.longContextPricing = {
-			threshold: discovered.threshold,
-			cost: { ...discovered.cost },
-		};
-	}
+	model.cost = { ...pricing.cost };
+	model.longContextPricing = {
+		threshold: pricing.longContextPricing.threshold,
+		cost: { ...pricing.longContextPricing.cost },
+	};
 }

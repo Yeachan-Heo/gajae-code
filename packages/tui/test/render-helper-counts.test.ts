@@ -464,37 +464,41 @@ describe("TUI render helper counters", () => {
 				{ columns: 12, text: "漢".repeat(20), visibleText: "漢".repeat(6) },
 			].map(scenario => ({ ...scenario, ...host })),
 		),
-	)(
-		"preserves $repaint resize output on $host at $columns columns",
-		async ({ columns, text, visibleText, isProcessTerminal, repaint, tmux }) => {
-			if (tmux !== undefined) Bun.env.TMUX = tmux;
-			const term = new VirtualTerminal(48, 12, { isProcessTerminal });
-			const component = new MutableLinesComponent(Array.from({ length: 80 }, () => `\x1b[36m${text}\x1b[0m`));
-			const tui = new TUI(term, undefined, { widthSettleMs: 0 });
-			tui.addChild(component);
+	)("preserves $repaint resize output on $host at $columns columns", async ({
+		columns,
+		text,
+		visibleText,
+		isProcessTerminal,
+		repaint,
+		tmux,
+	}) => {
+		if (tmux !== undefined) Bun.env.TMUX = tmux;
+		const term = new VirtualTerminal(48, 12, { isProcessTerminal });
+		const component = new MutableLinesComponent(Array.from({ length: 80 }, () => `\x1b[36m${text}\x1b[0m`));
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		tui.addChild(component);
 
-			try {
-				tui.start();
-				await committedFrame(tui, term, "setup");
-				TUI.resetRenderCountersForTest();
-				term.resize(columns, 12);
-				await committedFrame(tui, term, "resize");
+		try {
+			tui.start();
+			await committedFrame(tui, term, "setup");
+			TUI.resetRenderCountersForTest();
+			term.resize(columns, 12);
+			await committedFrame(tui, term, "resize");
 
-				const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
-				// Viewport repaints skip the decision; plain hosts still consume the
-				// scan, including the overwide CJK fixture at 12 columns.
-				if (repaint === "viewport") expect(measurements).toBe(0);
-				else expect(measurements).toBe(columns === 44 ? 80 : 1);
-				expect(visible(term).filter(Boolean)).toContain(visibleText);
-				expect(term.getViewportAnsi()).toContain("\x1b[36m");
-				for (const line of visible(term)) expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
-			} finally {
-				tui.stop();
-				tui.dispose();
-				term.reset();
-			}
-		},
-	);
+			const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
+			// Viewport repaints skip the decision; plain hosts still consume the
+			// scan, including the overwide CJK fixture at 12 columns.
+			if (repaint === "viewport") expect(measurements).toBe(0);
+			else expect(measurements).toBe(columns === 44 ? 80 : 1);
+			expect(visible(term).filter(Boolean)).toContain(visibleText);
+			expect(term.getViewportAnsi()).toContain("\x1b[36m");
+			for (const line of visible(term)) expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
+		} finally {
+			tui.stop();
+			tui.dispose();
+			term.reset();
+		}
+	});
 
 	it.each([
 		["none", null, false],

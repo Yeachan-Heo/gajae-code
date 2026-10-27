@@ -72,62 +72,70 @@ describe("ultragoal Git integration base resolution", () => {
 		});
 	});
 
-	it.each(["dev", "develop", "main", "master", "origin/dev", "origin/develop", "origin/main", "origin/master"])(
-		"captures committed paths despite a tag shadowing branch candidate %s",
-		async candidate => {
-			await withIntegrationFixture(async (root, baseline) => {
-				await fixtureGit(root, "branch", "-m", "feature");
-				const ref = candidate.startsWith("origin/") ? `refs/remotes/${candidate}` : `refs/heads/${candidate}`;
-				await fixtureGit(root, "update-ref", ref, baseline);
-				await commitFixtureFile(root, "feature.txt");
-				await fixtureGit(root, "tag", candidate);
-				const changeSet = await computeCheckpointChangeSet(root);
-				expect(changeSet?.mergeBase).toBe(baseline);
-				expect(changeSet?.paths.map(row => row.path)).toEqual(["feature.txt"]);
-				expect(changeSet?.captureIncomplete).toBe(false);
-				expect(changeSet?.rawDiff).toContain("+feature.txt");
-			});
-		},
-	);
+	it.each([
+		"dev",
+		"develop",
+		"main",
+		"master",
+		"origin/dev",
+		"origin/develop",
+		"origin/main",
+		"origin/master",
+	])("captures committed paths despite a tag shadowing branch candidate %s", async candidate => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "branch", "-m", "feature");
+			const ref = candidate.startsWith("origin/") ? `refs/remotes/${candidate}` : `refs/heads/${candidate}`;
+			await fixtureGit(root, "update-ref", ref, baseline);
+			await commitFixtureFile(root, "feature.txt");
+			await fixtureGit(root, "tag", candidate);
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.mergeBase).toBe(baseline);
+			expect(changeSet?.paths.map(row => row.path)).toEqual(["feature.txt"]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+			expect(changeSet?.rawDiff).toContain("+feature.txt");
+		});
+	});
 
-	it.each(["refs/heads/dev", "refs/remotes/origin/dev"])(
-		"ignores qualified-looking tag %s when a genuine branch baseline exists",
-		async candidate => {
-			await withIntegrationFixture(async (root, baseline) => {
-				await fixtureGit(root, "checkout", "-b", "feature");
-				await commitFixtureFile(root, "feature.txt");
-				await fixtureGit(root, "tag", candidate);
-				await expectIntegrationBase(root, "refs/heads/develop", baseline);
-				const changeSet = await computeCheckpointChangeSet(root);
-				expect(changeSet?.mergeBase).toBe(baseline);
-				expect(changeSet?.paths.map(row => row.path)).toEqual(["feature.txt"]);
-				expect(changeSet?.captureIncomplete).toBe(false);
-			});
-		},
-	);
+	it.each([
+		"refs/heads/dev",
+		"refs/remotes/origin/dev",
+	])("ignores qualified-looking tag %s when a genuine branch baseline exists", async candidate => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "checkout", "-b", "feature");
+			await commitFixtureFile(root, "feature.txt");
+			await fixtureGit(root, "tag", candidate);
+			await expectIntegrationBase(root, "refs/heads/develop", baseline);
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.mergeBase).toBe(baseline);
+			expect(changeSet?.paths.map(row => row.path)).toEqual(["feature.txt"]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+		});
+	});
 
-	it.each(["develop", "dev", "main", "master"])(
-		"excludes checked-out local %s and captures committed changes beyond a distinct ancestor",
-		async branch => {
-			await withIntegrationFixture(async (root, baseline) => {
-				await fixtureGit(root, "branch", "-m", branch);
-				const integration = branch === "main" ? "refs/heads/dev" : "refs/heads/main";
-				await fixtureGit(root, "update-ref", integration, baseline);
-				await commitFixtureFile(root, "feature.txt");
-				await expectIntegrationBase(root, integration, baseline);
+	it.each([
+		"develop",
+		"dev",
+		"main",
+		"master",
+	])("excludes checked-out local %s and captures committed changes beyond a distinct ancestor", async branch => {
+		await withIntegrationFixture(async (root, baseline) => {
+			await fixtureGit(root, "branch", "-m", branch);
+			const integration = branch === "main" ? "refs/heads/dev" : "refs/heads/main";
+			await fixtureGit(root, "update-ref", integration, baseline);
+			await commitFixtureFile(root, "feature.txt");
+			await expectIntegrationBase(root, integration, baseline);
 
-				const changeSet = await computeCheckpointChangeSet(root);
-				expect(changeSet?.baseRef).toBe(integration);
-				expect(changeSet?.mergeBase).toBe(baseline);
-				expect(changeSet?.paths).toEqual([
-					{ path: "feature.txt", oldPath: undefined, status: "added", category: "other" },
-				]);
-				expect(changeSet?.captureIncomplete).toBe(false);
-				expect(changeSet?.rawDiff).toContain("+feature.txt");
-				expect(computeUltragoalReviewSourceHash(changeSet)).toMatch(/^sha256:[0-9a-f]{64}$/);
-			});
-		},
-	);
+			const changeSet = await computeCheckpointChangeSet(root);
+			expect(changeSet?.baseRef).toBe(integration);
+			expect(changeSet?.mergeBase).toBe(baseline);
+			expect(changeSet?.paths).toEqual([
+				{ path: "feature.txt", oldPath: undefined, status: "added", category: "other" },
+			]);
+			expect(changeSet?.captureIncomplete).toBe(false);
+			expect(changeSet?.rawDiff).toContain("+feature.txt");
+			expect(computeUltragoalReviewSourceHash(changeSet)).toMatch(/^sha256:[0-9a-f]{64}$/);
+		});
+	});
 
 	it.each(["main", "master", "dev", "develop"])("refuses checked-out %s as the only integration ref", async branch => {
 		await withIntegrationFixture(async root => {
@@ -140,21 +148,23 @@ describe("ultragoal Git integration base resolution", () => {
 		});
 	});
 
-	it.each(["main", "master", "dev", "develop"])(
-		"does not authenticate an empty checkpoint for committed-only work on standalone %s",
-		async branch => {
-			await withIntegrationFixture(async root => {
-				await fixtureGit(root, "branch", "-m", branch);
-				await commitFixtureFile(root, "feature.txt");
-				expect(await fixtureGit(root, "status", "--porcelain")).toBe("");
-				expect(await fixtureGit(root, "diff", "--name-only", "HEAD^...HEAD")).toBe("feature.txt");
-				await expect(resolveGitBase(root)).rejects.toThrow("unable to resolve an authoritative integration base");
-				await expect(computeCheckpointChangeSet(root)).rejects.toThrow(
-					"unable to resolve an authoritative integration base",
-				);
-			});
-		},
-	);
+	it.each([
+		"main",
+		"master",
+		"dev",
+		"develop",
+	])("does not authenticate an empty checkpoint for committed-only work on standalone %s", async branch => {
+		await withIntegrationFixture(async root => {
+			await fixtureGit(root, "branch", "-m", branch);
+			await commitFixtureFile(root, "feature.txt");
+			expect(await fixtureGit(root, "status", "--porcelain")).toBe("");
+			expect(await fixtureGit(root, "diff", "--name-only", "HEAD^...HEAD")).toBe("feature.txt");
+			await expect(resolveGitBase(root)).rejects.toThrow("unable to resolve an authoritative integration base");
+			await expect(computeCheckpointChangeSet(root)).rejects.toThrow(
+				"unable to resolve an authoritative integration base",
+			);
+		});
+	});
 
 	it("captures uncommitted main changes against an independent baseline", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-main-checkpoint-"));

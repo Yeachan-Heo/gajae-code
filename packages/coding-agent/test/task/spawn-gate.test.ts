@@ -37,21 +37,24 @@ describe("task spawn gate", () => {
 		expect(decision.missingFields).toEqual([]);
 	});
 
-	it.each(["whyParallel", "whyNotLocal", "independence", "expectedReceiptShape", "maxInlineTokens"] as const)(
-		"rejects a batch above the threshold when %s is missing",
-		field => {
-			const plan = { ...completePlan };
-			if (field === "maxInlineTokens") {
-				plan.maxInlineTokens = 0;
-			} else {
-				plan[field] = "";
-			}
+	it.each([
+		"whyParallel",
+		"whyNotLocal",
+		"independence",
+		"expectedReceiptShape",
+		"maxInlineTokens",
+	] as const)("rejects a batch above the threshold when %s is missing", field => {
+		const plan = { ...completePlan };
+		if (field === "maxInlineTokens") {
+			plan.maxInlineTokens = 0;
+		} else {
+			plan[field] = "";
+		}
 
-			const decision = evaluateSpawnGate({ childCount: 5, plan });
-			expect(decision.outcome).toBe("rejected");
-			expect(decision.missingFields).toContain(field);
-		},
-	);
+		const decision = evaluateSpawnGate({ childCount: 5, plan });
+		expect(decision.outcome).toBe("rejected");
+		expect(decision.missingFields).toContain(field);
+	});
 
 	it("validates childCount", () => {
 		expect(() => evaluateSpawnGate({ childCount: -1 })).toThrow("childCount must be a non-negative integer");

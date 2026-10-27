@@ -209,26 +209,25 @@ describe("composer-print-trace", () => {
 		expect(classified.failureClasses).toContain("missing-tool-turn");
 	});
 
-	it.each(MUTATION_TARGET_SCENARIO_CASES)(
-		"classifies missing target-path edit as failure for %s",
-		(id, targetPath) => {
-			const record = buildTraceRecord({
-				scenarioId: id,
-				modelRole: "candidate",
-				model: "grok-build/grok-composer-2.5-fast",
-				trial: 0,
-				events: [
-					{ type: "tool_execution_end", toolName: "read", status: "success", arguments: { path: targetPath } },
-					{ type: "scenario_result", status: "passed" },
-				],
-				tracePath: "/tmp/trace.json",
-				expected: traceExpectationForScenario(id),
-			});
-			const classified = classifyTraceRecord(record);
-			expect(classified.status).toBe("failed");
-			expect(classified.failureClasses).toContain("missing-tool-turn");
-		},
-	);
+	it.each(
+		MUTATION_TARGET_SCENARIO_CASES,
+	)("classifies missing target-path edit as failure for %s", (id, targetPath) => {
+		const record = buildTraceRecord({
+			scenarioId: id,
+			modelRole: "candidate",
+			model: "grok-build/grok-composer-2.5-fast",
+			trial: 0,
+			events: [
+				{ type: "tool_execution_end", toolName: "read", status: "success", arguments: { path: targetPath } },
+				{ type: "scenario_result", status: "passed" },
+			],
+			tracePath: "/tmp/trace.json",
+			expected: traceExpectationForScenario(id),
+		});
+		const classified = classifyTraceRecord(record);
+		expect(classified.status).toBe("failed");
+		expect(classified.failureClasses).toContain("missing-tool-turn");
+	});
 
 	it.each(MUTATION_TARGET_SCENARIO_CASES)("classifies wrong target-path edit as failure for %s", (id, targetPath) => {
 		const record = buildTraceRecord({
@@ -256,63 +255,61 @@ describe("composer-print-trace", () => {
 		expect(classified.failureClasses).toEqual(["missing-tool-turn", "wrong-file-edit"]);
 	});
 
-	it.each(MUTATION_TARGET_SCENARIO_CASES)(
-		"classifies wrong-content target edit as failure for %s",
-		(id, targetPath) => {
-			const record = buildTraceRecord({
-				scenarioId: id,
-				modelRole: "candidate",
-				model: "grok-build/grok-composer-2.5-fast",
-				trial: 0,
-				events: [
-					...successfulMutationEvents(id, targetPath).filter(
-						event => event.type !== "scenario_result" && event.toolName !== "edit",
-					),
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "success",
-						arguments: { path: targetPath, input: "NO_OP_MUTATION" },
-					},
-					{ type: "scenario_result", status: "passed" },
-				],
-				tracePath: "/tmp/trace.json",
-				expected: traceExpectationForScenario(id),
-			});
-			const classified = classifyTraceRecord(record);
-			expect(classified.status).toBe("failed");
-			expect(classified.failureClasses).toEqual(["missing-tool-turn"]);
-		},
-	);
+	it.each(
+		MUTATION_TARGET_SCENARIO_CASES,
+	)("classifies wrong-content target edit as failure for %s", (id, targetPath) => {
+		const record = buildTraceRecord({
+			scenarioId: id,
+			modelRole: "candidate",
+			model: "grok-build/grok-composer-2.5-fast",
+			trial: 0,
+			events: [
+				...successfulMutationEvents(id, targetPath).filter(
+					event => event.type !== "scenario_result" && event.toolName !== "edit",
+				),
+				{
+					type: "tool_execution_end",
+					toolName: "edit",
+					status: "success",
+					arguments: { path: targetPath, input: "NO_OP_MUTATION" },
+				},
+				{ type: "scenario_result", status: "passed" },
+			],
+			tracePath: "/tmp/trace.json",
+			expected: traceExpectationForScenario(id),
+		});
+		const classified = classifyTraceRecord(record);
+		expect(classified.status).toBe("failed");
+		expect(classified.failureClasses).toEqual(["missing-tool-turn"]);
+	});
 
-	it.each(MUTATION_TARGET_SCENARIO_CASES)(
-		"classifies target-only expectation wrong-content edit as failure for %s",
-		(id, targetPath) => {
-			const record = buildTraceRecord({
-				scenarioId: id,
-				modelRole: "candidate",
-				model: "grok-build/grok-composer-2.5-fast",
-				trial: 0,
-				events: [
-					...successfulMutationEvents(id, targetPath).filter(
-						event => event.type !== "scenario_result" && event.toolName !== "edit",
-					),
-					{
-						type: "tool_execution_end",
-						toolName: "edit",
-						status: "success",
-						arguments: { path: targetPath, input: "NO_OP_MUTATION" },
-					},
-					{ type: "scenario_result", status: "passed" },
-				],
-				tracePath: "/tmp/trace.json",
-				expected: { targetPath, requireSuccess: true },
-			});
-			const classified = classifyTraceRecord(record);
-			expect(classified.status).toBe("failed");
-			expect(classified.failureClasses).toEqual(["missing-tool-turn"]);
-		},
-	);
+	it.each(
+		MUTATION_TARGET_SCENARIO_CASES,
+	)("classifies target-only expectation wrong-content edit as failure for %s", (id, targetPath) => {
+		const record = buildTraceRecord({
+			scenarioId: id,
+			modelRole: "candidate",
+			model: "grok-build/grok-composer-2.5-fast",
+			trial: 0,
+			events: [
+				...successfulMutationEvents(id, targetPath).filter(
+					event => event.type !== "scenario_result" && event.toolName !== "edit",
+				),
+				{
+					type: "tool_execution_end",
+					toolName: "edit",
+					status: "success",
+					arguments: { path: targetPath, input: "NO_OP_MUTATION" },
+				},
+				{ type: "scenario_result", status: "passed" },
+			],
+			tracePath: "/tmp/trace.json",
+			expected: { targetPath, requireSuccess: true },
+		});
+		const classified = classifyTraceRecord(record);
+		expect(classified.status).toBe("failed");
+		expect(classified.failureClasses).toEqual(["missing-tool-turn"]);
+	});
 
 	it.each(MUTATION_TARGET_SCENARIO_CASES)("classifies failed target-path edit as failure for %s", (id, targetPath) => {
 		const record = buildTraceRecord({

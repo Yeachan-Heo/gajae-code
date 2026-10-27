@@ -605,112 +605,112 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		expect(finishShutdown).toHaveBeenLastCalledWith(expect.any(Object), "commit");
 	});
 
-	it.each(["proof", "settlement"] as const)(
-		"eventually finalizes the successor after post-validation owner %s timeout",
-		async failure => {
-			const ownerManager = installOwnerManager();
-			const previousFile = session.sessionFile;
-			if (!previousFile) throw new Error("Expected a persisted predecessor session");
-			await sessionManager.ensureOnDisk();
-			const copiedFile = path.join(tempDir.path(), `${failure}-timeout-successor.jsonl`);
-			await Bun.write(copiedFile, Bun.file(previousFile));
-			const fallbackRoot = await fs.mkdtemp(path.join(tempDir.path(), `${failure}-resume-fallback-`));
-			const fallbackManager = new ArtifactManager(fallbackRoot);
-			sessionManager.adoptArtifactManager(fallbackManager);
-			session.registerToolSessionTransitionCleanup(async () => {
-				sessionManager.releaseArtifactManager(fallbackManager);
-				await fs.rm(fallbackRoot, { recursive: true, force: true });
-			});
-			const retryAllowed = Promise.withResolvers<void>();
-			const foreignGate = Promise.withResolvers<string>();
-			const foreignJobId = ownerManager.register(
-				"task",
-				"foreign deferred cleanup job",
-				async () => foreignGate.promise,
-				{
-					ownerId: "foreign",
-				},
-			);
-			if (failure === "proof") {
-				let calls = 0;
-				vi.spyOn(ownerManager, "cancelAndProveOwnerSubagents").mockImplementation(async lease => {
-					calls += 1;
-					if (calls === 1) {
-						return {
-							ownerId: "owner",
-							leaseId: lease.id,
-							confirmed: false,
-							reason: "deadline_exceeded",
-							targets: [],
-							terminalIds: [],
-							unresolvedIds: ["stuck"],
-						};
-					}
-					await retryAllowed.promise;
+	it.each([
+		"proof",
+		"settlement",
+	] as const)("eventually finalizes the successor after post-validation owner %s timeout", async failure => {
+		const ownerManager = installOwnerManager();
+		const previousFile = session.sessionFile;
+		if (!previousFile) throw new Error("Expected a persisted predecessor session");
+		await sessionManager.ensureOnDisk();
+		const copiedFile = path.join(tempDir.path(), `${failure}-timeout-successor.jsonl`);
+		await Bun.write(copiedFile, Bun.file(previousFile));
+		const fallbackRoot = await fs.mkdtemp(path.join(tempDir.path(), `${failure}-resume-fallback-`));
+		const fallbackManager = new ArtifactManager(fallbackRoot);
+		sessionManager.adoptArtifactManager(fallbackManager);
+		session.registerToolSessionTransitionCleanup(async () => {
+			sessionManager.releaseArtifactManager(fallbackManager);
+			await fs.rm(fallbackRoot, { recursive: true, force: true });
+		});
+		const retryAllowed = Promise.withResolvers<void>();
+		const foreignGate = Promise.withResolvers<string>();
+		const foreignJobId = ownerManager.register(
+			"task",
+			"foreign deferred cleanup job",
+			async () => foreignGate.promise,
+			{
+				ownerId: "foreign",
+			},
+		);
+		if (failure === "proof") {
+			let calls = 0;
+			vi.spyOn(ownerManager, "cancelAndProveOwnerSubagents").mockImplementation(async lease => {
+				calls += 1;
+				if (calls === 1) {
 					return {
 						ownerId: "owner",
 						leaseId: lease.id,
-						confirmed: true,
-						reason: "confirmed",
+						confirmed: false,
+						reason: "deadline_exceeded",
 						targets: [],
 						terminalIds: [],
-						unresolvedIds: [],
+						unresolvedIds: ["stuck"],
 					};
-				});
-			} else {
-				let calls = 0;
-				vi.spyOn(ownerManager, "cancelAndSettleOwnerJobs").mockImplementation(async () => {
-					calls += 1;
-					if (calls === 1) return false;
-					await retryAllowed.promise;
-					return true;
-				});
-			}
-			const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
-			const appendMessage = vi.spyOn(sessionManager, "appendMessage");
-			const notices: string[] = [];
-			session.subscribe(event => {
-				if (event.type === "notice") notices.push(event.message);
-			});
-
-			try {
-				await expect(session.switchSession(copiedFile)).resolves.toBe(true);
-				expect(session.sessionFile).toBe(copiedFile);
-				expect(finishShutdown).not.toHaveBeenCalled();
-				expect(ownerManager.beginOwnerSubagentShutdown("owner")).toBeUndefined();
-				expect(await pathExists(fallbackRoot)).toBe(true);
-				expect(notices.some(message => message.includes("Successor session is active"))).toBe(true);
-				session.agent.emitExternalEvent({
-					type: "message_end",
-					message: { role: "user", content: "successor remains connected", timestamp: Date.now() },
-				});
-				expect(appendMessage).toHaveBeenCalledWith(
-					expect.objectContaining({ content: "successor remains connected" }),
-				);
-			} finally {
-				retryAllowed.resolve();
-			}
-			await waitForCondition(() => finishShutdown.mock.calls.some(call => call[1] === "commit"));
-			await waitForCondition(async () => !(await pathExists(fallbackRoot)));
-			expect(sessionManager.isArtifactManagerAuthorized(fallbackManager)).toBe(false);
-			expect(ownerManager.getJob(foreignJobId)?.status).toBe("running");
-			const successorJobId = ownerManager.register(
-				"bash",
-				"successor owner job",
-				async () => "successor job complete",
-				{
+				}
+				await retryAllowed.promise;
+				return {
 					ownerId: "owner",
-				},
+					leaseId: lease.id,
+					confirmed: true,
+					reason: "confirmed",
+					targets: [],
+					terminalIds: [],
+					unresolvedIds: [],
+				};
+			});
+		} else {
+			let calls = 0;
+			vi.spyOn(ownerManager, "cancelAndSettleOwnerJobs").mockImplementation(async () => {
+				calls += 1;
+				if (calls === 1) return false;
+				await retryAllowed.promise;
+				return true;
+			});
+		}
+		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
+		const appendMessage = vi.spyOn(sessionManager, "appendMessage");
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		try {
+			await expect(session.switchSession(copiedFile)).resolves.toBe(true);
+			expect(session.sessionFile).toBe(copiedFile);
+			expect(finishShutdown).not.toHaveBeenCalled();
+			expect(ownerManager.beginOwnerSubagentShutdown("owner")).toBeUndefined();
+			expect(await pathExists(fallbackRoot)).toBe(true);
+			expect(notices.some(message => message.includes("Successor session is active"))).toBe(true);
+			session.agent.emitExternalEvent({
+				type: "message_end",
+				message: { role: "user", content: "successor remains connected", timestamp: Date.now() },
+			});
+			expect(appendMessage).toHaveBeenCalledWith(
+				expect.objectContaining({ content: "successor remains connected" }),
 			);
-			await ownerManager.getJob(successorJobId)?.promise;
-			expect(ownerManager.getJob(successorJobId)?.status).toBe("completed");
-			await expect(session.newSession()).resolves.toBe(true);
-			expect(finishShutdown.mock.calls.filter(call => call[1] === "commit")).toHaveLength(2);
-			expect(ownerManager.getJob(foreignJobId)?.status).toBe("running");
-			foreignGate.resolve("foreign complete");
-			await ownerManager.getJob(foreignJobId)?.promise;
-		},
-	);
+		} finally {
+			retryAllowed.resolve();
+		}
+		await waitForCondition(() => finishShutdown.mock.calls.some(call => call[1] === "commit"));
+		await waitForCondition(async () => !(await pathExists(fallbackRoot)));
+		expect(sessionManager.isArtifactManagerAuthorized(fallbackManager)).toBe(false);
+		expect(ownerManager.getJob(foreignJobId)?.status).toBe("running");
+		const successorJobId = ownerManager.register(
+			"bash",
+			"successor owner job",
+			async () => "successor job complete",
+			{
+				ownerId: "owner",
+			},
+		);
+		await ownerManager.getJob(successorJobId)?.promise;
+		expect(ownerManager.getJob(successorJobId)?.status).toBe("completed");
+		await expect(session.newSession()).resolves.toBe(true);
+		expect(finishShutdown.mock.calls.filter(call => call[1] === "commit")).toHaveLength(2);
+		expect(ownerManager.getJob(foreignJobId)?.status).toBe("running");
+		foreignGate.resolve("foreign complete");
+		await ownerManager.getJob(foreignJobId)?.promise;
+	});
 
 	it("settles detached owner jobs before fork and branch artifact retirement", async () => {
 		const ownerManager = installOwnerManager();

@@ -323,31 +323,34 @@ describe("Composer bash policy recovery", () => {
 		expect(hasText(agent.state.messages, CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT)).toBe(false);
 	});
 
-	it.each(["read", "search", "find", "write", "delete"])(
-		"does not add a Cursor continuation when the same remote turn recovers through %s",
-		async toolName => {
-			const mock = createMockModel({ responses: [{ content: ["recovered in the remote turn"] }] });
-			const requests: CapturedRequest[] = [];
-			const agent = new Agent({
-				initialState: { model: cursorComposerModel(mock), systemPrompt: ["Test"], tools: [], messages: [] },
-				convertToLlm: identityConverter,
-				cursorOnToolResult: async result => result,
-				streamFn: async (model, requestContext, options) => {
-					requests.push({ context: requestContext, options });
-					await options?.cursorOnToolResult?.(
-						cursorToolResult("bash", formatComposerBashPolicyError("cursor"), true, "bash-1"),
-					);
-					await options?.cursorOnToolResult?.(cursorToolResult(toolName, "ok", false, `${toolName}-1`));
-					return mock.stream(model, requestContext, options);
-				},
-			});
+	it.each([
+		"read",
+		"search",
+		"find",
+		"write",
+		"delete",
+	])("does not add a Cursor continuation when the same remote turn recovers through %s", async toolName => {
+		const mock = createMockModel({ responses: [{ content: ["recovered in the remote turn"] }] });
+		const requests: CapturedRequest[] = [];
+		const agent = new Agent({
+			initialState: { model: cursorComposerModel(mock), systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm: identityConverter,
+			cursorOnToolResult: async result => result,
+			streamFn: async (model, requestContext, options) => {
+				requests.push({ context: requestContext, options });
+				await options?.cursorOnToolResult?.(
+					cursorToolResult("bash", formatComposerBashPolicyError("cursor"), true, "bash-1"),
+				);
+				await options?.cursorOnToolResult?.(cursorToolResult(toolName, "ok", false, `${toolName}-1`));
+				return mock.stream(model, requestContext, options);
+			},
+		});
 
-			await agent.prompt("Inspect the file and continue.");
+		await agent.prompt("Inspect the file and continue.");
 
-			expect(requests).toHaveLength(1);
-			expect(hasText(agent.state.messages, CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT)).toBe(false);
-		},
-	);
+		expect(requests).toHaveLength(1);
+		expect(hasText(agent.state.messages, CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT)).toBe(false);
+	});
 
 	it("does not retry a second Cursor Composer policy block", async () => {
 		const mock = createMockModel({

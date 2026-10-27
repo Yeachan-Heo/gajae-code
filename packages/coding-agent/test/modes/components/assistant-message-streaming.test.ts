@@ -111,56 +111,56 @@ describe("AssistantMessageComponent streaming markdown", () => {
 		}
 	});
 
-	it.each(["text", "thinking"] as const)(
-		"guards captured %s repaint callbacks without expiring finalized assistants",
-		kind => {
-			const repaint = vi.fn();
-			const visibleMutation = vi.fn();
-			const staleThrottle = vi.spyOn(Markdown.prototype, "setOnStaleThrottle");
-			const block =
-				kind === "text"
-					? { type: "text" as const, text: "initial" }
-					: { type: "thinking" as const, thinking: "initial" };
-			let component: AssistantMessageComponent | undefined;
-			try {
-				component = new AssistantMessageComponent(message([block]), false, repaint, undefined, visibleMutation);
-				const markdown = contentChildren(component).find(child => child instanceof Markdown);
-				expect(markdown).toBeDefined();
-				if (!markdown) return;
-				component.updateContent(message([block]), { streaming: true });
-				if (block.type === "text") block.text = "updated";
-				else block.thinking = "updated";
-				component.updateContent(message([block]), { streaming: true });
-				component.updateContent(message([block]), { streaming: false });
-				expect(contentChildren(component)).toContain(markdown);
-				const callbacks = staleThrottle.mock.calls.map(([callback]) => callback);
-				expect(callbacks.length).toBeGreaterThanOrEqual(4);
-				expect(callbacks[0]).toBeTypeOf("function");
-				expect(new Set(callbacks).size).toBe(1);
-				repaint.mockClear();
-				callbacks[0]?.();
-				expect(repaint).toHaveBeenCalledTimes(1);
-				// Detach the cached child before disposal: its captured callback still belongs to the assistant.
-				component.updateContent(message([{ type: "text", text: "replacement" }]), { streaming: false });
-				component.dispose();
-				const disposedChildren = [...component.children];
-				repaint.mockClear();
-				visibleMutation.mockClear();
-				for (const callback of callbacks) callback?.();
-				component.setHideThinkingBlock(true);
-				component.setUsageInfo(message([]).usage);
-				component.setToolResultImages("read-1", [{ type: "image", data: "source", mimeType: "image/png" }]);
-				component.updateContent(message([{ type: "text", text: "must not resurrect" }]));
-				component.invalidate();
-				expect(component.children).toEqual(disposedChildren);
-				expect(repaint).not.toHaveBeenCalled();
-				expect(visibleMutation).not.toHaveBeenCalled();
-			} finally {
-				component?.dispose();
-				staleThrottle.mockRestore();
-			}
-		},
-	);
+	it.each([
+		"text",
+		"thinking",
+	] as const)("guards captured %s repaint callbacks without expiring finalized assistants", kind => {
+		const repaint = vi.fn();
+		const visibleMutation = vi.fn();
+		const staleThrottle = vi.spyOn(Markdown.prototype, "setOnStaleThrottle");
+		const block =
+			kind === "text"
+				? { type: "text" as const, text: "initial" }
+				: { type: "thinking" as const, thinking: "initial" };
+		let component: AssistantMessageComponent | undefined;
+		try {
+			component = new AssistantMessageComponent(message([block]), false, repaint, undefined, visibleMutation);
+			const markdown = contentChildren(component).find(child => child instanceof Markdown);
+			expect(markdown).toBeDefined();
+			if (!markdown) return;
+			component.updateContent(message([block]), { streaming: true });
+			if (block.type === "text") block.text = "updated";
+			else block.thinking = "updated";
+			component.updateContent(message([block]), { streaming: true });
+			component.updateContent(message([block]), { streaming: false });
+			expect(contentChildren(component)).toContain(markdown);
+			const callbacks = staleThrottle.mock.calls.map(([callback]) => callback);
+			expect(callbacks.length).toBeGreaterThanOrEqual(4);
+			expect(callbacks[0]).toBeTypeOf("function");
+			expect(new Set(callbacks).size).toBe(1);
+			repaint.mockClear();
+			callbacks[0]?.();
+			expect(repaint).toHaveBeenCalledTimes(1);
+			// Detach the cached child before disposal: its captured callback still belongs to the assistant.
+			component.updateContent(message([{ type: "text", text: "replacement" }]), { streaming: false });
+			component.dispose();
+			const disposedChildren = [...component.children];
+			repaint.mockClear();
+			visibleMutation.mockClear();
+			for (const callback of callbacks) callback?.();
+			component.setHideThinkingBlock(true);
+			component.setUsageInfo(message([]).usage);
+			component.setToolResultImages("read-1", [{ type: "image", data: "source", mimeType: "image/png" }]);
+			component.updateContent(message([{ type: "text", text: "must not resurrect" }]));
+			component.invalidate();
+			expect(component.children).toEqual(disposedChildren);
+			expect(repaint).not.toHaveBeenCalled();
+			expect(visibleMutation).not.toHaveBeenCalled();
+		} finally {
+			component?.dispose();
+			staleThrottle.mockRestore();
+		}
+	});
 
 	it.each(["success", "failure"] as const)("ignores late image %s after disposal", async outcome => {
 		await withDeferredImages(async conversions => {
@@ -187,54 +187,48 @@ describe("AssistantMessageComponent streaming markdown", () => {
 		});
 	});
 
-	it.each(["success", "failure"] as const)(
-		"ignores stale generation %s while completing a live finalized image",
-		async outcome => {
-			await withDeferredImages(async conversions => {
-				const repaint = vi.fn();
-				const visibleMutation = vi.fn();
-				const block = { type: "text" as const, text: "streaming" };
-				const component = new AssistantMessageComponent(
-					message([block]),
-					false,
-					repaint,
-					undefined,
-					visibleMutation,
-				);
-				try {
-					component.updateContent(message([block]), { streaming: true });
-					const images = [{ type: "image" as const, data: "source", mimeType: "image/webp" }];
-					component.setToolResultImages("read-1", images);
-					component.setToolResultImages("read-1", []);
-					component.setToolResultImages("read-1", images);
-					expect(conversions).toHaveLength(2);
-					block.text = "authoritative final";
-					component.updateContent(message([block]), { streaming: false });
-					const finalChildren = [...contentChildren(component)];
-					repaint.mockClear();
-					visibleMutation.mockClear();
-					if (outcome === "success") conversions[0].resolve("obsolete");
-					else conversions[0].reject(new Error("obsolete conversion"));
-					await Promise.resolve();
-					await Promise.resolve();
-					expect(contentChildren(component)).toEqual(finalChildren);
-					expect(repaint).not.toHaveBeenCalled();
-					expect(visibleMutation).not.toHaveBeenCalled();
-					conversions[1].resolve("fresh");
-					await Promise.resolve();
-					await Promise.resolve();
-					expect(contentChildren(component).some(child => child instanceof Image)).toBe(true);
-					expect(repaint).toHaveBeenCalledTimes(1);
-					expect(visibleMutation).toHaveBeenCalledTimes(1);
-					visibleMutation.mockClear();
-					component.updateContent(message([block]), { streaming: false });
-					expect(visibleMutation).not.toHaveBeenCalled();
-				} finally {
-					component.dispose();
-				}
-			});
-		},
-	);
+	it.each([
+		"success",
+		"failure",
+	] as const)("ignores stale generation %s while completing a live finalized image", async outcome => {
+		await withDeferredImages(async conversions => {
+			const repaint = vi.fn();
+			const visibleMutation = vi.fn();
+			const block = { type: "text" as const, text: "streaming" };
+			const component = new AssistantMessageComponent(message([block]), false, repaint, undefined, visibleMutation);
+			try {
+				component.updateContent(message([block]), { streaming: true });
+				const images = [{ type: "image" as const, data: "source", mimeType: "image/webp" }];
+				component.setToolResultImages("read-1", images);
+				component.setToolResultImages("read-1", []);
+				component.setToolResultImages("read-1", images);
+				expect(conversions).toHaveLength(2);
+				block.text = "authoritative final";
+				component.updateContent(message([block]), { streaming: false });
+				const finalChildren = [...contentChildren(component)];
+				repaint.mockClear();
+				visibleMutation.mockClear();
+				if (outcome === "success") conversions[0].resolve("obsolete");
+				else conversions[0].reject(new Error("obsolete conversion"));
+				await Promise.resolve();
+				await Promise.resolve();
+				expect(contentChildren(component)).toEqual(finalChildren);
+				expect(repaint).not.toHaveBeenCalled();
+				expect(visibleMutation).not.toHaveBeenCalled();
+				conversions[1].resolve("fresh");
+				await Promise.resolve();
+				await Promise.resolve();
+				expect(contentChildren(component).some(child => child instanceof Image)).toBe(true);
+				expect(repaint).toHaveBeenCalledTimes(1);
+				expect(visibleMutation).toHaveBeenCalledTimes(1);
+				visibleMutation.mockClear();
+				component.updateContent(message([block]), { streaming: false });
+				expect(visibleMutation).not.toHaveBeenCalled();
+			} finally {
+				component.dispose();
+			}
+		});
+	});
 
 	it("only re-lexes the active block while earlier blocks are unchanged", () => {
 		const completed = { type: "text" as const, text: "## completed\n\nStable [link](https://example.com)" };
@@ -471,30 +465,31 @@ describe("AssistantMessageComponent streaming markdown", () => {
 		expect((render(errored).match(/Error: boom/g) ?? []).length).toBe(1);
 	});
 
-	it.each(["stop", "aborted", "error"] as const)(
-		"final %s update disables throttling and renders fresh output",
-		stopReason => {
-			const block = { type: "text" as const, text: "A [late][ref]" };
-			const component = new AssistantMessageComponent(message([block]));
-			component.updateContent(message([block]), { streaming: true });
-			render(component);
-			const afterInitial = __markdownPerfCounters.lexerInvocations;
+	it.each([
+		"stop",
+		"aborted",
+		"error",
+	] as const)("final %s update disables throttling and renders fresh output", stopReason => {
+		const block = { type: "text" as const, text: "A [late][ref]" };
+		const component = new AssistantMessageComponent(message([block]));
+		component.updateContent(message([block]), { streaming: true });
+		render(component);
+		const afterInitial = __markdownPerfCounters.lexerInvocations;
 
-			block.text = "A [late][ref]\n\n[ref]: https://example.com";
-			component.updateContent(message([block]), { streaming: true });
-			render(component);
-			expect(__markdownPerfCounters.lexerInvocations).toBe(afterInitial);
+		block.text = "A [late][ref]\n\n[ref]: https://example.com";
+		component.updateContent(message([block]), { streaming: true });
+		render(component);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(afterInitial);
 
-			component.updateContent(message([block], stopReason), { streaming: false });
-			const finalized = render(component);
-			expect(__markdownPerfCounters.lexerInvocations).toBe(afterInitial + 1);
+		component.updateContent(message([block], stopReason), { streaming: false });
+		const finalized = render(component);
+		expect(__markdownPerfCounters.lexerInvocations).toBe(afterInitial + 1);
 
-			clearRenderCache();
-			const fresh = new AssistantMessageComponent(message([{ type: "text", text: block.text }], stopReason));
-			expect(finalized).toContain("late");
-			expect(finalized).toBe(render(fresh));
-		},
-	);
+		clearRenderCache();
+		const fresh = new AssistantMessageComponent(message([{ type: "text", text: block.text }], stopReason));
+		expect(finalized).toContain("late");
+		expect(finalized).toBe(render(fresh));
+	});
 
 	it("only revises streaming finalization when it can alter rendered Markdown", () => {
 		const visibleTextMutation = vi.fn();

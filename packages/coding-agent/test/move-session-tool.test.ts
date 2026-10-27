@@ -104,53 +104,52 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	}, 20_000);
 
-	it.each([false, true])(
-		"initializes local storage when an explicit session moves to managed storage (populated=%s)",
-		async populated => {
-			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
-			tempDirs.push(tempDir);
-			setAgentDir(tempDir);
-			const cwdA = path.join(tempDir, "root");
-			const cwdB = path.join(cwdA, "repo-b");
-			fs.mkdirSync(cwdB, { recursive: true });
-			const sessionManager = SessionManager.create(
-				cwdA,
-				SessionManager.explicitDestination(path.join(tempDir, "shared")),
-			);
-			const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
-			const localOptions = {
-				getArtifactsDir: () => sessionManager.getArtifactsDir(),
-				isManagedDestination: () => sessionManager.isManagedDestination(),
-				getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
-				getSessionId: () => sessionManager.getSessionId(),
-			};
-			tempDirs.push(resolveLocalRoot({ ...localOptions, isManagedDestination: () => true }));
-			let observerPath: string | undefined;
-			const unregister = sessionManager.registerAfterMoveListener(() => {
-				observerPath = resolveLocalUrlToPath("local://note.txt", localOptions);
-			});
-			try {
-				await sessionManager.ensureOnDisk();
-				if (populated)
-					await Bun.write(resolveLocalUrlToPath("local://note.txt", localOptions), "preserved across move\n");
-				if (populated)
-					await session.getToolByName("move_session")!.execute("move-local-artifacts", { path: "repo-b" });
-				else await sessionManager.moveTo(cwdB);
-				expect(sessionManager.isManagedDestination()).toBe(true);
-				const resolved = resolveLocalUrlToPath("local://note.txt", localOptions);
-				expect(resolved).toBe(path.join(os.tmpdir(), "gjc-local", session.sessionId, "note.txt"));
-				expect(observerPath).toBe(resolved);
-				if (populated) expect(await Bun.file(resolved).text()).toBe("preserved across move\n");
-				else expect(await Bun.file(resolved).exists()).toBe(false);
-				await Bun.write(resolved, "writable after move\n");
-				expect(await Bun.file(resolved).text()).toBe("writable after move\n");
-			} finally {
-				unregister();
-				await session.dispose();
-			}
-		},
-		20_000,
-	);
+	it.each([
+		false,
+		true,
+	])("initializes local storage when an explicit session moves to managed storage (populated=%s)", async populated => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		setAgentDir(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(
+			cwdA,
+			SessionManager.explicitDestination(path.join(tempDir, "shared")),
+		);
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const localOptions = {
+			getArtifactsDir: () => sessionManager.getArtifactsDir(),
+			isManagedDestination: () => sessionManager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => sessionManager.getSessionId(),
+		};
+		tempDirs.push(resolveLocalRoot({ ...localOptions, isManagedDestination: () => true }));
+		let observerPath: string | undefined;
+		const unregister = sessionManager.registerAfterMoveListener(() => {
+			observerPath = resolveLocalUrlToPath("local://note.txt", localOptions);
+		});
+		try {
+			await sessionManager.ensureOnDisk();
+			if (populated)
+				await Bun.write(resolveLocalUrlToPath("local://note.txt", localOptions), "preserved across move\n");
+			if (populated)
+				await session.getToolByName("move_session")!.execute("move-local-artifacts", { path: "repo-b" });
+			else await sessionManager.moveTo(cwdB);
+			expect(sessionManager.isManagedDestination()).toBe(true);
+			const resolved = resolveLocalUrlToPath("local://note.txt", localOptions);
+			expect(resolved).toBe(path.join(os.tmpdir(), "gjc-local", session.sessionId, "note.txt"));
+			expect(observerPath).toBe(resolved);
+			if (populated) expect(await Bun.file(resolved).text()).toBe("preserved across move\n");
+			else expect(await Bun.file(resolved).exists()).toBe(false);
+			await Bun.write(resolved, "writable after move\n");
+			expect(await Bun.file(resolved).text()).toBe("writable after move\n");
+		} finally {
+			unregister();
+			await session.dispose();
+		}
+	}, 20_000);
 
 	it("settles coordinator persistence when post-move local initialization fails", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));

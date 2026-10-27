@@ -1056,28 +1056,24 @@ export function openrouterModelManagerOptions(
 						}),
 					};
 
-					// Map long-context pricing from pricing.overrides if present
-					const overrides = Array.isArray((entry as Record<string, unknown>).pricing_overrides)
-						? ((entry as Record<string, unknown>).pricing_overrides as Array<Record<string, unknown>>)
+					// OpenRouter publishes long-context rates as pricing.overrides[{ min_prompt_tokens, ...rates }].
+					const tier = Array.isArray(pricing?.overrides)
+						? (pricing.overrides as Array<Record<string, unknown>>).find(
+								override => typeof override?.min_prompt_tokens === "number" && override.min_prompt_tokens > 0,
+							)
 						: undefined;
-					if (overrides) {
-						for (const override of overrides) {
-							if (override.min_prompt_tokens === 272_000) {
-								const overridePricing = override.pricing as Record<string, unknown> | undefined;
-								if (overridePricing) {
-									model.longContextPricing = {
-										threshold: 272_000,
-										cost: {
-											input: parseFloat(String(overridePricing.prompt ?? "0")) * 1_000_000,
-											output: parseFloat(String(overridePricing.completion ?? "0")) * 1_000_000,
-											cacheRead: parseFloat(String(overridePricing.input_cache_read ?? "0")) * 1_000_000,
-											cacheWrite: parseFloat(String(overridePricing.input_cache_write ?? "0")) * 1_000_000,
-										},
-									};
-									break;
-								}
-							}
-						}
+					if (tier) {
+						const rate = (key: string, fallback: number) =>
+							tier[key] === undefined ? fallback : parseFloat(String(tier[key])) * 1_000_000;
+						model.longContextPricing = {
+							threshold: tier.min_prompt_tokens as number,
+							cost: {
+								input: rate("prompt", model.cost.input),
+								output: rate("completion", model.cost.output),
+								cacheRead: rate("input_cache_read", model.cost.cacheRead),
+								cacheWrite: rate("input_cache_write", model.cost.cacheWrite),
+							},
+						};
 					}
 
 					return model;

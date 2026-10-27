@@ -1933,42 +1933,43 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			value: "ultragoal→ultragoal",
 		});
 	});
-	it.each(["missing admission", "pending publication", "missing state"])(
-		"repairs the authenticated final admission projection after a crash-gap dedupe: %s",
-		async gap => {
-			const root = await tempDir();
-			const runId = "final-admission-crash-gap";
-			await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
-			await fs.writeFile(
-				path.join(root, ".gjc", "config.yml"),
-				YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
-				"utf-8",
-			);
-			const first = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
-			const expectedAdmission = first.auto_handoff;
-			const statePath = ralplanStatePath(root);
-			const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
-			delete state.auto_handoff;
-			if (gap === "pending publication") {
-				state.final_publication_pending = {
-					run_id: runId,
-					publication_id: "interrupted-final-publication",
-					final_sha256: first.sha256,
-					started_at: new Date().toISOString(),
-				};
-			}
-			if (gap === "missing state") await fs.rm(statePath);
-			else await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf-8");
+	it.each([
+		"missing admission",
+		"pending publication",
+		"missing state",
+	])("repairs the authenticated final admission projection after a crash-gap dedupe: %s", async gap => {
+		const root = await tempDir();
+		const runId = "final-admission-crash-gap";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
+			"utf-8",
+		);
+		const first = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		const expectedAdmission = first.auto_handoff;
+		const statePath = ralplanStatePath(root);
+		const state = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		delete state.auto_handoff;
+		if (gap === "pending publication") {
+			state.final_publication_pending = {
+				run_id: runId,
+				publication_id: "interrupted-final-publication",
+				final_sha256: first.sha256,
+				started_at: new Date().toISOString(),
+			};
+		}
+		if (gap === "missing state") await fs.rm(statePath);
+		else await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf-8");
 
-			const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
-			expect(retry).toMatchObject({ deduplicated: true, auto_handoff: expectedAdmission });
-			const restoredState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
-			expect(restoredState.auto_handoff).toEqual(expectedAdmission);
-			expect(restoredState.receipt).toMatchObject({ command: "gjc ralplan final-admission" });
-			expect(restoredState).toMatchObject({ run_id: runId, active: true, current_phase: "final" });
-			expect(restoredState.final_publication_pending).toBeUndefined();
-		},
-	);
+		const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		expect(retry).toMatchObject({ deduplicated: true, auto_handoff: expectedAdmission });
+		const restoredState = JSON.parse(await fs.readFile(statePath, "utf-8")) as Record<string, unknown>;
+		expect(restoredState.auto_handoff).toEqual(expectedAdmission);
+		expect(restoredState.receipt).toMatchObject({ command: "gjc ralplan final-admission" });
+		expect(restoredState).toMatchObject({ run_id: runId, active: true, current_phase: "final" });
+		expect(restoredState.final_publication_pending).toBeUndefined();
+	});
 	it("overlays a later durable PLANNING-STUCK marker on final dedupe", async () => {
 		const root = await tempDir();
 		const runId = "final-then-stuck";

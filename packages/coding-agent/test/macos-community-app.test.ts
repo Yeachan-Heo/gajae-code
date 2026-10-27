@@ -106,27 +106,32 @@ describe("macOS community app offer guards", () => {
 		}
 	});
 
-	test.each(["false", " FALSE ", "0", "no", "off", "", "   "])(
-		"false automation flag %j does not suppress consent",
-		async value => {
-			const logs: string[] = [];
-			const result = await offerMacosCommunityApp({
-				platform: "darwin",
-				arch: "arm64",
-				homeDir: await tempDir(),
-				env: { NONINTERACTIVE: value, npm_lifecycle_event: value, npm_command: value },
-				stdinIsTTY: true,
-				stdoutIsTTY: true,
-				command: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
-				log: message => logs.push(message),
-				prompt: async () => {
-					expect(logs).toHaveLength(1);
-					return false;
-				},
-			});
-			expect(result.reason).toBe("cancelled");
-		},
-	);
+	test.each([
+		"false",
+		" FALSE ",
+		"0",
+		"no",
+		"off",
+		"",
+		"   ",
+	])("false automation flag %j does not suppress consent", async value => {
+		const logs: string[] = [];
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir: await tempDir(),
+			env: { NONINTERACTIVE: value, npm_lifecycle_event: value, npm_command: value },
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			command: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
+			log: message => logs.push(message),
+			prompt: async () => {
+				expect(logs).toHaveLength(1);
+				return false;
+			},
+		});
+		expect(result.reason).toBe("cancelled");
+	});
 
 	test("bounds and sanitizes failure logs without mutating failure data", async () => {
 		const reason = `bad /tmp/app\r\nforged\t\x1b[31mred\x1b[0m\x00\u2028\u202e${"x".repeat(4096)}`;

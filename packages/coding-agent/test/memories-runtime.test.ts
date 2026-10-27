@@ -371,17 +371,17 @@ describe("memories runtime", () => {
 	test.each([
 		{ maxTokens: 128_000, expected: 64_000 },
 		{ maxTokens: 16_000, expected: 16_000 },
-	])(
-		"phase2 response budget is the model limit capped at 64k on a large context (model $maxTokens)",
-		async ({ maxTokens, expected }) => {
-			const fx = await createFixture(
-				undefined,
-				createModel("budget-model", true, { maxTokens, contextWindow: 1_000_000 }),
-			);
-			const phase2 = await runPhase2(fx, "budget", consolidatedResponse());
-			expect(phase2.options?.maxTokens).toBe(expected);
-		},
-	);
+	])("phase2 response budget is the model limit capped at 64k on a large context (model $maxTokens)", async ({
+		maxTokens,
+		expected,
+	}) => {
+		const fx = await createFixture(
+			undefined,
+			createModel("budget-model", true, { maxTokens, contextWindow: 1_000_000 }),
+		);
+		const phase2 = await runPhase2(fx, "budget", consolidatedResponse());
+		expect(phase2.options?.maxTokens).toBe(expected);
+	});
 
 	test("phase2 leaves the response budget to the provider default when no limit is known", async () => {
 		const fx = await createFixture(undefined, createModel("unknown-model", false, { contextWindow: undefined }));
@@ -404,20 +404,20 @@ describe("memories runtime", () => {
 	test.each([
 		{ mode: "effort" as const, thinkingReserve: 0 },
 		{ mode: "budget" as const, thinkingReserve: ai.ANTHROPIC_THINKING[ai.Effort.Low] },
-	])(
-		"phase2 shrinks oversized inputs to fit a small context window ($mode thinking)",
-		async ({ mode, thinkingReserve }) => {
-			const model = createModel("small-reasoning-model", true, { maxTokens: 32_768, contextWindow: 32_768 });
-			model.thinking = { mode, minLevel: ai.Effort.Low, maxLevel: ai.Effort.High };
-			const fx = await createFixture(undefined, model);
-			const phase2 = await runPhase2(fx, "oversized", consolidatedResponse(), "x".repeat(200_000));
+	])("phase2 shrinks oversized inputs to fit a small context window ($mode thinking)", async ({
+		mode,
+		thinkingReserve,
+	}) => {
+		const model = createModel("small-reasoning-model", true, { maxTokens: 32_768, contextWindow: 32_768 });
+		model.thinking = { mode, minLevel: ai.Effort.Low, maxLevel: ai.Effort.High };
+		const fx = await createFixture(undefined, model);
+		const phase2 = await runPhase2(fx, "oversized", consolidatedResponse(), "x".repeat(200_000));
 
-			const maxTokens = phase2.options?.maxTokens ?? 0;
-			expect(phase2.input).toContain("...[truncated]...");
-			expect(estimateTextTokensHeuristic(phase2.input) + maxTokens + thinkingReserve).toBeLessThanOrEqual(32_768);
-			expect(maxTokens).toBeGreaterThanOrEqual(8_192);
-		},
-	);
+		const maxTokens = phase2.options?.maxTokens ?? 0;
+		expect(phase2.input).toContain("...[truncated]...");
+		expect(estimateTextTokensHeuristic(phase2.input) + maxTokens + thinkingReserve).toBeLessThanOrEqual(32_768);
+		expect(maxTokens).toBeGreaterThanOrEqual(8_192);
+	});
 
 	test("phase2 reports a reasoning-only response as empty text instead of a JSON parse failure", async () => {
 		const fx = await createFixture(

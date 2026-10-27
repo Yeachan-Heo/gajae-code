@@ -2271,66 +2271,68 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach disconnected.");
 	});
 
-	it.each(["attach failed: EIO", "write /dev/tty: input/output error"])(
-		"recognizes exact tmux attach disconnect diagnostics: %s",
-		stderr => {
-			const diagnostics: string[] = [];
-			const calls: string[][] = [];
-			launchDefaultTmuxIfNeeded({
-				parsed: args({ tmux: true }),
-				rawArgs: [],
-				cwd: "/repo",
-				env: {},
-				argv: ["/usr/local/bin/gjc"],
-				execPath: "/bin/bun",
-				platform: "darwin",
-				tty: interactiveTty,
-				tmuxAvailable: true,
-				currentBranch: "",
-				existingBranchSessionName: null,
-				diagnosticWriter: message => diagnostics.push(message),
-				spawnSync: (_command, spawnArgs) => {
-					calls.push(spawnArgs);
-					return spawnArgs[0] === "attach-session"
-						? { exitCode: 1, stderr }
-						: { exitCode: 0, stdout: NATIVE_SESSION_ID };
-				},
-			});
-			expect(calls.some(call => call[0] === "kill-session")).toBe(false);
-			expect(diagnostics[0]).toContain("attach disconnected");
-		},
-	);
+	it.each([
+		"attach failed: EIO",
+		"write /dev/tty: input/output error",
+	])("recognizes exact tmux attach disconnect diagnostics: %s", stderr => {
+		const diagnostics: string[] = [];
+		const calls: string[][] = [];
+		launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "",
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (_command, spawnArgs) => {
+				calls.push(spawnArgs);
+				return spawnArgs[0] === "attach-session"
+					? { exitCode: 1, stderr }
+					: { exitCode: 0, stdout: NATIVE_SESSION_ID };
+			},
+		});
+		expect(calls.some(call => call[0] === "kill-session")).toBe(false);
+		expect(diagnostics[0]).toContain("attach disconnected");
+	});
 
-	it.each(["EIOFailure", "xEIO", "input/output errors", "preinput/output error"])(
-		"does not mistake a partial tmux attach disconnect diagnostic for EIO: %s",
-		stderr => {
-			const diagnostics: string[] = [];
-			const calls: string[][] = [];
-			launchDefaultTmuxIfNeeded({
-				parsed: args({ tmux: true }),
-				rawArgs: [],
-				cwd: "/repo",
-				env: {},
-				argv: ["/usr/local/bin/gjc"],
-				execPath: "/bin/bun",
-				platform: "darwin",
-				tty: interactiveTty,
-				tmuxAvailable: true,
-				currentBranch: "",
-				existingBranchSessionName: null,
-				diagnosticWriter: message => diagnostics.push(message),
-				spawnSync: (_command, spawnArgs) => {
-					calls.push(spawnArgs);
-					return spawnArgs[0] === "attach-session"
-						? { exitCode: 1, stderr }
-						: { exitCode: 0, stdout: NATIVE_SESSION_ID };
-				},
-			});
-			expect(calls.some(call => call[0] === "if-shell")).toBe(false);
-			expect(diagnostics[0]).toContain("attach failed");
-			expect(diagnostics[0]).not.toContain("attach disconnected");
-		},
-	);
+	it.each([
+		"EIOFailure",
+		"xEIO",
+		"input/output errors",
+		"preinput/output error",
+	])("does not mistake a partial tmux attach disconnect diagnostic for EIO: %s", stderr => {
+		const diagnostics: string[] = [];
+		const calls: string[][] = [];
+		launchDefaultTmuxIfNeeded({
+			parsed: args({ tmux: true }),
+			rawArgs: [],
+			cwd: "/repo",
+			env: {},
+			argv: ["/usr/local/bin/gjc"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+			currentBranch: "",
+			existingBranchSessionName: null,
+			diagnosticWriter: message => diagnostics.push(message),
+			spawnSync: (_command, spawnArgs) => {
+				calls.push(spawnArgs);
+				return spawnArgs[0] === "attach-session"
+					? { exitCode: 1, stderr }
+					: { exitCode: 0, stdout: NATIVE_SESSION_ID };
+			},
+		});
+		expect(calls.some(call => call[0] === "if-shell")).toBe(false);
+		expect(diagnostics[0]).toContain("attach failed");
+		expect(diagnostics[0]).not.toContain("attach disconnected");
+	});
 
 	it("strips terminal controls and bounds multibyte tmux diagnostics", () => {
 		const diagnostics: string[] = [];
@@ -3190,37 +3192,39 @@ it.each([
 	expect(calls.some(call => call[0] === "kill-session")).toBe(false);
 });
 
-it.each(["", "not-a-session-id", "$0 trailing", "$-1"])(
-	"fails closed and preserves a native session when new-session stdout is %p",
-	stdout => {
-		const calls: string[][] = [];
-		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
-			parsed: args({ messages: ["hello world"], tmux: true }),
-			rawArgs: ["--tmux", "hello world"],
-			cwd: "/repo",
-			env: { GJC_TMUX_COMMAND: "tmux" },
-			argv: ["bun", "packages/coding-agent/src/cli.ts"],
-			execPath: "/bin/bun",
-			platform: "linux",
-			tty: interactiveTty,
-			tmuxAvailable: true,
-			currentBranch: "",
-			existingBranchSessionName: null,
-			diagnosticWriter: message => diagnostics.push(message),
-			spawnSync: (_command, spawnArgs) => {
-				calls.push(spawnArgs);
-				return spawnArgs[0] === "new-session" ? { exitCode: 0, stdout } : { exitCode: 0 };
-			},
-		});
+it.each([
+	"",
+	"not-a-session-id",
+	"$0 trailing",
+	"$-1",
+])("fails closed and preserves a native session when new-session stdout is %p", stdout => {
+	const calls: string[][] = [];
+	const diagnostics: string[] = [];
+	const handled = launchDefaultTmuxIfNeeded({
+		parsed: args({ messages: ["hello world"], tmux: true }),
+		rawArgs: ["--tmux", "hello world"],
+		cwd: "/repo",
+		env: { GJC_TMUX_COMMAND: "tmux" },
+		argv: ["bun", "packages/coding-agent/src/cli.ts"],
+		execPath: "/bin/bun",
+		platform: "linux",
+		tty: interactiveTty,
+		tmuxAvailable: true,
+		currentBranch: "",
+		existingBranchSessionName: null,
+		diagnosticWriter: message => diagnostics.push(message),
+		spawnSync: (_command, spawnArgs) => {
+			calls.push(spawnArgs);
+			return spawnArgs[0] === "new-session" ? { exitCode: 0, stdout } : { exitCode: 0 };
+		},
+	});
 
-		expect(handled).toBe(true);
-		expect(calls.map(call => call[0])).toEqual(["new-session"]);
-		expect(diagnostics).toEqual([
-			"gjc --tmux failed after creating tmux session: native session identity was unavailable; preserving session for recovery.\n",
-		]);
-	},
-);
+	expect(handled).toBe(true);
+	expect(calls.map(call => call[0])).toEqual(["new-session"]);
+	expect(diagnostics).toEqual([
+		"gjc --tmux failed after creating tmux session: native session identity was unavailable; preserving session for recovery.\n",
+	]);
+});
 
 describe("tmux owner isolation launch gate", () => {
 	afterEach(() => {

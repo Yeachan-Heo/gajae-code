@@ -174,17 +174,17 @@ describe("ordered credential preferences", () => {
 		expect(await storage.getApiKey("anthropic", "capped-last-resort")).toBe(token(SHARED));
 	});
 
-	test.each(["openai-codex", "kimi-code"] as const)(
-		"%s caps read the windows that provider reports",
-		async provider => {
-			setUsage(PERSONAL, 0.5, 0.5, provider);
-			setUsage(CHEAP, 0.2, 0.2, provider);
-			setUsage(SHARED, 0.8, 0.1, provider);
-			const storage = await createStorage([prefer(SHARED, 75), prefer(CHEAP)], { provider });
+	test.each([
+		"openai-codex",
+		"kimi-code",
+	] as const)("%s caps read the windows that provider reports", async provider => {
+		setUsage(PERSONAL, 0.5, 0.5, provider);
+		setUsage(CHEAP, 0.2, 0.2, provider);
+		setUsage(SHARED, 0.8, 0.1, provider);
+		const storage = await createStorage([prefer(SHARED, 75), prefer(CHEAP)], { provider });
 
-			expect(await storage.getApiKey(provider, `${provider}-cap`)).toBe(token(CHEAP));
-		},
-	);
+		expect(await storage.getApiKey(provider, `${provider}-cap`)).toBe(token(CHEAP));
+	});
 
 	test("a provider without usage reporting follows list order and treats caps as not reached", async () => {
 		const storage = await createStorage([prefer(SHARED, 10), prefer(CHEAP)], { reportsUsage: false });

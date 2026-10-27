@@ -1689,127 +1689,127 @@ test.each([
 	["acquisition", { acquisitionId: "acquisition-b" }],
 	["pid", { pid: process.pid + 1 }],
 	["incarnation", { incarnation: "linux:4242" }],
-] as const)(
-	"provisional retirement rejects a foreign %s and accepts the matching lock",
-	async (_field, foreignIdentity) => {
-		const agentDir = tempAgentDir();
-		const incarnation = "linux:4241";
-		try {
-			const state: DaemonState = {
-				pid: process.pid,
-				incarnation,
-				ownerId: "owner-a",
-				acquisitionId: "owner-a",
-				ownershipPhase: "provisional",
-				tokenFingerprint: tokenFingerprint(BOT_TOKEN),
-				chatId: "42",
-				startedAt: 1,
-				heartbeatAt: 1,
-				version: DAEMON_VERSION,
-				generation: DAEMON_GENERATION,
-				servingEpoch: SERVING_EPOCH,
-			};
-			await writeDaemonOwner(agentDir, state);
-			const paths = daemonPaths(agentDir);
-			const originalState = await Bun.file(paths.state).text();
-			const foreignLock = `${JSON.stringify({
-				pid: state.pid,
-				incarnation,
-				ownerId: state.ownerId,
-				acquisitionId: state.acquisitionId,
-				startedAt: state.startedAt,
-				...foreignIdentity,
-			})}\n`;
-			await Bun.write(paths.lock, foreignLock);
+] as const)("provisional retirement rejects a foreign %s and accepts the matching lock", async (_field, foreignIdentity) => {
+	const agentDir = tempAgentDir();
+	const incarnation = "linux:4241";
+	try {
+		const state: DaemonState = {
+			pid: process.pid,
+			incarnation,
+			ownerId: "owner-a",
+			acquisitionId: "owner-a",
+			ownershipPhase: "provisional",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
+			startedAt: 1,
+			heartbeatAt: 1,
+			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
+		};
+		await writeDaemonOwner(agentDir, state);
+		const paths = daemonPaths(agentDir);
+		const originalState = await Bun.file(paths.state).text();
+		const foreignLock = `${JSON.stringify({
+			pid: state.pid,
+			incarnation,
+			ownerId: state.ownerId,
+			acquisitionId: state.acquisitionId,
+			startedAt: state.startedAt,
+			...foreignIdentity,
+		})}\n`;
+		await Bun.write(paths.lock, foreignLock);
 
-			const retirement = {
-				settings: settings(agentDir),
-				ownerId: state.ownerId,
-				acquisitionId: state.acquisitionId,
-				pid: state.pid,
-				pidAlive: () => false,
-				pidIncarnation: () => incarnation,
-				now: () => 2,
-			};
-			const retired = await retireProvisionalDaemonOwnership(retirement);
+		const retirement = {
+			settings: settings(agentDir),
+			ownerId: state.ownerId,
+			acquisitionId: state.acquisitionId,
+			pid: state.pid,
+			pidAlive: () => false,
+			pidIncarnation: () => incarnation,
+			now: () => 2,
+		};
+		const retired = await retireProvisionalDaemonOwnership(retirement);
 
-			expect(retired).toBe(false);
-			expect(await Bun.file(paths.lock).text()).toBe(foreignLock);
-			expect(await Bun.file(paths.state).text()).toBe(originalState);
+		expect(retired).toBe(false);
+		expect(await Bun.file(paths.lock).text()).toBe(foreignLock);
+		expect(await Bun.file(paths.state).text()).toBe(originalState);
 
-			// Retirement acquires its own transition lock. This positive control
-			// proves the same setup reaches retirement rather than an early refusal.
-			await writeDaemonOwner(agentDir, state);
-			expect(await retireProvisionalDaemonOwnership(retirement)).toBe(true);
-			expect(await readDaemonState(retirement.settings)).toMatchObject({
-				ownershipPhase: "retired",
-				stoppedAt: 2,
-				stopCause: "startup_failed",
-			});
-			expect(fs.existsSync(paths.lock)).toBe(false);
-		} finally {
-			fs.rmSync(agentDir, { recursive: true, force: true });
+		// Retirement acquires its own transition lock. This positive control
+		// proves the same setup reaches retirement rather than an early refusal.
+		await writeDaemonOwner(agentDir, state);
+		expect(await retireProvisionalDaemonOwnership(retirement)).toBe(true);
+		expect(await readDaemonState(retirement.settings)).toMatchObject({
+			ownershipPhase: "retired",
+			stoppedAt: 2,
+			stopCause: "startup_failed",
+		});
+		expect(fs.existsSync(paths.lock)).toBe(false);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"stop",
+	"reload",
+	"signal",
+	"idle_timeout",
+	"stalled_signal",
+] as const)("first stop cause %s survives orderly release", async cause => {
+	const agentDir = tempAgentDir();
+	const incarnation = "linux:4241";
+	const expectedCause = cause === "stalled_signal" ? "signal" : cause;
+	try {
+		const state: DaemonState = {
+			pid: process.pid,
+			incarnation,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			ownershipPhase: "ready",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
+			startedAt: 1,
+			heartbeatAt: 1,
+			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
+		};
+		await writeDaemonOwner(agentDir, state);
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: state.ownerId,
+			botToken: BOT_TOKEN,
+			chatId: state.chatId,
+			pid: process.pid,
+			pidIncarnation: () => incarnation,
+			botApi: { call: async () => ({ ok: true, result: [] }) },
+			idleTimeoutMs: 0,
+			...(cause === "stalled_signal"
+				? {
+						control: {
+							shouldStop: async () => false,
+							requestedAction: () => Promise.withResolvers<"reload" | "stop" | undefined>().promise,
+						},
+					}
+				: {}),
+		});
+
+		if (cause !== "idle_timeout") {
+			daemon.requestStop(expectedCause);
+			daemon.requestStop("unexpected_exception");
+			daemon.requestStop();
 		}
-	},
-);
+		await daemon.run();
 
-test.each(["stop", "reload", "signal", "idle_timeout", "stalled_signal"] as const)(
-	"first stop cause %s survives orderly release",
-	async cause => {
-		const agentDir = tempAgentDir();
-		const incarnation = "linux:4241";
-		const expectedCause = cause === "stalled_signal" ? "signal" : cause;
-		try {
-			const state: DaemonState = {
-				pid: process.pid,
-				incarnation,
-				ownerId: "owner",
-				acquisitionId: "owner",
-				ownershipPhase: "ready",
-				tokenFingerprint: tokenFingerprint(BOT_TOKEN),
-				chatId: "42",
-				startedAt: 1,
-				heartbeatAt: 1,
-				version: DAEMON_VERSION,
-				generation: DAEMON_GENERATION,
-				servingEpoch: SERVING_EPOCH,
-			};
-			await writeDaemonOwner(agentDir, state);
-			const daemon = new TelegramNotificationDaemon({
-				settings: settings(agentDir),
-				ownerId: state.ownerId,
-				botToken: BOT_TOKEN,
-				chatId: state.chatId,
-				pid: process.pid,
-				pidIncarnation: () => incarnation,
-				botApi: { call: async () => ({ ok: true, result: [] }) },
-				idleTimeoutMs: 0,
-				...(cause === "stalled_signal"
-					? {
-							control: {
-								shouldStop: async () => false,
-								requestedAction: () => Promise.withResolvers<"reload" | "stop" | undefined>().promise,
-							},
-						}
-					: {}),
-			});
-
-			if (cause !== "idle_timeout") {
-				daemon.requestStop(expectedCause);
-				daemon.requestStop("unexpected_exception");
-				daemon.requestStop();
-			}
-			await daemon.run();
-
-			const stopped = await readDaemonState(settings(agentDir));
-			expect(stopped?.stopCause).toBe(expectedCause);
-			expect(stopped?.stoppedAt).toBeDefined();
-			expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
-		} finally {
-			fs.rmSync(agentDir, { recursive: true, force: true });
-		}
-	},
-);
+		const stopped = await readDaemonState(settings(agentDir));
+		expect(stopped?.stopCause).toBe(expectedCause);
+		expect(stopped?.stoppedAt).toBeDefined();
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
 
 test("controller reload action survives the SIGTERM wakeup and daemon release", async () => {
 	const agentDir = tempAgentDir();

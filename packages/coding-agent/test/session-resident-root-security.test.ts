@@ -238,36 +238,36 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 		expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
 	});
 
-	it.each(["symlink", "corrupt file"] as const)(
-		"fails closed when an adopted store cache miss reads a replaced %s blob",
-		async kind => {
-			const root = makeTempDir();
-			const instanceDir = openVerifiedResidentCacheInstanceDir(path.join(root, "resident-cache"));
-			const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
-			// Exceeds the 8 MiB buffer cache so getSync must reopen the replacement.
-			const payload = Buffer.alloc(8 * 1024 * 1024 + 1, "r");
-			const { hash, path: blobPath } = store.putSync(payload);
-			let result: Buffer | null | undefined;
-			try {
-				if (kind === "symlink") {
-					const attackerFile = path.join(root, "attacker-controlled.txt");
-					fs.writeFileSync(attackerFile, "attacker-controlled bytes");
-					fs.unlinkSync(blobPath);
-					fs.symlinkSync(attackerFile, blobPath);
-				} else {
-					fs.writeFileSync(blobPath, "corrupt replacement", { mode: 0o600 });
-				}
-
-				expect(() => {
-					result = store.getSync(hash);
-				}).toThrow(ResidentCacheTrustError);
-				expect(result).toBeUndefined();
-				await expect(store.get(hash)).rejects.toThrow(ResidentCacheTrustError);
-			} finally {
-				store.dispose();
+	it.each([
+		"symlink",
+		"corrupt file",
+	] as const)("fails closed when an adopted store cache miss reads a replaced %s blob", async kind => {
+		const root = makeTempDir();
+		const instanceDir = openVerifiedResidentCacheInstanceDir(path.join(root, "resident-cache"));
+		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		// Exceeds the 8 MiB buffer cache so getSync must reopen the replacement.
+		const payload = Buffer.alloc(8 * 1024 * 1024 + 1, "r");
+		const { hash, path: blobPath } = store.putSync(payload);
+		let result: Buffer | null | undefined;
+		try {
+			if (kind === "symlink") {
+				const attackerFile = path.join(root, "attacker-controlled.txt");
+				fs.writeFileSync(attackerFile, "attacker-controlled bytes");
+				fs.unlinkSync(blobPath);
+				fs.symlinkSync(attackerFile, blobPath);
+			} else {
+				fs.writeFileSync(blobPath, "corrupt replacement", { mode: 0o600 });
 			}
-		},
-	);
+
+			expect(() => {
+				result = store.getSync(hash);
+			}).toThrow(ResidentCacheTrustError);
+			expect(result).toBeUndefined();
+			await expect(store.get(hash)).rejects.toThrow(ResidentCacheTrustError);
+		} finally {
+			store.dispose();
+		}
+	});
 
 	// `expectedCauseCode` is the discriminator `reason` cannot provide: ELOOP and
 	// ENOENT both demote as `blob_create_failed`, so a demotion that reports only
@@ -276,72 +276,65 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 		["foreign EEXIST symlink", "blob_untrusted", undefined],
 		["injected ELOOP", "blob_create_failed", "ELOOP"],
 		["injected ENOENT", "blob_create_failed", "ENOENT"],
-	] as const)(
-		"demotes the whole resident store after %s, preserves old content, and retries the triggering append once",
-		async (injection, expectedReason, expectedCauseCode) => {
-			const root = makeTempDir();
-			const manager = createManager(root);
-			const preDemotionText = `pre-demotion ${"a".repeat(4096)}`;
-			const triggeringText = `triggering append ${"b".repeat(4096)}`;
-			const triggeringBytes = Buffer.from(triggeringText, "utf8");
-			try {
-				const preDemotionId = appendLargeUserText(manager, preDemotionText);
-				const instanceDir = activeResidentInstanceDir();
-				const target = path.join(instanceDir, sha256(triggeringBytes));
+	] as const)("demotes the whole resident store after %s, preserves old content, and retries the triggering append once", async (injection, expectedReason, expectedCauseCode) => {
+		const root = makeTempDir();
+		const manager = createManager(root);
+		const preDemotionText = `pre-demotion ${"a".repeat(4096)}`;
+		const triggeringText = `triggering append ${"b".repeat(4096)}`;
+		const triggeringBytes = Buffer.from(triggeringText, "utf8");
+		try {
+			const preDemotionId = appendLargeUserText(manager, preDemotionText);
+			const instanceDir = activeResidentInstanceDir();
+			const target = path.join(instanceDir, sha256(triggeringBytes));
 
-				const residentPut = EphemeralBlobStore.prototype.putSync;
-				let residentTriggerPutCalls = 0;
-				vi.spyOn(EphemeralBlobStore.prototype, "putSync").mockImplementation(function (
-					this: EphemeralBlobStore,
-					data: Buffer,
-				) {
-					if (data.equals(triggeringBytes)) residentTriggerPutCalls++;
-					return residentPut.call(this, data);
-				});
-				const memoryPut = MemoryBlobStore.prototype.putSync;
-				let memoryTriggerPutCalls = 0;
-				vi.spyOn(MemoryBlobStore.prototype, "putSync").mockImplementation(function (
-					this: MemoryBlobStore,
-					data: Buffer,
-				) {
-					if (data.equals(triggeringBytes)) memoryTriggerPutCalls++;
-					return memoryPut.call(this, data);
-				});
+			const residentPut = EphemeralBlobStore.prototype.putSync;
+			let residentTriggerPutCalls = 0;
+			vi.spyOn(EphemeralBlobStore.prototype, "putSync").mockImplementation(function (
+				this: EphemeralBlobStore,
+				data: Buffer,
+			) {
+				if (data.equals(triggeringBytes)) residentTriggerPutCalls++;
+				return residentPut.call(this, data);
+			});
+			const memoryPut = MemoryBlobStore.prototype.putSync;
+			let memoryTriggerPutCalls = 0;
+			vi.spyOn(MemoryBlobStore.prototype, "putSync").mockImplementation(function (
+				this: MemoryBlobStore,
+				data: Buffer,
+			) {
+				if (data.equals(triggeringBytes)) memoryTriggerPutCalls++;
+				return memoryPut.call(this, data);
+			});
 
-				if (injection === "foreign EEXIST symlink") {
-					const attackerFile = path.join(root, "pre-planted-attacker.txt");
-					fs.writeFileSync(attackerFile, "attacker bytes");
-					fs.symlinkSync(attackerFile, target);
-				} else {
-					const code = injection === "injected ELOOP" ? "ELOOP" : "ENOENT";
-					const realOpenSync = fs.openSync.bind(fs);
-					vi.spyOn(fs, "openSync").mockImplementation(((
-						file: fs.PathLike,
-						flags?: fs.OpenMode,
-						mode?: fs.Mode,
-					) => {
-						if (path.resolve(asPathname(file)) === target) throw makeFsError(code);
-						return realOpenSync(file, flags as never, mode as never);
-					}) as typeof fs.openSync);
-				}
-
-				const triggeringId = appendLargeUserText(manager, triggeringText);
-
-				expect(residentTriggerPutCalls).toBe(1);
-				expect(memoryTriggerPutCalls).toBe(1);
-				expect(userText(manager, preDemotionId)).toBe(preDemotionText);
-				expect(userText(manager, triggeringId)).toBe(triggeringText);
-				expect(manager.getObservabilityStatsForTests()).toMatchObject({
-					residentCacheTrustRejectCount: 1,
-					residentCacheDegradedReason: expectedReason,
-					residentCacheDegradedCauseCode: expectedCauseCode,
-				});
-				expect(residentInstanceDirs()).toEqual([]);
-			} finally {
-				await manager.close().catch(() => {});
+			if (injection === "foreign EEXIST symlink") {
+				const attackerFile = path.join(root, "pre-planted-attacker.txt");
+				fs.writeFileSync(attackerFile, "attacker bytes");
+				fs.symlinkSync(attackerFile, target);
+			} else {
+				const code = injection === "injected ELOOP" ? "ELOOP" : "ENOENT";
+				const realOpenSync = fs.openSync.bind(fs);
+				vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+					if (path.resolve(asPathname(file)) === target) throw makeFsError(code);
+					return realOpenSync(file, flags as never, mode as never);
+				}) as typeof fs.openSync);
 			}
-		},
-	);
+
+			const triggeringId = appendLargeUserText(manager, triggeringText);
+
+			expect(residentTriggerPutCalls).toBe(1);
+			expect(memoryTriggerPutCalls).toBe(1);
+			expect(userText(manager, preDemotionId)).toBe(preDemotionText);
+			expect(userText(manager, triggeringId)).toBe(triggeringText);
+			expect(manager.getObservabilityStatsForTests()).toMatchObject({
+				residentCacheTrustRejectCount: 1,
+				residentCacheDegradedReason: expectedReason,
+				residentCacheDegradedCauseCode: expectedCauseCode,
+			});
+			expect(residentInstanceDirs()).toEqual([]);
+		} finally {
+			await manager.close().catch(() => {});
+		}
+	});
 });
 
 describe("ResidentCacheTrustError cause exposure", () => {

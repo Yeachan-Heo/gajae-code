@@ -290,39 +290,36 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	it.each([
 		["published", 1],
 		["fenced", 1],
-	] as const)(
-		"does not replay a stale discovery snapshot over an empty %s catalog",
-		async (publication, generation) => {
-			authStorage.setRuntimeApiKey("openai", "test-key");
-			const configPath = path.join(tempDir, `deferred-${publication}-mcp.json`);
-			const staleTool = createMcpCustomTool("mcp__stale_lookup", "exact", "lookup");
-			vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([staleTool]));
-			// `published`: a connected server legitimately exposes zero tools after
-			// discovery copied a now-stale result. `fenced`: an exact suspend/disconnect
-			// wins the race before the SDK continuation consumes the discovery result.
-			// Either empty catalog is authoritative and must not be replaced.
-			vi.spyOn(MCPManager.prototype, "getToolCatalogSnapshot").mockReturnValue({
-				tools: [],
-				publication,
-				generation,
-			});
-			const setOnToolsChanged = vi.spyOn(MCPManager.prototype, "setOnToolsChanged");
+	] as const)("does not replay a stale discovery snapshot over an empty %s catalog", async (publication, generation) => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, `deferred-${publication}-mcp.json`);
+		const staleTool = createMcpCustomTool("mcp__stale_lookup", "exact", "lookup");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([staleTool]));
+		// `published`: a connected server legitimately exposes zero tools after
+		// discovery copied a now-stale result. `fenced`: an exact suspend/disconnect
+		// wins the race before the SDK continuation consumes the discovery result.
+		// Either empty catalog is authoritative and must not be replaced.
+		vi.spyOn(MCPManager.prototype, "getToolCatalogSnapshot").mockReturnValue({
+			tools: [],
+			publication,
+			generation,
+		});
+		const setOnToolsChanged = vi.spyOn(MCPManager.prototype, "setOnToolsChanged");
 
-			const { session, startDeferredMcpConfig } = await createAgentSession({
-				...createIsolatedSessionOptions(),
-				mcpConfigPath: configPath,
-				deferMcpConfigStartup: true,
-			});
-			try {
-				await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: true });
-				expect(setOnToolsChanged).not.toHaveBeenCalled();
-				expect(session.getAllToolNames()).not.toContain(staleTool.name);
-				expect(session.getActiveToolNames()).not.toContain(staleTool.name);
-			} finally {
-				await session.dispose();
-			}
-		},
-	);
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: true });
+			expect(setOnToolsChanged).not.toHaveBeenCalled();
+			expect(session.getAllToolNames()).not.toContain(staleTool.name);
+			expect(session.getActiveToolNames()).not.toContain(staleTool.name);
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it(
 		"keeps deferred MCP startup and tool use alive across a logical session transition",

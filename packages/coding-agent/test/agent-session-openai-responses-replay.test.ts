@@ -1300,55 +1300,55 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expectAssistantReplayMetadataSanitized(findRuntimeAssistant(session, "Unreadable assistant snapshot"));
 	});
 
-	it.each(["EACCES", "EPERM", "EROFS"] as const)(
-		"publishes a read-only successor and retries local:// setup after %s",
-		async code => {
-			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-readonly-local-switch-${Snowflake.next()}-`));
-			tempDirs.push(tempDir);
-			const currentSessionManager = SessionManager.create(tempDir, tempDir);
-			const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
-			sessions.push(session);
-			authStorages.push(authStorage);
-			const predecessorSessionId = session.sessionId;
-			const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
-				sessionManager.appendMessage({ role: "user", content: "read-only successor", timestamp: Date.now() });
-			});
-			const readiness = vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValue(makeFsError(code));
+	it.each([
+		"EACCES",
+		"EPERM",
+		"EROFS",
+	] as const)("publishes a read-only successor and retries local:// setup after %s", async code => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-readonly-local-switch-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const currentSessionManager = SessionManager.create(tempDir, tempDir);
+		const { session, authStorage } = await createSessionHarness(tempDir, currentSessionManager);
+		sessions.push(session);
+		authStorages.push(authStorage);
+		const predecessorSessionId = session.sessionId;
+		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
+			sessionManager.appendMessage({ role: "user", content: "read-only successor", timestamp: Date.now() });
+		});
+		const readiness = vi.spyOn(internalUrls, "initializeLocalRoot").mockRejectedValue(makeFsError(code));
 
+		try {
+			await expect(session.switchSession(sessionFile)).resolves.toBe(true);
+			const successorSessionId = session.sessionManager.getSessionId();
+			expect(successorSessionId).not.toBe(predecessorSessionId);
+			expect(session.sessionId).toBe(successorSessionId);
+			expect(session.agent.sessionId).toBe(successorSessionId);
+			expect(session.sessionFile).toBe(sessionFile);
+
+			await expect(session.reload()).resolves.toBeUndefined();
+			expect(readiness).toHaveBeenCalledTimes(2);
+
+			const localOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				isManagedDestination: () => session.sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			const localMkdir = vi.spyOn(fs, "mkdirSync").mockImplementation((() => {
+				throw makeFsError(code);
+			}) as typeof fs.mkdirSync);
 			try {
-				await expect(session.switchSession(sessionFile)).resolves.toBe(true);
-				const successorSessionId = session.sessionManager.getSessionId();
-				expect(successorSessionId).not.toBe(predecessorSessionId);
-				expect(session.sessionId).toBe(successorSessionId);
-				expect(session.agent.sessionId).toBe(successorSessionId);
-				expect(session.sessionFile).toBe(sessionFile);
-
-				await expect(session.reload()).resolves.toBeUndefined();
-				expect(readiness).toHaveBeenCalledTimes(2);
-
-				const localOptions = {
-					getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
-					isManagedDestination: () => session.sessionManager.isManagedDestination(),
-					getManagedLegacyLocalMigrationSource: () =>
-						session.sessionManager.getManagedLegacyLocalMigrationSource(),
-					getSessionId: () => session.sessionManager.getSessionId(),
-				};
-				const localMkdir = vi.spyOn(fs, "mkdirSync").mockImplementation((() => {
-					throw makeFsError(code);
-				}) as typeof fs.mkdirSync);
-				try {
-					expect(() => internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions)).toThrow(code);
-				} finally {
-					localMkdir.mockRestore();
-				}
-				const localPath = internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions);
-				fs.writeFileSync(localPath, "retried local root");
-				expect(fs.readFileSync(localPath, "utf8")).toBe("retried local root");
+				expect(() => internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions)).toThrow(code);
 			} finally {
-				readiness.mockRestore();
+				localMkdir.mockRestore();
 			}
-		},
-	);
+			const localPath = internalUrls.resolveLocalUrlToPath("local://retry.md", localOptions);
+			fs.writeFileSync(localPath, "retried local root");
+			expect(fs.readFileSync(localPath, "utf8")).toBe("retried local root");
+		} finally {
+			readiness.mockRestore();
+		}
+	});
 
 	it("rolls back an unrelated local-root failure with predecessor authority intact", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-local-switch-rollback-${Snowflake.next()}-`));

@@ -607,16 +607,21 @@ describe("TopicRegistry", () => {
 		expect(reg.sessionForTopic(topicId)).toBeUndefined();
 	});
 
-	test.each(["", "1e2", "0", "-1", "9007199254740992", 1, null])(
-		"rejects malformed create callback topic id (%p)",
-		async topicId => {
-			const reg = new TopicRegistry();
-			await expect(reg.getOrCreateTopic("bad", async () => topicId)).rejects.toThrow(
-				"createForumTopic: invalid message_thread_id",
-			);
-			expect(reg.get("bad")).toBeUndefined();
-		},
-	);
+	test.each([
+		"",
+		"1e2",
+		"0",
+		"-1",
+		"9007199254740992",
+		1,
+		null,
+	])("rejects malformed create callback topic id (%p)", async topicId => {
+		const reg = new TopicRegistry();
+		await expect(reg.getOrCreateTopic("bad", async () => topicId)).rejects.toThrow(
+			"createForumTopic: invalid message_thread_id",
+		);
+		expect(reg.get("bad")).toBeUndefined();
+	});
 	test("retains an accepted revoked create as a durable delete fence", async () => {
 		const reg = new TopicRegistry();
 		const created = Promise.withResolvers<string>();

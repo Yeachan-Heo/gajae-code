@@ -140,15 +140,19 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 			attachment: { fileId: "doc-1", kind: "document", mime: "application/pdf", fileName: "report.pdf" },
 		});
 	});
-	test.each([undefined, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN])(
-		"rejects an invalid message id (%p) before injection",
-		message_id => {
-			expect(
-				decideThreadedInbound(
-					{ update_id: 11, message: { message_id, text: "go", chat: { id: 42 }, message_thread_id: "topic-1" } },
-					ctx(),
-				),
-			).toEqual({ kind: "ignore", reason: "missing_message_id" });
-		},
-	);
+	test.each([
+		undefined,
+		0,
+		-1,
+		1.5,
+		Number.MAX_SAFE_INTEGER + 1,
+		Number.NaN,
+	])("rejects an invalid message id (%p) before injection", message_id => {
+		expect(
+			decideThreadedInbound(
+				{ update_id: 11, message: { message_id, text: "go", chat: { id: 42 }, message_thread_id: "topic-1" } },
+				ctx(),
+			),
+		).toEqual({ kind: "ignore", reason: "missing_message_id" });
+	});
 });

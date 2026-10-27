@@ -385,32 +385,32 @@ describe("telemetry install ID", () => {
 		}
 	});
 
-	it.each(["EPERM", "EACCES"] as const)(
-		"treats a Windows %s directory sync as a supported durability limitation",
-		async code => {
-			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
-			tempDirs.push(directory);
-			const filePath = path.join(directory, "telemetry-install-id");
-			const originalOpen = realOpen;
-			const originalPlatform = process.platform;
-			const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
-				if (String(args[0]) === directory) {
-					const error = new Error("directory handles are unsupported") as NodeJS.ErrnoException;
-					error.code = code;
-					throw error;
-				}
-				return originalOpen(...args);
-			});
-
-			try {
-				Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-				expect(await getTelemetryInstallId(filePath)).toMatch(UUID_PATTERN);
-			} finally {
-				Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
-				openSpy.mockRestore();
+	it.each([
+		"EPERM",
+		"EACCES",
+	] as const)("treats a Windows %s directory sync as a supported durability limitation", async code => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
+		tempDirs.push(directory);
+		const filePath = path.join(directory, "telemetry-install-id");
+		const originalOpen = realOpen;
+		const originalPlatform = process.platform;
+		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (String(args[0]) === directory) {
+				const error = new Error("directory handles are unsupported") as NodeJS.ErrnoException;
+				error.code = code;
+				throw error;
 			}
-		},
-	);
+			return originalOpen(...args);
+		});
+
+		try {
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			expect(await getTelemetryInstallId(filePath)).toMatch(UUID_PATTERN);
+		} finally {
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+			openSpy.mockRestore();
+		}
+	});
 
 	it("keeps readers behind the claim until the publisher sync completes", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));

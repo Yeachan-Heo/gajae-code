@@ -528,36 +528,38 @@ describe("agent-loop OTEL instrumentation", () => {
 		expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
 	});
 
-	it.each(["true", "1", "yes", "summary"])(
-		"maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=%s to summary capture",
-		async value => {
-			const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
-			try {
-				process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
-				resetContentCaptureEnvCacheForTest();
-				const mock = createMockModel({
-					...MOCK_IDENT,
-					responses: [{ content: ["hi back"], stopReason: "stop" }],
-				});
-				const config: AgentLoopConfig = {
-					model: mock,
-					convertToLlm: identityConverter,
-					telemetry: {},
-				};
-				const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
-				await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+	it.each([
+		"true",
+		"1",
+		"yes",
+		"summary",
+	])("maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=%s to summary capture", async value => {
+		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		try {
+			process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
+			resetContentCaptureEnvCacheForTest();
+			const mock = createMockModel({
+				...MOCK_IDENT,
+				responses: [{ content: ["hi back"], stopReason: "stop" }],
+			});
+			const config: AgentLoopConfig = {
+				model: mock,
+				convertToLlm: identityConverter,
+				telemetry: {},
+			};
+			const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
+			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
 
-				const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
-				expect(JSON.parse(chat?.attributes[PiGenAIAttr.ResponseText] as string)).toEqual(["hi back"]);
-				expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
-				expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
-				expect(chat?.attributes[GenAIAttr.SystemInstructions]).toBeUndefined();
-			} finally {
-				if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
-				else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
-			}
-		},
-	);
+			const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+			expect(JSON.parse(chat?.attributes[PiGenAIAttr.ResponseText] as string)).toEqual(["hi back"]);
+			expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.SystemInstructions]).toBeUndefined();
+		} finally {
+			if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
+		}
+	});
 
 	it("maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=full to full capture", async () => {
 		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
@@ -597,37 +599,40 @@ describe("agent-loop OTEL instrumentation", () => {
 		}
 	});
 
-	it.each([undefined, "", "none", "false", "garbage"])(
-		"maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=%s to none",
-		async value => {
-			const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
-			try {
-				if (value === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
-				else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
-				resetContentCaptureEnvCacheForTest();
-				const mock = createMockModel({
-					...MOCK_IDENT,
-					responses: [{ content: ["hi back"], stopReason: "stop" }],
-				});
-				const config: AgentLoopConfig = {
-					model: mock,
-					convertToLlm: identityConverter,
-					telemetry: {},
-				};
-				const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
-				await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+	it.each([
+		undefined,
+		"",
+		"none",
+		"false",
+		"garbage",
+	])("maps env OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=%s to none", async value => {
+		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+		try {
+			if (value === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = value;
+			resetContentCaptureEnvCacheForTest();
+			const mock = createMockModel({
+				...MOCK_IDENT,
+				responses: [{ content: ["hi back"], stopReason: "stop" }],
+			});
+			const config: AgentLoopConfig = {
+				model: mock,
+				convertToLlm: identityConverter,
+				telemetry: {},
+			};
+			const ctx: AgentContext = { systemPrompt: ["sys-instruction"], messages: [], tools: [] };
+			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
 
-				const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
-				expect(chat?.attributes[PiGenAIAttr.RequestMessages]).toBeUndefined();
-				expect(chat?.attributes[PiGenAIAttr.ResponseText]).toBeUndefined();
-				expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
-				expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
-			} finally {
-				if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
-				else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
-			}
-		},
-	);
+			const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+			expect(chat?.attributes[PiGenAIAttr.RequestMessages]).toBeUndefined();
+			expect(chat?.attributes[PiGenAIAttr.ResponseText]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.InputMessages]).toBeUndefined();
+			expect(chat?.attributes[GenAIAttr.OutputMessages]).toBeUndefined();
+		} finally {
+			if (before === undefined) delete process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;
+			else process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT = before;
+		}
+	});
 
 	it("keeps explicit captureMessageContent true as full capture even though env truthy maps to summary", async () => {
 		const before = process.env.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT;

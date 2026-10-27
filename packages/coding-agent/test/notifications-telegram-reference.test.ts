@@ -164,18 +164,24 @@ describe("Telegram presentation helpers", () => {
 		expect(markdown).toContain(`${longSensitiveLabel} (Recommended)`);
 	});
 
-	test.each([undefined, -1, 3, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "1", null])(
-		"ignores malformed recommendedIndex %p",
-		recommendedIndex => {
-			const options = ["First", "Second", "Third"];
-			expect(
-				buildActionMessage({ kind: "ask", id: "a1", question: "Proceed?", options, recommendedIndex }).text,
-			).not.toContain("(Recommended)");
-			expect(buildActionMarkdown({ kind: "ask", question: "Proceed?", options, recommendedIndex })).not.toContain(
-				"(Recommended)",
-			);
-		},
-	);
+	test.each([
+		undefined,
+		-1,
+		3,
+		1.5,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		"1",
+		null,
+	])("ignores malformed recommendedIndex %p", recommendedIndex => {
+		const options = ["First", "Second", "Third"];
+		expect(
+			buildActionMessage({ kind: "ask", id: "a1", question: "Proceed?", options, recommendedIndex }).text,
+		).not.toContain("(Recommended)");
+		expect(buildActionMarkdown({ kind: "ask", question: "Proceed?", options, recommendedIndex })).not.toContain(
+			"(Recommended)",
+		);
+	});
 
 	test("buildActionMessage renders free-text ask and idle ping", () => {
 		const freeText = buildActionMessage({ kind: "ask", id: "a1", question: "Name?" });

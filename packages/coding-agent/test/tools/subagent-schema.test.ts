@@ -38,15 +38,20 @@ describe("subagent await heartbeat schema", () => {
 		expect(parsed.heartbeat_ms).toBe(heartbeatMs);
 	});
 
-	it.each([-1, 1, 99, 100.5, 60_001, Number.NaN, Number.POSITIVE_INFINITY])(
-		"rejects out-of-range or non-integer heartbeat_ms=%s",
-		heartbeatMs => {
-			const parsed = createTool().parameters.safeParse({ ...reportedArguments, heartbeat_ms: heartbeatMs });
-			expect(parsed.success).toBe(false);
-			if (parsed.success) throw new Error("expected heartbeat validation failure");
-			expect(parsed.error.issues[0]?.path).toEqual(["heartbeat_ms"]);
-		},
-	);
+	it.each([
+		-1,
+		1,
+		99,
+		100.5,
+		60_001,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+	])("rejects out-of-range or non-integer heartbeat_ms=%s", heartbeatMs => {
+		const parsed = createTool().parameters.safeParse({ ...reportedArguments, heartbeat_ms: heartbeatMs });
+		expect(parsed.success).toBe(false);
+		if (parsed.success) throw new Error("expected heartbeat validation failure");
+		expect(parsed.error.issues[0]?.path).toEqual(["heartbeat_ms"]);
+	});
 
 	it("keeps heartbeat omission optional", () => {
 		const parsed = createTool().parameters.parse({ action: "await", timeout_ms: 120_000 });

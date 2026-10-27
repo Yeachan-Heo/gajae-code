@@ -102,74 +102,74 @@ describe("SDK production ACP fold path", () => {
 		});
 	}
 
-	test.each(["inline", "refused"] as const)(
-		"creates, folds, wakes, and releases through SDK and ACP with %s storage",
-		async storage => {
-			const mock = await createSession();
-			if (!created || !sessionManager) throw new Error("expected SDK fixture");
-			const output = storage === "inline" ? "folded output\n" : "folded output\n".repeat(1_000);
-			const save = vi.spyOn(sessionManager, "saveArtifact");
-			if (storage === "refused") save.mockRejectedValue(new Error("private folded refusal"));
+	test.each([
+		"inline",
+		"refused",
+	] as const)("creates, folds, wakes, and releases through SDK and ACP with %s storage", async storage => {
+		const mock = await createSession();
+		if (!created || !sessionManager) throw new Error("expected SDK fixture");
+		const output = storage === "inline" ? "folded output\n" : "folded output\n".repeat(1_000);
+		const save = vi.spyOn(sessionManager, "saveArtifact");
+		if (storage === "refused") save.mockRejectedValue(new Error("private folded refusal"));
 
-			const exit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
-			let releaseCalls = 0;
-			const terminal: ClientBridgeTerminalHandle = {
-				terminalId: "sdk-acp-fold-terminal",
-				currentOutput: async () => ({ output, truncated: false }),
-				waitForExit: () => exit.promise,
-				kill: async () => {},
-				release: async () => {
-					releaseCalls += 1;
-				},
-			};
-			const connection = {
-				createTerminal: async () => ({
-					id: terminal.terminalId,
-					currentOutput: terminal.currentOutput,
-					waitForExit: terminal.waitForExit,
-					kill: terminal.kill,
-					release: terminal.release,
-				}),
-			} as unknown as AgentSideConnection;
-			const bridge = createAcpClientBridge(connection, created.session.sessionId, {
-				terminal: true,
-			} as ClientCapabilities);
-			created.session.setClientBridge(bridge);
+		const exit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+		let releaseCalls = 0;
+		const terminal: ClientBridgeTerminalHandle = {
+			terminalId: "sdk-acp-fold-terminal",
+			currentOutput: async () => ({ output, truncated: false }),
+			waitForExit: () => exit.promise,
+			kill: async () => {},
+			release: async () => {
+				releaseCalls += 1;
+			},
+		};
+		const connection = {
+			createTerminal: async () => ({
+				id: terminal.terminalId,
+				currentOutput: terminal.currentOutput,
+				waitForExit: terminal.waitForExit,
+				kill: terminal.kill,
+				release: terminal.release,
+			}),
+		} as unknown as AgentSideConnection;
+		const bridge = createAcpClientBridge(connection, created.session.sessionId, {
+			terminal: true,
+		} as ClientCapabilities);
+		created.session.setClientBridge(bridge);
 
-			const bash = created.session.getToolForExecution("bash");
-			if (!bash) throw new Error("expected SDK bash tool");
-			const run = bash.execute("sdk-fold-call", { command: "sleep 30" }, undefined, () => {});
-			await waitFor(() => created!.session.hasForegroundBashBackgroundRequestHandler());
+		const bash = created.session.getToolForExecution("bash");
+		if (!bash) throw new Error("expected SDK bash tool");
+		const run = bash.execute("sdk-fold-call", { command: "sleep 30" }, undefined, () => {});
+		await waitFor(() => created!.session.hasForegroundBashBackgroundRequestHandler());
 
-			expect(await created.session.requestForegroundBashBackground()).toBe(true);
-			const foreground = await run;
-			expect(foreground.details?.async?.state).toBe("running");
-			const jobId = foreground.details?.async?.jobId;
-			if (!jobId) throw new Error("expected folded SDK job id");
-			const callsBeforeWake = mock.calls.length;
+		expect(await created.session.requestForegroundBashBackground()).toBe(true);
+		const foreground = await run;
+		expect(foreground.details?.async?.state).toBe("running");
+		const jobId = foreground.details?.async?.jobId;
+		if (!jobId) throw new Error("expected folded SDK job id");
+		const callsBeforeWake = mock.calls.length;
 
-			exit.resolve({ exitCode: 0, signal: null });
-			await waitFor(() => releaseCalls === 1);
-			await waitFor(() => created!.session.yieldQueue.has("async-result"));
-			await created.session.yieldQueue.flush("idle");
-			// Flushing the receipt through the public queue drives the normal model wake.
-			expect(mock.calls.length).toBeGreaterThan(callsBeforeWake);
-			expect(mock.calls.length).toBe(callsBeforeWake + 1);
-			expect(releaseCalls).toBe(1);
-			const wakeMessages = JSON.stringify(mock.calls[mock.calls.length - 1]?.context.messages);
-			expect(wakeMessages).toContain("folded output");
-			expect(wakeMessages).toContain("folded client-terminal wait");
-			if (storage === "refused") {
-				expect(save).toHaveBeenCalledWith(expect.stringContaining("folded output"), "async");
-				expect(wakeMessages).toContain("storage unavailable");
-				expect(wakeMessages).not.toContain("artifact://");
-				expect(wakeMessages).not.toContain("private folded refusal");
-			} else {
-				expect(save).not.toHaveBeenCalled();
-			}
-			await created.session.yieldQueue.flush("idle");
-			expect(mock.calls.length).toBe(callsBeforeWake + 1);
-			expect(releaseCalls).toBe(1);
-		},
-	);
+		exit.resolve({ exitCode: 0, signal: null });
+		await waitFor(() => releaseCalls === 1);
+		await waitFor(() => created!.session.yieldQueue.has("async-result"));
+		await created.session.yieldQueue.flush("idle");
+		// Flushing the receipt through the public queue drives the normal model wake.
+		expect(mock.calls.length).toBeGreaterThan(callsBeforeWake);
+		expect(mock.calls.length).toBe(callsBeforeWake + 1);
+		expect(releaseCalls).toBe(1);
+		const wakeMessages = JSON.stringify(mock.calls[mock.calls.length - 1]?.context.messages);
+		expect(wakeMessages).toContain("folded output");
+		expect(wakeMessages).toContain("folded client-terminal wait");
+		if (storage === "refused") {
+			expect(save).toHaveBeenCalledWith(expect.stringContaining("folded output"), "async");
+			expect(wakeMessages).toContain("storage unavailable");
+			expect(wakeMessages).not.toContain("artifact://");
+			expect(wakeMessages).not.toContain("private folded refusal");
+		} else {
+			expect(save).not.toHaveBeenCalled();
+		}
+		await created.session.yieldQueue.flush("idle");
+		expect(mock.calls.length).toBe(callsBeforeWake + 1);
+		expect(releaseCalls).toBe(1);
+	});
 });

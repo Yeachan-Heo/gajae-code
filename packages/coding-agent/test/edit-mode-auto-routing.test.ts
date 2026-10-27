@@ -212,13 +212,14 @@ describe("resolveEditModeDetails precedence", () => {
 		expect(() => resolveEditMode(makeSession({ model: "openai/gpt-5.4" }))).toThrow(/Invalid GJC_EDIT_VARIANT/);
 	});
 
-	test.each(["toString", "constructor", "__proto__"])(
-		"rejects inherited property name %s in GJC_EDIT_VARIANT",
-		value => {
-			Bun.env.GJC_EDIT_VARIANT = value;
-			expect(() => resolveEditMode(makeSession({ model: "openai/gpt-5.4" }))).toThrow(/Invalid GJC_EDIT_VARIANT/);
-		},
-	);
+	test.each([
+		"toString",
+		"constructor",
+		"__proto__",
+	])("rejects inherited property name %s in GJC_EDIT_VARIANT", value => {
+		Bun.env.GJC_EDIT_VARIANT = value;
+		expect(() => resolveEditMode(makeSession({ model: "openai/gpt-5.4" }))).toThrow(/Invalid GJC_EDIT_VARIANT/);
+	});
 
 	test("invalid matched model override fails closed", () => {
 		const session = makeSession({
@@ -229,17 +230,18 @@ describe("resolveEditModeDetails precedence", () => {
 		expect(() => resolveEditModeDetails(session)).toThrow(/Invalid edit\.modelVariants value "atom"/);
 	});
 
-	test.each(["toString", "constructor", "__proto__"])(
-		"rejects inherited property name %s in a matched model override",
-		value => {
-			const session = makeSession({
-				editMode: "auto",
-				modelVariants: { "gpt-5.4": value },
-				model: "custom/gpt-5.4",
-			});
-			expect(() => resolveEditModeDetails(session)).toThrow(/Invalid edit\.modelVariants value/);
-		},
-	);
+	test.each([
+		"toString",
+		"constructor",
+		"__proto__",
+	])("rejects inherited property name %s in a matched model override", value => {
+		const session = makeSession({
+			editMode: "auto",
+			modelVariants: { "gpt-5.4": value },
+			model: "custom/gpt-5.4",
+		});
+		expect(() => resolveEditModeDetails(session)).toThrow(/Invalid edit\.modelVariants value/);
+	});
 
 	test("non-matching invalid entries do not affect another model", () => {
 		const session = makeSession({

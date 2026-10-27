@@ -115,31 +115,33 @@ describe("LifecycleLedger retention", () => {
 				});
 			},
 		},
-	] as const)(
-		"rejects byte-pressure admission when only $name entries remain",
-		async ({ seed, protectedIdentity, maxBytes, incomingSize }) => {
-			const agentDir = await temporaryAgentDir("gjc-ledger-retention-byte-protected-");
-			try {
-				const ledger = await new LifecycleLedger(agentDir, {
-					maxBytes,
-					maxRows: 100,
-					maxLineBytes: 2_000,
-				}).open();
-				await seed(ledger);
-				const beforeBytes = await ledgerBytes(agentDir);
-				const beforeEntry = ledger.get(protectedIdentity);
+	] as const)("rejects byte-pressure admission when only $name entries remain", async ({
+		seed,
+		protectedIdentity,
+		maxBytes,
+		incomingSize,
+	}) => {
+		const agentDir = await temporaryAgentDir("gjc-ledger-retention-byte-protected-");
+		try {
+			const ledger = await new LifecycleLedger(agentDir, {
+				maxBytes,
+				maxRows: 100,
+				maxLineBytes: 2_000,
+			}).open();
+			await seed(ledger);
+			const beforeBytes = await ledgerBytes(agentDir);
+			const beforeEntry = ledger.get(protectedIdentity);
 
-				await expect(
-					ledger.begin("incoming", "r", { operationKey: "o", fingerprint: "x".repeat(incomingSize) }),
-				).rejects.toThrow("Lifecycle ledger append exceeds configured bounds.");
-				expect(await ledgerBytes(agentDir)).toBe(beforeBytes);
-				expect(ledger.get(protectedIdentity)).toEqual(beforeEntry);
-				expect(ledger.get("incoming")).toBeUndefined();
-			} finally {
-				await fs.rm(agentDir, { recursive: true, force: true });
-			}
-		},
-	);
+			await expect(
+				ledger.begin("incoming", "r", { operationKey: "o", fingerprint: "x".repeat(incomingSize) }),
+			).rejects.toThrow("Lifecycle ledger append exceeds configured bounds.");
+			expect(await ledgerBytes(agentDir)).toBe(beforeBytes);
+			expect(ledger.get(protectedIdentity)).toEqual(beforeEntry);
+			expect(ledger.get("incoming")).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
 
 	it("evicts old final identities so bounded appends continue succeeding", async () => {
 		const agentDir = await temporaryAgentDir("gjc-ledger-retention-");

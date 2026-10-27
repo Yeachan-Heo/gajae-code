@@ -336,67 +336,67 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.getDefaultFallbackRuntimeState()).toEqual(recoveredRuntimeState);
 	});
 
-	it.each(["user", "registry"] as const)(
-		"rolls back without durable fallback when the %s durable profile has an unresolved qualified executor",
-		async source => {
-			const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-			const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
-			authStorage.setRuntimeApiKey("openai-codex", "test-key");
-			const profile: ModelProfileDefinition = {
-				name: `${source}-resume-unresolved-executor`,
-				requiredProviders: ["openai-codex"],
-				modelMapping: {
-					default: `${codex.provider}/${codex.id}`,
-					executor: "openai-codex/missing-executor",
-				},
-				source,
-			};
-			const settings = Settings.isolated({
-				"compaction.enabled": false,
-				"modelProfile.default": profile.name,
-				"session.resumeModelBehavior": "keepSessionModel",
-			});
-			const sessionFile = await createPersistedTarget(sonnet, settings);
-			targetSession!.setConfiguredModelChain(
-				"default",
-				[`${sonnet.provider}/${sonnet.id}`],
-				"profile-activation",
-				"removed-profile",
-			);
-			await targetSession!.sessionManager.ensureOnDisk();
-			session = new AgentSession({
-				agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
-				sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-				settings,
-				modelRegistry,
-			});
-			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
-			vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
-			vi.spyOn(modelRegistry, "getModelProfiles").mockReturnValue(new Map([[profile.name, profile]]));
-			vi.spyOn(modelRegistry, "getModelProfile").mockImplementation(name =>
-				name === profile.name ? profile : undefined,
-			);
-			const notice = vi.spyOn(session, "emitNotice");
+	it.each([
+		"user",
+		"registry",
+	] as const)("rolls back without durable fallback when the %s durable profile has an unresolved qualified executor", async source => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const profile: ModelProfileDefinition = {
+			name: `${source}-resume-unresolved-executor`,
+			requiredProviders: ["openai-codex"],
+			modelMapping: {
+				default: `${codex.provider}/${codex.id}`,
+				executor: "openai-codex/missing-executor",
+			},
+			source,
+		};
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": profile.name,
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			[`${sonnet.provider}/${sonnet.id}`],
+			"profile-activation",
+			"removed-profile",
+		);
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([codex]);
+		vi.spyOn(modelRegistry, "getModelProfiles").mockReturnValue(new Map([[profile.name, profile]]));
+		vi.spyOn(modelRegistry, "getModelProfile").mockImplementation(name =>
+			name === profile.name ? profile : undefined,
+		);
+		const notice = vi.spyOn(session, "emitNotice");
 
-			expect(await session.switchSession(sessionFile)).toBe(false);
-			expect(session.model?.id).toBe(sonnet.id);
-			expect(session.getDefaultFallbackRuntimeState().chain).not.toMatchObject({
-				origin: "runtime",
-				identity: profile.name,
-			});
-			expect(notice).not.toHaveBeenCalledWith(
-				"warning",
-				"Saved session model is no longer registered; restored the durable default preset instead.",
-				"fallback",
-			);
-			expect(notice).toHaveBeenCalledWith(
-				"error",
-				expect.stringContaining("durable default preset resolution failed"),
-				"fallback",
-			);
-			expect(notice).not.toHaveBeenCalledWith("error", expect.stringContaining("missing-executor"), "fallback");
-		},
-	);
+		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(session.model?.id).toBe(sonnet.id);
+		expect(session.getDefaultFallbackRuntimeState().chain).not.toMatchObject({
+			origin: "runtime",
+			identity: profile.name,
+		});
+		expect(notice).not.toHaveBeenCalledWith(
+			"warning",
+			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"fallback",
+		);
+		expect(notice).toHaveBeenCalledWith(
+			"error",
+			expect.stringContaining("durable default preset resolution failed"),
+			"fallback",
+		);
+		expect(notice).not.toHaveBeenCalledWith("error", expect.stringContaining("missing-executor"), "fallback");
+	});
 
 	it("fails without rewriting the saved chain when the durable default is unavailable", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;

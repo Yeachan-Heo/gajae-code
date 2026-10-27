@@ -234,70 +234,74 @@ describe("macOS community app integration", () => {
 			write.mockRestore();
 		}
 	});
-	it.each(["linux", "check", "up-to-date", "failed", "throw", "suppressed"] as const)(
-		"preserves update behavior for %s",
-		async scenario => {
-			await initTheme();
-			let offers = 0;
-			const events: string[] = [];
-			const warnings: string[] = [];
-			const warning = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
-				warnings.push(String(chunk));
-				return true;
-			});
-			const exit = new Error("exit");
-			const deps: UpdateCommandDependencies = {
-				platform: scenario === "linux" ? "linux" : "darwin",
-				getLatestRelease: async () => (scenario === "up-to-date" ? { ...release, version: "0.0.1" } : release),
-				resolveUpdateTarget: async () => ({ method: "binary", path: "/verified/gjc" }),
-				performUpdate: async () => {
-					if (scenario === "failed") throw new Error("core update failed");
-					return { ok: true, path: "/verified/gjc" };
-				},
-				runPostUpdateRecovery: async () => {},
-				refreshInstalledDefaultSkills: async () => {},
-				offerMacosCommunityApp: async options => {
-					offers++;
-					if (scenario === "throw") throw new Error(`\x1b[31moptional failure\x1b[0m\n${"x".repeat(1_000)}`);
-					const result = await offerMacosCommunityApp({
-						...options,
-						env: { GJC_NO_COMMUNITY_APP: "1" },
-						prompt: async () => {
-							throw new Error("must not prompt");
-						},
-						fetchImpl: async () => {
-							throw new Error("must not fetch");
-						},
-					});
-					expect(result).toEqual({ status: "skipped", reason: "suppressed by environment" });
-					return result;
-				},
-				recordTelemetryEvent: event => {
-					events.push(event);
-				},
-				exit: () => {
-					throw exit;
-				},
-			};
-			try {
-				const result = runUpdateCommand({ force: false, check: scenario === "check" }, deps);
-				if (scenario === "failed") await expect(result).rejects.toBe(exit);
-				else await result;
-				expect(offers).toBe(scenario === "throw" || scenario === "suppressed" ? 1 : 0);
-				if (scenario === "throw") {
-					expect(events).toContain("update_install_completed");
-					expect(events).not.toContain("update_install_failed");
-					expect(warnings.join("\n")).toContain("optional failure");
-					expect(warnings.join("\n")).toContain("https://github.com/devswha/gajae-code-app");
-					expect(warnings.join("")).not.toContain("\x1b");
-					expect(warnings.join("")).not.toContain("x".repeat(513));
-					expect(warnings.join("")).toContain("GJC remains installed.");
-				}
-			} finally {
-				warning.mockRestore();
+	it.each([
+		"linux",
+		"check",
+		"up-to-date",
+		"failed",
+		"throw",
+		"suppressed",
+	] as const)("preserves update behavior for %s", async scenario => {
+		await initTheme();
+		let offers = 0;
+		const events: string[] = [];
+		const warnings: string[] = [];
+		const warning = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+			warnings.push(String(chunk));
+			return true;
+		});
+		const exit = new Error("exit");
+		const deps: UpdateCommandDependencies = {
+			platform: scenario === "linux" ? "linux" : "darwin",
+			getLatestRelease: async () => (scenario === "up-to-date" ? { ...release, version: "0.0.1" } : release),
+			resolveUpdateTarget: async () => ({ method: "binary", path: "/verified/gjc" }),
+			performUpdate: async () => {
+				if (scenario === "failed") throw new Error("core update failed");
+				return { ok: true, path: "/verified/gjc" };
+			},
+			runPostUpdateRecovery: async () => {},
+			refreshInstalledDefaultSkills: async () => {},
+			offerMacosCommunityApp: async options => {
+				offers++;
+				if (scenario === "throw") throw new Error(`\x1b[31moptional failure\x1b[0m\n${"x".repeat(1_000)}`);
+				const result = await offerMacosCommunityApp({
+					...options,
+					env: { GJC_NO_COMMUNITY_APP: "1" },
+					prompt: async () => {
+						throw new Error("must not prompt");
+					},
+					fetchImpl: async () => {
+						throw new Error("must not fetch");
+					},
+				});
+				expect(result).toEqual({ status: "skipped", reason: "suppressed by environment" });
+				return result;
+			},
+			recordTelemetryEvent: event => {
+				events.push(event);
+			},
+			exit: () => {
+				throw exit;
+			},
+		};
+		try {
+			const result = runUpdateCommand({ force: false, check: scenario === "check" }, deps);
+			if (scenario === "failed") await expect(result).rejects.toBe(exit);
+			else await result;
+			expect(offers).toBe(scenario === "throw" || scenario === "suppressed" ? 1 : 0);
+			if (scenario === "throw") {
+				expect(events).toContain("update_install_completed");
+				expect(events).not.toContain("update_install_failed");
+				expect(warnings.join("\n")).toContain("optional failure");
+				expect(warnings.join("\n")).toContain("https://github.com/devswha/gajae-code-app");
+				expect(warnings.join("")).not.toContain("\x1b");
+				expect(warnings.join("")).not.toContain("x".repeat(513));
+				expect(warnings.join("")).toContain("GJC remains installed.");
 			}
-		},
-	);
+		} finally {
+			warning.mockRestore();
+		}
+	});
 
 	it("dispatches only exact single-argument capability and internal offer flags", async () => {
 		const stdout: string[] = [];
@@ -380,33 +384,32 @@ describe("update-cli release lookup", () => {
 		);
 	});
 
-	it.each([403, 429])(
-		"resolves the stable tag through the github.com redirect when the API is rate limited (%i)",
-		async status => {
-			const requested: string[] = [];
+	it.each([
+		403, 429,
+	])("resolves the stable tag through the github.com redirect when the API is rate limited (%i)", async status => {
+		const requested: string[] = [];
 
-			const release = await getLatestReleaseForTest({
-				...isolated,
-				fetchImpl: async url => {
-					requested.push(String(url));
-					if (String(url).startsWith("https://api.github.com/")) return new Response("limited", { status });
-					return new Response(null, {
-						status: 302,
-						headers: { location: "https://github.com/Yeachan-Heo/gajae-code/releases/tag/v9.9.9" },
-					});
-				},
-			});
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			fetchImpl: async url => {
+				requested.push(String(url));
+				if (String(url).startsWith("https://api.github.com/")) return new Response("limited", { status });
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://github.com/Yeachan-Heo/gajae-code/releases/tag/v9.9.9" },
+				});
+			},
+		});
 
-			expect(requested).toEqual([
-				"https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest",
-				"https://github.com/Yeachan-Heo/gajae-code/releases/latest",
-			]);
-			expect(release.tag).toBe("v9.9.9");
-			expect(release.version).toBe("9.9.9");
-			expect(release.warnings.join("\n")).toContain(`responded ${status}`);
-			expect(release.warnings.join("\n")).toContain("GITHUB_TOKEN");
-		},
-	);
+		expect(requested).toEqual([
+			"https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest",
+			"https://github.com/Yeachan-Heo/gajae-code/releases/latest",
+		]);
+		expect(release.tag).toBe("v9.9.9");
+		expect(release.version).toBe("9.9.9");
+		expect(release.warnings.join("\n")).toContain(`responded ${status}`);
+		expect(release.warnings.join("\n")).toContain("GITHUB_TOKEN");
+	});
 
 	it("never reaches the web fallback for a non-rate-limit API failure", async () => {
 		const requested: string[] = [];
