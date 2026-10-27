@@ -6,7 +6,8 @@
 
 - Reject unsafe paths, invalid operations, overlapping batches, and unjournaled ancestor replacements before mutation. Stage in-memory updates atomically, protect YAML builders and CAS preconditions from mutable inputs, and avoid inherited-property traversal when clearing overrides.
 - Return independently owned inverse receipts from memory restores, preserve literal model-role names across reload, and reject intervening writes to asynchronously prepared current-value batches.
-- Return failed notification saves to fresh setup instead of retrying consumed drafts. Require portable interaction shutdown before session shutdown and settle only validated request identities.
+- Return failed notification saves to fresh setup instead of retrying consumed drafts, distinguish runtime and rollback failure outcomes, and protect secret-safe diagnostics. Require portable interaction shutdown before session shutdown, settle only validated request identities, and enforce payload limits on detached data.
+- Reject reentrant and opposing nested YAML queue acquisitions without blocking independent FIFO writers; preserve deferred Settings writes and refuse reentrant flushes.
 
 ### Added
 
